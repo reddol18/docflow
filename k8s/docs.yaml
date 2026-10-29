@@ -1,0 +1,159 @@
+# 공문서 처리 플랫폼: docs 네임스페이스 하나에 docflow(API + LangGraph + PaddleOCR), Postgres, Qdrant.
+# 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → OpenAI(공인 IP 443)만.
+apiVersion: v1
+kind: Namespace
+metadata: {name: docs, labels: {purpose: doc-platform}}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: docs-quota, namespace: docs}
+spec:
+  hard: {requests.cpu: "3", requests.memory: 4Gi, limits.memory: 7Gi, persistentvolumeclaims: "4"}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: docs}
+spec: {podSelector: {}, policyTypes: [Ingress, Egress]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: docs}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: docflow-egress, namespace: docs}
+spec:
+  podSelector: {matchLabels: {app: docflow}}
+  policyTypes: [Egress]
+  egress:
+  - to: [{podSelector: {matchLabels: {app: postgres}}}]
+    ports: [{protocol: TCP, port: 5432}]
+  - to: [{podSelector: {matchLabels: {app: qdrant}}}]
+    ports: [{protocol: TCP, port: 6333}]
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+    ports: [{protocol: TCP, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: stores-from-docflow, namespace: docs}
+spec:
+  podSelector: {matchExpressions: [{key: app, operator: In, values: [postgres, qdrant]}]}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: docflow}}}]
+    ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6333}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: pg-data, namespace: docs}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: postgres, namespace: docs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17.10-alpine
+        env:
+        - {name: POSTGRES_USER, value: docflow}
+        - {name: POSTGRES_DB, value: docflow}
+        - {name: POSTGRES_PASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
+        - {name: PGDATA, value: /var/lib/postgresql/data/pg}
+        ports: [{containerPort: 5432}]
+        resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
+        readinessProbe: {exec: {command: [pg_isready, -U, docflow]}, periodSeconds: 5}
+        volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumes: [{name: data, persistentVolumeClaim: {claimName: pg-data}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: docs}
+spec: {selector: {app: postgres}, ports: [{port: 5432}]}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: qdrant-data, namespace: docs}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 2Gi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: qdrant, namespace: docs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: qdrant}}
+  template:
+    metadata: {labels: {app: qdrant}}
+    spec:
+      containers:
+      - name: qdrant
+        image: qdrant/qdrant:v1.19.2
+        env: [{name: QDRANT__TELEMETRY_DISABLED, value: "true"}]
+        ports: [{containerPort: 6333}]
+        resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
+        readinessProbe: {httpGet: {path: /readyz, port: 6333}, periodSeconds: 5}
+        volumeMounts: [{name: data, mountPath: /qdrant/storage}]
+      volumes: [{name: data, persistentVolumeClaim: {claimName: qdrant-data}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: qdrant, namespace: docs}
+spec: {selector: {app: qdrant}, ports: [{port: 6333}]}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: docflow-data, namespace: docs}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 5Gi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: docflow, namespace: docs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: docflow}}
+  template:
+    metadata: {labels: {app: docflow}}
+    spec:
+      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      containers:
+      - name: docflow
+        image: docflow:dev
+        imagePullPolicy: Never
+        env:
+        - {name: PG_URL, value: "postgresql://docflow@postgres:5432/docflow"}
+        - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
+        - {name: QDRANT_URL, value: "http://qdrant:6333"}
+        - {name: OCR_THREADS, value: "4"}
+        - {name: DAILY_BUDGET_USD, value: "3.0"}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        ports: [{containerPort: 8000}]
+        resources: {requests: {cpu: 1500m, memory: 2Gi}, limits: {memory: 5Gi}}
+        readinessProbe: {httpGet: {path: /healthz, port: 8000}, periodSeconds: 5}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+        - {name: openai, mountPath: /etc/openai, readOnly: true}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: docflow-data}}
+      - {name: openai, secret: {secretName: openai, optional: true}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: docflow, namespace: docs}
+spec: {selector: {app: docflow}, ports: [{port: 8000}]}

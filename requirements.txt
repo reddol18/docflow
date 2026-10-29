@@ -1,0 +1,15 @@
+# OCR: PoC(Windows .venv)와 같은 버전
+paddlepaddle==3.2.2
+paddleocr==3.3.3
+paddlex==3.3.13
+# 플랫폼: 첫 빌드(2026-10-29)에서 받은 버전. 전체 목록은 requirements.lock
+langgraph==1.2.18
+langgraph-checkpoint==4.3.1
+langgraph-checkpoint-postgres==3.2.0
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3
+qdrant-client==1.20.0
+openai==3.41.0
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.32

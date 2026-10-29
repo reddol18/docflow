@@ -1,0 +1,26 @@
+# 원본 쪽 이미지·OCR 결과·채점 결과는 공개하지 않는다 (실명·서명·직인)
+work/
+data/
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.pdf
+!docs/screens/*.png
+
+# 비밀값
+.env
+.env.*
+*api-key*
+openai_key
+
+# 개인 메모
+docs/vocab_handoff_*.md
+
+# 빌드 산출물
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.next/
+*.tsbuildinfo
