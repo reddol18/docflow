@@ -59,3 +59,13 @@ gpt-4.1-mini(high)가 일련번호 7/10, 일자 8/10, 20칸 $0.0026으로 가장
 ## 7. 사람 검토 시연과 화면 캡처
 - 1997-0002 철을 human으로 다시 실행 → validate 뒤 `interrupt()`에서 멈춤 (10건 중 9건 표시). 대시보드에 '검토 대기'로 뜸.
 - 캡처는 `NEXT_PUBLIC_MASK_IMAGES=1`로 머리부 이미지를 흐리게 하고 Chrome headless로 찍음. 손글씨 칸 조각(숫자)만 그대로 보인다.
+
+## 8. 부하 시뮬레이션 (breakscale_wrap)
+- 시나리오 `sim/a_mac.json`(지금 구성), `sim/b_cloud.json`(클라우드). 결과와 넣은 값은 README "부하 시뮬레이션" 절.
+- 실행: `cd <breakscale_wrap>; bun <docflow>/sim/run.ts <docflow>/sim/a_mac.json 300` (`run.ts`, `compress.py`는 bank_llm_gateway에서 가져옴).
+  영상은 30배 압축본을 breakscale_wrap의 `lab/scenarios/`에 녹화하는 동안만 복사해 `lab/viz/record.mjs`로 찍고 지웠다.
+- 처음엔 B를 breakscale_wrap 자체 오토스케일러(fleet)로 만들었는데, 대기열 → 워커 구조에서 꺼진 워커도 대기열에서 일을 꺼내 가 실패했다(쪽이 사라짐).
+  대기열과 워커 사이에 LB를 넣으니 워커가 대기열에서 꺼내 가지 않아 아무것도 처리되지 않았다. 엔진의 worker는 대기열에서 끌어오는 쪽이고 LB는 밀어 넣는 쪽이라서다.
+  → 워커 노드 하나의 `instances`를 시각표로 1→6→1 바꾸는 방식으로 KEDA를 근사.
+- B 첫 판에서 사양을 노드 1대(4 vCPU)로 적어 화면에 CPU 150%가 떴다. Pod마다 노드가 따로라 vCPU를 6대 합(24)으로 고침. (worker 종류는 CPU 경합 모델 대상이 아니라 처리 결과는 같았다.)
+- 몰림 크기가 seed마다 크게 다르다(seed 1 약 210쪽, seed 2 약 130쪽). 도착 간격을 바뀌기 전 속도로 뽑는 탓으로 보임(추정). seed 1로 고정해 보고.

@@ -1,0 +1,33 @@
+{
+  "name": "B 클라우드 (OCR 워커 KEDA 1~6 Pod)",
+  "description": "A와 같은 트래픽. 공유 대기열 + OCR 워커 Pod(노드 c6i.xlarge 1대에 1개) 대기열 길이로 1~6개, 새 노드+이미지 110s",
+  "seconds": 1200,
+  "design": {
+    "name": "docflow on cloud",
+    "nodes": [
+      { "id": "upload", "kind": "client", "label": "쪽 업로드", "x": 0, "y": 200,
+        "config": { "rps": 0.05, "timeoutMs": 2000, "retries": 0 } },
+      { "id": "q", "kind": "queue", "label": "쪽 대기열 (Redis/SQS)", "x": 380, "y": 200,
+        "config": { "serviceMs": 1, "serviceCv": 0.2, "queueLimit": 5000 } },
+      { "id": "ocr", "kind": "worker", "label": "OCR 워커 Pod (KEDA 1~6)", "x": 760, "y": 200,
+        "config": { "capacity": 1, "instances": 1, "serviceMs": 9000, "serviceCv": 0.2 } },
+      { "id": "gpt", "kind": "service", "label": "GPT (추출·손글씨)", "x": 1140, "y": 200,
+        "config": { "capacity": 4, "serviceMs": 2800, "serviceCv": 0.3, "queueLimit": 1000, "timeoutMs": 0, "retries": 0 } }
+    ],
+    "edges": [
+      { "from": "upload", "to": "q" },
+      { "from": "q", "to": "ocr" },
+      { "from": "ocr", "to": "gpt" }
+    ]
+  },
+  "specs": {
+    "ocr": { "product": "Pod당 노드 c6i.xlarge(4vCPU) × 최대 6", "vcpu": 24, "memMiB": 49152, "cpuPerReq": 4, "memBaseMiB": 2048, "memPerInflightMiB": 300 },
+    "gpt": { "product": "OpenAI gpt-4.1-mini (계정 한도 안)", "managed": true }
+  },
+  "timeline": [
+    { "at": 120, "set": { "upload": { "rps": 2 } } },
+    { "at": 220, "set": { "upload": { "rps": 0.05 } } },
+    { "at": 260, "set": { "ocr": { "instances": 6 } } },
+    { "at": 900, "set": { "ocr": { "instances": 1 } } }
+  ]
+}

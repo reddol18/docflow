@@ -1,0 +1,31 @@
+{
+  "name": "A 지금 구성 (맥 k3s 1노드)",
+  "description": "평소 분당 3쪽, 120~220s에 200쪽 철 업로드. OCR Pod 1개가 한 쪽씩 처리(쪽당 9s 실측)",
+  "seconds": 3900,
+  "design": {
+    "name": "docflow on mac",
+    "nodes": [
+      { "id": "upload", "kind": "client", "label": "쪽 업로드", "x": 0, "y": 200,
+        "config": { "rps": 0.05, "timeoutMs": 2000, "retries": 0 } },
+      { "id": "q", "kind": "queue", "label": "철 대기열 (Pod 메모리)", "x": 380, "y": 200,
+        "config": { "serviceMs": 1, "serviceCv": 0.2, "queueLimit": 5000 } },
+      { "id": "ocr", "kind": "worker", "label": "docflow OCR Pod ×1", "x": 760, "y": 200,
+        "config": { "capacity": 1, "serviceMs": 9000, "serviceCv": 0.2 } },
+      { "id": "gpt", "kind": "service", "label": "GPT (추출·손글씨)", "x": 1140, "y": 200,
+        "config": { "capacity": 4, "serviceMs": 2800, "serviceCv": 0.3, "queueLimit": 1000, "timeoutMs": 0, "retries": 0 } }
+    ],
+    "edges": [
+      { "from": "upload", "to": "q" },
+      { "from": "q", "to": "ocr" },
+      { "from": "ocr", "to": "gpt" }
+    ]
+  },
+  "specs": {
+    "ocr": { "product": "맥 colima 4vCPU/8GB (k3s 1노드)", "vcpu": 4, "memMiB": 5120, "cpuPerReq": 1, "memBaseMiB": 2048, "memPerInflightMiB": 300 },
+    "gpt": { "product": "OpenAI gpt-4.1-mini", "managed": true }
+  },
+  "timeline": [
+    { "at": 120, "set": { "upload": { "rps": 2 } } },
+    { "at": 220, "set": { "upload": { "rps": 0.05 } } }
+  ]
+}
