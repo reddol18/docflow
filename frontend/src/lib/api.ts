@@ -81,6 +81,7 @@ export type DailyRow = {
   docs_extracted: number;
   docs_indexed: number;
   docs_flagged: number;
+  flag_rate: number | null;
   docs_reviewed: number;
   cells_reviewed: number;
   cells_fixed: number;
@@ -161,12 +162,11 @@ export const api = {
     return call<SearchHit[]>(`/search?${p}`);
   },
   ask: (q: string) => call<{ answer: string; sources: SearchHit[] }>(`/ask?q=${enc(q)}`),
-  timings: (vol: string, rows: Timing[], keepalive = false) =>
-    call<{ saved: number }>(`/volumes/${enc(vol)}/timings`, {
+  timings: (vol: string, rows: Timing[]) =>
+    call<{ saved: number; dropped: number }>(`/volumes/${enc(vol)}/timings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(rows),
-      keepalive, // 페이지를 떠나는 중에도 전송
     }),
   report: (dayFrom?: string, dayTo?: string) => call<Report>(`/report?${reportQuery(dayFrom, dayTo)}`),
 };

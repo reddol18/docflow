@@ -13,6 +13,7 @@ const DAILY: { key: keyof DailyRow; label: string; fmt?: (r: DailyRow) => string
   { key: "docs_extracted", label: "추출 건" },
   { key: "docs_indexed", label: "색인 건" },
   { key: "docs_flagged", label: "검토 표시 건" },
+  { key: "flag_rate", label: "표시 비율", fmt: (r) => pct(r.flag_rate) },
   { key: "docs_reviewed", label: "검토 건" },
   { key: "cells_reviewed", label: "표시된 칸" },
   { key: "cells_fixed", label: "고친 칸" },
@@ -102,7 +103,9 @@ export default function ReportPage() {
           </table>
         </div>
         <p className="mt-3 text-xs text-slate-400">
-          수정률 = 검토 제출 때 고친 칸 / 검토 표시된 칸. 검사(2인 검증) 단계가 생기면 검사 오류율로 바꾼다. 날짜는 KST.
+          표시 비율 = 그날 색인된 문서 중 검토 표시된 문서. 수정률 = 검토 제출 때 고친 칸 / 검토 표시된 칸 (표시 안 된 칸의
+          오류는 빠진다). 검사(2인 검증) 단계가 생기면 검사 오류율로 바꾼다. 검토 시간은 검토 제출·문서 저장으로 확정한 것만 센다.
+          날짜는 KST.
         </p>
       </Card>
 

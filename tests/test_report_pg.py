@@ -56,13 +56,14 @@ def test_daily_report(mods):
     r1, r2, r3 = report.daily(dt.date(2026, 11, 1), dt.date(2026, 11, 3))
     assert r1["pages_ocr"] == 0 and r1["fix_rate"] is None
     assert (r2["pages_ocr"], r3["pages_ocr"]) == (2, 1)
-    assert (r2["docs_extracted"], r2["docs_indexed"], r2["docs_flagged"]) == (2, 2, 1)
+    assert (r2["docs_extracted"], r2["docs_indexed"], r2["docs_flagged"], r2["flag_rate"]) == (2, 2, 1, 0.5)
     assert (r3["docs_reviewed"], r3["cells_reviewed"], r3["cells_fixed"], r3["fix_rate"]) == (2, 3, 2, 0.667)
     assert r3["cells_edited"] == 1
     assert (r3["review_docs_timed"], r3["review_sec_median"], r3["review_min_total"]) == (2, 40.0, 1.3)
     assert r2["usd"] == 0.0123
-    assert report.review_time_summary()["review"]["docs"] == 2
+    assert report.review_time_summary(dt.date(2026, 11, 1), dt.date(2026, 11, 3))["review"]["docs"] == 2
+    assert report.review_time_summary(dt.date(2026, 11, 1), dt.date(2026, 11, 2)) == {}  # 기간 밖은 안 셈
 
     csv = report.to_csv([r1, r2, r3])
     assert csv.startswith("﻿날짜,OCR 면")
-    assert "2026-11-03,1,0,0,0,2,3,2,0.667,1,2,40.0,1.3,0.0" in csv
+    assert "2026-11-03,1,0,0,0,,2,3,2,0.667,1,2,40.0,1.3,0.0" in csv

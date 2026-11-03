@@ -18,7 +18,7 @@ import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Annotated, Literal
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from app import graph as flow
 from app import llm, ocr, report, store
+from app.review_input import clean_fixes
 
 VOL_RX = re.compile(r"^[\w.-]{1,80}$")
 runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
@@ -283,26 +284,23 @@ async def review_submit(vol: str, request: Request):
         raise HTTPException(409, "검토 대기 없음")
     form = await request.form()
     flagged = snap.interrupts[0].value["flagged"]
-    cur = {d["doc_id"]: d["fields"] for d in flagged}
-    fixes = {}
-    for key, val in form.items():
-        did, _, k = key.rpartition("__")
-        if did in cur and k in cur[did] and val.strip() != (cur[did][k] or ""):
-            fixes.setdefault(did, {})[k] = val.strip()
+    fixes = clean_fixes(flagged, [(*key.rpartition("__")[::2], val) for key, val in form.items()])
     submit(vol, Command(resume=fixes))
     record_review(vol, flagged, fixes)
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
 
 @app.post("/review/{vol}/json")
-def review_json(vol: str, fixes: dict):
-    """스크립트용: {doc_id: {칸: 값}} 으로 이어 가기."""
+def review_json(vol: str, body: dict[str, dict[str, str]]):
+    """스크립트·검토 화면용: {doc_id: {칸: 값}} 으로 이어 가기. 검토 대기 문서의 바뀐 칸만 반영한다."""
     check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
         raise HTTPException(409, "검토 대기 없음")
+    flagged = snap.interrupts[0].value["flagged"]
+    fixes = clean_fixes(flagged, [(did, k, v) for did, f in body.items() for k, v in f.items()])
     submit(vol, Command(resume=fixes))
-    record_review(vol, snap.interrupts[0].value["flagged"], fixes)
+    record_review(vol, flagged, fixes)
     return {"vol": vol, "fixed": {k: list(v) for k, v in fixes.items()}}
 
 
@@ -315,14 +313,14 @@ class Timing(BaseModel):
 
 
 @app.post("/volumes/{vol}/timings")
-def timings(vol: str, rows: list[Timing]):
-    """검토 화면이 잰 문서별 작업 시간 (자리 비움 제외). 1초 미만(넘겨 보기만 한 것)은 버린다."""
+def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)]):
+    """검토 화면이 확정(검토 제출·문서 저장) 때 보내는 문서별 작업 시간 (자리 비움 제외).
+    이 철에 없는 문서와 1초 미만(넘겨 보기만 한 것)은 버린다."""
     check(vol)
-    if len(rows) > 1000:
-        raise HTTPException(413, "too many rows")
-    keep = [r.model_dump() for r in rows if r.active_ms >= 1000]
+    known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
+    keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
     store.add_review_times(vol, keep)
-    return {"saved": len(keep)}
+    return {"saved": len(keep), "dropped": len(rows) - len(keep)}
 
 
 def _range(day_from, day_to):
@@ -341,7 +339,7 @@ def report_view(day_from: dt.date | None = None, day_to: dt.date | None = None):
     root = store.DATA / "pages"
     vols = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
     return {"day_from": lo, "day_to": hi, "volume": report.volume_counts([summary(v) for v in vols]),
-            "daily": report.daily(lo, hi), "review_time": report.review_time_summary(),
+            "daily": report.daily(lo, hi), "review_time": report.review_time_summary(lo, hi),
             "columns": dict(report.COLUMNS)}
 
 

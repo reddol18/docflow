@@ -12,16 +12,19 @@ type Acc = { ms: number; openedAt: string };
 /**
  * 검토 화면에서 지금 보고 있는 문서(docId)의 실제 작업 시간을 잰다.
  * 탭이 숨겨졌거나 창이 포커스를 잃었거나 60초 동안 입력이 없으면 세지 않는다.
- * flush()로 모은 시간을 서버에 보내고 비운다. 페이지를 떠날 때도 보낸다(keepalive).
+ * 시간은 확정할 때만 보낸다(flush: 검토 제출, 문서 저장). 확정하지 않고 떠나면 버린다
+ * — 이슈 정의 "화면을 연 시각 → 확정 시각".
  */
 export function useReviewTimer(vol: string, docId: string | undefined, mode: Timing["mode"], enabled: boolean) {
   const acc = useRef<Record<string, Acc>>({});
+  const opened = useRef<Record<string, string>>({});
   const lastInput = useRef(0);
   const cur = useRef(docId);
   const modeRef = useRef(mode);
   useEffect(() => {
     cur.current = docId;
     modeRef.current = mode;
+    if (docId) opened.current[docId] ??= new Date().toISOString(); // 그 문서를 처음 화면에 연 시각
   }, [docId, mode]);
 
   useEffect(() => {
@@ -38,7 +41,7 @@ export function useReviewTimer(vol: string, docId: string | undefined, mode: Tim
       const active =
         enabled && id && document.visibilityState === "visible" && document.hasFocus() && now - lastInput.current < IDLE_MS;
       if (!active) return;
-      const a = (acc.current[id] ??= { ms: 0, openedAt: new Date().toISOString() });
+      const a = (acc.current[id] ??= { ms: 0, openedAt: opened.current[id] ?? new Date().toISOString() });
       a.ms += dt;
     }, TICK_MS);
     return () => {
@@ -61,6 +64,7 @@ export function useReviewTimer(vol: string, docId: string | undefined, mode: Tim
         fields_changed: Math.min(changed?.[id] ?? 0, 10),
       });
       delete acc.current[id];
+      delete opened.current[id];
     }
     return rows;
   }, []);
@@ -78,18 +82,6 @@ export function useReviewTimer(vol: string, docId: string | undefined, mode: Tim
     },
     [vol, take],
   );
-
-  useEffect(() => {
-    const onHide = () => {
-      const rows = take();
-      if (rows.length) api.timings(vol, rows, true).catch(() => {});
-    };
-    window.addEventListener("pagehide", onHide);
-    return () => {
-      window.removeEventListener("pagehide", onHide);
-      onHide(); // 화면 안에서 다른 페이지로 옮길 때
-    };
-  }, [vol, take]);
 
   return { flush };
 }
