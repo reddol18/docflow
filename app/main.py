@@ -12,7 +12,6 @@
 """
 import html
 import re
-import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager

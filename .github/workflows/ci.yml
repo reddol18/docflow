@@ -1,0 +1,118 @@
+# CI 0층: LLM·외부 API 호출 없음(토큰 0). https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docflow/issues/25
+# 실제 모델을 부르는 평가(1층 이상)는 여기서 돌리지 않는다. 평가 데이터(AI Hub)가 저장소에 없고, 공개 저장소라 외부 PR이 키를 쓰면 안 된다.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: tsc
+        # LayoutProps 등 Next가 만드는 경로 타입(.next/types)이 있어야 한다
+        run: npx next typegen && npx tsc --noEmit
+      - name: eslint
+        run: npx eslint src
+
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.10-alpine
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 2s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      # 시험에 필요한 것만 설치한다 (OCR·LangGraph 등 이미지 의존성은 무겁고 시험 대상 모듈이 쓰지 않음)
+      - run: pip install ruff==0.14.3 pytest==8.4.2 "psycopg[binary]==3.3.6" psycopg-pool==3.3.3
+      - name: ruff (보안 규칙 S 포함)
+        run: ruff check .
+      - name: pytest
+        env:
+          TEST_PG_URL: postgresql://postgres:ci-only@localhost:5432/postgres
+        # 종료 코드 5 = 모은 시험이 없음 (tests/가 아직 없는 브랜치). 그 외 실패는 그대로 실패
+        run: pytest -q || test $? -eq 5
+
+  security:
+    runs-on: ubuntu-24.04
+    env:
+      GITLEAKS: "8.30.1"
+      OSV: "2.7.0"
+      TRIVY: "0.75.0"
+      SEMGREP: "1.180.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # gitleaks가 커밋 이력 전체를 본다
+      - name: 도구 받기 (체크섬 확인)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP/bin"
+          base=https://github.com
+          curl -sSfLO "$base/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_linux_x64.tar.gz"
+          curl -sSfLO "$base/gitleaks/gitleaks/releases/download/v$GITLEAKS/gitleaks_${GITLEAKS}_checksums.txt"
+          sha256sum -c --ignore-missing "gitleaks_${GITLEAKS}_checksums.txt"
+          curl -sSfLO "$base/google/osv-scanner/releases/download/v$OSV/osv-scanner_linux_amd64"
+          curl -sSfLO "$base/google/osv-scanner/releases/download/v$OSV/osv-scanner_SHA256SUMS"
+          sha256sum -c --ignore-missing osv-scanner_SHA256SUMS
+          curl -sSfLO "$base/aquasecurity/trivy/releases/download/v$TRIVY/trivy_${TRIVY}_Linux-64bit.tar.gz"
+          curl -sSfLO "$base/aquasecurity/trivy/releases/download/v$TRIVY/trivy_${TRIVY}_checksums.txt"
+          sha256sum -c --ignore-missing "trivy_${TRIVY}_checksums.txt"
+          tar xzf "gitleaks_${GITLEAKS}_linux_x64.tar.gz" gitleaks
+          tar xzf "trivy_${TRIVY}_Linux-64bit.tar.gz" trivy
+          mv osv-scanner_linux_amd64 osv-scanner && chmod +x osv-scanner
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: gitleaks (비밀값, 커밋 이력)
+        run: gitleaks git . --no-banner --redact
+      - name: osv-scanner (의존성 취약점)
+        # --no-resolve: requirements.lock은 pip freeze 전체 목록이라 다시 풀지 않는다
+        # (풀면 freeze에 없는 setuptools를 아주 낮은 버전으로 추정해 거짓 경보가 난다)
+        # 받아들인 위험은 osv-scanner.toml (사유·만료일)
+        run: |
+          osv-scanner scan source --no-resolve --config osv-scanner.toml \
+            --lockfile requirements.txt:requirements.lock --lockfile frontend/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: semgrep (정적 분석, OWASP·Python·TS 규칙)
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        # k8s 매니페스트는 아래 Trivy가 맡는다
+        run: |
+          pip install "semgrep==$SEMGREP"
+          semgrep scan --metrics=off --error --config p/python --config p/typescript --config p/owasp-top-ten \
+            --exclude k8s --exclude sim --severity ERROR --severity WARNING
+      - name: trivy config (k8s·Dockerfile) — 보고만
+        # 알려진 지적(securityContext)을 고치기 전까지는 실패시키지 않는다. 고치면 --exit-code 1
+        run: trivy config --severity HIGH,CRITICAL --exit-code 0 .

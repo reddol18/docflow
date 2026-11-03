@@ -1,0 +1,7 @@
+# 받아들인 의존성 위험. 항목마다 사유와 만료일을 둔다. 만료되면 CI가 다시 실패한다.
+# 절차: https://github.com/reddol18/docflow/issues/25 (Act — 위험 수용은 사유를 남긴다)
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+ignoreUntil = 2027-02-01
+reason = "minimatch: eslint가 쓰는 개발용 의존성. 배포 산출물(next build)에 들어가지 않고 외부 입력을 받지 않는다. eslint 갱신 때 함께 올린다."

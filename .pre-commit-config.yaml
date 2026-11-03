@@ -1,0 +1,11 @@
+# 커밋 전 검사 (https://github.com/reddol18/docflow/issues/25 Do 단계). 설치: pip install pre-commit && pre-commit install
+# CI(.github/workflows/ci.yml)가 같은 검사를 다시 하므로, 여기서 빠뜨려도 병합 전에 걸린다.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.3
+    hooks:
+      - id: ruff

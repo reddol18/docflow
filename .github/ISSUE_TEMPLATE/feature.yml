@@ -1,0 +1,50 @@
+name: 기능·개선
+description: 목표와 측정 가능한 완료 조건이 있는 작업
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 목표
+      description: 왜 하는가. 끝나면 무엇이 달라지는가.
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: 완료 조건
+      description: |
+        항목마다 **측정 방법**을 적는다. 계약 리뷰(/spec-review)가 이 목록으로 충족 여부를 판정한다.
+        예) - [ ] 표시 없이 틀린 문서 3% 이하 — `eval/flag_whatif.py` 김해 7개 철
+      value: |
+        - [ ] … — 측정:
+    validations:
+      required: true
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: 범위 밖
+      description: 이번에 하지 않는 것. 리뷰에서 범위 밖 변경을 가려낸다.
+  - type: checkboxes
+    id: security
+    attributes:
+      label: 보안 영향
+      description: 해당하는 칸을 고르면 OWASP 항목을 완료 조건의 '보안' 소절로 붙인다 (https://github.com/reddol18/docflow/issues/25)
+      options:
+        - label: 새 입력·폼·쿼리 파라미터
+        - label: 파일 업로드·다운로드
+        - label: 새 엔드포인트
+        - label: 인증·세션 변경
+        - label: 권한·역할 변경
+        - label: LLM 호출 추가·변경
+        - label: 검색·RAG·임베딩
+        - label: 외부 통신·새 외부 서비스
+        - label: 개인정보·민감 데이터 저장·표시
+        - label: 새 의존성·이미지·배포 설정
+        - label: 로그·오류 처리
+        - label: 비용·한도가 걸린 흐름
+  - type: textarea
+    id: related
+    attributes:
+      label: 관련
+      description: 이슈·PR·ADR·문서 (전체 URL)

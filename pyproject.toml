@@ -1,0 +1,27 @@
+# 도구 설정만 둔다. 실행 의존성은 requirements.txt / requirements.lock (Docker 이미지).
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+extend-exclude = ["frontend", "sim"]
+
+[tool.ruff.lint]
+# E/F/W 기본 + I(import 순서) + B(흔한 버그) + S(보안, Bandit 규칙) — https://github.com/reddol18/docflow/issues/25
+select = ["E", "F", "W", "I", "B", "S"]
+ignore = [
+  "E731",  # 짧은 lambda 대입 허용 (평가 스크립트)
+  "S101",  # assert (테스트)
+  "B008",  # FastAPI 관례: File(...)·Depends(...)를 기본값으로 쓴다
+  "B905",  # zip(strict=) — 길이가 같은 것을 짝짓는 곳뿐
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S"]
+"eval/*" = ["S", "B023"]  # 로컬 평가 스크립트 (외부 입력 없음). 반복문 안 lambda는 그 자리에서 바로 쓴다
+"app/llm.py" = ["E501"]  # 프롬프트 문자열
+# 리포트 SQL은 f-string이지만 끼워 넣는 것은 모듈 상수(열 이름, PER_DOC)뿐이고 값은 모두 %s 매개변수다
+"app/report.py" = ["S608"]
