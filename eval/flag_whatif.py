@@ -2,10 +2,12 @@
 
 규칙은 app/flags.py 하나를 그래프와 같이 쓴다. 표시는 저장된 값이 아니라 여기서 다시 계산한다.
 실행 (records_poc 폴더에서):
-  .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/flag_whatif.py work/platform/*.json [--sweep] [--detail 이름]
+  .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/flag_whatif.py work/platform/*.json [--sweep] [--loo] [--detail 이름]
 
-  기본      지금 기본값(DEFAULT)과 추천 설정을 칸별·문서별로 비교
-  --sweep   확신도 기준값 × 추가 규칙 조합을 훑어 '표시 없이 틀린 문서'와 '표시 비율'을 표로
+  기본      이전 규칙(LEGACY)·기본값(DEFAULT)·전체 규칙을 칸별·문서별로 비교
+  --sweep   확신도 기준값(이전보다 낮은 값, 0=끔 포함) × 일자 불일치 켬/끔 × 추가 규칙 조합의 파레토 경계,
+            표시 80% 이하에서의 최선, 이론 하한
+  --loo     철 하나 빼고 고르기: 6개 철로 설정을 고르고 남은 철에서 잰다 (표본 맞춤 정도 확인)
   --detail  지정한 설정 이름에서 표시 없이 틀린 문서를 칸별로 나열
 목표 (https://github.com/reddol18/docflow/issues/2): 표시 없이 틀린 문서 3% 이하, 표시된 문서 80% 이하.
 """
@@ -75,6 +77,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results", nargs="+")
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--loo", action="store_true")
     ap.add_argument("--detail", choices=["이전", "기본", "전체 규칙"])
     a = ap.parse_args()
     vols = load(a.results)
@@ -105,24 +108,75 @@ def main():
                     print(f"    {v}: {len(sub):3d}건 표시 {rate:4.0%}, 표시 없이 틀림 {len(s)}")
         print()
 
-    if a.sweep:
-        names = list(F.RULES)
-        print("conf_s conf_d conf_llm 규칙                                   표시   표시없이틀림")
-        rows = []
-        for cs, cd, cl in itertools.product([0.9, 0.95], [0.8, 0.9, 0.95], [0.8, 0.85, 0.9]):
-            for k in range(len(names) + 1):
-                for rs in itertools.combinations(names, k):
-                    cfg = {**F.DEFAULT, "conf_serial": cs, "conf_date": cd, "conf_llm": cl, "rules": rs}
-                    _, rate, sr, _ = evaluate(docs, idx, recompute(vols, cfg))
-                    rows.append((sr, rate, cs, cd, cl, rs))
-        # 표시 비율별로 '표시 없이 틀림'이 가장 낮은 설정 (파레토)
-        best, seen = [], 1.0
-        for r in sorted(rows, key=lambda r: (r[1], r[0])):
-            if r[0] < seen - 1e-9:
-                best.append(r)
-                seen = r[0]
-        for sr, rate, cs, cd, cl, rs in best:
-            print(f"{cs:5.2f} {cd:6.2f} {cl:7.2f}  {','.join(rs):38s} {rate:5.0%}   {sr:5.1%}")
+    if a.sweep or a.loo:
+        cfgs, flagged = sweep(vols, docs, idx)
+        bad = {p for p in idx if p not in docs or not all(ok_field(f, docs[p]["fields"][f], idx[p][f]) for f in FIELDS)}
+        print(f"설정 {len(cfgs)}개 (기준값은 이전보다 낮은 값과 0=끔 포함, 일자 불일치 규칙 끔 포함)")
+        print(f"틀린 문서 {len(bad)}/{len(idx)}, 맞는 문서 {len(idx) - len(bad)}\n")
+        if a.sweep:
+            print("파레토 경계 (표시 비율마다 '표시 없이 틀림'이 가장 낮은 설정)")
+            print("  표시   표시없이틀림  설정")
+            best, seen = [], len(idx) + 1
+            stats = [(len(flagged[i]), len(bad - flagged[i]), i) for i in range(len(cfgs))]
+            for nf, ns, i in sorted(stats):
+                if ns < seen:
+                    best.append((nf, ns, i))
+                    seen = ns
+            for nf, ns, i in best:
+                print(f"  {nf / len(idx):4.0%}  {ns:3d} ({ns / len(idx):4.1%})   {label(cfgs[i])}")
+            under80 = [s for s in stats if s[0] <= 0.8 * len(idx)]
+            nf, ns, i = min(under80, key=lambda s: (s[1], s[0]))
+            print(f"\n표시 80% 이하 중 '표시 없이 틀림' 최소: 표시 {nf / len(idx):.0%}, {ns}건 ({ns / len(idx):.1%}) — {label(cfgs[i])}")
+            print(f"이론 하한: 틀린 문서를 모두 표시하면 표시 {len(bad) / len(idx):.0%}. "
+                  f"80% 이하 + 3% 이하가 되려면 맞는 문서 오표시가 "
+                  f"{int(0.8 * len(idx)) - (len(bad) - int(0.03 * len(idx)))}건 이하여야 한다")
+        if a.loo:
+            loo(vols, idx, bad, cfgs, flagged)
+
+
+GRID = {"conf_serial": [0, 0.9, 0.95], "conf_date": [0, 0.8, 0.9], "conf_llm": [0, 0.8, 0.9], "mismatch_date": [True, False]}
+
+
+def label(c):
+    return (f"serial {c['conf_serial']:g} / date {c['conf_date']:g} / llm {c['conf_llm']:g}"
+            f"{'' if c['mismatch_date'] else ' / 일자불일치 끔'} / 규칙 {','.join(c['rules']) or '-'}")
+
+
+def sweep(vols, docs, idx):
+    """모든 설정에 대해 '표시된 문서' 집합을 한 번만 계산한다 (--loo가 다시 쓴다)."""
+    names = list(F.RULES)
+    cfgs, flagged = [], []
+    for vals in itertools.product(*GRID.values()):
+        for k in range(len(names) + 1):
+            for rs in itertools.combinations(names, k):
+                cfg = {**F.LEGACY, **dict(zip(GRID, vals)), "rules": rs}
+                fl = recompute(vols, cfg)
+                cfgs.append(cfg)
+                flagged.append(frozenset(p for p in idx if p in docs and fl[p]))
+    return cfgs, flagged
+
+
+def choose(ids, bad, flagged, target=0.03):
+    """ids 안에서 '표시 없이 틀림' ≤ target 중 표시가 가장 적은 설정. 없으면 표시 없이 틀림이 가장 적은 것."""
+    n = len(ids)
+    stats = [(len((bad & ids) - f), len(f & ids), i) for i, f in enumerate(flagged)]
+    ok = [s for s in stats if s[0] <= target * n]
+    return min(ok, key=lambda s: (s[1], s[0]))[2] if ok else min(stats, key=lambda s: (s[0], s[1]))[2]
+
+
+def loo(vols, idx, bad, cfgs, flagged):
+    """철 하나 빼고 고르기: 나머지 6개 철로 설정을 고르고, 뺀 철에서 잰다. 고른 설정이 표본에 맞춰졌는지 보는 확인."""
+    print("철 하나 빼고 고르기 (나머지 철로 설정 선택 → 뺀 철에서 측정)")
+    tot_n = tot_s = tot_f = 0
+    for v in sorted(vols):
+        test = frozenset(p for p in idx if p.startswith(v + "-"))
+        if not test:
+            continue
+        i = choose(frozenset(idx) - test, bad, flagged)
+        s, f = len((bad & test) - flagged[i]), len(flagged[i] & test)
+        tot_n, tot_s, tot_f = tot_n + len(test), tot_s + s, tot_f + f
+        print(f"  {v}: {len(test):3d}건 표시 {f / len(test):4.0%}, 표시 없이 틀림 {s}  ← {label(cfgs[i])}")
+    print(f"  합계: 표시 {tot_f / tot_n:.0%}, 표시 없이 틀림 {tot_s}/{tot_n} ({tot_s / tot_n:.1%})")
 
 
 if __name__ == "__main__":

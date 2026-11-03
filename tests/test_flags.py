@@ -80,6 +80,16 @@ def test_rec_part_address_without_name():
     assert "주소 없음" in fl[2]["recipient"]
 
 
+def test_order_rule_and_mismatch_toggle():
+    docs = clean_volume()
+    # 일련번호 103인데 날짜가 104번(1999-03-14)보다 열흘 늦음
+    docs[3]["fields"]["date"] = docs[3]["info"]["b_date"] = "1999-03-24"
+    assert "순서" in run(docs, rules=("order",))[3]["date"]
+    docs[2]["info"]["b_date"] = "1999-03-01"
+    assert "불일치" in run(docs)[2]["date"]
+    assert "date" not in run(docs, mismatch_date=False)[2]
+
+
 def test_default_is_legacy_plus_documented_rules():
     assert set(F.DEFAULT["rules"]) <= set(F.RULES)
     assert {k: v for k, v in F.DEFAULT.items() if k != "rules"}.keys() == {k for k in F.LEGACY if k != "rules"}

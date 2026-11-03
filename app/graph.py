@@ -23,8 +23,13 @@ from langgraph.types import Send, interrupt
 from app import flags, layout, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
-# 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["order", "rec_part"]}'
-FLAG_CONFIG = {**flags.DEFAULT, **json.loads(os.environ.get("FLAG_CONFIG") or "{}")}
+# 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
+# 예전 환경변수 CONF_SERIAL·CONF_DATE도 계속 받는다 (FLAG_CONFIG가 우선)
+FLAG_CONFIG = {
+    **flags.DEFAULT,
+    **{k: float(os.environ[e]) for k, e in [("conf_serial", "CONF_SERIAL"), ("conf_date", "CONF_DATE")] if os.environ.get(e)},
+    **json.loads(os.environ.get("FLAG_CONFIG") or "{}"),
+}
 HEAD_RATIOS = [0.40, 0.48, 0.56]  # 머리부가 쪽 위 몇 % 안에 있다고 볼지. PoC는 0.40 고정이라 창원 양식(41~43%)에서 놓쳤다
 FIELDS = ["docno", "date", "recipient", "title"]
 
