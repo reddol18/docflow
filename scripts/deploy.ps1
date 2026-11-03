@@ -5,13 +5,17 @@
   .\scripts\deploy.ps1
   .\scripts\deploy.ps1 -Mac user@host
   .\scripts\deploy.ps1 -NoTag          # 시험 배포 (태그 없음)
+  .\scripts\deploy.ps1 -NoCheck        # 로컬 검사 건너뜀 (방금 돌렸을 때만)
 
-순서: 커밋 안 된 변경 확인 → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기) → 태그 deploy-YYYYMMDD-HHMM push
+순서: 커밋 안 된 변경 확인 → 로컬 검사(scripts/check.ps1) → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기)
+      → 태그 deploy-YYYYMMDD-HHMM push
+(맥에는 git 저장소가 없어서 태그는 이 스크립트가 남긴다)
 프런트엔드는 k3s가 아니라 이 PC에서 next로 돈다(배포 대상 아님).
 #>
 param(
     [string]$Mac = $env:DOCFLOW_MAC,
-    [switch]$NoTag
+    [switch]$NoTag,
+    [switch]$NoCheck
 )
 $ErrorActionPreference = "Stop"
 if (-not $Mac) { throw "맥 주소가 없습니다: -Mac user@host 또는 `$env:DOCFLOW_MAC" }
@@ -22,6 +26,11 @@ try {
     $sha = (git rev-parse --short HEAD).Trim()
     $branch = (git rev-parse --abbrev-ref HEAD).Trim()
     if ($branch -ne "main" -and -not $NoTag) { throw "main이 아닌 브랜치($branch)입니다. 시험 배포는 -NoTag" }
+
+    if (-not $NoCheck) {
+        & (Join-Path $PSScriptRoot "check.ps1")
+        if ($LASTEXITCODE) { throw "로컬 검사 실패. 배포하지 않습니다." }
+    }
 
     Write-Host "== 복사 ($sha → $Mac)"
     ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s"

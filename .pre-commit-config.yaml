@@ -1,5 +1,5 @@
 # 커밋 전 검사 (https://github.com/reddol18/docflow/issues/25 Do 단계). 설치: pip install pre-commit && pre-commit install
-# CI(.github/workflows/ci.yml)가 같은 검사를 다시 하므로, 여기서 빠뜨려도 병합 전에 걸린다.
+# 병합·배포 전에는 scripts/check.ps1(로컬 검사 전체)이 같은 검사를 다시 한다. deploy.ps1이 먼저 부른다.
 repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1

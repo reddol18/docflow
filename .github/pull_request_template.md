@@ -10,7 +10,7 @@ Closes #
 <!-- 이슈에 없던 변경. 없으면 "없음" -->
 
 ## 테스트
-- [ ] CI 통과 (frontend · backend · security)
+- [ ] 로컬 검사 `scripts/check.ps1` 통과 — 출력 끝의 요약 표를 붙인다
 - 추가·바꾼 시험:
 - 수동 확인:
 
