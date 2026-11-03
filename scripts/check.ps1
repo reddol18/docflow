@@ -127,7 +127,8 @@ try {
 
     Step "trivy" $false {
         $tv = Get-Tool trivy $V.trivy "trivy_$($V.trivy)_windows-64bit.zip" "trivy_$($V.trivy)_checksums.txt" "aquasecurity/trivy" "trivy.exe"
-        & $tv config --quiet --severity HIGH,CRITICAL --exit-code 0 .
+        # 빌드 산출물은 건너뛴다 (next dev가 .next 안 파일을 잠가 두면 스캔이 멈춘다)
+        & $tv config --quiet --severity HIGH,CRITICAL --exit-code 0 --skip-dirs frontend/node_modules --skip-dirs frontend/.next .
     }
 } finally {
     Pop-Location
