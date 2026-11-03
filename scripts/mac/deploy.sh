@@ -1,5 +1,6 @@
 #!/bin/sh
 # 맥에서: 이미지 다시 빌드(앱 코드만 바뀌면 캐시로 빠름) → docflow 재시작 → 준비될 때까지 기다림 → 고정된 패키지 버전 저장.
+# 보통은 Windows에서 scripts/deploy.ps1로 부른다(복사 + 이 스크립트 + 배포 태그).
 set -e
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 sh ~/doc_platform/scripts/build_image.sh

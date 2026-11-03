@@ -1,0 +1,56 @@
+name: 버그
+description: 기대와 다르게 동작함
+labels: ["bug"]
+body:
+  - type: textarea
+    id: repro
+    attributes:
+      label: 재현
+      description: 순서대로. 데이터는 실제 원문 대신 철·문서 id로.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제
+      description: 오류 문구, 수치. 비밀값·개인정보는 빼고.
+    validations:
+      required: true
+  - type: dropdown
+    id: found_at
+    attributes:
+      label: 발견 단계
+      description: 과정 지표(리뷰·테스트가 놓친 비율)에 쓴다
+      options:
+        - 리뷰
+        - 로컬 검사
+        - 배포 후 확인
+        - 운영
+        - 평가 스크립트
+    validations:
+      required: true
+  - type: input
+    id: cause_pr
+    attributes:
+      label: 원인 PR
+      description: 알면 전체 URL (https://github.com/reddol18/docflow/pull/N)
+  - type: textarea
+    id: criteria
+    attributes:
+      label: 완료 조건
+      description: 고쳤다고 판정할 기준과 측정 방법. 재현 시험을 테스트로 남기면 가장 좋다.
+      value: |
+        - [ ] 재현 순서에서 기대대로 동작 — 측정:
+  - type: checkboxes
+    id: security
+    attributes:
+      label: 보안 영향
+      options:
+        - label: 보안 취약점이다 (공개 이슈에 공격 방법을 적지 말 것)
+        - label: 개인정보·민감 데이터가 노출된다

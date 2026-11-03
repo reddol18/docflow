@@ -121,7 +121,7 @@ def keyword_search(words, year_from=None, year_to=None, limit=20):
         return []
     hay = "coalesce(title,'') || ' ' || coalesce(recipient,'') || ' ' || coalesce(docno,'')"
     score = " + ".join(f"(CASE WHEN {hay} ILIKE %s THEN 1 ELSE 0 END)" for _ in words)
-    sql = f"SELECT doc_id, ({score}) AS score FROM documents WHERE ({score}) > 0"
+    sql = f"SELECT doc_id, ({score}) AS score FROM documents WHERE ({score}) > 0"  # noqa: S608 — 자리표시자만 끼움, 값은 매개변수
     args = [f"%{w}%" for w in words] * 2
     if year_from:
         sql += " AND left(date,4) >= %s"

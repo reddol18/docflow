@@ -1,0 +1,11 @@
+# 커밋 전 검사 (https://github.com/reddol18/docflow/issues/25 Do 단계). 설치: pip install pre-commit && pre-commit install
+# 병합·배포 전에는 scripts/check.ps1(로컬 검사 전체)이 같은 검사를 다시 한다. deploy.ps1이 먼저 부른다.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.3
+    hooks:
+      - id: ruff
