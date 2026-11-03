@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" font-family="'Malgun Gothic','Apple SD Gothic Neo',sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <style>
+      .box{fill:#fff;stroke:#94a3b8;stroke-width:1.5}
+      .grp{fill:#f8fafc;stroke:#cbd5e1;stroke-width:1.5;stroke-dasharray:6 4}
+      .t{font-size:15px;font-weight:700;fill:#0f172a}
+      .s{font-size:12.5px;fill:#475569}
+      .g{font-size:13px;font-weight:700;fill:#64748b}
+      .n{fill:#eef2ff;stroke:#818cf8;stroke-width:1.2}
+      .nt{font-size:12.5px;font-weight:700;fill:#3730a3}
+      .l{stroke:#475569;stroke-width:1.6;fill:none}
+      .lab{font-size:12px;fill:#334155}
+    </style>
+  </defs>
+  <rect width="1400" height="820" fill="#fff"/>
+  <text x="20" y="40" font-size="22" font-weight="700" fill="#0f172a">docflow 전체 구성</text>
+  <text x="250" y="40" class="s">스캔 공문서 철 → 문서 나누기 → 색인 4칸 추출 → 사람 검토 → 검색</text>
+
+  <!-- 사용자 -->
+  <rect x="20" y="110" width="220" height="70" rx="10" class="box"/>
+  <text x="130" y="140" text-anchor="middle" class="t">외부 브라우저</text>
+  <text x="130" y="162" text-anchor="middle" class="s">https://…trycloudflare.com</text>
+
+  <rect x="20" y="250" width="220" height="80" rx="10" class="box" style="fill:#fff7ed;stroke:#fb923c"/>
+  <text x="130" y="280" text-anchor="middle" class="t">Cloudflare 임시 터널</text>
+  <text x="130" y="302" text-anchor="middle" class="s">PC IP 노출 없음 · DNS 연결 없음</text>
+
+  <rect x="20" y="550" width="220" height="70" rx="10" class="box"/>
+  <text x="130" y="580" text-anchor="middle" class="t">로컬 브라우저</text>
+  <text x="130" y="602" text-anchor="middle" class="s">http://localhost:3000</text>
+
+  <path d="M130,180 L130,248" class="l" marker-end="url(#a)"/>
+
+  <!-- Windows PC -->
+  <rect x="280" y="80" width="390" height="580" rx="14" class="grp"/>
+  <text x="300" y="106" class="g">Windows PC</text>
+
+  <rect x="310" y="250" width="330" height="80" rx="10" class="box"/>
+  <text x="475" y="280" text-anchor="middle" class="t">cloudflared</text>
+  <text x="475" y="302" text-anchor="middle" class="s">밖으로 나가는 연결만 · 포트를 열지 않음</text>
+  <path d="M242,290 L308,290" class="l" marker-start="url(#a)" marker-end="url(#a)"/>
+
+  <rect x="310" y="370" width="330" height="120" rx="10" class="box"/>
+  <text x="475" y="398" text-anchor="middle" class="t">Next.js 대시보드 :3001 (외부용)</text>
+  <text x="475" y="422" text-anchor="middle" class="s">proxy.ts — Basic 인증 · 읽기 전용</text>
+  <text x="475" y="442" text-anchor="middle" class="s">(업로드·실행·검토 저장은 403)</text>
+  <text x="475" y="466" text-anchor="middle" class="s">업로드 · 진행 단계 · 검토 에디터 · 검색</text>
+  <path d="M475,330 L475,368" class="l" marker-end="url(#a)"/>
+
+  <rect x="310" y="535" width="330" height="100" rx="10" class="box"/>
+  <text x="475" y="563" text-anchor="middle" class="t">Next.js 대시보드 :3000 (로컬)</text>
+  <text x="475" y="587" text-anchor="middle" class="s">모든 기능 · 인증 없음</text>
+  <text x="475" y="609" text-anchor="middle" class="s">/api/* → docflow API로 넘김</text>
+  <path d="M240,585 L308,585" class="l" marker-end="url(#a)"/>
+
+  <!-- PC → Mac -->
+  <path d="M640,430 L690,430 L690,300 L758,300" class="l" marker-end="url(#a)"/>
+  <path d="M640,585 L690,585 L690,430" class="l"/>
+  <text x="475" y="652" text-anchor="middle" class="lab">/api/* → ssh -L 8000 → kubectl port-forward → docflow</text>
+
+  <!-- Mac k3s -->
+  <rect x="730" y="80" width="650" height="560" rx="14" class="grp"/>
+  <text x="750" y="106" class="g">Mac · colima k3s · namespace docs (NetworkPolicy 기본 차단)</text>
+
+  <rect x="760" y="120" width="590" height="300" rx="10" class="box" style="stroke:#6366f1"/>
+  <text x="780" y="148" class="t">docflow Pod — FastAPI + LangGraph + PaddleOCR (CPU, 한국어)</text>
+
+  <!-- 그래프 -->
+  <rect x="780" y="180" width="60" height="34" rx="6" class="n"/><text x="810" y="202" text-anchor="middle" class="nt">ocr</text>
+  <rect x="860" y="180" width="60" height="34" rx="6" class="n"/><text x="890" y="202" text-anchor="middle" class="nt">split</text>
+  <rect x="940" y="180" width="100" height="34" rx="6" class="n"/><text x="990" y="202" text-anchor="middle" class="nt">doc ×N</text>
+  <rect x="1060" y="180" width="80" height="34" rx="6" class="n"/><text x="1100" y="202" text-anchor="middle" class="nt">validate</text>
+  <rect x="1160" y="180" width="80" height="34" rx="6" class="n" style="fill:#fef3c7;stroke:#f59e0b"/><text x="1200" y="202" text-anchor="middle" class="nt" style="fill:#92400e">review</text>
+  <rect x="1260" y="180" width="70" height="34" rx="6" class="n"/><text x="1295" y="202" text-anchor="middle" class="nt">index</text>
+  <path d="M840,197 L858,197" class="l" marker-end="url(#a)"/>
+  <path d="M920,197 L938,197" class="l" marker-end="url(#a)"/>
+  <path d="M1040,197 L1058,197" class="l" marker-end="url(#a)"/>
+  <path d="M1140,197 L1158,197" class="l" marker-end="url(#a)"/>
+  <path d="M1240,197 L1258,197" class="l" marker-end="url(#a)"/>
+  <path d="M1100,180 C1100,160 1295,160 1295,178" class="l" stroke-dasharray="4 3" marker-end="url(#a)"/>
+  <text x="990" y="236" text-anchor="middle" class="s">Send 병렬 4</text>
+  <rect x="780" y="250" width="420" height="44" rx="8" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="792" y="277" class="s">문서 하위 그래프: extract → locate ⇄ widen → read → merge</text>
+  <text x="1210" y="236" text-anchor="middle" class="s" style="fill:#92400e">interrupt()</text>
+  <text x="1210" y="254" text-anchor="middle" class="s" style="fill:#92400e">사람 검토 후</text>
+  <text x="1210" y="272" text-anchor="middle" class="s" style="fill:#92400e">Command(resume)</text>
+
+  <text x="780" y="326" class="s">• ocr: 쪽 이미지 → 단어 상자·줄 텍스트 (쪽당 7~11초, 쪽마다 저장해 재실행 시 건너뜀)</text>
+  <text x="780" y="348" class="s">• split: 규칙으로 문서 시작 쪽 판별 · extract: GPT가 4칸 + 확신도</text>
+  <text x="780" y="370" class="s">• read: 손글씨 칸을 비전으로 판독 · validate: 형식·범위·흐름·확신도·불일치 → 검토 표시</text>
+  <text x="780" y="392" class="s">• 검색: Qdrant 벡터 + Postgres 낱말 → RRF로 합침 → 근거 문서를 단 답변</text>
+
+  <rect x="760" y="460" width="280" height="150" rx="10" class="box" style="stroke:#0ea5e9"/>
+  <text x="900" y="490" text-anchor="middle" class="t">Postgres 17</text>
+  <text x="900" y="516" text-anchor="middle" class="s">문서 색인 · 비용 장부</text>
+  <text x="900" y="538" text-anchor="middle" class="s">노드 이벤트 (진행 단계 화면)</text>
+  <text x="900" y="560" text-anchor="middle" class="s">LangGraph 체크포인트</text>
+  <text x="900" y="582" text-anchor="middle" class="s">낱말 검색 (ILIKE)</text>
+
+  <rect x="1070" y="460" width="280" height="150" rx="10" class="box" style="stroke:#dc2626"/>
+  <text x="1210" y="490" text-anchor="middle" class="t">Qdrant 1.19</text>
+  <text x="1210" y="516" text-anchor="middle" class="s">문서 벡터 (1536차원, cosine)</text>
+  <text x="1210" y="538" text-anchor="middle" class="s">payload 색인: 연도 · 철</text>
+  <text x="1210" y="560" text-anchor="middle" class="s">연도 범위 필터 검색</text>
+
+  <path d="M900,420 L900,458" class="l" marker-end="url(#a)"/>
+  <path d="M1210,420 L1210,458" class="l" marker-end="url(#a)"/>
+
+  <!-- OpenAI -->
+  <rect x="730" y="690" width="650" height="100" rx="10" class="box" style="fill:#f0fdf4;stroke:#22c55e"/>
+  <text x="755" y="720" class="t">OpenAI API</text>
+  <text x="755" y="746" class="s">gpt-4.1-mini — 4칸 추출 · 손글씨 칸 판독(비전, logprobs 확신도)</text>
+  <text x="755" y="768" class="s">text-embedding-3-small — 문서 벡터 · gpt-4o-mini — 검색 답변 · 680쪽 1회 약 $0.35</text>
+  <path d="M1055,420 L1055,688" class="l" marker-end="url(#a)"/>
+  <text x="1062" y="660" class="lab">443만 허용</text>
+
+  <text x="20" y="700" class="s">— 진한 화살표: 요청 흐름</text>
+  <text x="20" y="722" class="s">- - 점선 화살표: 검토 표시가 없거나 auto면 review 건너뜀</text>
+  <text x="20" y="744" class="s">비밀값(OpenAI 키, DB 비밀번호)은 k8s Secret으로만</text>
+</svg>

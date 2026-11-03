@@ -110,3 +110,133 @@ Windows ─(ssh 터널 → kubectl port-forward)→ docs 네임스페이스 (k3s
 - 낱말 검색은 형태소 분석 없는 부분 일치. 벡터 검색과 RRF로 합칠 뿐 튜닝은 안 했다.
 - 철 대기열이 프로세스 메모리에 있다 → Pod가 죽으면 대기 중이던 철은 다시 걸어야 한다(진행 중이던 철은 `/resume`).
 - 사람 검토 화면에 인증이 없다 (port-forward로만 접근).
+
+## 7. 클라우드 이식 (설계, 아직 안 만듦)
+
+맥 k3s 1노드에서 한 Pod·한 DB로 붙어 있던 것을 클라우드로 옮긴다는 가정의 목표 구성이다.
+처리량 근거는 README "부하 시뮬레이션" 절의 B안이다(OCR 워커 1~6개, 몰림 끝 → 약 6분).
+설계 이슈: https://github.com/reddol18/docflow/issues/16
+
+### 목표 구성
+
+```
+브라우저 ─HTTPS/SSE─▶ [노드 그룹 A · 상시, 작게]   Next.js · docflow API (FastAPI, SSE)
+                          │  ▲
+                넣기(XADD) │  │ 알림(Pub/Sub)
+                          ▼  │
+                     [관리형 Redis/Valkey]       작업 대기열(Streams) · 토큰/진행 알림(Pub/Sub) · 검색어 임베딩 캐시
+                          │  ▲
+                꺼내기     │  │ 토큰·진행 발행
+                          ▼  │
+                     [노드 그룹 B · KEDA 1~N]    OCR·LLM 워커 Pod (taint → 워커만 올라감)
+                          │
+          ┌───────────────┼──────────────────┐
+          ▼               ▼                  ▼
+   [관리형 Postgres]   [Qdrant]        [오브젝트 스토리지]
+   색인·문서·수정 이력   문서 벡터        쪽 이미지 · 잘라 줄인 이미지
+   비용 장부·체크포인트
+   진행 이벤트 기록
+                                   바깥으로 나가는 통신: 워커·API → OpenAI(443)
+```
+
+API도 Postgres·Qdrant·오브젝트 스토리지를 읽는다(검색, 상태 조회, 이미지). 그림에서는 선을 줄였다.
+
+| 저장소 | 두는 것 | 잃으면 |
+|---|---|---|
+| 관리형 Postgres | 문서 색인·수정 이력·비용 장부(`usage`)·LangGraph 체크포인트·진행 이벤트 기록 | 전체가 멈춤. 원본 기록 |
+| 관리형 Redis/Valkey | 작업 대기열(Streams + 컨슈머 그룹), 토큰·진행 알림(Pub/Sub), 검색어 임베딩 캐시 | 대기 중 작업이 사라짐 → 아래 내구성 설정 필요. 알림·캐시는 다시 만들 수 있음 |
+| Qdrant | 문서 벡터 (1536차원, 연도 필터) | Postgres 색인에서 다시 임베딩하면 복구 (비용 듦) |
+| 오브젝트 스토리지 | 쪽 이미지, `/head`·`/crops`용 잘라 줄인 이미지 | 원본. 지금의 PVC 자리 |
+
+- **분리 단위는 노드 그룹이다.** 구성요소마다 VM을 따로 두지 않는다. OCR이 CPU를 다 쓰므로 워커만 노드 그룹 B에 올리고(taint + toleration·nodeSelector), API가 CPU를 빼앗기지 않게 한다.
+- Qdrant를 StatefulSet + 볼륨으로 둘지 관리형으로 둘지는 아직 안 정했다.
+
+### 대기열을 Postgres에서 Redis로 옮기는 이유
+
+처음에는 Postgres `SELECT … FOR UPDATE SKIP LOCKED`로 대기열을, `LISTEN/NOTIFY`로 알림을 만들 생각이었다. 클라우드 구성에서는 Redis로 뺀다.
+
+- **`NOTIFY`는 커밋 때 전역 잠금을 잡는다.** 토큰 스트리밍처럼 알림이 잦으면 동시 스트림이 늘수록 다른 쓰기까지 느려질 수 있다. 알려진 성질이고, 여기서 잰 것은 아니다.
+- **`NOTIFY`는 읽기 복제본으로 전달되지 않는다.** 복제본을 붙여도 알림은 주 DB에서만 받는다.
+- **장애 범위를 나눈다.** 대기열이 몰릴 때 색인 DB까지 흔들리지 않게 한다.
+- **Redis 하나로 대기열과 토큰 통로를 같이 쓴다.** Streams + 컨슈머 그룹 + `XAUTOCLAIM`(죽은 워커 작업 되찾기)과 Pub/Sub이 한 인스턴스에 있다.
+  SQS는 토큰 통로가 따로 필요하고, RabbitMQ·Kafka는 이 규모에 운영이 무겁다. KEDA에 redis-streams 스케일러가 있다.
+- 로컬(k3s 1노드)에서는 같은 인터페이스를 Postgres로 구현해도 된다(대기열은 `SKIP LOCKED`, 알림은 Pod당 LISTEN 연결 1개).
+
+**대기열 전용 VM을 따로 두지 않는 이유:** Postgres가 멈추면 어차피 전체가 멈춘다(체크포인트·색인이 거기 있음). 대기열만 따로 띄워도 가용성은 오르지 않는다.
+분리하는 목적은 부하와 장애 범위이고, 그건 관리형 Redis로 충분하다.
+
+### 요청 흐름
+
+**쪽 OCR 작업** (https://github.com/reddol18/docflow/issues/5)
+```
+업로드 → 오브젝트 스토리지에 쪽 이미지 → 쪽마다 OCR 작업을 Streams에 넣음
+워커(노드 그룹 B)가 꺼냄 → OCR → 결과 저장 → ack   (죽은 워커 작업은 XAUTOCLAIM으로 되찾음)
+철의 모든 쪽 OCR이 끝나면 → LangGraph 그래프를 이어 돌림 (split → doc → validate → review → index, 체크포인트는 Postgres)
+```
+- 지금은 철 하나 = 그래프 실행 한 번이지만, 클라우드에서는 OCR을 쪽 단위로 쪼개 여러 워커가 나눠 갖는다.
+- 기동 시 체크포인트가 끝나지 않은 철을 찾아 자동으로 이어 간다.
+- 대기열 길이 상한을 넘으면 `429 + Retry-After`로 바로 거절한다.
+
+**검색 답변 `/ask`** (https://github.com/reddol18/docflow/issues/17)
+```
+브라우저 ──SSE──▶ API
+                  ├ Pod당 동시 LLM 스트림 < N : 바로 OpenAI stream=True → 토큰 전달
+                  ├ N 이상                   : Streams에 넣고 같은 SSE로 "대기 N번째"(queued) → 차례가 오면 토큰
+                  └ 대기열 상한 초과          : 429 + Retry-After
+워커(동시 처리 수 = LLM 한도에 맞춤) → 토큰을 약 100ms 단위로 묶어 Pub/Sub 발행 + partial_text에 쌓음
+API(SSE를 연 Pod)가 구독 → 브라우저로 전달
+```
+- 연결은 처음 연 SSE 하나다. 바로 처리든 대기열이든 같은 연결로 끝낸다. 대기 중에는 `queued` 이벤트와 ping을 보낸다.
+- 토큰 뿌리기를 Pub/Sub으로 하는 이유: 워커와 SSE를 연 API Pod가 서로 다르다.
+- **재연결:** 이벤트마다 `id:`를 붙인다. 브라우저가 `Last-Event-ID`로 다시 붙으면 그 뒤 내용을 `partial_text`(답변)나 Postgres 이벤트 기록(진행 단계)에서 다시 보낸다.
+- **취소·재시도:** 연결이 끊기면 작업을 `cancelled`로 표시하고 워커는 시작 전에 확인한다. OpenAI 429·5xx면 작업을 대기열로 되돌리고 `reset` 이벤트를 보낸다.
+- **진행 단계:** 이벤트는 지금처럼 Postgres에 기록하고, 기록할 때 Pub/Sub에도 알린다. 기록과 알림을 나눠서, Redis가 비워져도 기록으로 이어 간다.
+- **비용 한도:** API·워커 Pod가 여러 개라 Pod 메모리로 예약할 수 없다. 예약·정산은 Redis 원자적 증가(`INCRBYFLOAT` + 날짜 키 만료)나 Postgres 행 잠금으로 한다 (https://github.com/reddol18/docflow/issues/7).
+
+### KEDA 증설·축소
+
+- KEDA redis-streams 스케일러로 대기열 길이에 따라 워커 1~N개. 노드 그룹 B도 같이 늘고 준다.
+- README B안의 값: 증설 대기 110초(KEDA 감지 30초 + 노드 준비 + 2GB 이미지 + 모델 적재), 대기열이 빈 뒤 5분에 축소. 둘 다 [가정].
+- 워커를 12개 넘게 늘리면 그다음 병목은 GPT 동시 호출 수와 계정 분당 한도다(README 시뮬레이션). 워커 상한은 그 아래로 둔다.
+
+### Redis 내구성 (필수)
+
+- 관리형이면 Multi-AZ 복제 + 자동 장애 조치를 켠다. 직접 운영하면 AOF 영속화를 켠다.
+- 없으면 Redis 재시작 때 대기열이 사라진다. 지금 Pod 메모리 대기열의 문제(https://github.com/reddol18/docflow/issues/5)가 그대로 재발한다.
+- 알림(Pub/Sub)과 캐시는 잃어도 된다. 기록은 Postgres에 있다.
+
+### 비용 어림
+
+| 항목 | 월 | 근거 |
+|---|---|---|
+| EKS 제어부 | 약 $73 | [가정, 서울 온디맨드] README |
+| OCR 노드 1대 상시 (노드 그룹 B 최소) | 약 $140 | [가정] README |
+| API·DB 노드 (노드 그룹 A) | 약 $76 | [가정] README |
+| **고정비 합** | **약 $290** | [가정] README |
+| 몰림 1번 증설 | 약 $0.20/회 | [가정: c6i.xlarge 약 $0.19/h × 노드 5대 × 약 12.5분] |
+| 관리형 Postgres | 미확인 | README 어림은 DB를 노드에 올린 셈. 관리형으로 바꾸면 따로 든다 |
+| 관리형 Redis/Valkey (Multi-AZ) | 미확인 | |
+| 오브젝트 스토리지 | 미확인 | 680쪽 기준이면 작을 것으로 보지만 안 쟀다 |
+| GPT (월정액 아님, 쓴 만큼) | 680쪽 한 번에 약 $0.35 | [실측] 5절 |
+
+### 폐쇄망 배포와의 관계
+
+현장 공고는 폐쇄망·인터넷 불가 조건이 많다(https://github.com/reddol18/docflow/issues/13). 관리형 서비스를 쓸 수 없으니 방향이 다르다.
+구성요소 인터페이스는 같게 두고 배포만 둘로 나눈다.
+
+| | 클라우드 | 폐쇄망 |
+|---|---|---|
+| 대기열·알림 | 관리형 Redis/Valkey (Streams·Pub/Sub) | Postgres(`SKIP LOCKED`·`LISTEN/NOTIFY`) 또는 직접 띄운 Redis(AOF) |
+| DB | 관리형 Postgres | 클러스터 안 Postgres (지금처럼) |
+| 이미지 저장 | 오브젝트 스토리지 | 로컬 PVC |
+| LLM·임베딩 | OpenAI | 로컬 모델 (Ollama·vLLM 등 OpenAI 호환) |
+| 한도 | 일일 비용 한도 | 동시 처리 수 한도 |
+| 네트워크 경계 | 보안 그룹 | NetworkPolicy (외부 송신 0) |
+
+**같은 것:** LangGraph 흐름과 체크포인트, 대기열 인터페이스(넣기·꺼내기·완료·되돌리기·길이·순번), SSE 이벤트 형식, Qdrant, API.
+
+### 남은 일 (https://github.com/reddol18/docflow/issues/16)
+- 저장 경로 추상화: 쪽 이미지를 로컬 PVC 대신 오브젝트 스토리지로 (`app/store.py`).
+- 워커를 API와 분리한 Deployment로 (https://github.com/reddol18/docflow/issues/5). 노드 그룹 B에 taint, 워커에 toleration·nodeSelector.
+- 관리형 Postgres·Redis 접속을 Secret/환경변수로. NetworkPolicy가 보안 그룹으로 바뀌는 부분 정리.
+- Qdrant 운영 방식 결정. 이미지·검색어 캐시는 https://github.com/reddol18/docflow/issues/15.

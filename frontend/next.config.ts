@@ -16,7 +16,15 @@ const nextConfig: NextConfig = {
     },
   },
   async rewrites() {
-    return [{ source: "/api/:path*", destination: `${DOCFLOW_URL}/:path*` }];
+    return {
+      // 흐림 빌드(외부 공개·캡처용): 원본 쪽 이미지는 서버에서 흐린 것만 내보낸다 (CSS 흐림은 이미지 주소로 우회 가능)
+      beforeFiles:
+        process.env.NEXT_PUBLIC_MASK_IMAGES === "1"
+          ? [{ source: "/api/head/:vol/:page", destination: "/masked/head/:vol/:page" }]
+          : [],
+      afterFiles: [],
+      fallback: [{ source: "/api/:path*", destination: `${DOCFLOW_URL}/:path*` }],
+    };
   },
 };
 
