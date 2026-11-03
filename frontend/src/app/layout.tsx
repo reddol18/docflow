@@ -19,6 +19,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             <nav className="flex gap-4 text-sm text-slate-600">
               <Link href="/" className="hover:text-slate-900">대시보드</Link>
               <Link href="/search" className="hover:text-slate-900">검색</Link>
+              <Link href="/report" className="hover:text-slate-900">리포트</Link>
             </nav>
             <span className="ml-auto text-xs text-slate-400">PaddleOCR · LangGraph · Qdrant · GPT</span>
           </div>

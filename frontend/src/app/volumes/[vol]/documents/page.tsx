@@ -14,6 +14,7 @@ import {
   type Fields,
 } from "@/lib/api";
 import { usePoll } from "@/lib/usePoll";
+import { useReviewTimer } from "@/lib/useReviewTimer";
 import { Card, ErrorNote, FlagChips, StageBadge } from "@/components/ui";
 
 type Fixes = Record<string, Partial<Fields>>;
@@ -58,6 +59,9 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const cur = shown.find((d) => d.doc_id === sel) ?? shown[0];
   const idx = cur ? shown.indexOf(cur) : -1;
   const changed = Object.values(fixes).reduce((n, f) => n + Object.keys(f).length, 0);
+  const changedBy = Object.fromEntries(Object.entries(fixes).map(([id, f]) => [id, Object.keys(f).length]));
+  // 공정 리포트용 검토 시간: 지금 보고 있는 문서의 실제 작업 시간(자리 비움 제외)
+  const timer = useReviewTimer(vol, cur?.doc_id, reviewing ? "review" : "edit", reviewing || s?.stage === "done");
 
   const value = (d: Doc, k: EditField) => fixes[d.doc_id]?.[k] ?? d.fields[k] ?? "";
   const setValue = (d: Doc, k: EditField, v: string) =>
@@ -74,6 +78,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
     setNote(null);
     try {
       await api.submitReview(vol, fixes);
+      await timer.flush(undefined, changedBy);
       setFixes({});
       setNote(`검토 반영 → 흐름 재개 (고친 칸 ${changed}개). 색인이 끝나면 결과가 갱신됩니다.`);
     } catch (e) {
@@ -89,6 +94,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
     setNote(null);
     try {
       const updated = await api.editDocument(vol, d.doc_id, fixes[d.doc_id]);
+      await timer.flush([d.doc_id], changedBy);
       setDocs((prev) => prev?.map((x) => (x.doc_id === d.doc_id ? updated : x)) ?? null);
       setFixes((prev) => {
         const next = { ...prev };
