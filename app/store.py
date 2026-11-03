@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS events (
   phase text NOT NULL, doc_id text, info jsonb);
 CREATE INDEX IF NOT EXISTS events_vol_id ON events (vol, id);
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS edited boolean DEFAULT false;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
+CREATE TABLE IF NOT EXISTS review_time (
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), vol text NOT NULL, doc_id text NOT NULL,
+  mode text NOT NULL, active_ms int NOT NULL, opened_at timestamptz, fields_changed int);
+CREATE INDEX IF NOT EXISTS review_time_ts ON review_time (ts);
+CREATE INDEX IF NOT EXISTS events_ts ON events (ts)
 """
 
 
@@ -97,6 +103,15 @@ def events(vol, after=0, limit=500):
     with pool.connection() as c:
         return c.execute("SELECT id, ts, node, phase, doc_id, info FROM events WHERE vol = %s AND id > %s "
                          "ORDER BY id LIMIT %s", (vol, after, limit)).fetchall()
+
+
+def add_review_times(vol, rows):
+    """검토 화면이 잰 문서별 작업 시간. rows = [{doc_id, mode, active_ms, opened_at, fields_changed}]"""
+    with pool.connection() as c:
+        for r in rows:
+            c.execute("INSERT INTO review_time (vol, doc_id, mode, active_ms, opened_at, fields_changed) "
+                      "VALUES (%s,%s,%s,%s,%s,%s)",
+                      (vol, r["doc_id"], r["mode"], r["active_ms"], r.get("opened_at"), r.get("fields_changed")))
 
 
 def save_documents(docs):

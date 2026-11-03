@@ -67,6 +67,54 @@ export type SearchHit = {
   title: string;
 };
 
+export type Timing = {
+  doc_id: string;
+  mode: "review" | "edit";
+  active_ms: number;
+  opened_at: string;
+  fields_changed: number;
+};
+
+export type DailyRow = {
+  day: string;
+  pages_ocr: number;
+  docs_extracted: number;
+  docs_indexed: number;
+  docs_flagged: number;
+  flag_rate: number | null;
+  docs_reviewed: number;
+  cells_reviewed: number;
+  cells_fixed: number;
+  fix_rate: number | null;
+  cells_edited: number;
+  review_docs_timed: number;
+  review_sec_median: number | null;
+  review_min_total: number;
+  usd: number;
+};
+
+export type Report = {
+  day_from: string;
+  day_to: string;
+  volume: {
+    total: {
+      volumes: number;
+      volumes_done: number;
+      pages: number;
+      pages_ocr: number;
+      pages_left: number;
+      docs: number;
+      docs_flagged: number;
+      docs_indexed: number;
+      docs_left: number;
+    };
+    volumes: { vol: string; stage: Stage; pages: number; pages_ocr: number; docs: number; docs_flagged: number; docs_indexed: number }[];
+  };
+  daily: DailyRow[];
+  review_time: Partial<Record<Timing["mode"], { docs: number; median_sec: number; mean_sec: number; total_min: number }>>;
+  columns: Record<string, string>;
+};
+
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`/api${path}`, { cache: "no-store", ...init });
   if (!r.ok) {
@@ -114,7 +162,22 @@ export const api = {
     return call<SearchHit[]>(`/search?${p}`);
   },
   ask: (q: string) => call<{ answer: string; sources: SearchHit[] }>(`/ask?q=${enc(q)}`),
+  timings: (vol: string, rows: Timing[]) =>
+    call<{ saved: number; dropped: number }>(`/volumes/${enc(vol)}/timings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(rows),
+    }),
+  report: (dayFrom?: string, dayTo?: string) => call<Report>(`/report?${reportQuery(dayFrom, dayTo)}`),
 };
+
+const reportQuery = (dayFrom?: string, dayTo?: string) => {
+  const p = new URLSearchParams();
+  if (dayFrom) p.set("day_from", dayFrom);
+  if (dayTo) p.set("day_to", dayTo);
+  return p.toString();
+};
+export const reportCsv = (dayFrom?: string, dayTo?: string) => `/api/report.csv?${reportQuery(dayFrom, dayTo)}`;
 
 export const headImage = (vol: string, page: string) => `/api/head/${enc(vol)}/${enc(page)}`;
 export const cropImage = (vol: string, docId: string, field: "docno" | "date") =>
