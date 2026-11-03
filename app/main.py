@@ -9,21 +9,26 @@
   GET  /search?q=&year_from=&year_to=   벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침
   GET  /ask?q=                   검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다
   GET  /graph                    흐름 그림 (mermaid)
+  POST /volumes/{vol}/timings    검토 화면이 잰 문서별 작업 시간
+  GET  /report, /report.csv      공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
 """
+import datetime as dt
 import html
 import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from app import graph as flow
-from app import llm, ocr, store
+from app import llm, ocr, report, store
 
 VOL_RX = re.compile(r"^[\w.-]{1,80}$")
 runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
@@ -263,6 +268,13 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
     return "".join(out)
 
 
+def record_review(vol, flagged, fixes):
+    """공정 리포트용: 표시된 문서·칸 수와 사람이 고친 칸 수 (https://github.com/reddol18/docflow/issues/11)."""
+    store.event(vol, "review", "submit", None, docs=len(flagged),
+                cells=sum(len(d["flags"]) for d in flagged),
+                fixed_docs=len(fixes), fixed_cells=sum(len(v) for v in fixes.values()))
+
+
 @app.post("/review/{vol}")
 async def review_submit(vol: str, request: Request):
     check(vol)
@@ -270,13 +282,15 @@ async def review_submit(vol: str, request: Request):
     if not snap.interrupts:
         raise HTTPException(409, "검토 대기 없음")
     form = await request.form()
-    cur = {d["doc_id"]: d["fields"] for d in snap.interrupts[0].value["flagged"]}
+    flagged = snap.interrupts[0].value["flagged"]
+    cur = {d["doc_id"]: d["fields"] for d in flagged}
     fixes = {}
     for key, val in form.items():
         did, _, k = key.rpartition("__")
         if did in cur and k in cur[did] and val.strip() != (cur[did][k] or ""):
             fixes.setdefault(did, {})[k] = val.strip()
     submit(vol, Command(resume=fixes))
+    record_review(vol, flagged, fixes)
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
 
@@ -284,10 +298,58 @@ async def review_submit(vol: str, request: Request):
 def review_json(vol: str, fixes: dict):
     """스크립트용: {doc_id: {칸: 값}} 으로 이어 가기."""
     check(vol)
-    if not G.get_state(cfg(vol)).interrupts:
+    snap = G.get_state(cfg(vol))
+    if not snap.interrupts:
         raise HTTPException(409, "검토 대기 없음")
     submit(vol, Command(resume=fixes))
+    record_review(vol, snap.interrupts[0].value["flagged"], fixes)
     return {"vol": vol, "fixed": {k: list(v) for k, v in fixes.items()}}
+
+
+class Timing(BaseModel):
+    doc_id: str = Field(pattern=r"^[\w.-]{1,120}$")
+    mode: Literal["review", "edit"] = "review"
+    active_ms: int = Field(ge=0, le=4 * 3600 * 1000)
+    opened_at: dt.datetime | None = None
+    fields_changed: int = Field(0, ge=0, le=10)
+
+
+@app.post("/volumes/{vol}/timings")
+def timings(vol: str, rows: list[Timing]):
+    """검토 화면이 잰 문서별 작업 시간 (자리 비움 제외). 1초 미만(넘겨 보기만 한 것)은 버린다."""
+    check(vol)
+    if len(rows) > 1000:
+        raise HTTPException(413, "too many rows")
+    keep = [r.model_dump() for r in rows if r.active_ms >= 1000]
+    store.add_review_times(vol, keep)
+    return {"saved": len(keep)}
+
+
+def _range(day_from, day_to):
+    today = dt.datetime.now(store.KST).date()
+    hi = day_to or today
+    lo = day_from or hi - dt.timedelta(days=13)
+    if lo > hi or (hi - lo).days > 366:
+        raise HTTPException(400, "기간은 1일~1년")
+    return lo, hi
+
+
+@app.get("/report")
+def report_view(day_from: dt.date | None = None, day_to: dt.date | None = None):
+    """공정·품질 리포트: 물량(철/건/면)·단계별 진척, 날짜별 처리량·검토 표시·수정률·검토 시간·비용."""
+    lo, hi = _range(day_from, day_to)
+    root = store.DATA / "pages"
+    vols = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    return {"day_from": lo, "day_to": hi, "volume": report.volume_counts([summary(v) for v in vols]),
+            "daily": report.daily(lo, hi), "review_time": report.review_time_summary(),
+            "columns": dict(report.COLUMNS)}
+
+
+@app.get("/report.csv")
+def report_csv(day_from: dt.date | None = None, day_to: dt.date | None = None):
+    lo, hi = _range(day_from, day_to)
+    return Response(report.to_csv(report.daily(lo, hi)), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
 
 
 def hybrid(q, year_from=None, year_to=None, k=10):
