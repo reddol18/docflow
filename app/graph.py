@@ -10,8 +10,6 @@
 PoC에서 스크립트를 차례로 돌리던 단계(run_ocr → gt_draft → 추출 → recipient_fix → crop_fields → hw_read → hw_flags)를
 노드로 옮겼다. OCR 결과는 쪽마다 파일로 남겨, 중간에 Pod가 죽어도 다시 돌리면 이미 읽은 쪽은 건너뛴다.
 """
-import collections
-import datetime as dt
 import json
 import os
 import re
@@ -22,11 +20,16 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import layout, llm, ocr, store
+from app import flags, layout, llm, ocr, store
 
-CONF_SERIAL = float(os.environ.get("CONF_SERIAL", "0.9"))  # PoC 권장값 (ko-trocr 기준). GPT 확신도에는 다시 맞춰야 함
-CONF_DATE = float(os.environ.get("CONF_DATE", "0.8"))
-CONF_LLM = 0.8  # 추출 프롬프트가 쓰던 review 기준
+# 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
+# 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
+# 예전 환경변수 CONF_SERIAL·CONF_DATE도 계속 받는다 (FLAG_CONFIG가 우선)
+FLAG_CONFIG = {
+    **flags.DEFAULT,
+    **{k: float(os.environ[e]) for k, e in [("conf_serial", "CONF_SERIAL"), ("conf_date", "CONF_DATE")] if os.environ.get(e)},
+    **json.loads(os.environ.get("FLAG_CONFIG") or "{}"),
+}
 HEAD_RATIOS = [0.40, 0.48, 0.56]  # 머리부가 쪽 위 몇 % 안에 있다고 볼지. PoC는 0.40 고정이라 창원 양식(41~43%)에서 놓쳤다
 FIELDS = ["docno", "date", "recipient", "title"]
 
@@ -140,62 +143,11 @@ def fan_out(s: VolState):
             for g in s["segments"]]
 
 
-def _valid(d):
-    try:
-        return dt.date.fromisoformat(d)
-    except ValueError:
-        return None
-
-
 def validate(s: VolState):
-    """검토 필요 표시 (PoC hw_flags 규칙 + LLM 자체 확신도). 같은 철 앞뒤 3건과 비교하는 '흐름' 규칙이 있어 철 단위로 한다."""
+    """검토 필요 표시. 앞뒤 문서·같은 분류번호 문서와 비교하는 규칙이 있어 철 단위로 한다 (규칙은 app/flags.py)."""
     docs = [dict(d) for d in s.get("docs", [])]
-    years = collections.Counter(d["fields"]["date"][:4] for d in docs if d["fields"]["date"])
-    ok_years = {y for y, c in years.items() if c >= 3}
-    for i, d in enumerate(docs):
-        f, info = d["fields"], d["info"]
-        nb = docs[max(0, i - 3):i] + docs[i + 1:i + 4]
-        fl = {k: [] for k in ["serial", "date", "recipient", "title"]}
-        # 날짜
-        day = _valid(f["date"]) if f["date"] else None
-        if not day:
-            fl["date"].append("형식")
-        else:
-            if f["date"][:4] not in ok_years:
-                fl["date"].append("범위")
-            nd = [x for x in (_valid(o["fields"]["date"]) for o in nb if o["fields"]["date"]) if x]
-            if len(nd) >= 2 and not (min(nd) - dt.timedelta(45) <= day <= max(nd) + dt.timedelta(45)):
-                fl["date"].append("흐름")
-        if info["conf_date"] and info["conf_date"] < CONF_DATE:
-            fl["date"].append("확신도")
-        # 일련번호
-        if info["blank"]:
-            if info["conf_serial"] < CONF_SERIAL:
-                fl["serial"].append("빈칸")
-        elif not re.fullmatch(r"\d{1,5}", f["serial"] or ""):
-            fl["serial"].append("형식")
-        else:
-            n = int(f["serial"])
-            ns = [int(o["fields"]["serial"]) for o in nb if re.fullmatch(r"\d{1,5}", o["fields"]["serial"] or "")
-                  and o["info"]["prefix"] == info["prefix"] and o["fields"]["date"][:4] == f["date"][:4]]
-            if len(ns) >= 2:
-                lo, hi = min(ns), max(ns)
-                m = max(50, 0.3 * hi)
-                if not (lo - m <= n <= hi + m):
-                    fl["serial"].append("흐름")
-        if info["conf_serial"] and info["conf_serial"] < CONF_SERIAL:
-            fl["serial"].append("확신도")
-        # 불일치: GPT 텍스트 추출(B)과 손글씨 칸 판독이 다르면 표시. 비전 판독은 틀려도 확신도가 높아서
-        # 확신도만으로는 틀린 일련번호의 56%, 일자의 23%만 잡혔다 (6개 철 129건, eval/flag_whatif.py)
-        if info["b_serial"] and info["b_serial"] != f["serial"]:
-            fl["serial"].append("불일치")
-        if info["b_date"] and info["b_date"] != f["date"]:
-            fl["date"].append("불일치")
-        # 수신·제목: GPT가 스스로 낮게 본 칸 (PoC에서 'hw + LLM 표시')
-        for k in ["recipient", "title"]:
-            if d["b"][k]["confidence"] < CONF_LLM:
-                fl[k].append("LLM")
-        d["flags"] = {k: v for k, v in fl.items() if v}
+    for d, fl in zip(docs, flags.flags(docs, FLAG_CONFIG)):
+        d["flags"] = fl
     return {"docs": docs}
 
 
