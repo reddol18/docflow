@@ -17,3 +17,6 @@ python-multipart==0.0.32
 argon2-cffi==25.1.0
 PyJWT[crypto]==2.15.1
 httpx==0.28.1
+# 기반 이미지에 든 판을 고친 판으로 (setuptools 안 jaraco.context 6.1.0·wheel 0.46.3, https://github.com/reddol18/docflow/issues/44)
+setuptools==84.2.1
+wheel==0.48.0

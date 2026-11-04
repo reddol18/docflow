@@ -5,6 +5,10 @@ set -e
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 sh ~/doc_platform/scripts/build_image.sh
 kubectl apply -f ~/doc_platform/k8s/docs.yaml >/dev/null
+# postgres·qdrant 이미지를 바꾸면 apply가 둘을 다시 띄운다(Recreate) — docflow는 시작할 때 DB에 붙으므로 먼저 기다린다
+for d in postgres qdrant; do
+  kubectl rollout status deploy/$d -n docs --timeout=300s || { kubectl logs deploy/$d -n docs --tail=40; exit 1; }
+done
 kubectl rollout restart deploy/docflow -n docs >/dev/null
 kubectl rollout status deploy/docflow -n docs --timeout=300s || { kubectl logs deploy/docflow -n docs --tail=40; exit 1; }
 kubectl get pods -n docs
