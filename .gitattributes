@@ -3,3 +3,5 @@
 Dockerfile text eol=lf
 # 맥에서 받아 오는 잠금 파일: 줄바꿈 차이로 deploy.ps1이 '바뀜' 경고를 내지 않게
 requirements.lock text eol=lf
+# 평가 세트 diff: CRLF로 바뀌면 git apply가 깨진다
+evals/**/*.patch text eol=lf
