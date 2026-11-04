@@ -18,16 +18,30 @@ pool = ConnectionPool(PG_URL, open=False, min_size=1, max_size=8,
                       kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row})
 
 
+class PathEscape(ValueError):
+    """철·쪽 이름이 저장 폴더 밖을 가리킴 (main이 400으로 바꾼다)"""
+
+
+def under(kind, *parts):
+    """DATA/kind 아래 경로. 합친 결과가 그 폴더(의 철 폴더) 밖이면 거부한다 — 철 이름·쪽 이름이 '..'·'/'로 새지 않게
+    (https://github.com/reddol18/docflow/issues/49, ASVS V12.3.1). 입력 형식 검사(main.check)에 더한 두 번째 방어."""
+    root = (DATA / kind).resolve()
+    p = (root / Path(*parts)).resolve()
+    if p == root or not p.is_relative_to(root) or p.relative_to(root).parts[0] != parts[0]:
+        raise PathEscape(f"path escapes {kind}: {parts!r}")
+    return DATA / kind / Path(*parts)
+
+
 def pages_dir(vol):
-    return DATA / "pages" / vol
+    return under("pages", vol)
 
 
 def ocr_path(vol, page):
-    return DATA / "ocr" / vol / f"{page}.json"
+    return under("ocr", vol, f"{page}.json")
 
 
 def crop_path(vol, page, field):
-    return DATA / "crops" / vol / f"{page}_{field}.png"
+    return under("crops", vol, f"{page}_{field}.png")
 
 
 def load_ocr(vol, page):

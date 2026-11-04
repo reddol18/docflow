@@ -62,6 +62,7 @@ function Search() {
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && run("search")}
             placeholder="예: 한국전력공사에 보낸 원상복구 통보"
+            maxLength={200} // 서버 상한 Q_MAX (app/main.py)와 같게
             className="min-w-[320px] flex-1 rounded-md border border-slate-300 px-3 py-2"
           />
           <input value={yf} onChange={(e) => setYf(e.target.value)} placeholder="연도부터" className="w-24 rounded-md border border-slate-300 px-2" />
