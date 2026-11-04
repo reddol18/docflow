@@ -127,6 +127,16 @@ def test_short_password_rejected(db, monkeypatch):
         add_user(monkeypatch, "erin", "viewer", pw="short")
 
 
+def test_local_only_mode(client, db, monkeypatch):
+    monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
+    add_user(monkeypatch, "gus", "viewer")
+    assert client.get("/auth/config").json()["modes"] == ["local"]
+    assert login(client, "gus").status_code == 200
+    assert client.get("/p").status_code == 200
+    assert client.post("/auth/logout", headers=CSRF).status_code == 200
+    assert client.get("/p").status_code == 401
+
+
 def test_local_off_hides_login(client, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"oidc"}))
     assert login(client, "x").status_code == 404
@@ -210,6 +220,18 @@ def test_oidc_open_redirect_and_role_refresh(client, db, idp):
     assert client.get("/auth/oidc/callback", params={"code": "c", "state": state}).headers["location"] == "/login?error=role"
 
 
+def test_oidc_only_mode_login_logout(client, db, idp, monkeypatch):
+    monkeypatch.setattr(auth, "MODES", frozenset({"oidc"}))
+    seen, _ = idp
+    state = start(client, seen)
+    assert client.get("/auth/oidc/callback", params={"code": "c", "state": state}).status_code == 303
+    assert client.get("/p").status_code == 200
+    assert client.post("/auth/logout", headers=CSRF).status_code == 200
+    assert client.get("/p").status_code == 401
+    with db.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM sessions").fetchone()["n"] == 0  # 서버에서도 폐기
+
+
 def test_oidc_off(client, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
     assert client.get("/auth/oidc/login").status_code == 404
@@ -226,3 +248,22 @@ def test_edit_history(db, monkeypatch):
     assert [(r["field"], r["old"], r["new"], r["source"], r["username"]) for r in h] == [
         ("date", "1999.1.2", "1999.1.20", "review", "fay"), ("title", None, "제목", "review", "fay"),
         ("date", "1999.1.20", "1999.1.21", "edit", None)]
+
+
+def test_review_submit_records_edits_and_user(db, monkeypatch):
+    """검토 제출 경로(/review/{vol}, /review/{vol}/json 공통)가 고친 칸마다 이전 값·새 값·사용자를 남긴다."""
+    from app import main
+    add_user(monkeypatch, "hana", "reviewer")
+    with db.pool.connection() as c:
+        uid = c.execute("SELECT id FROM users WHERE username = 'hana'").fetchone()["id"]
+    user = auth.User(uid, "hana", "hana", "reviewer")
+    flagged = [{"doc_id": "v2-0001", "flags": {"date": ["확신도"]},
+                "fields": {"docno": "가나 100-1", "date": "1999.3.4", "recipient": "가나시장", "title": "t"}}]
+    fixes = main.clean_fixes(flagged, [("v2-0001", "date", "1999.3.14"), ("v2-0001", "title", "t"), ("nope", "date", "x")])
+    main.record_review("v2", flagged, fixes, user)
+    h = db.edit_history("v2", "v2-0001")
+    assert [(r["field"], r["old"], r["new"], r["source"], r["username"]) for r in h] == [
+        ("date", "1999.3.4", "1999.3.14", "review", "hana")]
+    db.add_review_times("v2", [{"doc_id": "v2-0001", "mode": "review", "active_ms": 5000}], uid)
+    with db.pool.connection() as c:
+        assert c.execute("SELECT user_id FROM review_time WHERE vol = 'v2'").fetchone()["user_id"] == uid
