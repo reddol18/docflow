@@ -1,6 +1,6 @@
 # 로컬 검사(scripts/check.ps1)의 pytest 환경. OCR(paddle)은 빼고, 앱을 불러올 만큼만.
 # 버전은 requirements.txt·requirements.lock과 같게 둔다 (opencv는 같은 버전의 headless판)
-pytest==8.4.2
+pytest==9.1.1
 psycopg[binary]==3.3.6
 psycopg-pool==3.3.3
 fastapi==0.162.0
@@ -13,5 +13,4 @@ langgraph-checkpoint==4.3.1
 langgraph-checkpoint-postgres==3.2.0
 openai==3.41.0
 opencv-python-headless==4.10.0.84
-numpy==2.4.6
-PyYAML==6.0.2
+numpy==2.4.6

@@ -8,11 +8,11 @@ import { forgetMe, useMe } from "@/lib/useMe";
 export function UserMenu() {
   const path = usePathname();
   if (path === "/login") return null;
-  return <Menu />;
+  return <Menu path={path} />;
 }
 
-function Menu() {
-  const me = useMe();
+function Menu({ path }: { path: string }) {
+  const me = useMe(path);
   if (!me) return null;
   return (
     <div className="flex items-center gap-3 text-sm">

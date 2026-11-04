@@ -22,9 +22,11 @@ export function forgetMe() {
 }
 
 // 화면이 버튼을 숨기는 데만 쓴다. 실제 권한은 서버가 강제한다 (app/auth.py).
-export function useMe(): Me | null {
+// retryKey가 바뀌면(예: 화면 이동) 아직 못 읽었을 때 다시 시도한다 — 서버 재시작 중 한 번 실패해도 메뉴가 돌아오게
+export function useMe(retryKey?: string): Me | null {
   const [me, setMe] = useState<Me | null>(null);
   useEffect(() => {
+    if (me) return;
     let alive = true;
     loadMe()
       .then((m) => alive && setMe(m))
@@ -35,6 +37,6 @@ export function useMe(): Me | null {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [retryKey, me]);
   return me;
 }

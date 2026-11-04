@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS edits (
   id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), vol text NOT NULL, doc_id text NOT NULL, field text NOT NULL,
   old text, new text, user_id bigint REFERENCES users (id), source text NOT NULL);
 CREATE INDEX IF NOT EXISTS edits_doc ON edits (vol, doc_id);
-ALTER TABLE review_time ADD COLUMN IF NOT EXISTS user_id bigint
+ALTER TABLE review_time ADD COLUMN IF NOT EXISTS user_id bigint;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS attempt_at timestamptz
 """
 
 

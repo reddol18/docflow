@@ -117,7 +117,6 @@ def test_oidc_config_check(monkeypatch):
 
 def test_rate_limit(monkeypatch):
     monkeypatch.setattr(auth, "USER_RATE", (3, 300))
-    monkeypatch.setattr(auth, "ALL_RATE", (6, 300))
     monkeypatch.setattr(auth, "LOGIN_RATE", (2, 300))
     monkeypatch.setattr(auth, "_hits", {})
 
@@ -131,10 +130,8 @@ def test_rate_limit(monkeypatch):
     with pytest.raises(HTTPException) as e:
         auth.rate_limit(R("127.0.0.1", xff="1.2.3.4"), "admin")  # 대소문자·XFF를 바꿔도 같은 이름 창
     assert e.value.status_code == 429
-    for i in range(3):
-        auth.rate_limit(R("127.0.0.1", xff=f"9.9.9.{i}"), f"u{i}")  # 이름을 바꿔 가며
-    with pytest.raises(HTTPException):
-        auth.rate_limit(R("127.0.0.1"), "u9")  # 전체 창(6) 초과
+    for i in range(20):
+        auth.rate_limit(R("127.0.0.1", xff=f"9.9.9.{i}"), f"u{i}")  # 전체 창은 없다 (남이 채워 모두를 막지 못하게)
     assert not any(k.startswith("ip:") for k in auth._hits)  # 프록시를 믿지 않으면 IP 창을 쓰지 않는다
     monkeypatch.setattr(auth, "_hits", {})
     monkeypatch.setattr(auth, "TRUST_PROXY", True)

@@ -116,7 +116,8 @@ try {
         # --no-resolve: requirements.lock은 pip freeze 전체 목록이라 다시 풀지 않는다 (풀면 setuptools 거짓 경보)
         # requirements.txt도 본다: 새로 고정한 패키지는 배포해서 잠금 파일을 받아 오기 전까지 lock에 없다 (PyJWT 2.10.1이 그렇게 지나갔다)
         & $osv scan source --no-resolve --config osv-scanner.toml --lockfile requirements.txt:requirements.lock `
-            --lockfile requirements.txt:requirements.txt --lockfile frontend/package-lock.json
+            --lockfile requirements.txt:requirements.txt --lockfile requirements.txt:requirements-test.txt `
+            --lockfile frontend/package-lock.json
     }
 
     Step "semgrep" $true {

@@ -24,7 +24,6 @@ OIDC 설정 (oidc를 켤 때)
 그 밖에
   COOKIE_SECURE          기본 1(Secure 쿠키). http로 데모할 때만 0. https 콜백인데 0이면 시작을 거부한다
   LOGIN_RATE_USER        같은 계정 이름으로 5분에 로그인 몇 번까지 (기본 10)
-  LOGIN_RATE_ALL         전체 5분에 로그인·로그인 시작 몇 번까지 (기본 200)
   TRUST_PROXY            X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 → IP별 창(LOGIN_RATE_MAX, 기본 20)도 쓴다.
                          Next rewrites는 덮어쓰지 않으므로 지금 구성에서는 0
   OIDC_LABEL             로그인 버튼 글자 (기본 "SSO")
@@ -63,6 +62,7 @@ LOGIN_RATE = (int(os.environ.get("LOGIN_RATE_MAX", "20")), 300)  # 같은 IP에�
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "0") == "1"
 MAX_NEXT = 2048
 MAX_FAILS, LOCK_MIN = 5, 15
+CLAIM_SEC = 60  # 로그인 시도 자리를 잡고 검증을 끝내기까지 이보다 길 수 없다 (argon2 검증은 1초 안)
 PENDING_SEC = 600  # OIDC 로그인 시작부터 콜백까지
 ID_TOKEN_ALGS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]  # none·HS*는 받지 않는다
 FAIL_MSG = "아이디 또는 비밀번호가 맞지 않습니다"  # 계정이 있는지·잠겼는지 드러내지 않는다
@@ -126,16 +126,15 @@ def _verify(h, pw):
 def login_local(username, password):
     """맞으면 User, 틀리거나 잠겼거나 없는 계정이면 None. 없는 계정에도 해시 검증을 한 번 돌려 시간 차를 줄인다."""
     with store.pool.connection() as c:
-        # 시도 자리를 잡은 뒤 요청이 죽으면(풀 오류·프로세스 종료) failed가 MAX_FAILS에 머문 채 locked_until이 비어
-        # 영원히 막힌다 → 그런 상태는 보통 잠금으로 바꿔 두어 LOCK_MIN 뒤 저절로 풀리게 한다
-        c.execute("UPDATE users SET failed = 0, locked_until = now() + make_interval(mins => %s) "
-                  "WHERE username = %s AND issuer IS NULL AND failed >= %s AND locked_until IS NULL",
-                  (LOCK_MIN, username, MAX_FAILS))
-        # 검증 전에 시도 한 번을 원자적으로 잡는다 → 동시에 여러 요청을 보내도 잠금 전 MAX_FAILS번까지만 검증한다
-        u = c.execute("UPDATE users SET failed = failed + 1 WHERE username = %s AND issuer IS NULL "
-                      "AND NOT disabled AND password_hash IS NOT NULL AND (locked_until IS NULL OR locked_until < now()) "
-                      "AND failed < %s RETURNING id, username, name, role, password_hash, failed",
-                      (username, MAX_FAILS)).fetchone()
+        # 검증 전에 시도 한 번을 원자적으로 잡는다 → 동시에 여러 요청을 보내도 잠금 전 MAX_FAILS번까지만 검증한다.
+        # 자리를 잡은 뒤 요청이 죽으면(풀 오류·프로세스 종료) failed가 MAX_FAILS에 남는다 → 마지막 시도가 CLAIM_SEC보다
+        # 오래됐으면 남은 자리로 보지 않고 1부터 다시 센다 (검증 중인 정상 요청은 그보다 짧다)
+        u = c.execute("UPDATE users SET failed = CASE WHEN failed >= %s THEN 1 ELSE failed + 1 END, attempt_at = now() "
+                      "WHERE username = %s AND issuer IS NULL AND NOT disabled AND password_hash IS NOT NULL "
+                      "AND (locked_until IS NULL OR locked_until < now()) "
+                      "AND (failed < %s OR attempt_at IS NULL OR attempt_at < now() - make_interval(secs => %s)) "
+                      "RETURNING id, username, name, role, password_hash, failed",
+                      (MAX_FAILS, username, MAX_FAILS, CLAIM_SEC)).fetchone()
     if not u:  # 없음·꺼짐·잠김·이미 MAX_FAILS번 시도 중
         _verify(_dummy_hash(), password)
         return None
@@ -153,13 +152,13 @@ def login_local(username, password):
 
 
 # ---------- 시도 제한 (인증 전 경로) ----------
-# 창 3개를 함께 본다: 계정 이름별(대입), 전체(이름을 바꿔 가며 뿌리기), IP별(TRUST_PROXY일 때만).
+# 계정 이름별 창(대입)과 IP별 창(TRUST_PROXY일 때만). 전체 창은 두지 않는다: 누구나 채워 모든 사람의 로그인을 막을 수 있다.
 # Next 프록시는 X-Forwarded-For를 덮어쓰지 않고 클라이언트가 보낸 값을 그대로 넘긴다 → Next 뒤에서는 TRUST_PROXY를 켜지 않는다.
+# 남는 위험(IP를 못 믿을 때 이름을 바꿔 가며 뿌리기)은 https://github.com/reddol18/docflow/issues/40
 
 _hits: dict[str, collections.deque] = {}
 _hits_lock = threading.Lock()
 USER_RATE = (int(os.environ.get("LOGIN_RATE_USER", "10")), 300)
-ALL_RATE = (int(os.environ.get("LOGIN_RATE_ALL", "200")), 300)
 
 
 def client_ip(request):
@@ -172,7 +171,7 @@ def client_ip(request):
 
 def rate_limit(request, username=None):
     """로그인 대입·로그인 시작 반복(DB 행·argon2 CPU)을 막는다. 한 프로세스 안의 메모리 창."""
-    keys = [("all", ALL_RATE)]
+    keys = []
     if username is not None:
         keys.append((f"user:{username.lower()}", USER_RATE))
     if TRUST_PROXY:  # 앞단 프록시가 X-Forwarded-For를 덮어쓴다고 확인된 경우만 (Next는 아님)
@@ -180,7 +179,8 @@ def rate_limit(request, username=None):
     now = time.monotonic()
     with _hits_lock:
         if len(_hits) > 10000:
-            for k in [k for k, q in _hits.items() if not q or q[-1] < now - 3600]:
+            oldest = max(USER_RATE[1], LOGIN_RATE[1])
+            for k in [k for k, q in _hits.items() if not q or q[-1] < now - oldest]:
                 del _hits[k]
         qs = []
         for key, (n, win) in keys:
@@ -572,7 +572,7 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
         if "id_token" not in tok:
             raise HTTPException(502, "OIDC 응답에 id_token 없음")
         u = upsert_oidc_user(verify_id_token(tok["id_token"], d, p["nonce"]))
-    except (httpx.HTTPError, HTTPException, RuntimeError, ValueError) as e:
+    except (httpx.HTTPError, HTTPException, RuntimeError, ValueError, KeyError, TypeError) as e:
         # 제공자 연결 실패·응답 오류·토큰 검증 실패 → 오류 화면 대신 로그인 화면으로 (원인은 서버 로그에만, 토큰은 남기지 않음)
         print(f"OIDC 콜백 실패: {type(e).__name__}", flush=True)
         resp = RedirectResponse("/login?error=oidc", status_code=303)
