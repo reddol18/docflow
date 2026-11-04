@@ -25,7 +25,8 @@ MIN_LEN = 12  # ASVS V2.1.1
 
 def _password(args):
     if args.password_stdin:
-        pw = sys.stdin.readline().rstrip("\r\n")  # PowerShell 파이프는 CRLF
+        # Windows PowerShell 5.1 파이프는 CRLF이고 맨 앞에 BOM을 붙인다 → 둘 다 떼지 않으면 다른 비밀번호가 저장된다
+        pw = sys.stdin.readline().rstrip("\r\n").removeprefix("﻿")
     else:
         pw = getpass.getpass("비밀번호: ")
         if getpass.getpass("한 번 더: ") != pw:
