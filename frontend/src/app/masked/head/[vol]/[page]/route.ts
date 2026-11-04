@@ -18,6 +18,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ vol: str
   const { width = 1000 } = await img.metadata();
   const out = await img.blur(Math.max(3, width / 120)).png().toBuffer();
   return new Response(new Uint8Array(out), {
-    headers: { "Content-Type": "image/png", "Cache-Control": "no-store" },
+    headers: { "Content-Type": "image/png", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
   });
 }
