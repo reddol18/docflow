@@ -178,7 +178,7 @@ def test_password_stdin_strips_crlf(db, monkeypatch):
 
 
 def test_password_stdin_strips_bom(db, monkeypatch):
-    add_user(monkeypatch, "bom", "viewer", pw="﻿" + PW + "\r")  # Windows PowerShell 5.1 파이프
+    add_user(monkeypatch, "bom", "viewer", pw="\ufeff" + PW + "\r")  # Windows PowerShell 5.1 파이프
     assert auth.login_local("bom", PW) is not None
 
 
