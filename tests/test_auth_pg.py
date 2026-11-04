@@ -177,6 +177,11 @@ def test_password_stdin_strips_crlf(db, monkeypatch):
     assert auth.login_local("lee", PW) is not None
 
 
+def test_password_stdin_strips_bom(db, monkeypatch):
+    add_user(monkeypatch, "bom", "viewer", pw="\ufeff" + PW + "\r")  # Windows PowerShell 5.1 파이프
+    assert auth.login_local("bom", PW) is not None
+
+
 def test_login_drops_previous_session(client, db, monkeypatch):
     add_user(monkeypatch, "jin", "viewer")
     login(client, "jin")

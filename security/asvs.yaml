@@ -78,7 +78,7 @@ items:
 
   # ---------- V12 파일 ----------
   - {id: V12.1.1, level: 1, text: "업로드 크기·개수 상한", status: 미충족, evidence: "app/main.py:106-116 상한 없음, :115 전체를 메모리로. https://github.com/reddol18/docflow/issues/26"}
-  - {id: V12.3.1, level: 1, text: "파일 이름으로 경로 이탈 방지", status: 미충족, evidence: "파일 이름 정규식은 안전. VOL_RX(app/main.py:42)가 '..' 허용, store.py:21-30 결합만 https://github.com/reddol18/docflow/issues/49"}
+  - {id: V12.3.1, level: 1, text: "파일 이름으로 경로 이탈 방지", status: 미충족, evidence: "파일 이름 정규식은 안전. VOL_RX(app/main.py:42)가 '..' 허용 — 요청으로 확인: /volumes/%2E%2E/documents 200, /head/%2E%2E/x 500 https://github.com/reddol18/docflow/issues/49"}
   - {id: V12.5.1, level: 1, text: "정해진 형식만 내려보냄", status: 충족, evidence: "/head 재인코딩 app/main.py:253-259, /crops png 고정 :239-244, 원본 그대로 내려주는 경로 없음"}
 
   # ---------- V13 API ----------
@@ -90,8 +90,8 @@ items:
   - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 미충족, evidence: "osv 깨끗. 이미지 3개 CRITICAL 7(https://github.com/reddol18/docflow/issues/44#issuecomment-6624365177), 사람이 돌릴 때만. 고치기 https://github.com/reddol18/docflow/issues/44 자동화 https://github.com/reddol18/docflow/issues/46"}
   - {id: V14.3.2, level: 1, text: "디버그·문서 화면 끔", status: 일부, evidence: "API는 꺼짐(app/main.py:60-62). 프런트 운영 실행 방식 없음(README next dev) https://github.com/reddol18/docflow/issues/48"}
   - {id: V14.4.1, level: 1, text: "Content-Type과 문자셋", status: 충족, evidence: "app/main.py:244,259,384 명시, HTML·텍스트는 Starlette가 charset=utf-8"}
-  - {id: V14.4.3, level: 1, text: "CSP", status: 미충족, evidence: "FastAPI 미들웨어·Next headers() 없음. https://github.com/reddol18/docflow/issues/47"}
-  - {id: V14.4.4, level: 1, text: "X-Content-Type-Options: nosniff", status: 미충족, evidence: "양쪽 다 없음. https://github.com/reddol18/docflow/issues/47"}
+  - {id: V14.4.3, level: 1, text: "CSP", status: 미충족, evidence: "FastAPI 미들웨어·Next headers() 없음, 응답에서도 없음(scripts/zap_scan.ps1 직접 확인). https://github.com/reddol18/docflow/issues/47"}
+  - {id: V14.4.4, level: 1, text: "X-Content-Type-Options: nosniff", status: 미충족, evidence: "양쪽 다 없음 — ZAP 10021·직접 확인으로 응답에서 확인(2026-11-04). https://github.com/reddol18/docflow/issues/47"}
   - {id: V14.4.7, level: 1, text: "다른 사이트에 끼워 넣기 금지 (frame-ancestors)", status: 미충족, evidence: "없음, /review 폼 클릭재킹 가능(app/main.py:281). https://github.com/reddol18/docflow/issues/47"}
   - {id: V14.5.3, level: 1, text: "CORS는 허용 목록", status: 충족, evidence: "CORSMiddleware 없음(app/main.py:61-63), 같은 출처 프록시(next.config.ts:26)"}
 
