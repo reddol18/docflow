@@ -1,0 +1,41 @@
+diff --git a/app/main.py b/app/main.py
+index 97e6d48..5c933e8 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
+ from typing import Annotated, Literal
+ 
+ import cv2
+-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
++from fastapi import Query, Depends, FastAPI, File, HTTPException, Request, UploadFile
+ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+ from langgraph.checkpoint.postgres import PostgresSaver
+ from langgraph.types import Command
+@@ -188,9 +188,9 @@ def status(vol: str, _: Viewer):
+ 
+ 
+ @app.get("/volumes/{vol}/events")
+-def volume_events(vol: str, _: Viewer, after: int = 0):
++def volume_events(vol: str, _: Viewer, after: int = 0, limit: int = Query(500, ge=1, le=500)):
+     check(vol)
+-    return store.events(vol, after)
++    return store.events(vol, after, limit)
+ 
+ 
+ @app.patch("/documents/{vol}/{doc_id}")
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 6491fd3..608bab6 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -239,3 +239,11 @@ def test_role_and_csrf_enforced(main_app, monkeypatch):
+     # 쿠키로 온 바꾸는 요청은 CSRF 표시가 없으면 거절 (역할이 맞아도)
+     c.cookies.set(auth.COOKIE, "r")
+     assert c.post("/volumes/vol/timings", json=[]).status_code == 403
++
++
++def test_events_limit_bounds(main_app):
++    from fastapi.routing import APIRoute
++    app, routes = main_app
++    r = next(r for r in routes if isinstance(r, APIRoute) and r.path == "/volumes/{vol}/events")
++    p = next(q for q in r.dependant.query_params if q.name == "limit")
++    assert p.default == 500

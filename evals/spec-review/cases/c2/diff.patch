@@ -1,0 +1,22 @@
+diff --git a/app/main.py b/app/main.py
+index 97e6d48..f22b046 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -17,6 +17,7 @@
+ 인증: /healthz와 로그인 경로를 빼고 모두 로그인 필요 (앱 전체 의존성 auth.guard, 기본 거부).
+ 역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정 reviewer, 업로드·실행 admin.
+ """
++import codecs
+ import datetime as dt
+ import html
+ import os
+@@ -381,7 +382,8 @@ def report_view(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | No
+ @app.get("/report.csv")
+ def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | None = None):
+     lo, hi = _range(day_from, day_to)
+-    return Response(report.to_csv(report.daily(lo, hi)), media_type="text/csv; charset=utf-8",
++    # 엑셀이 한글을 깨지 않게 UTF-8 BOM을 앞에 붙인다
++    return Response(codecs.BOM_UTF8 + report.to_csv(report.daily(lo, hi)).encode("utf-8"), media_type="text/csv; charset=utf-8",
+                     headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
+ 
+ 

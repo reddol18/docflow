@@ -1,0 +1,27 @@
+diff --git a/app/main.py b/app/main.py
+index 97e6d48..0e4c8ee 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -68,7 +68,7 @@ def cfg(vol):
+ 
+ 
+ def check(vol):
+-    if not VOL_RX.match(vol):
++    if not VOL_RX.match(vol) or vol == "..":
+         raise HTTPException(400, "bad volume id")
+ 
+ 
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 6491fd3..250c95c 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -239,3 +239,9 @@ def test_role_and_csrf_enforced(main_app, monkeypatch):
+     # 쿠키로 온 바꾸는 요청은 CSRF 표시가 없으면 거절 (역할이 맞아도)
+     c.cookies.set(auth.COOKIE, "r")
+     assert c.post("/volumes/vol/timings", json=[]).status_code == 403
++
++
++def test_check_rejects_dotdot():
++    from app import main
++    with pytest.raises(HTTPException):
++        main.check("..")

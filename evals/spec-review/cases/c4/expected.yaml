@@ -1,0 +1,7 @@
+criteria:
+  - {n: 1, verdict: 충족, why: "LOCK_MIN = int(os.environ.get('LOGIN_LOCK_MIN', '15'))"}
+  - {n: 2, verdict: [충족, 일부], why: "test_lock_min_from_env는 상수만 본다 — 실제 잠금 시간까지 안 본다고 일부로 봐도 맞다"}
+out_of_scope:
+  - {must_flag: true, what: "MAX_FAILS 5 → 10 (이슈가 범위 밖이라고 명시한 실패 횟수 기준 변경)"}
+merge: [보류, 근거 보강 필요]
+note: 조건은 다 채웠지만 범위 밖 변경이 있다 — 리뷰가 그것을 잡는지 본다. 판정이 '통과'여도 범위 밖에 MAX_FAILS를 적었으면 잡은 것으로 센다

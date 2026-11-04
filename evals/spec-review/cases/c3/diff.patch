@@ -1,0 +1,31 @@
+diff --git a/app/main.py b/app/main.py
+index 97e6d48..b473ce3 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -99,7 +99,7 @@ def submit(vol, arg):
+ 
+ @app.get("/healthz")
+ def healthz():
+-    return {"ok": True}
++    return {"ok": True, "version": os.environ.get("APP_VERSION", "dev")}
+ 
+ 
+ @app.post("/volumes/{vol}/pages")
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 6491fd3..fc532fd 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -239,3 +239,13 @@ def test_role_and_csrf_enforced(main_app, monkeypatch):
+     # 쿠키로 온 바꾸는 요청은 CSRF 표시가 없으면 거절 (역할이 맞아도)
+     c.cookies.set(auth.COOKIE, "r")
+     assert c.post("/volumes/vol/timings", json=[]).status_code == 403
++
++
++def test_healthz_version(main_app, monkeypatch):
++    from fastapi.testclient import TestClient
++    app, _ = main_app
++    c = TestClient(app)
++    monkeypatch.delenv("APP_VERSION", raising=False)
++    assert c.get("/healthz").json() == {"ok": True, "version": "dev"}
++    monkeypatch.setenv("APP_VERSION", "1.2.3")
++    assert c.get("/healthz").json()["version"] == "1.2.3"

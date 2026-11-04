@@ -1,0 +1,6 @@
+criteria:
+  - {n: 1, verdict: [충족, 일부], why: "BOM을 붙이지만 app/report.py to_csv가 이미 BOM을 붙여 BOM이 두 번 — 이를 지적해 '일부'로 보면 더 정확"}
+  - {n: 2, verdict: 미충족, why: "diff에 시험이 없다"}
+out_of_scope: []
+merge: 보류
+note: 처음 세트를 만들 때 to_csv가 이미 BOM을 붙인다는 것을 놓쳤다. 2026-11-04 첫 평가에서 리뷰어가 이중 BOM을 찾아냈다 — 조건 1의 기대에 '일부'를 넣었다

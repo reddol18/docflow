@@ -1,0 +1,6 @@
+criteria:
+  - {n: 1, verdict: 충족, why: "Query(500, ge=1, le=500)로 기본값·범위 구현"}
+  - {n: 2, verdict: 미충족, why: "응답이 여전히 목록 그대로, next_after 없음"}
+  - {n: 3, verdict: [일부, 미충족], why: "시험은 기본값 500만 본다. 경계 0·1·501과 next_after 시험 없음"}
+out_of_scope: []
+merge: 보류

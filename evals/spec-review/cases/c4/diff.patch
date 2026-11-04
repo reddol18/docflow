@@ -1,0 +1,33 @@
+diff --git a/app/auth.py b/app/auth.py
+index 9f3788a..23397eb 100644
+--- a/app/auth.py
++++ b/app/auth.py
+@@ -61,7 +61,8 @@ LOGIN_RATE = (int(os.environ.get("LOGIN_RATE_MAX", "20")), 300)  # 같은 IP에
+ # X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 (Next rewrites는 클라이언트 값을 그대로 넘기므로 안 됨)
+ TRUST_PROXY = os.environ.get("TRUST_PROXY", "0") == "1"
+ MAX_NEXT = 2048
+-MAX_FAILS, LOCK_MIN = 5, 15
++MAX_FAILS = 10
++LOCK_MIN = int(os.environ.get("LOGIN_LOCK_MIN", "15"))  # 잠금 시간(분)
+ CLAIM_SEC = 60  # 로그인 시도 자리를 잡고 검증을 끝내기까지 이보다 길 수 없다 (argon2 검증은 1초 안)
+ PENDING_SEC = 600  # OIDC 로그인 시작부터 콜백까지
+ ID_TOKEN_ALGS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]  # none·HS*는 받지 않는다
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 6491fd3..f9568d0 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -239,3 +239,14 @@ def test_role_and_csrf_enforced(main_app, monkeypatch):
+     # 쿠키로 온 바꾸는 요청은 CSRF 표시가 없으면 거절 (역할이 맞아도)
+     c.cookies.set(auth.COOKIE, "r")
+     assert c.post("/volumes/vol/timings", json=[]).status_code == 403
++
++
++def test_lock_min_from_env(monkeypatch):
++    import importlib
++    monkeypatch.setenv("LOGIN_LOCK_MIN", "30")
++    m = importlib.reload(auth)
++    try:
++        assert m.LOCK_MIN == 30
++    finally:
++        monkeypatch.delenv("LOGIN_LOCK_MIN")
++        importlib.reload(auth)
