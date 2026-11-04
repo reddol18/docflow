@@ -49,6 +49,20 @@ def test_every_route_has_security_headers(main, monkeypatch):
     _check(c.get("/없는-경로"))
 
 
+def test_unhandled_error_500_has_headers(main, monkeypatch):
+    """처리 안 된 예외(500)에도 헤더가 붙고, 예외 문구는 응답에 나가지 않는다."""
+    monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
+    monkeypatch.setattr(auth, "session_user", lambda t: auth.User(1, "v", "v", "viewer"))
+
+    def boom(path):
+        raise RuntimeError("내부 경로 /secret/x")
+    monkeypatch.setattr(main.ocr, "read_image", boom)
+    c = TestClient(main.app, raise_server_exceptions=False)
+    res = c.get("/head/vol/p1", headers={"authorization": "Bearer v"})
+    assert res.status_code == 500 and "secret" not in res.text
+    _check(res)
+
+
 def _snap(flagged):
     return SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": flagged})] if flagged else [])
 

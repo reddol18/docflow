@@ -72,9 +72,15 @@ SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosn
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    res = await call_next(request)
+    try:
+        res = await call_next(request)
+    except Exception:  # 처리 안 된 예외의 500은 이 미들웨어 바깥(ServerErrorMiddleware)에서 만들어져 헤더가 빠진다 → 여기서 만든다
+        traceback.print_exc()
+        res = PlainTextResponse("Internal Server Error", status_code=500)
     for k, v in SECURITY_HEADERS.items():
         res.headers[k] = v  # 민감 응답(색인·쪽 이미지·리포트)이 브라우저·중간 캐시에 남지 않게 모두 no-store
+    if _docs and request.url.path.startswith("/docs"):
+        return res  # 개발용 Swagger UI(API_DOCS=1)는 CDN 스크립트·인라인 스크립트가 필요하다 — CSP를 걸지 않는다
     html_page = res.headers.get("content-type", "").startswith("text/html")
     res.headers["Content-Security-Policy"] = HTML_CSP if html_page else API_CSP
     return res
@@ -298,7 +304,8 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
 <form method=post>"""]
     for d in flagged:
         did = d["doc_id"]
-        out.append(f"<div class=doc><img src='/head/{vol}/{did}' width=600><div><b>{html.escape(did)}</b> ({len(d['pages'])}쪽)")
+        out.append(f"<div class=doc><img src='/head/{html.escape(vol)}/{html.escape(did)}' width=600>"
+                   f"<div><b>{html.escape(did)}</b> ({len(d['pages'])}쪽)")
         for k in ["docno", "date", "recipient", "title"]:
             fk = "serial" if k == "docno" else k
             fl = " ".join(d["flags"].get(fk, []))
@@ -307,8 +314,8 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
                        f" <span class=flag>{html.escape(fl)}</span></div>")
             if k in ("docno", "date") and d["hw"].get(k, {}).get("text") is not None:
                 # 인라인 onerror 대신 파일이 있을 때만 그린다 (CSP가 인라인 스크립트를 막는다)
-                if (store.DATA / "crops" / vol / f"{did}_{k}.png").exists():
-                    out.append(f"<img class=crop src='/crops/{vol}/{did}_{k}.png'>")
+                if store.crop_path(vol, did, k).exists():
+                    out.append(f"<img class=crop src='/crops/{html.escape(vol)}/{html.escape(did)}_{k}.png'>")
                 out.append(f"<span class=flag>손글씨 판독: {html.escape(d['hw'][k]['text'])} (확신도 {d['hw'][k]['conf']})</span>")
         out.append("</div></div>")
     out.append("<button type=submit>검토 끝 — 이어서 색인</button></form>" if editor else "</form>")

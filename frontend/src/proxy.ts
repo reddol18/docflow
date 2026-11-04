@@ -23,12 +23,18 @@ function csp(nonce: string, dev = DEV): string {
   ].join("; ");
 }
 
-const SECURITY_HEADERS: Record<string, string> = { "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY" };
+// 모든 응답에 같은 기본 헤더. 외부(docflow)로 넘기는 /api/* rewrite에는 실리지 않고 docflow 헤더가 그대로 가지만,
+// Next 안에서 답하는 /api/* (흐림 이미지 /masked/head)와 여기서 막은 401·403에는 이것이 붙는다
+const SECURITY_HEADERS: Record<string, string> = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Cache-Control": "no-store", // 색인·쪽 이미지가 보이는 화면도 브라우저·중간 캐시에 남기지 않는다
+};
+const NO_CONTENT_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
-function secure(res: NextResponse, api: boolean, policy?: string): NextResponse {
+function secure(res: NextResponse, policy = NO_CONTENT_CSP): NextResponse {
   for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
-  if (api) res.headers.set("Cache-Control", "no-store"); // 여기서 막은 응답(401·403)용. 넘긴 API 응답은 docflow가 붙인다
-  if (policy) res.headers.set("Content-Security-Policy", policy);
+  res.headers.set("Content-Security-Policy", policy);
   return res;
 }
 
@@ -39,20 +45,20 @@ export function proxy(req: NextRequest) {
     return secure(new NextResponse("Authentication required", {
       status: 401,
       headers: { "WWW-Authenticate": 'Basic realm="docflow", charset="UTF-8"' },
-    }), api);
+    }));
   }
   // 업로드·실행·검토 저장을 막는다 (OpenAI 비용·데이터 변경). 검색·답변(GET)과 로그인·로그아웃은 열어 둔다.
   const authPath = path === "/api/auth/login" || path === "/api/auth/logout";
   if (READONLY && api && !authPath && req.method !== "GET" && req.method !== "HEAD") {
-    return secure(NextResponse.json({ detail: "외부 접속은 읽기 전용입니다" }, { status: 403 }), api);
+    return secure(NextResponse.json({ detail: "외부 접속은 읽기 전용입니다" }, { status: 403 }));
   }
-  if (api) return NextResponse.next(); // docflow로 넘긴다 — 헤더는 docflow 응답 것이 그대로 간다
+  if (api) return secure(NextResponse.next()); // docflow로 넘기면 docflow 헤더가, Next가 답하면(/masked/head) 이것이 간다
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
   const policy = csp(nonce);
   const headers = new Headers(req.headers);
   headers.set("x-nonce", nonce);
   headers.set("Content-Security-Policy", policy); // Next가 여기서 nonce를 읽어 자기 스크립트에 붙인다
-  return secure(NextResponse.next({ request: { headers } }), false, policy);
+  return secure(NextResponse.next({ request: { headers } }), policy);
 }
 
 export const config = {
