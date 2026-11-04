@@ -11,9 +11,15 @@
   GET  /graph                    흐름 그림 (mermaid)
   POST /volumes/{vol}/timings    검토 화면이 잰 문서별 작업 시간
   GET  /report, /report.csv      공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
+  GET  /documents/{vol}/{doc_id}/edits   수정 이력 (칸·이전 값·새 값·사용자·시각)
+  /auth/*                        로그인·로그아웃·OIDC (app/auth.py)
+
+인증: /healthz와 로그인 경로를 빼고 모두 로그인 필요 (앱 전체 의존성 auth.guard, 기본 거부).
+역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정 reviewer, 업로드·실행 admin.
 """
 import datetime as dt
 import html
+import os
 import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -21,16 +27,18 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 import cv2
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from app import auth, llm, ocr, report, store
 from app import graph as flow
-from app import llm, ocr, report, store
-from app.review_input import clean_fixes
+from app.auth import Admin, Reviewer, Viewer
+from app.review_input import EDITABLE, clean_fixes
 
+CellValue = Annotated[str, Field(max_length=500)]  # 색인 칸 하나 (제목도 이 안에 든다)
 VOL_RX = re.compile(r"^[\w.-]{1,80}$")
 runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
 running: dict[str, str] = {}  # vol -> 상태 문자열
@@ -48,7 +56,11 @@ async def lifespan(_):
     store.pool.close()
 
 
-app = FastAPI(title="docflow", lifespan=lifespan)
+# /docs·/openapi.json은 guard 밖이라 기본으로 끈다 (API_DOCS=1이면 개발용으로 켬)
+_docs = os.environ.get("API_DOCS") == "1"
+app = FastAPI(title="docflow", lifespan=lifespan, dependencies=[Depends(auth.guard)],
+              docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
+app.include_router(auth.router)
 
 
 def cfg(vol):
@@ -91,7 +103,7 @@ def healthz():
 
 
 @app.post("/volumes/{vol}/pages")
-async def upload(vol: str, files: list[UploadFile] = File(...)):
+async def upload(vol: str, _: Admin, files: list[UploadFile] = File(...)):
     check(vol)
     d = store.pages_dir(vol)
     d.mkdir(parents=True, exist_ok=True)
@@ -106,7 +118,7 @@ async def upload(vol: str, files: list[UploadFile] = File(...)):
 
 
 @app.post("/volumes/{vol}/run")
-def run(vol: str, review: str = "human"):
+def run(vol: str, _: Admin, review: str = "human"):
     check(vol)
     if review not in ("human", "auto"):
         raise HTTPException(400, "review=human|auto")
@@ -117,7 +129,7 @@ def run(vol: str, review: str = "human"):
 
 
 @app.post("/volumes/{vol}/resume")
-def resume(vol: str):
+def resume(vol: str, _: Admin):
     check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.next:
@@ -163,26 +175,26 @@ def summary(vol):
 
 
 @app.get("/volumes")
-def volumes():
+def volumes(_: Viewer):
     root = store.DATA / "pages"
     vols = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
     return [summary(v) for v in vols]
 
 
 @app.get("/volumes/{vol}")
-def status(vol: str):
+def status(vol: str, _: Viewer):
     check(vol)
     return summary(vol)
 
 
 @app.get("/volumes/{vol}/events")
-def volume_events(vol: str, after: int = 0):
+def volume_events(vol: str, _: Viewer, after: int = 0):
     check(vol)
     return store.events(vol, after)
 
 
 @app.patch("/documents/{vol}/{doc_id}")
-def edit_document(vol: str, doc_id: str, fields: dict):
+def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Reviewer):
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
     check(vol)
@@ -192,25 +204,36 @@ def edit_document(vol: str, doc_id: str, fields: dict):
     docs = {d["doc_id"]: d for d in (snap.values or {}).get("docs", [])}
     if doc_id not in docs:
         raise HTTPException(404)
-    fix = {k: str(v).strip() for k, v in fields.items() if k in ("docno", "date", "recipient", "title")}
-    d = dict(docs[doc_id], fields={**docs[doc_id]["fields"], **fix}, edited=True)
+    old = docs[doc_id]["fields"]
+    fix = {k: str(v).strip() for k, v in fields.items() if k in EDITABLE}
+    fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
+    if not fix:
+        return docs[doc_id]
+    d = dict(docs[doc_id], fields={**old, **fix}, edited=True)
     if "docno" in fix:
         d["fields"]["serial"] = flow.layout.serial_of(fix["docno"])
     G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
     store.save_documents([d])
     store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
-    store.event(vol, "edit", "end", doc_id, fields=list(fix))
+    store.add_edits(vol, doc_id, [(k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
+    store.event(vol, "edit", "end", doc_id, fields=list(fix), user=user.username)
     return d
 
 
+@app.get("/documents/{vol}/{doc_id}/edits")
+def document_edits(vol: str, doc_id: str, _: Viewer):
+    check(vol)
+    return store.edit_history(vol, doc_id)
+
+
 @app.get("/volumes/{vol}/documents")
-def documents(vol: str):
+def documents(vol: str, _: Viewer):
     check(vol)
     return (G.get_state(cfg(vol)).values or {}).get("docs", [])
 
 
 @app.get("/crops/{vol}/{name}")
-def crop(vol: str, name: str):
+def crop(vol: str, name: str, _: Viewer):
     check(vol)
     if not re.fullmatch(r"[\w.-]+_(docno|date)\.png", name):
         raise HTTPException(400)
@@ -221,7 +244,7 @@ def crop(vol: str, name: str):
 
 
 @app.get("/head/{vol}/{page}")
-def head(vol: str, page: str):
+def head(vol: str, page: str, _: Viewer):
     """검토용: 쪽 위 45%를 줄여서 보여 준다."""
     check(vol)
     if not re.fullmatch(r"[\w.-]+", page):
@@ -239,7 +262,7 @@ LABEL = {"docno": "문서번호", "date": "시행일자", "recipient": "수신",
 
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
-def review_page(vol: str):
+def review_page(vol: str, _: Viewer):
     check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
@@ -269,15 +292,19 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
     return "".join(out)
 
 
-def record_review(vol, flagged, fixes):
-    """공정 리포트용: 표시된 문서·칸 수와 사람이 고친 칸 수 (https://github.com/reddol18/docflow/issues/11)."""
+def record_review(vol, flagged, fixes, user):
+    """공정 리포트용: 표시된 문서·칸 수와 사람이 고친 칸 수 (https://github.com/reddol18/docflow/issues/11).
+    수정 이력: 고친 칸마다 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/6)."""
+    cur = {d["doc_id"]: d["fields"] for d in flagged}
+    for did, f in fixes.items():
+        store.add_edits(vol, did, [(k, cur[did].get(k), v) for k, v in f.items()], user.id, "review")
     store.event(vol, "review", "submit", None, docs=len(flagged),
                 cells=sum(len(d["flags"]) for d in flagged),
-                fixed_docs=len(fixes), fixed_cells=sum(len(v) for v in fixes.values()))
+                fixed_docs=len(fixes), fixed_cells=sum(len(v) for v in fixes.values()), user=user.username)
 
 
 @app.post("/review/{vol}")
-async def review_submit(vol: str, request: Request):
+async def review_submit(vol: str, request: Request, user: Reviewer):
     check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
@@ -286,12 +313,12 @@ async def review_submit(vol: str, request: Request):
     flagged = snap.interrupts[0].value["flagged"]
     fixes = clean_fixes(flagged, [(*key.rpartition("__")[::2], val) for key, val in form.items()])
     submit(vol, Command(resume=fixes))
-    record_review(vol, flagged, fixes)
+    record_review(vol, flagged, fixes, user)
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
 
 @app.post("/review/{vol}/json")
-def review_json(vol: str, body: dict[str, dict[str, str]]):
+def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field(max_length=1000)], user: Reviewer):
     """스크립트·검토 화면용: {doc_id: {칸: 값}} 으로 이어 가기. 검토 대기 문서의 바뀐 칸만 반영한다."""
     check(vol)
     snap = G.get_state(cfg(vol))
@@ -300,7 +327,7 @@ def review_json(vol: str, body: dict[str, dict[str, str]]):
     flagged = snap.interrupts[0].value["flagged"]
     fixes = clean_fixes(flagged, [(did, k, v) for did, f in body.items() for k, v in f.items()])
     submit(vol, Command(resume=fixes))
-    record_review(vol, flagged, fixes)
+    record_review(vol, flagged, fixes, user)
     return {"vol": vol, "fixed": {k: list(v) for k, v in fixes.items()}}
 
 
@@ -313,13 +340,13 @@ class Timing(BaseModel):
 
 
 @app.post("/volumes/{vol}/timings")
-def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)]):
+def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)], user: Reviewer):
     """검토 화면이 확정(검토 제출·문서 저장) 때 보내는 문서별 작업 시간 (자리 비움 제외).
     이 철에 없는 문서와 1초 미만(넘겨 보기만 한 것)은 버린다."""
     check(vol)
     known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
     keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
-    store.add_review_times(vol, keep)
+    store.add_review_times(vol, keep, user.id)
     return {"saved": len(keep), "dropped": len(rows) - len(keep)}
 
 
@@ -333,7 +360,7 @@ def _range(day_from, day_to):
 
 
 @app.get("/report")
-def report_view(day_from: dt.date | None = None, day_to: dt.date | None = None):
+def report_view(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | None = None):
     """공정·품질 리포트: 물량(철/건/면)·단계별 진척, 날짜별 처리량·검토 표시·수정률·검토 시간·비용."""
     lo, hi = _range(day_from, day_to)
     root = store.DATA / "pages"
@@ -344,7 +371,7 @@ def report_view(day_from: dt.date | None = None, day_to: dt.date | None = None):
 
 
 @app.get("/report.csv")
-def report_csv(day_from: dt.date | None = None, day_to: dt.date | None = None):
+def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | None = None):
     lo, hi = _range(day_from, day_to)
     return Response(report.to_csv(report.daily(lo, hi)), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
@@ -368,12 +395,12 @@ def hybrid(q, year_from=None, year_to=None, k=10):
 
 
 @app.get("/search")
-def search(q: str, year_from: int | None = None, year_to: int | None = None, k: int = 10):
+def search(q: str, _: Viewer, year_from: int | None = None, year_to: int | None = None, k: int = 10):
     return hybrid(q, year_from, year_to, k)
 
 
 @app.get("/ask")
-def ask(q: str, year_from: int | None = None, year_to: int | None = None):
+def ask(q: str, _: Viewer, year_from: int | None = None, year_to: int | None = None):
     hits = hybrid(q, year_from, year_to, 5)
     for h in hits:
         h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
@@ -381,5 +408,5 @@ def ask(q: str, year_from: int | None = None, year_to: int | None = None):
 
 
 @app.get("/graph", response_class=PlainTextResponse)
-def graph_view():
+def graph_view(_: Viewer):
     return G.get_graph(xray=True).draw_mermaid()

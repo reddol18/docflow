@@ -52,16 +52,37 @@ CREATE TABLE IF NOT EXISTS review_time (
   id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), vol text NOT NULL, doc_id text NOT NULL,
   mode text NOT NULL, active_ms int NOT NULL, opened_at timestamptz, fields_changed int);
 CREATE INDEX IF NOT EXISTS review_time_ts ON review_time (ts);
-CREATE INDEX IF NOT EXISTS events_ts ON events (ts)
+CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
+CREATE TABLE IF NOT EXISTS users (
+  id bigserial PRIMARY KEY, username text NOT NULL, name text, role text NOT NULL,
+  issuer text, subject text, password_hash text, failed int NOT NULL DEFAULT 0, locked_until timestamptz,
+  disabled boolean NOT NULL DEFAULT false, created_at timestamptz DEFAULT now(), last_login timestamptz);
+CREATE UNIQUE INDEX IF NOT EXISTS users_local ON users (username) WHERE issuer IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS users_oidc ON users (issuer, subject) WHERE issuer IS NOT NULL;
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash text PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  via text NOT NULL, created_at timestamptz DEFAULT now(), last_seen timestamptz DEFAULT now(), expires_at timestamptz NOT NULL);
+CREATE TABLE IF NOT EXISTS oidc_pending (
+  state text PRIMARY KEY, nonce text NOT NULL, verifier text NOT NULL, next text, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS edits (
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), vol text NOT NULL, doc_id text NOT NULL, field text NOT NULL,
+  old text, new text, user_id bigint REFERENCES users (id), source text NOT NULL);
+CREATE INDEX IF NOT EXISTS edits_doc ON edits (vol, doc_id);
+ALTER TABLE review_time ADD COLUMN IF NOT EXISTS user_id bigint
 """
 
 
-def init():
-    pool.open()
+def init_db():
+    if pool.closed:
+        pool.open()
     with pool.connection() as c:
         for stmt in SCHEMA.split(";"):  # prepare_threshold=0이라 한 번에 한 문장만 실행할 수 있다
             if stmt.strip():
                 c.execute(stmt)
+
+
+def init():
+    init_db()
     q = qdrant()
     if not q.collection_exists(COLLECTION):
         from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
@@ -105,13 +126,29 @@ def events(vol, after=0, limit=500):
                          "ORDER BY id LIMIT %s", (vol, after, limit)).fetchall()
 
 
-def add_review_times(vol, rows):
+def add_review_times(vol, rows, user_id=None):
     """검토 화면이 잰 문서별 작업 시간. rows = [{doc_id, mode, active_ms, opened_at, fields_changed}]"""
     with pool.connection() as c:
         for r in rows:
-            c.execute("INSERT INTO review_time (vol, doc_id, mode, active_ms, opened_at, fields_changed) "
-                      "VALUES (%s,%s,%s,%s,%s,%s)",
-                      (vol, r["doc_id"], r["mode"], r["active_ms"], r.get("opened_at"), r.get("fields_changed")))
+            c.execute("INSERT INTO review_time (vol, doc_id, mode, active_ms, opened_at, fields_changed, user_id) "
+                      "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                      (vol, r["doc_id"], r["mode"], r["active_ms"], r.get("opened_at"), r.get("fields_changed"), user_id))
+
+
+def add_edits(vol, doc_id, changes, user_id, source):
+    """수정 이력: changes = [(칸, 이전 값, 새 값)], source = review(검토 제출) | edit(색인 뒤 수정)."""
+    with pool.connection() as c:
+        for field, old, new in changes:
+            c.execute("INSERT INTO edits (vol, doc_id, field, old, new, user_id, source) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                      (vol, doc_id, field, old, new, user_id, source))
+
+
+def edit_history(vol, doc_id):
+    with pool.connection() as c:
+        # sso: SSO 사용자는 이름을 제공자가 정하므로 local 계정과 이름이 같을 수 있다 → 구별해서 보여 준다
+        return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, u.username, u.name, u.issuer IS NOT NULL AS sso FROM edits e "
+                         "LEFT JOIN users u ON u.id = e.user_id WHERE e.vol = %s AND e.doc_id = %s ORDER BY e.id",
+                         (vol, doc_id)).fetchall()
 
 
 def save_documents(docs):

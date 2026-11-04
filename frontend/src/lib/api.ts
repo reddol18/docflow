@@ -115,8 +115,30 @@ export type Report = {
   columns: Record<string, string>;
 };
 
-async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(`/api${path}`, { cache: "no-store", ...init });
+export type Role = "viewer" | "reviewer" | "admin";
+export type Me = { username: string; name: string; role: Role };
+export type AuthConfig = { modes: ("local" | "oidc")[]; off: boolean; oidc_label: string | null };
+export type EditRow = { ts: string; field: string; old: string | null; new: string; source: "review" | "edit"; username: string | null; name: string | null };
+
+const ROLE_ORDER: Role[] = ["viewer", "reviewer", "admin"];
+export const can = (me: Me | null | undefined, need: Role) => !!me && ROLE_ORDER.indexOf(me.role) >= ROLE_ORDER.indexOf(need);
+export const ROLE_LABEL: Record<Role, string> = { viewer: "보기", reviewer: "검토", admin: "관리" };
+
+export const loginUrl = () => {
+  const here = window.location.pathname + window.location.search;
+  return `/login?next=${encodeURIComponent(here)}`;
+};
+
+async function call<T>(path: string, init?: RequestInit & { noRedirect?: boolean }): Promise<T> {
+  const { noRedirect, ...rest } = init ?? {};
+  // X-Docflow-CSRF: 다른 사이트의 폼·스크립트는 이 헤더를 붙일 수 없다 → 서버가 쿠키 요청을 믿는 근거 (app/auth.py)
+  const headers = new Headers(rest.headers);
+  headers.set("X-Docflow-CSRF", "1");
+  const r = await fetch(`/api${path}`, { cache: "no-store", ...rest, headers });
+  if (r.status === 401 && !noRedirect && window.location.pathname !== "/login") {
+    window.location.assign(loginUrl()); // 세션 만료·로그인 안 함 → 로그인 뒤 이 화면으로 돌아온다
+    return new Promise<T>(() => {});
+  }
   if (!r.ok) {
     let msg = `${r.status}`;
     try {
@@ -169,7 +191,20 @@ export const api = {
       body: JSON.stringify(rows),
     }),
   report: (dayFrom?: string, dayTo?: string) => call<Report>(`/report?${reportQuery(dayFrom, dayTo)}`),
+  edits: (vol: string, docId: string) => call<EditRow[]>(`/documents/${enc(vol)}/${enc(docId)}/edits`),
+  authConfig: () => call<AuthConfig>("/auth/config", { noRedirect: true }),
+  me: () => call<{ user: Me }>("/auth/me", { noRedirect: true }),
+  login: (username: string, password: string) =>
+    call<{ user: Me }>("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+      noRedirect: true,
+    }),
+  logout: () => call<{ ok: boolean }>("/auth/logout", { method: "POST", noRedirect: true }),
 };
+
+export const oidcLoginUrl = (next: string) => `/api/auth/oidc/login?next=${encodeURIComponent(next)}`;
 
 const reportQuery = (dayFrom?: string, dayTo?: string) => {
   const p = new URLSearchParams();

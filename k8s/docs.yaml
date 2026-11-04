@@ -143,6 +143,26 @@ spec:
         - {name: OCR_THREADS, value: "4"}
         - {name: DAILY_BUDGET_USD, value: "3.0"}
         - {name: PYTHONUNBUFFERED, value: "1"}
+        # 인증 (app/auth.py 머리말). 설치 환경마다: local / oidc / local,oidc
+        # 첫 관리자: kubectl exec -it -n docs deploy/docflow -- python -m app.users add admin --role admin
+        - {name: AUTH_MODES, value: "local"}
+        - {name: SESSION_HOURS, value: "12"}
+        - {name: COOKIE_SECURE, value: "0"}  # 지금 데모는 http. https로 서비스하면 이 줄을 지운다 (코드 기본값이 Secure)
+        - {name: TRUST_PROXY, value: "1"}  # Next 프록시 뒤: 로그인 시도 제한에 X-Forwarded-For 마지막 값을 쓴다
+        # OIDC를 켤 때 (AUTH_MODES에 oidc 추가). client secret은 Secret으로:
+        #   kubectl create secret generic oidc -n docs --from-file=client-secret=<파일>
+        # - {name: OIDC_ISSUER, value: "https://sso.example.go.kr/realms/docflow"}
+        # - {name: OIDC_CLIENT_ID, value: "docflow"}
+        # - {name: OIDC_CLIENT_SECRET_FILE, value: /etc/oidc/client-secret}
+        # - {name: OIDC_REDIRECT_URI, value: "https://docflow.example.go.kr/api/auth/oidc/callback"}
+        # - {name: OIDC_ROLE_CLAIM, value: "realm_access.roles"}
+        # - {name: OIDC_ROLE_MAP, value: '{"docflow-admin":"admin","docflow-reviewer":"reviewer"}'}
+        # - {name: OIDC_DEFAULT_ROLE, value: "none"}   # 기본값도 none(지도에 없는 사람은 거절). viewer로 열려면 명시
+        #   그리고 아래 volumeMounts에 {name: oidc, mountPath: /etc/oidc, readOnly: true},
+        #   volumes에 {name: oidc, secret: {secretName: oidc}} 를 더한다.
+        # 세션 서명 비밀값은 없다: 세션은 서버가 만든 무작위 토큰이고 DB(sessions)에 해시로만 둔다.
+        # 주의: 위 docflow-egress는 사설 IP(10/8, 172.16/12, 192.168/16)로 나가는 것을 막는다.
+        #       기관 내부망 SSO나 클러스터 안 Keycloak을 쓰면 그 주소로 가는 규칙을 더해야 한다.
         ports: [{containerPort: 8000}]
         resources: {requests: {cpu: 1500m, memory: 2Gi}, limits: {memory: 5Gi}}
         readinessProbe: {httpGet: {path: /healthz, port: 8000}, periodSeconds: 5}

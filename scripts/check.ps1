@@ -25,8 +25,8 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $env:LOCALAPPDATA "docflow-tools"
-$V = @{ gitleaks = "8.30.1"; osv = "2.7.0"; trivy = "0.75.0"; semgrep = "1.180.0"; ruff = "0.14.3"; pytest = "8.4.2"
-        pglite = "0.5.14"; pgliteSocket = "0.2.17"; psycopg = "3.3.6"; psycopgPool = "3.3.3" }
+$V = @{ gitleaks = "8.30.1"; osv = "2.7.0"; trivy = "0.75.0"; semgrep = "1.180.0"; ruff = "0.14.3"
+        pglite = "0.5.14"; pgliteSocket = "0.2.17" }
 $Skip = @($Skip | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File로 부르면 "a,b"가 한 문자열로 온다
 if ($Quick) { $Skip += "osv", "semgrep", "trivy" }
 $env:PYTHONUTF8 = "1"
@@ -94,8 +94,8 @@ try {
         }
         $code = 1
         try {
-            uv run --quiet --no-project --with "pytest==$($V.pytest)" --with "psycopg[binary]==$($V.psycopg)" `
-                --with "psycopg-pool==$($V.psycopgPool)" python -m pytest -q
+            # 버전은 requirements-test.txt (앱을 불러와 경로 보호를 시험할 만큼, OCR 제외)
+            uv run --quiet --no-project --with-requirements requirements-test.txt python -m pytest -q
             $code = $LASTEXITCODE
             if ($code -eq 5) { Write-Host "(모은 시험 없음 — 통과로 본다)"; $code = 0 }
         } finally {

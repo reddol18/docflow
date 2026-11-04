@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { UserMenu } from "@/components/UserMenu";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -22,6 +23,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <Link href="/report" className="hover:text-slate-900">리포트</Link>
             </nav>
             <span className="ml-auto text-xs text-slate-400">PaddleOCR · LangGraph · Qdrant · GPT</span>
+            <UserMenu />
           </div>
         </header>
         <main className="mx-auto w-full max-w-7xl flex-1 px-6 py-6">{children}</main>
