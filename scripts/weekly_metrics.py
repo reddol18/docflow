@@ -17,6 +17,9 @@
                 분모에 넣고 제때 한 것과 따로 센다. 늦은 리뷰를 하면 제목을 이렇게 단다
     규칙 전     절차(템플릿·`scripts/check.ps1`)가 생긴 PR #30 병합 전에 열고, 그 뒤 하루 안에 병합한 PR (분모에서 뺌)
     코드 없음   `docs/`·README·잠금 파일·의존성 목록만 바꾼 PR → 계약·버그 리뷰는 볼 것이 없다 (분모에서 뺌)
+- 속도·품질·리뷰·계약 (표의 '어떻게 셌나' 칸): 이슈 시작→병합→배포 시간, 변경 실패율, 재작업률, 다시 열린 이슈,
+  리뷰 지적 처리, 리뷰 뒤 버그, 완료 조건 충족률, 범위 변경 비율, 첫 로컬 검사 통과율. AI 비용은 집계 수단이 없어 –
+  글에서 읽는 지표는 PR 템플릿·리뷰 댓글 형식('완료 조건별 결과' 표, '지적·반영' 표)을 따를 때만 잡힌다
 - 이슈: 연 것·닫은 것, 우선순위별 열린 수, 위험 수용(라벨 risk-accepted) 열린 수
 - 보안: `security/asvs.yaml`의 미충족·일부·미판정 항목 수 (지금 작업 트리 기준)
 흔적은 글자로 찾는다: PR 본문(템플릿 줄을 뺀 나머지)·댓글·리뷰 본문·줄 댓글. 제목은 흔적이 아니다.
@@ -48,8 +51,8 @@ RULES_GRACE = dt.timedelta(days=1)  # 규칙 전에 연 PR이라도 이보다 �
 REVIEWS = ("계약 리뷰", "버그 리뷰")  # 코드가 없으면 볼 것이 없는 리뷰
 # 절차를 바꾸는 .md(템플릿·에이전트·스킬)는 코드로 본다 → docs/와 README만
 NON_CODE = re.compile(r"^docs/|(^|/)README\.md$|\.lock$|(^|/)requirements[^/]*\.txt$|(^|/)package-lock\.json$|^\.gitattributes$")
+REWORK_DAYS = dt.timedelta(days=7)  # 재작업: 병합 뒤 이 안에 같은 코드 파일을 다른 PR이 고침
 FILES_CAP = 100  # gh pr view --json files 상한: 이만큼이면 잘렸을 수 있으니 코드 있음으로 본다
-SEC_SECTION = re.compile(r"#+\s*보안 영향\s*\n(.*?)(?=\n#+\s|\Z)", re.S)
 
 
 def sh(*args):
@@ -95,8 +98,8 @@ def evidence(body):
 
 
 def needs_security(issue_body):
-    m = SEC_SECTION.search(issue_body or "")
-    return bool(m and re.search(r"- \[[xX]\]", m.group(1)))
+    s = section(issue_body, "보안 영향")
+    return bool(s and re.search(r"- \[[xX]\]", s))
 
 
 def deploy_tags():
@@ -121,9 +124,112 @@ def pr_extra(n):
 
 def pr_marks(p):
     commits, files, reviews = pr_extra(p["number"])
-    text = "\n".join([evidence(p["body"])] + [c["body"] for c in p["comments"]] + reviews)  # 제목은 흔적 아님
+    text = "\n\n".join([evidence(p["body"])] + [c["body"] for c in p["comments"]] + reviews)  # 빈 줄로 이어 표끼리 붙지 않게
     return commits, files, text, {k: bool(rx.search(text)) for k, rx in MARKS.items()}
 
+
+# ---------- 글에서 읽는 지표 (순수 함수 — 시험은 tests/test_weekly_metrics.py) ----------
+
+def section(body, name):
+    """'## name' 절의 내용 (HTML 주석 뺌). 절이 없으면 None"""
+    body = re.sub(r"<!--.*?-->", "", (body or "").replace("\r\n", "\n"), flags=re.S)  # 이슈 본문은 CRLF일 수 있다
+    m = re.search(rf"#+[ \t]*{re.escape(name)}[ \t]*\n(.*?)(?=\n#+\s|\Z)", body, re.S)  # \s*는 빈 줄을 삼켜 다음 절까지 읽는다
+    return m.group(1) if m else None
+
+
+def _plain(cell):
+    return re.sub(r"[*_`]", "", cell).strip()  # **충족**·_그대로_도 같게
+
+
+def _tables(text, *need):
+    """머리 줄에 need 낱말이 모두 있는 마크다운 표의 데이터 행들 (칸 목록, 강조 표시 뺌)"""
+    rows, head = [], None
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s.startswith("|"):
+            head = None
+            continue
+        cells = [_plain(c) for c in s.strip("|").split("|")]
+        if head is None:
+            head = cells if all(any(w in c for c in cells) for w in need) else []
+            continue
+        if not head or set(s) <= set("|-: "):
+            continue
+        rows.append(dict(zip(head, cells)))
+    return rows
+
+
+DECLINED = re.compile(r"^(그대로|아님|반영 없음|없음)")
+DEFERRED = re.compile(r"후속|^https://github\.com/\S+/issues/\d+\s*$|^#\d+")
+
+
+def review_fixes(text):
+    """리뷰 결과 댓글의 '| 지적 | 반영 |' 표 (PR 템플릿이 정한 형식) → (고침, 후속으로 넘김, 그대로 둠)"""
+    fixed = deferred = declined = 0
+    for r in _tables(text, "지적", "반영"):
+        v = r.get("반영", "")
+        if DECLINED.search(v):
+            declined += 1
+        elif DEFERRED.search(v):
+            deferred += 1
+        elif v:
+            fixed += 1
+    return fixed, deferred, declined
+
+
+def criteria_met(body):
+    """PR 본문 '완료 조건별 결과' 표 → (충족, 대상). 빈 행과 '해당 없음'은 뺀다. 작성자가 적은 값이다"""
+    rows = [r for r in _tables(body, "완료 조건", "결과") if r.get("완료 조건")]
+    rows = [r for r in rows if not r.get("결과", "").startswith("해당 없음")]
+    return sum(r.get("결과", "").startswith("충족") for r in rows), len(rows)
+
+
+def extra_changes(body):
+    """'범위 밖 변경' 절에 무엇이 적혀 있나: True / '없음'이면 False / 절이 없거나 비었으면 None(안 채움)"""
+    s = section(body, "범위 밖 변경")
+    if s is None:
+        return None
+    s = s.strip().lstrip("-* ").strip()
+    if not s:
+        return None
+    return not s.startswith("없음")
+
+
+SCOPE_CHANGE = re.compile(r"범위 변경")  # '범위 밖 변경'과 다르다: 완료 조건을 줄이거나 바꾼 기록
+
+
+def scope_change(body):
+    return bool(SCOPE_CHANGE.search(re.sub(r"<!--.*?-->", "", body or "", flags=re.S)))
+
+
+def first_check_passed(texts):
+    """시간 순 글들에서 처음 나온 로컬 검사 요약 표가 통과였나 (없으면 None). 표가 끝나는 곳까지만 본다"""
+    for t in texts:
+        lines = (t or "").splitlines()
+        for i, ln in enumerate(lines):
+            if MARKS["로컬 검사"].search(ln):
+                block, started = [ln], False
+                for nxt in lines[i + 1:]:
+                    if nxt.strip().startswith("|"):
+                        started = True
+                    elif started or len(block) > 3:
+                        if nxt.strip().startswith("실패:"):
+                            block.append(nxt)
+                        break
+                    block.append(nxt)
+                text = "\n".join(block)
+                return "**실패**" not in text and "실패:" not in text
+    return None
+
+
+def bug_fields(body):
+    """버그 템플릿의 '발견 단계'·'원인 PR' 칸"""
+    stage = (section(body, "발견 단계") or "").strip().splitlines()
+    cause = re.search(r"/pull/(\d+)", section(body, "원인 PR") or "")
+    return (stage[0].strip() if stage else None), (int(cause.group(1)) if cause else None)
+
+
+ESCAPED = {"배포 후 확인", "운영"}  # 리뷰·로컬 검사를 지나 나온 버그
 
 def asvs_counts():
     p = ROOT / "security" / "asvs.yaml"
@@ -147,21 +253,39 @@ def collect(start, end):
             seen[p["number"]] = pr_marks(p)
         return seen[p["number"]]
 
-    def late(n, merged, key):
-        """제목에 'PR #N'이 있는 나중 PR 중 그 리뷰 흔적이 있는 첫 PR. 나중 PR 목록은 필요할 때 한 번만 받는다."""
+    def later_prs():
+        """이 주 시작 뒤 병합한 PR 전부 (늦은 리뷰·뒤따른 수정·재작업을 찾는다). 필요할 때 한 번만 받는다"""
         if not later:
             got = gh_json("pr", "list", "--state", "merged", "--search", f"merged:>={start.isoformat(timespec='seconds')}",
                           "--limit", "1000", "--json", "number,title,mergedAt,body,comments")
             if len(got) >= 1000:
                 raise SystemExit("나중 PR이 1000개 이상: --limit을 올릴 것")
             later.extend(sorted(got, key=lambda q: q["mergedAt"]) or [None])
+        return [q for q in later if q]
+
+    def follow_ups(n, merged):
+        """제목에 'PR #N'이 있는 나중 PR (늦은 리뷰 반영이나 그 PR의 수정)"""
         ref = re.compile(rf"\bPR #{n}\b")
-        for q in later:
-            if q is None or q["number"] == n or parse_ts(q["mergedAt"]) < merged or not ref.search(q["title"]):
-                continue
+        return [q for q in later_prs() if q["number"] != n and parse_ts(q["mergedAt"]) >= merged and ref.search(q["title"])]
+
+    def late(n, merged, key):
+        """뒤따른 PR 중 그 리뷰 흔적이 있는 첫 PR"""
+        for q in follow_ups(n, merged):
             if info(q)[3][key]:
                 return q["number"]
         return None
+
+    def rework(n, merged, files):
+        """병합 뒤 7일 안에 같은 코드 파일을 다시 고친 다른 PR. 코드를 안 바꾼 PR은 None(분모에서 뺌)"""
+        code = {f for f in files if not NON_CODE.search(f)}
+        if not code:
+            return None
+        out = []
+        for q in later_prs():
+            t = parse_ts(q["mergedAt"])
+            if q["number"] != n and merged < t <= merged + REWORK_DAYS and code & set(info(q)[1]):
+                out.append(q["number"])
+        return out
     limit = 1000
     issues = gh_json("issue", "list", "--state", "all", "--limit", str(limit),
                      "--json", "number,title,createdAt,closedAt,labels,state,body")
@@ -192,12 +316,34 @@ def collect(start, end):
             elif no_code and k in REVIEWS:
                 marks[k] = "코드 없음"
         sha = (p.get("mergeCommit") or {}).get("oid")
+        tag = deployed(sha) if sha else None
+        tag_at = dict(tags).get(tag)
+        started = [parse_ts(by_no[n]["createdAt"]) for n in refs]
+        comments = [c["body"] for c in p["comments"]]
+        # 변경 실패: 배포된 뒤에 제목 'PR #N'인 PR이 뒤따름 (배포 안 된 PR은 분모에서 뺌)
+        fixes = None if not tag_at else [q["number"] for q in follow_ups(p["number"], merged)
+                                         if parse_ts(q["mergedAt"]) > tag_at]
+        window_done = dt.datetime.now(dt.timezone.utc) >= merged + REWORK_DAYS
         rows.append({
             "n": p["number"], "title": p["title"], "size": p["additions"] + p["deletions"], "commits": commits,
-            "hours": (parse_ts(p["mergedAt"]) - parse_ts(p["createdAt"])).total_seconds() / 3600,
-            "closes": sorted(refs), "marks": marks, "deploy": deployed(sha) if sha else None,
+            "hours": (merged - parse_ts(p["createdAt"])).total_seconds() / 3600,
+            "closes": sorted(refs), "marks": marks, "deploy": tag,
+            "lead_h": (merged - min(started)).total_seconds() / 3600 if started else None,      # 이슈 시작 → 병합
+            "deploy_h": (tag_at - merged).total_seconds() / 3600 if tag_at else None,           # 병합 → 배포
+            "follow": fixes, "rework": rework(p["number"], merged, files), "rework_done": window_done,
+            "review": review_fixes(info(p)[2]),
+            "criteria": criteria_met(p["body"]), "extra": extra_changes(p["body"]), "scope": scope_change(p["body"]),
+            # 댓글(시간 순)을 먼저 본다 — 본문의 요약은 다시 돌린 뒤 바꿔 붙였을 수 있다
+            "first_check": first_check_passed(comments + [evidence(p["body"])]),
         })
-    return rows, issues, [t for t in tags if start <= t[1] < end]
+    # 다시 열린 이슈 (PR 제외, 이슈 수). 저장소 전체 이벤트를 넘겨 본다 — 커지면 기간으로 자를 방법을 찾을 것
+    ev = sh("gh", "api", "--paginate", f"repos/{REPO}/issues/events",
+            "--jq", '.[] | select(.event=="reopened" and .issue.pull_request == null) | "\\(.issue.number) \\(.created_at)"')
+    reopened = {int(n) for n, ts in (ln.split() for ln in ev.splitlines() if ln.strip()) if start <= parse_ts(ts) < end}
+    bugs = [(i["number"], *bug_fields(i["body"])) for i in issues if start <= parse_ts(i["createdAt"]) < end
+            and any(lb["name"] == "bug" for lb in i["labels"])]
+    extra = {"reopened": len(reopened), "bugs": bugs}
+    return rows, issues, [t for t in tags if start <= t[1] < end], extra
 
 
 def pct(xs):
@@ -213,7 +359,59 @@ def ok(b):
     return "–" if b is None else b if isinstance(b, str) else ("O" if b else "**X**")
 
 
-def render(label, start, end, rows, issues, tags):
+def _med(xs, unit="시간"):
+    xs = [x for x in xs if x is not None]
+    return f"{statistics.median(xs):.1f} {unit} (PR {len(xs)})" if xs else "–"
+
+
+def _ratio(xs):
+    xs = [x for x in xs if x is not None]
+    return f"{sum(bool(x) for x in xs)}/{len(xs)}" if xs else "–"
+
+
+HOW = {  # 표의 '어떻게 셌나' 칸
+    "lead": "PR이 가리키는 이슈(닫는 이슈·제목의 #N) 중 가장 이른 생성 시각부터. 오래 열린 묶음 이슈는 길게 나온다",
+    "deploy": "병합 커밋을 처음 포함한 deploy 태그",
+    "fail": "배포된 PR 중, 배포 뒤 제목에 'PR #N'인 PR(그 PR의 수정·늦은 리뷰 반영)이 뒤따른 것",
+    "rework": "코드를 바꾼 PR 중, 병합 뒤 7일 안에 다른 PR이 같은 코드 파일을 고친 것",
+    "reopen": "이 주에 reopened된 이슈 수 (PR 제외)",
+    "review": "리뷰 결과 댓글의 '지적·반영' 표 (PR 템플릿 형식)",
+    "bug": "이 주에 연 bug 이슈 중 발견 단계가 배포 후 확인·운영인 것",
+    "criteria": "PR 본문 '완료 조건별 결과' 표의 '충족' (작성자가 적은 값, 해당 없음 제외)",
+    "scope": "PR 본문에 '범위 변경' (완료 조건을 줄이거나 바꾼 기록)",
+    "extra": "'범위 밖 변경' 절이 '없음'이 아님 (안 채운 PR은 뺌)",
+    "check": "PR에 처음 붙인 `scripts/check.ps1` 요약에 실패가 없음 (붙이기 전 실패는 남지 않음)",
+    "cost": "gh·git에는 없다. 세션 기록(`~/.claude/projects/*.jsonl`)은 이 PC에만 있고 이슈와 잇는 키가 없다",
+}
+
+
+def quality(rows, extra):
+    fx = [sum(r["review"][i] for r in rows) for i in range(3)]
+    nfx = sum(fx)
+    met, total = sum(r["criteria"][0] for r in rows), sum(r["criteria"][1] for r in rows)
+    open_win = sum(r["rework"] is not None and not r["rework_done"] for r in rows)
+    escaped = [b for b in extra["bugs"] if b[1] in ESCAPED]
+    bugs = ", ".join(f"#{n}({s or '단계 없음'}{f', 원인 #{c}' if c else ''})" for n, s, c in extra["bugs"]) or "없음"
+    rework = _ratio([r["rework"] for r in rows]) + (f" (잠정: 7일이 안 지난 PR {open_win})" if open_win else "")
+    review = f"{fx[0]}/{nfx} (후속 {fx[1]}, 그대로 {fx[2]})" if nfx else "–"
+    vals = [
+        ("이슈 시작 → 병합 중앙값", _med([r["lead_h"] for r in rows]), HOW["lead"]),
+        ("병합 → 배포 중앙값", _med([r["deploy_h"] for r in rows]), HOW["deploy"]),
+        ("변경 실패율", _ratio([r["follow"] for r in rows]), HOW["fail"]),
+        ("재작업률", rework, HOW["rework"]),
+        ("다시 열린 이슈", extra["reopened"], HOW["reopen"]),
+        ("리뷰 지적 고친 비율", review, HOW["review"]),
+        ("리뷰 뒤 나온 버그", f"{len(escaped)} / bug 이슈 {len(extra['bugs'])}", f"{HOW['bug']}. {bugs}"),
+        ("병합 때 완료 조건 충족", f"{met}/{total}" if total else "–", HOW["criteria"]),
+        ("범위 변경 기록이 있는 PR", _ratio([r["scope"] for r in rows]), HOW["scope"]),
+        ("범위 밖 변경이 있는 PR", _ratio([r["extra"] for r in rows]), HOW["extra"]),
+        ("첫 로컬 검사 통과", _ratio([r["first_check"] for r in rows]), HOW["check"]),
+        ("AI 비용", "–", HOW["cost"]),
+    ]
+    return (["## 속도·품질·리뷰·계약", "", "| 지표 | 값 | 어떻게 셌나 |", "|---|---|---|"]
+            + [f"| {k} | {v} | {h} |" for k, v, h in vals] + [""])
+
+def render(label, start, end, rows, issues, tags, extra=None):
     opened = [i for i in issues if start <= parse_ts(i["createdAt"]) < end]
     closed = [i for i in issues if i["closedAt"] and start <= parse_ts(i["closedAt"]) < end]
     open_now = [i for i in issues if i["state"] == "OPEN"]
@@ -236,6 +434,8 @@ def render(label, start, end, rows, issues, tags):
             f"| 열린 위험 수용 (risk-accepted) | {risk} |",
             "| 보안 체크리스트 미충족 / 일부 / 미판정 (`security/asvs.yaml`) | {미충족} / {일부} / {미판정} |".format(**asvs_counts()),
             ""]
+    if extra is not None:
+        out += quality(rows, extra)
     out += [
             "## PR별 절차", "", "| PR | 크기 | 커밋 | 시간 | 닫는 이슈 | " + " | ".join(MARKS) + " | 배포 |",
             "|---|---|---|---|---|" + "---|" * len(MARKS) + "---|"]
