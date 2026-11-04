@@ -145,7 +145,8 @@ def add_edits(vol, doc_id, changes, user_id, source):
 
 def edit_history(vol, doc_id):
     with pool.connection() as c:
-        return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, u.username, u.name FROM edits e "
+        # sso: SSO 사용자는 이름을 제공자가 정하므로 local 계정과 이름이 같을 수 있다 → 구별해서 보여 준다
+        return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, u.username, u.name, u.issuer IS NOT NULL AS sso FROM edits e "
                          "LEFT JOIN users u ON u.id = e.user_id WHERE e.vol = %s AND e.doc_id = %s ORDER BY e.id",
                          (vol, doc_id)).fetchall()
 

@@ -90,16 +90,59 @@ def test_id_token_rejects_bad_signature_and_alg(oidc):
 def test_oidc_role(oidc):
     assert auth.oidc_role({"realm_access": {"roles": ["x", "docflow-review"]}}) == "reviewer"
     assert auth.oidc_role({"realm_access": {"roles": ["docflow-review", "docflow-admin"]}}) == "admin"
-    assert auth.oidc_role({"realm_access": {"roles": ["admin"]}}) == "viewer"  # 지도에 없는 값은 무시 → 기본 역할
-    auth.OIDC.default_role = None
-    assert auth.oidc_role({}) is None  # 기본 역할 없음 → 로그인 거절
+    assert auth.oidc_role({"realm_access": {"roles": ["admin"]}}) is None  # 지도에 없는 값은 무시 → 기본(거절)
+    assert auth.oidc_role({}) is None
+    auth.OIDC.default_role = "viewer"  # 명시하면 열린다
+    assert auth.oidc_role({}) == "viewer"
 
 
-def test_oidc_config_check():
+def test_oidc_config_check(monkeypatch):
+    ok = {"issuer": ISS, "client_id": CID, "redirect_uri": "https://docflow.test/api/auth/oidc/callback"}
+    auth.OidcConfig(**ok).check()
+    assert auth.OidcConfig().default_role is None
+    monkeypatch.delenv("OIDC_DEFAULT_ROLE", raising=False)
+    assert auth.OidcConfig.from_env().default_role is None  # 환경 변수 기본값도 거절
+    bad = [
+        {"issuer": ISS},  # 필수값 없음
+        {**ok, "role_map": {"g": "root"}},  # 없는 역할
+        {**ok, "issuer": "http://idp.test/realms/x"},  # http 발급자
+    ]
+    for kw in bad:
+        with pytest.raises(RuntimeError):
+            auth.OidcConfig(**kw).check()
+    auth.OidcConfig(**{**ok, "issuer": "http://keycloak:8080/realms/x", "allow_http": True}).check()
     with pytest.raises(RuntimeError):
-        auth.OidcConfig(issuer=ISS).check()
-    with pytest.raises(RuntimeError):
-        auth.OidcConfig(issuer=ISS, client_id=CID, redirect_uri="/cb", role_map={"g": "root"}).check()
+        auth.OidcConfig(**ok).check(cookie_secure=False)  # https 콜백인데 Secure 쿠키를 끔
+
+
+def test_rate_limit(monkeypatch):
+    monkeypatch.setattr(auth, "LOGIN_RATE", (3, 300))
+    monkeypatch.setattr(auth, "_hits", {})
+
+    class R:
+        def __init__(self, ip, xff=None):
+            self.client = type("C", (), {"host": ip})()
+            self.headers = {"x-forwarded-for": xff} if xff else {}
+
+    for _ in range(3):
+        auth.rate_limit(R("10.0.0.1"))
+    with pytest.raises(HTTPException) as e:
+        auth.rate_limit(R("10.0.0.1"))
+    assert e.value.status_code == 429
+    auth.rate_limit(R("10.0.0.2"))  # 다른 IP는 따로 센다
+    # 프록시를 믿지 않으면 X-Forwarded-For를 무시한다 (위조로 우회 못 함)
+    with pytest.raises(HTTPException):
+        auth.rate_limit(R("10.0.0.1", xff="1.2.3.4"))
+    monkeypatch.setattr(auth, "TRUST_PROXY", True)
+    auth.rate_limit(R("127.0.0.1", xff="9.9.9.9, 10.0.0.9"))  # 마지막 값(프록시가 본 주소)
+    assert "10.0.0.9" in auth._hits and "9.9.9.9" not in auth._hits
+
+
+def test_docs_disabled(main_app):
+    from fastapi.testclient import TestClient
+    app, _ = main_app
+    c = TestClient(app)
+    assert c.get("/openapi.json").status_code == 404 and c.get("/docs").status_code == 404
 
 
 class FakeReq:

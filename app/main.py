@@ -19,6 +19,7 @@
 """
 import datetime as dt
 import html
+import os
 import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,7 @@ from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
 from app.review_input import EDITABLE, clean_fixes
 
+CellValue = Annotated[str, Field(max_length=500)]  # 색인 칸 하나 (제목도 이 안에 든다)
 VOL_RX = re.compile(r"^[\w.-]{1,80}$")
 runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
 running: dict[str, str] = {}  # vol -> 상태 문자열
@@ -54,7 +56,10 @@ async def lifespan(_):
     store.pool.close()
 
 
-app = FastAPI(title="docflow", lifespan=lifespan, dependencies=[Depends(auth.guard)])
+# /docs·/openapi.json은 guard 밖이라 기본으로 끈다 (API_DOCS=1이면 개발용으로 켬)
+_docs = os.environ.get("API_DOCS") == "1"
+app = FastAPI(title="docflow", lifespan=lifespan, dependencies=[Depends(auth.guard)],
+              docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
 app.include_router(auth.router)
 
 
@@ -189,7 +194,7 @@ def volume_events(vol: str, _: Viewer, after: int = 0):
 
 
 @app.patch("/documents/{vol}/{doc_id}")
-def edit_document(vol: str, doc_id: str, fields: dict, user: Reviewer):
+def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Reviewer):
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
     check(vol)
@@ -313,7 +318,7 @@ async def review_submit(vol: str, request: Request, user: Reviewer):
 
 
 @app.post("/review/{vol}/json")
-def review_json(vol: str, body: dict[str, dict[str, str]], user: Reviewer):
+def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field(max_length=1000)], user: Reviewer):
     """스크립트·검토 화면용: {doc_id: {칸: 값}} 으로 이어 가기. 검토 대기 문서의 바뀐 칸만 반영한다."""
     check(vol)
     snap = G.get_state(cfg(vol))

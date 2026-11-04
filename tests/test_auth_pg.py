@@ -33,6 +33,8 @@ def db(pg_store):
 @pytest.fixture
 def client(db, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"local", "oidc"}))
+    monkeypatch.setattr(auth, "COOKIE_SECURE", False)  # 시험 클라이언트는 http → Secure 쿠키를 다시 보내지 않는다
+    monkeypatch.setattr(auth, "_hits", {})  # 시험마다 IP 제한 창을 비운다
     app = FastAPI(dependencies=[Depends(auth.guard)])
     app.include_router(auth.router)
 
@@ -110,6 +112,41 @@ def test_lockout_and_generic_message(client, db, monkeypatch):
     from app import users
     users.main(["unlock", "carol"])
     assert login(client, "carol").status_code == 200
+
+
+def test_lockout_holds_under_concurrency(db, monkeypatch):
+    """동시에 여러 번 틀려도 잠금 전까지 실제 비밀번호 검증은 MAX_FAILS번만 (시도 자리를 원자적으로 잡는다)."""
+    from concurrent.futures import ThreadPoolExecutor
+    add_user(monkeypatch, "ivan", "viewer")
+    real = []
+    orig = auth._verify
+
+    def counting(h, pw):
+        if h != auth._dummy_hash():
+            real.append(1)
+        return orig(h, pw)
+
+    monkeypatch.setattr(auth, "_verify", counting)
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda _: auth.login_local("ivan", "wrong-password-x"), range(20)))
+    assert not any(res)
+    assert len(real) <= auth.MAX_FAILS
+    assert auth.login_local("ivan", PW) is None  # 잠김
+
+
+def test_login_rate_limited(client, db, monkeypatch):
+    monkeypatch.setattr(auth, "LOGIN_RATE", (3, 300))
+    monkeypatch.setattr(auth, "_hits", {})
+    codes = [login(client, "nobody", "x-123456789").status_code for _ in range(4)]
+    assert codes == [401, 401, 401, 429]
+
+
+def test_login_drops_previous_session(client, db, monkeypatch):
+    add_user(monkeypatch, "jin", "viewer")
+    login(client, "jin")
+    login(client, "jin")
+    with db.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM sessions").fetchone()["n"] == 1
 
 
 def test_disable_drops_sessions(client, db, monkeypatch):
@@ -230,6 +267,20 @@ def test_oidc_only_mode_login_logout(client, db, idp, monkeypatch):
     assert client.get("/p").status_code == 401
     with db.pool.connection() as c:
         assert c.execute("SELECT count(*) AS n FROM sessions").fetchone()["n"] == 0  # 서버에서도 폐기
+
+
+def test_cli_can_disable_sso_user(client, db, idp):
+    from app import users
+    seen, _ = idp
+    state = start(client, seen)
+    client.get("/auth/oidc/callback", params={"code": "c", "state": state})
+    assert client.get("/p").status_code == 200
+    with pytest.raises(SystemExit):
+        users.main(["disable", "kim"])  # --sso 없이는 local 계정만 찾는다
+    users.main(["disable", "kim", "--sso"])
+    assert client.get("/p").status_code == 401  # 세션이 바로 끊긴다
+    state = start(client, seen)
+    assert client.get("/auth/oidc/callback", params={"code": "c", "state": state}).headers["location"] == "/login?error=role"
 
 
 def test_oidc_off(client, monkeypatch):

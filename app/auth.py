@@ -18,16 +18,24 @@ OIDC 설정 (oidc를 켤 때)
   OIDC_SCOPES            기본 "openid profile email"
   OIDC_ROLE_CLAIM        역할을 읽을 클레임. 점으로 내려간다 (Keycloak: realm_access.roles). 비우면 DB 역할 유지
   OIDC_ROLE_MAP          {"제공자 값": "docflow 역할"} JSON. 지도에 없는 값은 무시
-  OIDC_DEFAULT_ROLE      클레임으로 역할을 못 정했을 때. 기본 viewer, "none"이면 로그인 거절
+  OIDC_DEFAULT_ROLE      클레임으로 역할을 못 정했을 때. 기본 none(로그인 거절). viewer 등으로 열려면 명시
+  OIDC_ALLOW_HTTP        1이면 http 발급자 허용 (클러스터 안 시험 제공자 전용). 기본은 https만
+
+그 밖에
+  COOKIE_SECURE          기본 1(Secure 쿠키). http로 데모할 때만 0. https 콜백인데 0이면 시작을 거부한다
+  TRUST_PROXY            Next 프록시 뒤에서 1 → 로그인 시도 제한에 X-Forwarded-For 마지막 값을 쓴다
+  LOGIN_RATE_MAX         같은 IP에서 5분에 로그인·로그인 시작 몇 번까지 (기본 20)
   OIDC_LABEL             로그인 버튼 글자 (기본 "SSO")
 """
 import base64
+import collections
 import dataclasses
 import functools
 import hashlib
 import json
 import os
 import secrets
+import threading
 import time
 import urllib.parse
 from typing import Annotated
@@ -47,7 +55,11 @@ SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 COOKIE = "docflow_session"
 STATE_COOKIE = "docflow_oidc_state"
 SESSION_SEC = int(float(os.environ.get("SESSION_HOURS", "12")) * 3600)
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"  # https로 서비스하면 1
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"  # 기본 Secure. http로 데모할 때만 명시적으로 0
+LOGIN_RATE = (int(os.environ.get("LOGIN_RATE_MAX", "20")), 300)  # 같은 IP에서 300초에 20번까지 (/auth/login, /auth/oidc/login)
+# Next 프록시 뒤에서만 1: X-Forwarded-For의 마지막 값(프록시가 본 주소)을 IP로 쓴다. 직접 노출된 서버에서 켜면 위조된다
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "0") == "1"
+MAX_NEXT = 2048
 MAX_FAILS, LOCK_MIN = 5, 15
 PENDING_SEC = 600  # OIDC 로그인 시작부터 콜백까지
 ID_TOKEN_ALGS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]  # none·HS*는 받지 않는다
@@ -112,23 +124,55 @@ def _verify(h, pw):
 def login_local(username, password):
     """맞으면 User, 틀리거나 잠겼거나 없는 계정이면 None. 없는 계정에도 해시 검증을 한 번 돌려 시간 차를 줄인다."""
     with store.pool.connection() as c:
-        u = c.execute("SELECT id, username, name, role, password_hash, locked_until > now() AS locked, disabled "
-                      "FROM users WHERE username = %s AND issuer IS NULL", (username,)).fetchone()
-    if not u or not u["password_hash"] or u["disabled"] or u["locked"]:
+        # 검증 전에 시도 한 번을 원자적으로 잡는다 → 동시에 여러 요청을 보내도 잠금 전 MAX_FAILS번까지만 검증한다
+        u = c.execute("UPDATE users SET failed = failed + 1 WHERE username = %s AND issuer IS NULL "
+                      "AND NOT disabled AND password_hash IS NOT NULL AND (locked_until IS NULL OR locked_until < now()) "
+                      "AND failed < %s RETURNING id, username, name, role, password_hash, failed",
+                      (username, MAX_FAILS)).fetchone()
+    if not u:  # 없음·꺼짐·잠김·이미 MAX_FAILS번 시도 중
         _verify(_dummy_hash(), password)
         return None
     ok = _verify(u["password_hash"], password)
     with store.pool.connection() as c:
         if not ok:
-            # MAX_FAILS번째 실패에서 잠그고 횟수를 0으로 되돌린다 (잠금이 풀린 뒤 다시 MAX_FAILS번)
-            c.execute("UPDATE users SET failed = CASE WHEN failed + 1 >= %s THEN 0 ELSE failed + 1 END, "
-                      "locked_until = CASE WHEN failed + 1 >= %s THEN now() + make_interval(mins => %s) ELSE locked_until END "
-                      "WHERE id = %s", (MAX_FAILS, MAX_FAILS, LOCK_MIN, u["id"]))
+            if u["failed"] >= MAX_FAILS:  # MAX_FAILS번째 실패 → 잠그고 횟수를 되돌린다 (풀린 뒤 다시 MAX_FAILS번)
+                c.execute("UPDATE users SET failed = 0, locked_until = now() + make_interval(mins => %s) WHERE id = %s",
+                          (LOCK_MIN, u["id"]))
             return None
         c.execute("UPDATE users SET failed = 0, locked_until = NULL, last_login = now() WHERE id = %s", (u["id"],))
         if ph.check_needs_rehash(u["password_hash"]):
             c.execute("UPDATE users SET password_hash = %s WHERE id = %s", (ph.hash(password), u["id"]))
     return User(u["id"], u["username"], u["name"] or u["username"], u["role"])
+
+
+# ---------- IP별 시도 제한 (인증 전 경로) ----------
+
+_hits: dict[str, collections.deque] = {}
+_hits_lock = threading.Lock()
+
+
+def client_ip(request):
+    if TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff.strip():
+            return xff.split(",")[-1].strip()
+    return request.client.host if request.client else "?"
+
+
+def rate_limit(request):
+    """로그인 대입·로그인 시작 반복(DB 행·argon2 CPU)을 IP별로 막는다. 한 프로세스 안의 메모리 창."""
+    n, win = LOGIN_RATE
+    now, ip = time.monotonic(), client_ip(request)
+    with _hits_lock:
+        if len(_hits) > 10000:
+            for k in [k for k, q in _hits.items() if not q or q[-1] < now - win]:
+                del _hits[k]
+        q = _hits.setdefault(ip, collections.deque())
+        while q and q[0] < now - win:
+            q.popleft()
+        if len(q) >= n:
+            raise HTTPException(429, "시도가 너무 많습니다. 잠시 뒤 다시 하세요")
+        q.append(now)
 
 
 # ---------- 세션 ----------
@@ -252,22 +296,28 @@ class OidcConfig:
     scopes: str = "openid profile email"
     role_claim: str = ""
     role_map: dict = dataclasses.field(default_factory=dict)
-    default_role: str | None = "viewer"
+    default_role: str | None = None  # 기본은 거절: 제공자에 로그인할 수 있다고 모두 문서를 보게 하지 않는다
     label: str = "SSO"
+    allow_http: bool = False
 
     @classmethod
     def from_env(cls):
-        d = os.environ.get("OIDC_DEFAULT_ROLE", "viewer").strip()
+        d = os.environ.get("OIDC_DEFAULT_ROLE", "none").strip()
         return cls(issuer=os.environ.get("OIDC_ISSUER", "").strip(), client_id=os.environ.get("OIDC_CLIENT_ID", "").strip(),
                    client_secret=_env_secret("OIDC_CLIENT_SECRET"), redirect_uri=os.environ.get("OIDC_REDIRECT_URI", "").strip(),
                    scopes=os.environ.get("OIDC_SCOPES", "openid profile email"), role_claim=os.environ.get("OIDC_ROLE_CLAIM", "").strip(),
                    role_map=json.loads(os.environ.get("OIDC_ROLE_MAP") or "{}"),
-                   default_role=None if d == "none" else d, label=os.environ.get("OIDC_LABEL", "SSO"))
+                   default_role=None if d in ("", "none") else d, label=os.environ.get("OIDC_LABEL", "SSO"),
+                   allow_http=os.environ.get("OIDC_ALLOW_HTTP") == "1")
 
-    def check(self):
+    def check(self, cookie_secure=True):
         missing = [k for k in ("issuer", "client_id", "redirect_uri") if not getattr(self, k)]
         if missing:
             raise RuntimeError(f"oidc를 켰는데 설정이 없음: {', '.join('OIDC_' + k.upper() for k in missing)}")
+        if not self.allow_http and not self.issuer.startswith("https://"):
+            raise RuntimeError("OIDC_ISSUER는 https여야 한다 (클러스터 안 시험 제공자만 OIDC_ALLOW_HTTP=1)")
+        if self.redirect_uri.startswith("https://") and not cookie_secure:
+            raise RuntimeError("https로 서비스하면서 COOKIE_SECURE=0 — 세션 쿠키가 http로도 나간다")
         if self.default_role is not None and self.default_role not in ROLES:
             raise RuntimeError(f"OIDC_DEFAULT_ROLE 값이 잘못됨: {self.default_role}")
         bad = {v for v in self.role_map.values() if v not in ROLES}
@@ -277,7 +327,7 @@ class OidcConfig:
 
 OIDC = OidcConfig.from_env()
 if "oidc" in MODES:
-    OIDC.check()
+    OIDC.check(COOKIE_SECURE)
 
 
 def _get_json(url):
@@ -391,7 +441,7 @@ def upsert_oidc_user(claims):
 
 def safe_next(n):
     """로그인 뒤 돌아갈 곳: 같은 사이트의 상대 경로만 (오픈 리다이렉트 방지)."""
-    if not n or not n.startswith("/") or n.startswith("//") or "\\" in n or any(ord(ch) < 32 for ch in n):
+    if not n or len(n) > MAX_NEXT or not n.startswith("/") or n.startswith("//") or "\\" in n or any(ord(ch) < 32 for ch in n):
         return "/"
     p = urllib.parse.urlsplit(n)
     return "/" if p.scheme or p.netloc else n
@@ -422,12 +472,21 @@ def login(body: LoginBody, request: Request):
     if "local" not in MODES:
         raise HTTPException(404)
     check_csrf(request)  # 로그인 CSRF(남의 계정으로 로그인시키기) 방지
+    rate_limit(request)
     u = login_local(body.username, body.password)
     if not u:
         raise HTTPException(401, FAIL_MSG)
+    _drop_previous(request)
     resp = JSONResponse({"user": u.public()})
     set_session_cookie(resp, new_session(u.id, "local"))
     return resp
+
+
+def _drop_previous(request):
+    """로그인할 때 이 브라우저가 들고 있던 이전 세션은 서버에서도 지운다 (쿠키만 덮어쓰지 않고)."""
+    old = request.cookies.get(COOKIE)
+    if old:
+        drop_session(old)
 
 
 @router.post("/logout")
@@ -448,9 +507,10 @@ def me(user: Viewer):
 
 
 @router.get("/oidc/login")
-def oidc_login(next: str = "/"):
+def oidc_login(request: Request, next: str = "/"):
     if "oidc" not in MODES:
         raise HTTPException(404)
+    rate_limit(request)
     d = discovery()
     state, nonce, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(32), secrets.token_urlsafe(48)
     with store.pool.connection() as c:
@@ -492,6 +552,7 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     if u is None:
         resp = RedirectResponse("/login?error=role", status_code=303)
     else:
+        _drop_previous(request)
         resp = RedirectResponse(p["next"] or "/", status_code=303)
         set_session_cookie(resp, new_session(u.id, "oidc"))
     resp.delete_cookie(STATE_COOKIE, path="/")
