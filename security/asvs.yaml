@@ -84,7 +84,7 @@ items:
   - {id: V13.2.3, level: 1, text: "쿠키 쓰는 API의 CSRF", status: 충족, evidence: "V4.2.2와 같음"}
 
   # ---------- V14 설정 ----------
-  - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 일부, evidence: "파이썬·npm은 osv-scanner (check.ps1). 이미지는 scripts/mac/scan_image.sh (2026-11-04): OS HIGH 56·CRITICAL 4, 파이썬 HIGH 2. 고칠 판 있는 것 #44, 나머지는 Debian 고친 판 없음"}
+  - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 일부, evidence: "파이썬·npm은 osv-scanner (check.ps1). 배포 이미지 3개는 scripts/mac/scan_image.sh, 사람이 돌릴 때만 (2026-11-04 결과: https://github.com/reddol18/docflow/issues/44#issuecomment-6624365177). 고치기 https://github.com/reddol18/docflow/issues/44, 자동화 https://github.com/reddol18/docflow/issues/46"}
   - {id: V14.3.2, level: 1, text: "디버그·문서 화면 끔", status: 충족, evidence: "API_DOCS 기본 끔 (PR #38)"}
   - {id: V14.4.1, level: 1, text: "Content-Type과 문자셋", status: 미판정, evidence: ""}
   - {id: V14.4.3, level: 1, text: "CSP", status: 미판정, evidence: ""}
