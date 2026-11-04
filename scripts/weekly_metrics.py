@@ -12,6 +12,10 @@
     버그 리뷰   "code-review"
     보안 리뷰   "security-reviewer" — 닫는 이슈의 '보안 영향' 칸에 체크가 있을 때만 필요
     배포        병합 뒤 deploy-* 태그가 이 PR의 병합 커밋을 포함하는지
+  흔적이 없을 때 구분 (분모에서 뺌):
+    규칙 전     절차(템플릿·check.ps1)가 생긴 PR #30 병합 전에 연 PR
+    코드 없음   문서·잠금 파일·의존성 목록만 바꾼 PR → 계약·버그 리뷰는 볼 것이 없다
+  흔적이 없지만 나중 PR이 "PR #N"을 말하며 그 리뷰를 했으면 "늦게 #M" (분모에 넣고, 제때 한 것과 따로 센다)
 - 이슈: 연 것·닫은 것, 우선순위별 열린 수, 위험 수용(라벨 risk-accepted) 열린 수
 - 보안: `security/asvs.yaml`의 미충족·일부·미판정 항목 수 (지금 작업 트리 기준)
 흔적은 글자로 찾는다: PR 본문(템플릿 줄을 뺀 나머지)·댓글·리뷰 본문·줄 댓글.
@@ -37,6 +41,9 @@ MARKS = {
     "버그 리뷰": re.compile(r"code-review"),
     "보안 리뷰": re.compile(r"security-reviewer"),
 }
+RULES_SINCE = dt.datetime(2026, 11, 3, 23, 34, 20, tzinfo=dt.timezone.utc)  # PR #30 병합: 템플릿·check.ps1·리뷰 절차 시작
+REVIEWS = ("계약 리뷰", "버그 리뷰")  # 코드가 없으면 볼 것이 없는 리뷰
+NON_CODE = re.compile(r"^docs/|\.md$|\.lock$|(^|/)requirements[^/]*\.txt$|(^|/)package-lock\.json$|^\.gitattributes$")
 SEC_SECTION = re.compile(r"#+\s*보안 영향\s*\n(.*?)(?=\n#+\s|\Z)", re.S)
 
 
@@ -101,10 +108,16 @@ def deployed(merge_sha):
 
 
 def pr_extra(n):
-    """커밋 수와, 댓글이 아니라 리뷰로 남긴 글 (리뷰 본문·줄 댓글)"""
-    v = json.loads(sh("gh", "pr", "view", str(n), "--repo", REPO, "--json", "commits,reviews"))
+    """커밋 수, 바꾼 파일, 댓글이 아니라 리뷰로 남긴 글 (리뷰 본문·줄 댓글)"""
+    v = json.loads(sh("gh", "pr", "view", str(n), "--repo", REPO, "--json", "commits,reviews,files"))
     inline = sh("gh", "api", "--paginate", f"repos/{REPO}/pulls/{n}/comments", "--jq", ".[].body")
-    return len(v["commits"]), [r["body"] for r in v["reviews"]] + [inline]
+    return len(v["commits"]), [f["path"] for f in v["files"]], [r["body"] for r in v["reviews"]] + [inline]
+
+
+def pr_marks(p):
+    commits, files, reviews = pr_extra(p["number"])
+    text = "\n".join([p["title"], evidence(p["body"])] + [c["body"] for c in p["comments"]] + reviews)
+    return commits, files, text, {k: bool(rx.search(text)) for k, rx in MARKS.items()}
 
 
 def asvs_counts():
@@ -122,6 +135,27 @@ def collect(start, end):
     if len(prs) >= 200:
         raise SystemExit("한 주에 병합한 PR이 200개 이상: --limit을 올릴 것")
     prs = [p for p in prs if start <= parse_ts(p["mergedAt"]) < end]
+    # 늦은 리뷰를 찾을 나중 PR (이 주 시작 뒤 병합한 것 전부)
+    later = gh_json("pr", "list", "--state", "merged", "--search", f"merged:>={start.isoformat(timespec='seconds')}",
+                    "--limit", "500", "--json", fields)
+    if len(later) >= 500:
+        raise SystemExit("나중 PR이 500개 이상: --limit을 올릴 것")
+    seen = {}
+
+    def info(p):
+        if p["number"] not in seen:
+            seen[p["number"]] = pr_marks(p)
+        return seen[p["number"]]
+
+    def late(n, merged, key):
+        ref = re.compile(rf"PR #{n}\b|/pull/{n}\b")
+        for q in sorted(later, key=lambda q: q["mergedAt"]):
+            if q["number"] == n or parse_ts(q["mergedAt"]) < merged:
+                continue
+            _, _, text, m = info(q)
+            if m[key] and ref.search(text):
+                return q["number"]
+        return None
     limit = 1000
     issues = gh_json("issue", "list", "--state", "all", "--limit", str(limit),
                      "--json", "number,title,createdAt,closedAt,labels,state,body")
@@ -131,13 +165,24 @@ def collect(start, end):
     tags = deploy_tags()
     rows = []
     for p in sorted(prs, key=lambda p: p["number"]):
-        commits, reviews = pr_extra(p["number"])
-        text = "\n".join([evidence(p["body"])] + [c["body"] for c in p["comments"]] + reviews)
+        commits, files, _, marks = info(p)
         closes = [c["number"] for c in p["closingIssuesReferences"]]
         refs = set(closes) | {int(n) for n in re.findall(r"#(\d+)", p["title"])}  # 제목의 (#N)도 관련 이슈로 본다
         sec = any(needs_security(by_no.get(n, {}).get("body")) for n in refs)
-        marks = {k: bool(rx.search(text)) for k, rx in MARKS.items()}
-        marks["보안 리뷰"] = marks["보안 리뷰"] if sec else None  # 필요 없으면 세지 않음
+        marks = dict(marks)
+        if not sec:
+            marks["보안 리뷰"] = None  # 필요 없으면 세지 않음
+        no_code = bool(files) and all(NON_CODE.search(f) for f in files)
+        merged = parse_ts(p["mergedAt"])
+        for k, v in marks.items():
+            if v is not False:
+                continue
+            if parse_ts(p["createdAt"]) < RULES_SINCE:
+                marks[k] = "규칙 전"
+            elif no_code and k in REVIEWS:
+                marks[k] = "코드 없음"
+            elif k != "로컬 검사" and (m := late(p["number"], merged, k)):
+                marks[k] = f"늦게 #{m}"
         sha = (p.get("mergeCommit") or {}).get("oid")
         rows.append({
             "n": p["number"], "title": p["title"], "size": p["additions"] + p["deletions"], "commits": commits,
@@ -148,12 +193,19 @@ def collect(start, end):
 
 
 def pct(xs):
-    xs = [x for x in xs if x is not None]
-    return f"{sum(xs)}/{len(xs)}" if xs else "–"
+    """제때 한 것/대상. 규칙 전·코드 없음·해당 없음은 대상에서 뺀다. 늦게 한 것은 대상에 넣고 따로 적는다."""
+    xs = [x for x in xs if x is True or x is False or (isinstance(x, str) and x.startswith("늦게"))]
+    if not xs:
+        return "–"
+    n_late = sum(isinstance(x, str) for x in xs)
+    return f"{sum(x is True for x in xs)}/{len(xs)}" + (f" (늦게 {n_late})" if n_late else "")
+
+
+def ok(b):
+    return "–" if b is None else b if isinstance(b, str) else ("O" if b else "**X**")
 
 
 def render(label, start, end, rows, issues, tags):
-    ok = lambda b: "–" if b is None else ("O" if b else "**X**")  # noqa: E731
     opened = [i for i in issues if start <= parse_ts(i["createdAt"]) < end]
     closed = [i for i in issues if i["closedAt"] and start <= parse_ts(i["closedAt"]) < end]
     open_now = [i for i in issues if i["state"] == "OPEN"]
@@ -183,8 +235,9 @@ def render(label, start, end, rows, issues, tags):
         out.append(f"| #{r['n']} {r['title'][:40]} | {r['size']} | {r['commits']} | {r['hours']:.1f} | "
                    f"{', '.join(f'#{n}' for n in r['closes']) or '–'} | "
                    + " | ".join(ok(r["marks"][k]) for k in MARKS) + f" | {r['deploy'] or '**X**'} |")
-    out += ["", "O 흔적 있음, **X** 없음, – 해당 없음 (보안 영향 칸이 비었음). "
-            "흔적은 PR 본문(템플릿 줄 제외)·댓글·리뷰의 글자로 찾는다.", "",
+    out += ["", "O 흔적 있음, **X** 없음, – 해당 없음 (보안 영향 칸이 비었음), 늦게 #M 나중 PR에서 함, "
+            "규칙 전 절차가 생기기 전에 연 PR, 코드 없음 문서·잠금 파일만. 요약의 분모에는 O·X·늦게만 넣는다.",
+            "흔적은 PR 제목·본문(템플릿 줄 제외)·댓글·리뷰의 글자로 찾는다.", "",
             "## 회고 (사람이 채움)", "", "- 잘된 것:", "- 빠뜨린 것:", "- 다음 주 바꿀 규칙 1개:", ""]
     return "\n".join(out)
 
