@@ -34,3 +34,36 @@ def test_non_code_paths():
     for f in ("app/auth.py", "scripts/check.ps1", "scripts/mac/deploy.sh", "k8s/docs.yaml", "security/asvs.yaml",
               ".github/pull_request_template.md", ".claude/agents/spec-reviewer.md"):  # 절차를 바꾸는 .md는 코드
         assert not wm.NON_CODE.search(f), f
+
+
+def test_review_fixes_counts_table_rows():
+    text = "\n".join([
+        "| 지적 | 반영 |", "|---|---|",
+        "| 토큰이 명령줄에 | 헤더 파일로 |",
+        "| 해시 고정 | 후속 https://github.com/o/r/issues/46 |",
+        "| 경로 백틱 | https://github.com/o/r/issues/40 |",
+        "| -Mac 형식 | 그대로 (신뢰 경계 안) |",
+        "| useMe 401 | 아님: noRedirect |",
+        "", "| 검사 | 결과 |", "|---|---|", "| ruff | 통과 |",  # 다른 표는 세지 않는다
+    ])
+    assert wm.review_fixes(text) == (1, 2, 2)
+
+
+def test_criteria_met_skips_template_row():
+    body = ("## 완료 조건별 결과\n| 완료 조건 | 결과 | 근거 |\n|---|---|---|\n"
+            "| a | 충족 | x |\n| b | 일부 | y |\n| | 충족 / 일부 / 미충족 | |\n")
+    assert wm.criteria_met(body) == (1, 2)
+
+
+def test_scope_changed():
+    assert wm.scope_changed("## 범위 밖 변경\n<!-- 설명 -->\n없음\n\n## 테스트\n") is False
+    assert wm.scope_changed("## 범위 밖 변경\n- PR 템플릿 주석 한 줄\n## 테스트\n") is True
+    assert wm.scope_changed("본문에 그 절이 없음") is None
+
+
+def test_first_check_passed_uses_first_summary():
+    ok = "로컬 검사 `scripts/check.ps1` — 커밋 `abc`\n| ruff | 통과 |"
+    bad = "로컬 검사 `scripts/check.ps1` — 커밋 `abc`\n| ruff | **실패** |"
+    assert wm.first_check_passed(["본문", bad, ok]) is False
+    assert wm.first_check_passed([ok, bad]) is True
+    assert wm.first_check_passed(["요약 없음"]) is None
