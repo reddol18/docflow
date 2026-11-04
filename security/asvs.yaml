@@ -19,8 +19,8 @@ sources:
 boxes:
   새 입력·폼·쿼리 파라미터: [V5.1.3, V5.1.5, V5.3.3, V5.3.4, V13.2.1, API3, API4]
   파일 업로드·다운로드: [V12.1.1, V12.3.1, V12.5.1, V8.2.1, API4]
-  새 엔드포인트: [V4.1.1, V4.1.5, V4.2.1, V13.1.3, V13.2.1, V13.2.3, API1, API5, API9]
-  인증·세션 변경: [V2.1.1, V2.1.5, V2.1.7, V2.2.1, V2.4.1, V3.2.1, V3.2.2, V3.3.1, V3.3.2, V3.4.1, V3.4.2, V3.4.3, V3.4.4, V7.1.1, API2]
+  새 엔드포인트: [V4.1.1, V4.1.5, V4.2.1, V4.2.2, V13.1.3, V13.2.1, V13.2.3, API1, API5, API9]
+  인증·세션 변경: [V2.1.1, V2.1.5, V2.1.7, V2.2.1, V2.4.1, V4.2.2, V3.2.1, V3.2.2, V3.3.1, V3.3.2, V3.4.1, V3.4.2, V3.4.3, V3.4.4, V7.1.1, API2]
   권한·역할 변경: [V4.1.1, V4.1.3, V4.1.5, V4.2.1, V4.3.1, API1, API3, API5]
   LLM 호출 추가·변경: [LLM01, LLM02, LLM05, LLM06, LLM07, LLM10]
   검색·RAG·임베딩: [LLM01, LLM02, LLM08, V5.3.4]
@@ -35,7 +35,7 @@ items:
   - {id: V2.1.1, level: 1, text: "비밀번호 12자 이상", status: 충족, evidence: "app/users.py MIN_LEN=12 (PR #38)"}
   - {id: V2.1.5, level: 1, text: "사용자가 직접 비밀번호를 바꿀 수 있다", status: 미충족, evidence: "명령줄로만 (#40, risk-accepted)"}
   - {id: V2.1.7, level: 1, text: "유출·흔한 비밀번호를 거른다", status: 미충족, evidence: "#40, risk-accepted"}
-  - {id: V2.2.1, level: 1, text: "자동 대입 방지 (잠금·속도 제한)", status: 충족, evidence: "app/auth.py login_local 원자적 시도(attempt_at)·계정 이름별 rate_limit (PR #38, #42). 이름을 바꿔 가며 뿌리기는 #40"}
+  - {id: V2.2.1, level: 1, text: "자동 대입 방지 (잠금·속도 제한)", status: 일부, evidence: "app/auth.py login_local 원자적 시도(attempt_at)·계정 이름별 rate_limit (PR #38, #42). 이름을 바꿔 가며 뿌리기는 #40"}
   - {id: V2.4.1, level: 2, text: "비밀번호는 승인된 느린 해시로 저장", status: 충족, evidence: "argon2id (PR #38)"}
 
   # ---------- V3 세션 ----------
@@ -59,7 +59,7 @@ items:
   # ---------- V5 입력 검증·출력 인코딩 ----------
   - {id: V5.1.3, level: 1, text: "입력은 허용 목록·형식으로 검증", status: 미판정, evidence: ""}
   - {id: V5.1.5, level: 1, text: "리다이렉트 주소는 허용 목록", status: 충족, evidence: "auth.safe_next"}
-  - {id: V5.3.3, level: 1, text: "HTML 출력 이스케이프 (XSS)", status: 미판정, evidence: "review_page의 doc_id 미이스케이프 (#40 참고)"}
+  - {id: V5.3.3, level: 1, text: "HTML 출력 이스케이프 (XSS)", status: 일부, evidence: "review_page가 vol·doc_id를 속성에 이스케이프 없이 넣는다. 둘 다 [\\w.-] 허용 목록(VOL_RX, 파일 이름 규칙)을 거쳐 지금은 악용 불가. 고칠 때 html.escape (#40)"}
   - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 미판정, evidence: ""}
 
   # ---------- V7 오류·로그 ----------
