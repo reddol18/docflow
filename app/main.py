@@ -62,6 +62,29 @@ app = FastAPI(title="docflow", lifespan=lifespan, dependencies=[Depends(auth.gua
               docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
 app.include_router(auth.router)
 
+# 응답 보안 헤더 (https://github.com/reddol18/docflow/issues/47, ASVS V14.4.3·V14.4.4·V14.4.7·V8.2.1)
+# API는 무엇도 그리지 않으므로 'none'. 서버가 그리는 HTML(/review)만 그 화면에 필요한 만큼 연다 (인라인 스크립트는 없다)
+API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+HTML_CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'")
+SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY"}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    try:
+        res = await call_next(request)
+    except Exception:  # 처리 안 된 예외의 500은 이 미들웨어 바깥(ServerErrorMiddleware)에서 만들어져 헤더가 빠진다 → 여기서 만든다
+        traceback.print_exc()
+        res = PlainTextResponse("Internal Server Error", status_code=500)
+    for k, v in SECURITY_HEADERS.items():
+        res.headers[k] = v  # 민감 응답(색인·쪽 이미지·리포트)이 브라우저·중간 캐시에 남지 않게 모두 no-store
+    if _docs and request.url.path.startswith("/docs"):
+        return res  # 개발용 Swagger UI(API_DOCS=1)는 CDN 스크립트·인라인 스크립트가 필요하다 — CSP를 걸지 않는다
+    html_page = res.headers.get("content-type", "").startswith("text/html")
+    res.headers["Content-Security-Policy"] = HTML_CSP if html_page else API_CSP
+    return res
+
 
 def cfg(vol):
     return {"configurable": {"thread_id": vol}, "max_concurrency": 4}
@@ -281,7 +304,8 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
 <form method=post>"""]
     for d in flagged:
         did = d["doc_id"]
-        out.append(f"<div class=doc><img src='/head/{vol}/{did}' width=600><div><b>{html.escape(did)}</b> ({len(d['pages'])}쪽)")
+        out.append(f"<div class=doc><img src='/head/{html.escape(vol)}/{html.escape(did)}' width=600>"
+                   f"<div><b>{html.escape(did)}</b> ({len(d['pages'])}쪽)")
         for k in ["docno", "date", "recipient", "title"]:
             fk = "serial" if k == "docno" else k
             fl = " ".join(d["flags"].get(fk, []))
@@ -289,8 +313,10 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
             out.append(f"<div class=f><label>{LABEL[k]}</label><input name='{did}__{k}' value=\"{val}\"{ro}>"
                        f" <span class=flag>{html.escape(fl)}</span></div>")
             if k in ("docno", "date") and d["hw"].get(k, {}).get("text") is not None:
-                out.append(f"<img class=crop src='/crops/{vol}/{did}_{k}.png' onerror=\"this.style.display='none'\">"
-                           f"<span class=flag>손글씨 판독: {html.escape(d['hw'][k]['text'])} (확신도 {d['hw'][k]['conf']})</span>")
+                # 인라인 onerror 대신 파일이 있을 때만 그린다 (CSP가 인라인 스크립트를 막는다)
+                if store.crop_path(vol, did, k).exists():
+                    out.append(f"<img class=crop src='/crops/{html.escape(vol)}/{html.escape(did)}_{k}.png'>")
+                out.append(f"<span class=flag>손글씨 판독: {html.escape(d['hw'][k]['text'])} (확신도 {d['hw'][k]['conf']})</span>")
         out.append("</div></div>")
     out.append("<button type=submit>검토 끝 — 이어서 색인</button></form>" if editor else "</form>")
     return "".join(out)

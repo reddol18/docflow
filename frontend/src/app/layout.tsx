@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { connection } from "next/server";
 import { UserMenu } from "@/components/UserMenu";
 import "./globals.css";
 
@@ -8,7 +9,9 @@ export const metadata: Metadata = {
   description: "스캔 공문서 OCR · 색인 추출 · 사람 검토 · 검색 (LangGraph)",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  // 매 요청 렌더링: CSP nonce(src/proxy.ts)는 요청마다 새로 만들어지므로 미리 렌더링한 페이지에는 붙일 수 없다 (https://github.com/reddol18/docflow/issues/47)
+  await connection();
   return (
     <html lang="ko" className="h-full antialiased">
       <body className="min-h-full flex flex-col">
