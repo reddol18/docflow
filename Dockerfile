@@ -13,7 +13,9 @@ WORKDIR /app
 COPY requirements.txt .
 # setuptools·wheel도 requirements.txt에 고정한다 (기반 이미지에 든 판의 취약점, https://github.com/reddol18/docflow/issues/44)
 # freeze --all: 그 둘과 pip도 잠금 파일에 남겨 로컬 검사(osv)가 보게 한다
-RUN pip install --no-cache-dir -r requirements.txt && pip freeze --all > /app/requirements.lock
+# pip도 기반 이미지 판(24.0)에 취약점이 있어 먼저 올린다 (osv가 lock에서 잡음)
+RUN pip install --no-cache-dir pip==26.3 && pip install --no-cache-dir -r requirements.txt \
+    && pip freeze --all > /app/requirements.lock
 # 모델은 빌드 때 받아 이미지에 넣는다 (실행 중 Pod는 외부 통신이 OpenAI 443뿐)
 ENV PADDLE_PDX_CACHE_HOME=/opt/paddlex PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 COPY app/__init__.py app/ocr.py app/warm.py app/
