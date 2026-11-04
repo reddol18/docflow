@@ -135,10 +135,46 @@ def test_lockout_holds_under_concurrency(db, monkeypatch):
 
 
 def test_login_rate_limited(client, db, monkeypatch):
-    monkeypatch.setattr(auth, "LOGIN_RATE", (3, 300))
+    monkeypatch.setattr(auth, "USER_RATE", (3, 300))
     monkeypatch.setattr(auth, "_hits", {})
     codes = [login(client, "nobody", "x-123456789").status_code for _ in range(4)]
-    assert codes == [401, 401, 401, 429]
+    assert codes == [401, 401, 401, 429]  # 같은 이름
+    # X-Forwarded-For를 바꿔도 이름 창은 그대로 (프록시를 믿지 않음)
+    assert login(client, "nobody", "x-123456789", headers={**CSRF, "x-forwarded-for": "10.9.9.9"}).status_code == 429
+    # 전체 창이 없으므로 남이 이름을 바꿔 가며 보내도 다른 사람의 로그인은 막히지 않는다
+    for i in range(5):
+        login(client, f"u{i}", "x-123456789")
+    add_user(monkeypatch, "nora", "viewer")
+    assert login(client, "nora").status_code == 200
+
+
+def test_stuck_attempt_counter_heals(client, db, monkeypatch):
+    """시도 자리를 잡은 뒤 요청이 죽어 failed가 MAX_FAILS에 남아도 영원히 막히지 않는다 — 이전에 잠겼던 계정도."""
+    add_user(monkeypatch, "kai", "viewer")
+    for past_lock in ("NULL", "now() - interval '1 hour'"):
+        with db.pool.connection() as c:
+            c.execute(f"UPDATE users SET failed = %s, locked_until = {past_lock}, "  # noqa: S608 — 고정된 두 값
+                      "attempt_at = now() WHERE username = %s", (auth.MAX_FAILS, "kai"))
+        assert login(client, "kai").status_code == 401  # 방금 잡힌 자리(검증 중일 수 있음)는 그대로 존중
+        with db.pool.connection() as c:
+            c.execute("UPDATE users SET attempt_at = now() - make_interval(secs => %s) WHERE username = %s",
+                      (auth.CLAIM_SEC + 1, "kai"))
+        assert login(client, "kai").status_code == 200  # 오래된 자리는 남은 것으로 보지 않음
+
+
+def test_inflight_fifth_attempt_does_not_lock(client, db, monkeypatch):
+    """5번째 시도가 검증 중일 때 들어온 요청이 계정을 잠그지 않는다 (예전 자가 회복 UPDATE의 문제)."""
+    add_user(monkeypatch, "ona", "viewer")
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET failed = %s, attempt_at = now() WHERE username = %s", (auth.MAX_FAILS, "ona"))
+    login(client, "ona", "wrong-password-z")
+    with db.pool.connection() as c:
+        assert c.execute("SELECT locked_until FROM users WHERE username = %s", ("ona",)).fetchone()["locked_until"] is None
+
+
+def test_password_stdin_strips_crlf(db, monkeypatch):
+    add_user(monkeypatch, "lee", "viewer", pw=PW + "\r")
+    assert auth.login_local("lee", PW) is not None
 
 
 def test_login_drops_previous_session(client, db, monkeypatch):
@@ -283,6 +319,44 @@ def test_cli_can_disable_sso_user(client, db, idp):
     assert client.get("/auth/oidc/callback", params={"code": "c", "state": state}).headers["location"] == "/login?error=role"
 
 
+def test_oidc_provider_down_goes_to_login(client, db, idp, monkeypatch):
+    import httpx
+    seen, _ = idp
+    state = start(client, seen)
+
+    def down(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr(auth, "_post_form", down)
+    r = client.get("/auth/oidc/callback", params={"code": "c", "state": state})
+    assert r.status_code == 303 and r.headers["location"] == "/login?error=oidc"
+    assert auth.STATE_COOKIE in r.headers.get("set-cookie", "")  # state 쿠키 지움
+
+
+def test_oidc_error_param_clears_state(client, db, idp):
+    seen, _ = idp
+    start(client, seen)
+    r = client.get("/auth/oidc/callback", params={"error": "access_denied"})
+    assert r.status_code == 303 and r.headers["location"] == "/login?error=oidc"
+    sc = r.headers.get("set-cookie", "")
+    assert auth.STATE_COOKIE in sc and ("max-age=0" in sc.lower() or "expires=" in sc.lower())  # 지우는 쿠키
+
+
+def test_last_seen_updated_at_most_every_5_minutes(client, db, monkeypatch):
+    add_user(monkeypatch, "mia", "viewer")
+    login(client, "mia")
+    with db.pool.connection() as c:
+        c.execute("UPDATE sessions SET last_seen = now() - interval '1 minute'")
+        before = c.execute("SELECT last_seen FROM sessions").fetchone()["last_seen"]
+    client.get("/p")
+    with db.pool.connection() as c:
+        assert c.execute("SELECT last_seen FROM sessions").fetchone()["last_seen"] == before  # 5분 안이면 쓰지 않음
+        c.execute("UPDATE sessions SET last_seen = now() - interval '6 minutes'")
+    client.get("/p")
+    with db.pool.connection() as c:
+        assert c.execute("SELECT last_seen > now() - interval '1 minute' AS fresh FROM sessions").fetchone()["fresh"]
+
+
 def test_oidc_off(client, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
     assert client.get("/auth/oidc/login").status_code == 404
@@ -293,8 +367,8 @@ def test_edit_history(db, monkeypatch):
     add_user(monkeypatch, "fay", "reviewer")
     with db.pool.connection() as c:
         uid = c.execute("SELECT id FROM users WHERE username = 'fay'").fetchone()["id"]
-    db.add_edits("v1", "v1-0001", [("date", "1999.1.2", "1999.1.20"), ("title", None, "제목")], uid, "review")
-    db.add_edits("v1", "v1-0001", [("date", "1999.1.20", "1999.1.21")], None, "edit")
+    db.add_edits("v1", [("v1-0001", "date", "1999.1.2", "1999.1.20"), ("v1-0001", "title", None, "제목")], uid, "review")
+    db.add_edits("v1", [("v1-0001", "date", "1999.1.20", "1999.1.21")], None, "edit")
     h = db.edit_history("v1", "v1-0001")
     assert [(r["field"], r["old"], r["new"], r["source"], r["username"]) for r in h] == [
         ("date", "1999.1.2", "1999.1.20", "review", "fay"), ("title", None, "제목", "review", "fay"),

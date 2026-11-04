@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { use, useMemo, useState } from "react";
-import { api, type GraphEvent } from "@/lib/api";
+import { api, can, type GraphEvent } from "@/lib/api";
+import { useMe } from "@/lib/useMe";
 import { usePoll } from "@/lib/usePoll";
 import { currentRun, useEvents } from "@/lib/useEvents";
 import { Card, ErrorNote, Progress, StageBadge, usd } from "@/components/ui";
@@ -56,6 +57,7 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
   const all = useEvents(vol);
   const evs = useMemo(() => currentRun(all), [all]);
   const [busy, setBusy] = useState(false);
+  const admin = can(useMe(), "admin");
 
   // 문서별 하위 그래프 위치
   const docs = useMemo(() => {
@@ -112,7 +114,7 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
         <h1 className="font-mono text-lg font-semibold">{vol}</h1>
         {s && <StageBadge stage={s.stage} />}
         <div className="ml-auto flex gap-2">
-          {s?.stage === "stopped" && (
+          {s?.stage === "stopped" && admin && (
             <button onClick={resume} disabled={busy} className="rounded-md bg-rose-600 px-3 py-1.5 text-sm text-white">
               끊긴 곳부터 다시
             </button>

@@ -12,8 +12,9 @@ export function proxy(req: NextRequest) {
     });
   }
   const path = req.nextUrl.pathname;
-  // 업로드·실행·검토 저장을 막는다 (OpenAI 비용·데이터 변경). 검색·답변(GET)은 열어 둔다.
-  if (READONLY && path.startsWith("/api/") && req.method !== "GET" && req.method !== "HEAD") {
+  // 업로드·실행·검토 저장을 막는다 (OpenAI 비용·데이터 변경). 검색·답변(GET)과 로그인·로그아웃은 열어 둔다.
+  const authPath = path === "/api/auth/login" || path === "/api/auth/logout";
+  if (READONLY && path.startsWith("/api/") && !authPath && req.method !== "GET" && req.method !== "HEAD") {
     return NextResponse.json({ detail: "외부 접속은 읽기 전용입니다" }, { status: 403 });
   }
   return NextResponse.next();

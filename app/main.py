@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 from app import auth, llm, ocr, report, store
 from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
-from app.review_input import EDITABLE, clean_fixes
+from app.review_input import EDITABLE, changes, clean_fixes
 
 CellValue = Annotated[str, Field(max_length=500)]  # 색인 칸 하나 (제목도 이 안에 든다)
 VOL_RX = re.compile(r"^[\w.-]{1,80}$")
@@ -214,8 +214,9 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
         d["fields"]["serial"] = flow.layout.serial_of(fix["docno"])
     G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
     store.save_documents([d])
+    # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
+    store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
     store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
-    store.add_edits(vol, doc_id, [(k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
     store.event(vol, "edit", "end", doc_id, fields=list(fix), user=user.username)
     return d
 
@@ -262,18 +263,21 @@ LABEL = {"docno": "문서번호", "date": "시행일자", "recipient": "수신",
 
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
-def review_page(vol: str, _: Viewer):
+def review_page(vol: str, user: Viewer):
     check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
         return f"<meta charset=utf-8><p>{html.escape(vol)}: 검토 대기 없음. <a href='/volumes/{vol}'>상태</a></p>"
     flagged = snap.interrupts[0].value["flagged"]
+    editor = auth.role_at_least(user.role, "reviewer")  # 보기 역할은 읽기 전용 (제출은 서버가 403으로도 막음)
+    ro = "" if editor else " readonly"
     out = [f"""<!doctype html><meta charset=utf-8><title>검토 {html.escape(vol)}</title>
 <style>body{{font:14px sans-serif;margin:16px;max-width:1500px}} .doc{{display:flex;gap:16px;border-top:1px solid #ccc;padding:12px 0}}
 .f{{margin:4px 0}} .f label{{display:inline-block;width:70px}} .f input{{width:420px}} .flag{{color:#b8322a;font-size:12px}}
 img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</style>
 <h1>검토 — {html.escape(vol)} ({len(flagged)}건)</h1>
-<p>빨간 표시가 붙은 칸만 확인하면 됩니다. 고칠 값만 바꾸고 맨 아래 버튼을 누르면 흐름이 이어져 색인됩니다.</p>
+<p>{"빨간 표시가 붙은 칸만 확인하면 됩니다. 고칠 값만 바꾸고 맨 아래 버튼을 누르면 흐름이 이어져 색인됩니다." if editor
+     else "보기 역할이라 읽기만 할 수 있습니다."}</p>
 <form method=post>"""]
     for d in flagged:
         did = d["doc_id"]
@@ -282,25 +286,31 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
             fk = "serial" if k == "docno" else k
             fl = " ".join(d["flags"].get(fk, []))
             val = html.escape(d["fields"][k] or "")
-            out.append(f"<div class=f><label>{LABEL[k]}</label><input name='{did}__{k}' value=\"{val}\">"
+            out.append(f"<div class=f><label>{LABEL[k]}</label><input name='{did}__{k}' value=\"{val}\"{ro}>"
                        f" <span class=flag>{html.escape(fl)}</span></div>")
             if k in ("docno", "date") and d["hw"].get(k, {}).get("text") is not None:
                 out.append(f"<img class=crop src='/crops/{vol}/{did}_{k}.png' onerror=\"this.style.display='none'\">"
                            f"<span class=flag>손글씨 판독: {html.escape(d['hw'][k]['text'])} (확신도 {d['hw'][k]['conf']})</span>")
         out.append("</div></div>")
-    out.append("<button type=submit>검토 끝 — 이어서 색인</button></form>")
+    out.append("<button type=submit>검토 끝 — 이어서 색인</button></form>" if editor else "</form>")
     return "".join(out)
 
 
 def record_review(vol, flagged, fixes, user):
     """공정 리포트용: 표시된 문서·칸 수와 사람이 고친 칸 수 (https://github.com/reddol18/docflow/issues/11).
     수정 이력: 고친 칸마다 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/6)."""
-    cur = {d["doc_id"]: d["fields"] for d in flagged}
-    for did, f in fixes.items():
-        store.add_edits(vol, did, [(k, cur[did].get(k), v) for k, v in f.items()], user.id, "review")
+    store.add_edits(vol, changes(flagged, fixes), user.id, "review")
     store.event(vol, "review", "submit", None, docs=len(flagged),
                 cells=sum(len(d["flags"]) for d in flagged),
                 fixed_docs=len(fixes), fixed_cells=sum(len(v) for v in fixes.values()), user=user.username)
+
+
+def resume_review(vol, flagged, fixes, user):
+    """이력을 먼저 남기고 흐름을 잇는다 — 이력 저장이 실패하면 고친 값도 반영되지 않는다 (누가 바꿨는지 잃지 않게)."""
+    if vol in running:
+        raise HTTPException(409, f"{vol} 이미 실행 중")
+    record_review(vol, flagged, fixes, user)
+    submit(vol, Command(resume=fixes))
 
 
 @app.post("/review/{vol}")
@@ -312,8 +322,7 @@ async def review_submit(vol: str, request: Request, user: Reviewer):
     form = await request.form()
     flagged = snap.interrupts[0].value["flagged"]
     fixes = clean_fixes(flagged, [(*key.rpartition("__")[::2], val) for key, val in form.items()])
-    submit(vol, Command(resume=fixes))
-    record_review(vol, flagged, fixes, user)
+    resume_review(vol, flagged, fixes, user)
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
 
@@ -326,8 +335,7 @@ def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field
         raise HTTPException(409, "검토 대기 없음")
     flagged = snap.interrupts[0].value["flagged"]
     fixes = clean_fixes(flagged, [(did, k, v) for did, f in body.items() for k, v in f.items()])
-    submit(vol, Command(resume=fixes))
-    record_review(vol, flagged, fixes, user)
+    resume_review(vol, flagged, fixes, user)
     return {"vol": vol, "fixed": {k: list(v) for k, v in fixes.items()}}
 
 

@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { api } from "@/lib/api";
+import { api, can } from "@/lib/api";
+import { useMe } from "@/lib/useMe";
 import { usePoll } from "@/lib/usePoll";
 import { Card, ErrorNote, Progress, StageBadge, Stat, usd } from "@/components/ui";
 import { UploadPanel } from "@/components/UploadPanel";
@@ -16,6 +17,7 @@ export default function Dashboard() {
   const spent = list[0]?.spent_today_usd ?? 0;
   const cost = list.reduce((s, v) => s + v.usage.reduce((a, u) => a + u.usd, 0), 0);
   const waiting = list.filter((v) => v.stage === "review");
+  const admin = can(useMe(), "admin"); // 올리기·실행은 관리 역할만 (서버도 403으로 막음)
 
   return (
     <div className="space-y-6">
@@ -43,7 +45,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      <UploadPanel onDone={refresh} />
+      {admin && <UploadPanel onDone={refresh} />}
 
       <Card title="철 목록">
         <div className="overflow-x-auto">

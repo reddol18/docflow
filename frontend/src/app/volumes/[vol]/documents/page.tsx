@@ -4,6 +4,7 @@ import Link from "next/link";
 import { use, useEffect, useMemo, useState } from "react";
 import {
   api,
+  can,
   cropImage,
   EDIT_FIELDS,
   FIELD_LABEL,
@@ -14,6 +15,7 @@ import {
   type Fields,
 } from "@/lib/api";
 import { usePoll } from "@/lib/usePoll";
+import { useMe } from "@/lib/useMe";
 import { useReviewTimer } from "@/lib/useReviewTimer";
 import { Card, ErrorNote, FlagChips, StageBadge } from "@/components/ui";
 
@@ -35,6 +37,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const reviewing = s?.stage === "review";
+  const editor = can(useMe(), "reviewer"); // 보기 역할은 고치기·검토 버튼을 숨긴다 (서버도 403으로 막음)
 
   // 철 상태가 바뀔 때(검토 대기 → 처리 중 → 완료) 문서를 다시 읽는다
   useEffect(() => {
@@ -61,7 +64,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const changed = Object.values(fixes).reduce((n, f) => n + Object.keys(f).length, 0);
   const changedBy = Object.fromEntries(Object.entries(fixes).map(([id, f]) => [id, Object.keys(f).length]));
   // 공정 리포트용 검토 시간: 지금 보고 있는 문서의 실제 작업 시간(자리 비움 제외)
-  const timer = useReviewTimer(vol, cur?.doc_id, reviewing ? "review" : "edit", reviewing || s?.stage === "done");
+  const timer = useReviewTimer(vol, cur?.doc_id, reviewing ? "review" : "edit", editor && (reviewing || s?.stage === "done"));
 
   const value = (d: Doc, k: EditField) => fixes[d.doc_id]?.[k] ?? d.fields[k] ?? "";
   const setValue = (d: Doc, k: EditField, v: string) =>
@@ -122,7 +125,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
           <input type="checkbox" checked={onlyFlagged} onChange={(e) => setOnlyFlagged(e.target.checked)} />
           검토 필요만 ({(docs ?? []).filter((d) => Object.keys(d.flags).length).length}/{docs?.length ?? 0})
         </label>
-        {reviewing && (
+        {reviewing && editor && (
           <button
             onClick={submitReview}
             disabled={saving}
@@ -212,7 +215,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                       <input
                         value={value(cur, k)}
                         onChange={(e) => setValue(cur, k, e.target.value)}
-                        disabled={!reviewing && s?.stage !== "done"}
+                        disabled={!editor || (!reviewing && s?.stage !== "done")}
                         className={`w-full rounded-md border px-3 py-1.5 text-sm ${dirty ? "border-blue-500 bg-blue-50" : flags?.length ? "border-rose-300" : "border-slate-300"}`}
                       />
                       <div className="mt-1 space-y-1 text-xs text-slate-500">
@@ -239,7 +242,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                     </div>
                   );
                 })}
-                {!reviewing && s?.stage === "done" && (
+                {!reviewing && s?.stage === "done" && editor && (
                   <button
                     onClick={() => saveDoc(cur)}
                     disabled={saving || !fixes[cur.doc_id]}

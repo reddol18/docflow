@@ -129,6 +129,15 @@ export const loginUrl = () => {
   return `/login?next=${encodeURIComponent(here)}`;
 };
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
+    super(message);
+  }
+}
+
 async function call<T>(path: string, init?: RequestInit & { noRedirect?: boolean }): Promise<T> {
   const { noRedirect, ...rest } = init ?? {};
   // X-Docflow-CSRF: 다른 사이트의 폼·스크립트는 이 헤더를 붙일 수 없다 → 서버가 쿠키 요청을 믿는 근거 (app/auth.py)
@@ -145,7 +154,7 @@ async function call<T>(path: string, init?: RequestInit & { noRedirect?: boolean
       const j = await r.json();
       msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j);
     } catch {}
-    throw new Error(msg);
+    throw new ApiError(msg, r.status);
   }
   return r.json() as Promise<T>;
 }

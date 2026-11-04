@@ -1,27 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
-import { api, loginUrl, ROLE_LABEL, type Me } from "@/lib/api";
+import { api, ROLE_LABEL } from "@/lib/api";
+import { forgetMe, useMe } from "@/lib/useMe";
 
-// 헤더 오른쪽: 로그인한 사람과 로그아웃. 로그인 안 했으면(401) 로그인 화면으로 보낸다.
+// 헤더 오른쪽: 로그인한 사람과 로그아웃. 로그인이 풀렸으면(401만) 로그인 화면으로 보낸다 (useMe).
 export function UserMenu() {
   const path = usePathname();
-  const [me, setMe] = useState<Me | null>(null);
+  if (path === "/login") return null;
+  return <Menu path={path} />;
+}
 
-  useEffect(() => {
-    if (path === "/login") return;
-    let alive = true;
-    api
-      .me()
-      .then((r) => alive && setMe(r.user))
-      .catch(() => alive && window.location.assign(loginUrl()));
-    return () => {
-      alive = false;
-    };
-  }, [path]);
-
-  if (path === "/login" || !me) return null;
+function Menu({ path }: { path: string }) {
+  const me = useMe(path);
+  if (!me) return null;
   return (
     <div className="flex items-center gap-3 text-sm">
       <span className="text-slate-700">
@@ -31,6 +23,7 @@ export function UserMenu() {
       <button
         onClick={async () => {
           await api.logout().catch(() => {});
+          forgetMe();
           // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- 화면 상태를 모두 버리려고 새로 불러온다
           window.location.assign("/login");
         }}
