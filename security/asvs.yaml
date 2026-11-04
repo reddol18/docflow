@@ -5,6 +5,8 @@
 # - security-reviewer가 항목별로 판정한다: 충족 / 일부 / 미충족 / 해당없음 / 미판정
 # - status는 "지금 main의 상태". 기준선 점검(코드 전체 1회)과 PR 점검 결과로 갱신하고, 근거(파일 또는 PR)를 단다.
 # - 남기고 병합한 미충족은 risk-accepted 라벨 이슈로 (주간 지표가 센다).
+# - 기준선 점검: 2026-11-04, main 49a7d87, security-reviewer 3개 영역 (입력·파일·API / 인증·데이터·설정 / LLM·검색·비용).
+#   결과 https://github.com/reddol18/docflow/issues/25 댓글. 근거의 파일:줄은 그 커밋 기준.
 #
 # 기준: OWASP ASVS 4.0.3 (L1 + docflow에 필요한 L2 일부), API Security Top 10 2023, LLM Top 10 2025.
 # 항목 문구는 요약이다. 정확한 문장은 원문을 볼 것.
@@ -32,83 +34,83 @@ boxes:
 
 items:
   # ---------- V2 인증 ----------
-  - {id: V2.1.1, level: 1, text: "비밀번호 12자 이상", status: 충족, evidence: "app/users.py MIN_LEN=12 (PR #38)"}
-  - {id: V2.1.5, level: 1, text: "사용자가 직접 비밀번호를 바꿀 수 있다", status: 미충족, evidence: "명령줄로만 (#40, risk-accepted)"}
-  - {id: V2.1.7, level: 1, text: "유출·흔한 비밀번호를 거른다", status: 미충족, evidence: "#40, risk-accepted"}
-  - {id: V2.2.1, level: 1, text: "자동 대입 방지 (잠금·속도 제한)", status: 일부, evidence: "app/auth.py login_local 원자적 시도(attempt_at)·계정 이름별 rate_limit (PR #38, #42). 이름을 바꿔 가며 뿌리기는 #40"}
-  - {id: V2.4.1, level: 2, text: "비밀번호는 승인된 느린 해시로 저장", status: 충족, evidence: "argon2id (PR #38)"}
+  - {id: V2.1.1, level: 1, text: "비밀번호 12자 이상", status: 충족, evidence: "app/users.py:23 MIN_LEN=12, :33 생성·변경 때 검사"}
+  - {id: V2.1.5, level: 1, text: "사용자가 직접 비밀번호를 바꿀 수 있다", status: 미충족, evidence: "app/users.py CLI만, 변경 API 없음. https://github.com/reddol18/docflow/issues/40 (risk-accepted)"}
+  - {id: V2.1.7, level: 1, text: "유출·흔한 비밀번호를 거른다", status: 미충족, evidence: "app/users.py:33 길이만. https://github.com/reddol18/docflow/issues/40 (risk-accepted)"}
+  - {id: V2.2.1, level: 1, text: "자동 대입 방지 (잠금·속도 제한)", status: 일부, evidence: "app/auth.py:132-137 원자적 시도·잠금, :172-194 이름별 창. IP 창은 TRUST_PROXY 없어 꺼짐 (#40)"}
+  - {id: V2.4.1, level: 2, text: "비밀번호는 승인된 느린 해시로 저장", status: 충족, evidence: "app/auth.py:107 argon2id, :149-150 다시 해시"}
 
   # ---------- V3 세션 ----------
-  - {id: V3.2.1, level: 1, text: "인증할 때 새 세션 토큰", status: 충족, evidence: "new_session, 이전 세션 삭제 (PR #38)"}
-  - {id: V3.2.2, level: 1, text: "세션 토큰 64비트 이상 무작위", status: 충족, evidence: "token_urlsafe(32)"}
-  - {id: V3.3.1, level: 1, text: "로그아웃하면 서버에서 세션 폐기", status: 충족, evidence: "drop_session, 시험 test_local_login_session_logout"}
-  - {id: V3.3.2, level: 2, text: "절대 만료 (L2: 12시간)", status: 충족, evidence: "SESSION_HOURS=12"}
-  - {id: V3.4.1, level: 1, text: "쿠키 Secure", status: 일부, evidence: "코드 기본 Secure, 데모(http)는 COOKIE_SECURE=0"}
-  - {id: V3.4.2, level: 1, text: "쿠키 HttpOnly", status: 충족, evidence: "set_session_cookie"}
-  - {id: V3.4.3, level: 1, text: "쿠키 SameSite", status: 충족, evidence: "Lax"}
-  - {id: V3.4.4, level: 1, text: "__Host- 쿠키 접두어", status: 미충족, evidence: "#40, https 전환 때"}
+  - {id: V3.2.1, level: 1, text: "인증할 때 새 세션 토큰", status: 충족, evidence: "app/auth.py:499,505-509,584-586 이전 세션 삭제 후 new_session"}
+  - {id: V3.2.2, level: 1, text: "세션 토큰 64비트 이상 무작위", status: 충족, evidence: "app/auth.py:204 token_urlsafe(32), DB에는 SHA-256만"}
+  - {id: V3.3.1, level: 1, text: "로그아웃하면 서버에서 세션 폐기", status: 충족, evidence: "app/auth.py:512-521 → drop_session(:222-224)"}
+  - {id: V3.3.2, level: 2, text: "절대 만료 (L2: 12시간)", status: 충족, evidence: "app/auth.py:208,215 expires_at 고정, k8s/docs.yaml SESSION_HOURS=12"}
+  - {id: V3.4.1, level: 1, text: "쿠키 Secure", status: 일부, evidence: "app/auth.py:59,233 기본 Secure, 데모(http)는 COOKIE_SECURE=0. https://github.com/reddol18/docflow/issues/48"}
+  - {id: V3.4.2, level: 1, text: "쿠키 HttpOnly", status: 충족, evidence: "app/auth.py:233,547"}
+  - {id: V3.4.3, level: 1, text: "쿠키 SameSite", status: 충족, evidence: "app/auth.py:233,547 lax"}
+  - {id: V3.4.4, level: 1, text: "__Host- 쿠키 접두어", status: 미충족, evidence: "app/auth.py:56-57 접두어 없음. https 전환 때 https://github.com/reddol18/docflow/issues/48"}
 
   # ---------- V4 접근 제어 ----------
-  - {id: V4.1.1, level: 1, text: "권한은 서버에서 강제", status: 충족, evidence: "auth.guard + require(role), 시험 test_every_route_*"}
-  - {id: V4.1.3, level: 1, text: "최소 권한", status: 충족, evidence: "viewer/reviewer/admin, OIDC 기본 거절"}
-  - {id: V4.1.5, level: 1, text: "실패하면 막힌다 (기본 거부)", status: 충족, evidence: "앱 전체 의존성"}
-  - {id: V4.2.1, level: 1, text: "다른 사람 객체 접근 방지 (IDOR)", status: 해당없음, evidence: "철·문서 소유권이 없는 설계. 기관 분리가 필요하면 새 이슈"}
-  - {id: V4.2.2, level: 1, text: "CSRF 방지", status: 충족, evidence: "X-Docflow-CSRF 또는 Sec-Fetch-Site"}
-  - {id: V4.3.1, level: 1, text: "관리 기능 다중 인증", status: 미충족, evidence: "local은 비밀번호만. #40, risk-accepted (PR #42 보안 리뷰)"}
+  - {id: V4.1.1, level: 1, text: "권한은 서버에서 강제", status: 충족, evidence: "app/main.py:61 guard, app/auth.py:274-292 require, tests/test_auth.py 경로 순회"}
+  - {id: V4.1.3, level: 1, text: "최소 권한", status: 충족, evidence: "app/auth.py:54 3단 역할, OIDC 기본 거절(:319,325), viewer는 읽기 전용"}
+  - {id: V4.1.5, level: 1, text: "실패하면 막힌다 (기본 거부)", status: 충족, evidence: "app/auth.py:238 PUBLIC 정확히 일치, :274-278 그 밖은 401"}
+  - {id: V4.2.1, level: 1, text: "다른 사람 객체 접근 방지 (IDOR)", status: 해당없음, evidence: "소유권 없는 설계(app/main.py:177-181). 기관 분리가 필요하면 새 이슈"}
+  - {id: V4.2.2, level: 1, text: "CSRF 방지", status: 충족, evidence: "app/auth.py:248-254,268-269,494 check_csrf, frontend/src/lib/api.ts:145"}
+  - {id: V4.3.1, level: 1, text: "관리 기능 다중 인증", status: 미충족, evidence: "app/auth.py:490-502 local admin도 비밀번호만. https://github.com/reddol18/docflow/issues/40 (risk-accepted)"}
 
   # ---------- V5 입력 검증·출력 인코딩 ----------
-  - {id: V5.1.3, level: 1, text: "입력은 허용 목록·형식으로 검증", status: 미판정, evidence: ""}
-  - {id: V5.1.5, level: 1, text: "리다이렉트 주소는 허용 목록", status: 충족, evidence: "auth.safe_next"}
-  - {id: V5.3.3, level: 1, text: "HTML 출력 이스케이프 (XSS)", status: 일부, evidence: "review_page가 vol·doc_id를 속성에 이스케이프 없이 넣는다. 둘 다 [\\w.-] 허용 목록(VOL_RX, 파일 이름 규칙)을 거쳐 지금은 악용 불가. 고칠 때 html.escape (#40)"}
-  - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 미판정, evidence: ""}
+  - {id: V5.1.3, level: 1, text: "입력은 허용 목록·형식으로 검증", status: 일부, evidence: "허용 목록 app/main.py:42,113,239,341-347. 폼 값 길이·q·k 상한·업로드 형식 없음 https://github.com/reddol18/docflow/issues/49"}
+  - {id: V5.1.5, level: 1, text: "리다이렉트 주소는 허용 목록", status: 충족, evidence: "app/auth.py:462-467 safe_next(:539 저장, :585 사용), login/page.tsx:14-15"}
+  - {id: V5.3.3, level: 1, text: "HTML 출력 이스케이프 (XSS)", status: 일부, evidence: "app/main.py:270,284,289,292 vol·doc_id 미이스케이프, 허용 목록으로 지금은 악용 불가. https://github.com/reddol18/docflow/issues/40"}
+  - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 충족, evidence: "app/store.py 전 쿼리 %s(keyword_search :177-189는 자리표시자만), report.py 상수만, auth·users %s"}
 
   # ---------- V7 오류·로그 ----------
-  - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "앱은 남기지 않음. 접근 로그에 OIDC code·state (#40)"}
-  - {id: V7.4.1, level: 1, text: "사용자에게는 일반 오류 문구", status: 미판정, evidence: "https://github.com/reddol18/docflow/issues/28"}
+  - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "앱은 예외 종류만(app/auth.py:577). uvicorn 접근 로그에 OIDC code·state 쿼리 (#40)"}
+  - {id: V7.4.1, level: 1, text: "사용자에게는 일반 오류 문구", status: 일부, evidence: "500은 일반 문구. app/main.py:93 예외 원문을 events에, :190-193 viewer에 노출 https://github.com/reddol18/docflow/issues/47"}
 
   # ---------- V8 데이터 보호 ----------
-  - {id: V8.2.1, level: 1, text: "민감 응답은 캐시 금지 헤더", status: 미판정, evidence: ""}
-  - {id: V8.3.1, level: 1, text: "민감 데이터는 URL이 아닌 본문으로", status: 미판정, evidence: ""}
+  - {id: V8.2.1, level: 1, text: "민감 응답은 캐시 금지 헤더", status: 미충족, evidence: "app/main.py·next.config.ts에 Cache-Control 없음 (masked route만). https://github.com/reddol18/docflow/issues/47"}
+  - {id: V8.3.1, level: 1, text: "민감 데이터는 URL이 아닌 본문으로", status: 일부, evidence: "자격 증명은 본문(app/auth.py:485-491). 검색어 q가 URL에(app/main.py:405-411)"}
 
   # ---------- V9 통신 ----------
-  - {id: V9.1.1, level: 1, text: "모든 통신 TLS", status: 미충족, evidence: "데모는 http + ssh 터널. https 전환 때"}
+  - {id: V9.1.1, level: 1, text: "모든 통신 TLS", status: 미충족, evidence: "next.config.ts:5 http, PG sslmode 없음, Qdrant http. 데모는 ssh 터널. https://github.com/reddol18/docflow/issues/48"}
 
   # ---------- V12 파일 ----------
-  - {id: V12.1.1, level: 1, text: "업로드 크기·개수 상한", status: 미충족, evidence: "https://github.com/reddol18/docflow/issues/26"}
-  - {id: V12.3.1, level: 1, text: "파일 이름으로 경로 이탈 방지", status: 미판정, evidence: ""}
-  - {id: V12.5.1, level: 1, text: "정해진 형식만 내려보냄", status: 미판정, evidence: ""}
+  - {id: V12.1.1, level: 1, text: "업로드 크기·개수 상한", status: 미충족, evidence: "app/main.py:106-116 상한 없음, :115 전체를 메모리로. https://github.com/reddol18/docflow/issues/26"}
+  - {id: V12.3.1, level: 1, text: "파일 이름으로 경로 이탈 방지", status: 일부, evidence: "파일 이름 정규식은 안전. VOL_RX(app/main.py:42)가 '..' 허용, store.py:21-30 결합만 https://github.com/reddol18/docflow/issues/49"}
+  - {id: V12.5.1, level: 1, text: "정해진 형식만 내려보냄", status: 충족, evidence: "/head 재인코딩 app/main.py:253-259, /crops png 고정 :239-244, 원본 그대로 내려주는 경로 없음"}
 
   # ---------- V13 API ----------
-  - {id: V13.1.3, level: 1, text: "API 주소에 민감 정보 없음", status: 미판정, evidence: ""}
-  - {id: V13.2.1, level: 1, text: "허용한 HTTP 메서드만", status: 미판정, evidence: ""}
-  - {id: V13.2.3, level: 1, text: "쿠키 쓰는 API의 CSRF", status: 충족, evidence: "V4.2.2와 같음"}
+  - {id: V13.1.3, level: 1, text: "API 주소에 민감 정보 없음", status: 충족, evidence: "토큰은 쿠키·Authorization만(app/auth.py:241-245). URL엔 검색어·OIDC code만 (V8.3.1)"}
+  - {id: V13.2.1, level: 1, text: "허용한 HTTP 메서드만", status: 충족, evidence: "app/main.py 라우트별 단일 메서드(그 외 405), proxy.ts:17-19 읽기 전용 모드"}
+  - {id: V13.2.3, level: 1, text: "쿠키 쓰는 API의 CSRF", status: 충족, evidence: "V4.2.2와 같음, tests/test_auth.py:240-241"}
 
   # ---------- V14 설정 ----------
-  - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 일부, evidence: "파이썬·npm은 osv-scanner (check.ps1). 배포 이미지 3개는 scripts/mac/scan_image.sh, 사람이 돌릴 때만 (2026-11-04 결과: https://github.com/reddol18/docflow/issues/44#issuecomment-6624365177). 고치기 https://github.com/reddol18/docflow/issues/44, 자동화 https://github.com/reddol18/docflow/issues/46"}
-  - {id: V14.3.2, level: 1, text: "디버그·문서 화면 끔", status: 충족, evidence: "API_DOCS 기본 끔 (PR #38)"}
-  - {id: V14.4.1, level: 1, text: "Content-Type과 문자셋", status: 미판정, evidence: ""}
-  - {id: V14.4.3, level: 1, text: "CSP", status: 미판정, evidence: ""}
-  - {id: V14.4.4, level: 1, text: "X-Content-Type-Options: nosniff", status: 미판정, evidence: ""}
-  - {id: V14.4.7, level: 1, text: "다른 사이트에 끼워 넣기 금지 (frame-ancestors)", status: 미판정, evidence: ""}
-  - {id: V14.5.3, level: 1, text: "CORS는 허용 목록", status: 충족, evidence: "CORS 미들웨어 없음 (같은 출처 프록시)"}
+  - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 미충족, evidence: "파이썬·npm은 osv 깨끗. 이미지 3개 CRITICAL 7 https://github.com/reddol18/docflow/issues/44 (자동화 #46)"}
+  - {id: V14.3.2, level: 1, text: "디버그·문서 화면 끔", status: 일부, evidence: "API는 꺼짐(app/main.py:60-62). 프런트 운영 실행 방식 없음(README next dev) https://github.com/reddol18/docflow/issues/48"}
+  - {id: V14.4.1, level: 1, text: "Content-Type과 문자셋", status: 충족, evidence: "app/main.py:244,259,384 명시, HTML·텍스트는 Starlette가 charset=utf-8"}
+  - {id: V14.4.3, level: 1, text: "CSP", status: 미충족, evidence: "FastAPI 미들웨어·Next headers() 없음. https://github.com/reddol18/docflow/issues/47"}
+  - {id: V14.4.4, level: 1, text: "X-Content-Type-Options: nosniff", status: 미충족, evidence: "양쪽 다 없음. https://github.com/reddol18/docflow/issues/47"}
+  - {id: V14.4.7, level: 1, text: "다른 사이트에 끼워 넣기 금지 (frame-ancestors)", status: 미충족, evidence: "없음, /review 폼 클릭재킹 가능(app/main.py:281). https://github.com/reddol18/docflow/issues/47"}
+  - {id: V14.5.3, level: 1, text: "CORS는 허용 목록", status: 충족, evidence: "CORSMiddleware 없음(app/main.py:61-63), 같은 출처 프록시(next.config.ts:26)"}
 
   # ---------- API Security Top 10 ----------
-  - {id: API1, text: "객체 수준 권한", status: 해당없음, evidence: "V4.2.1과 같음"}
-  - {id: API2, text: "인증 깨짐", status: 충족, evidence: "PR #38"}
-  - {id: API3, text: "객체 속성 수준 권한 (과다 노출·대량 할당)", status: 미판정, evidence: ""}
-  - {id: API4, text: "자원 소모 무제한", status: 일부, evidence: "로그인 속도 제한만. 업로드 #26, 검색·질문 미판정"}
-  - {id: API5, text: "기능 수준 권한", status: 충족, evidence: "역할별 경로 시험"}
-  - {id: API6, text: "민감한 업무 흐름 남용", status: 미판정, evidence: "/ask 비용"}
-  - {id: API7, text: "SSRF", status: 미판정, evidence: "OIDC discovery·JWKS 주소는 설정값만"}
-  - {id: API8, text: "보안 설정 오류", status: 일부, evidence: "trivy config 경고 #29"}
-  - {id: API9, text: "API 목록 관리", status: 미판정, evidence: ""}
-  - {id: API10, text: "외부 API 응답을 믿음", status: 미판정, evidence: "OpenAI 응답 처리"}
+  - {id: API1, text: "객체 수준 권한", status: 해당없음, evidence: "V4.2.1과 같음 (역할 확인 app/auth.py:281-297)"}
+  - {id: API2, text: "인증 깨짐", status: 일부, evidence: "기본 구조 튼튼(app/auth.py:126-151,397-415). V2.2.1·V3.4.1·V4.3.1 남음"}
+  - {id: API3, text: "객체 속성 수준 권한 (과다 노출·대량 할당)", status: 충족, evidence: "노출 열 선택 app/main.py:401-402, store.py:151, auth.py:94. 수정은 EDITABLE만(main.py:208, review_input.py:13)"}
+  - {id: API4, text: "자원 소모 무제한", status: 일부, evidence: "로그인 제한·LLM 예산 있음. 업로드 무제한 #26, /search·/ask 호출 제한 없음 https://github.com/reddol18/docflow/issues/7"}
+  - {id: API5, text: "기능 수준 권한", status: 충족, evidence: "app/auth.py:281-297 require(role), tests/test_auth.py 경로 순회"}
+  - {id: API6, text: "민감한 업무 흐름 남용", status: 미충족, evidence: "/ask·/search 사용자별 제한 없음, 색인과 전역 예산 공유(store.py:101-104) https://github.com/reddol18/docflow/issues/7"}
+  - {id: API7, text: "SSRF", status: 충족, evidence: "외부 URL은 설정값만(app/auth.py:326,337,354,381), k8s/docs.yaml:39-43 사설 IP 차단"}
+  - {id: API8, text: "보안 설정 오류", status: 미충족, evidence: "보안 헤더·캐시 금지 없음 #47, COOKIE_SECURE=0·http #48, trivy config 경고 https://github.com/reddol18/docflow/issues/29"}
+  - {id: API9, text: "API 목록 관리", status: 일부, evidence: "app/main.py:3-15 목록에 라우트 7개 빠짐. https://github.com/reddol18/docflow/issues/49"}
+  - {id: API10, text: "외부 API 응답을 믿음", status: 충족, evidence: "OpenAI 추출 4칸·형 변환(app/llm.py:89-92), 출력 이스케이프, OIDC 서명·aud·nonce 확인"}
 
   # ---------- LLM Top 10 ----------
-  - {id: LLM01, text: "프롬프트 인젝션 (OCR 본문을 통한 간접 포함)", status: 미충족, evidence: "https://github.com/reddol18/docflow/issues/27"}
-  - {id: LLM02, text: "민감 정보 노출 (답변·로그)", status: 미판정, evidence: ""}
-  - {id: LLM05, text: "LLM 출력을 그대로 씀 (HTML·SQL·명령)", status: 미판정, evidence: ""}
-  - {id: LLM06, text: "과도한 권한 (LLM이 도구·쓰기 실행)", status: 미판정, evidence: "도구 호출 없음으로 보임"}
-  - {id: LLM07, text: "시스템 프롬프트 노출", status: 미판정, evidence: ""}
-  - {id: LLM08, text: "벡터·임베딩 약점 (색인 오염·권한 없는 검색)", status: 미판정, evidence: ""}
-  - {id: LLM10, text: "무제한 소비 (비용)", status: 일부, evidence: "일일 예산 사후 정산 https://github.com/reddol18/docflow/issues/7"}
+  - {id: LLM01, text: "프롬프트 인젝션 (OCR 본문을 통한 간접 포함)", status: 미충족, evidence: "app/llm.py:141-147, :85-86 본문을 구분·무시 지시 없이 연결. https://github.com/reddol18/docflow/issues/27"}
+  - {id: LLM02, text: "민감 정보 노출 (답변·로그)", status: 충족, evidence: "app/llm.py:55-59 토큰·비용만 기록, 답변 근거는 viewer가 볼 수 있는 문서뿐. OCR 본문이 OpenAI로 감(정책)"}
+  - {id: LLM05, text: "LLM 출력을 그대로 씀 (HTML·SQL·명령)", status: 충족, evidence: "app/llm.py:89-92 형 변환, store.py 매개변수, main.py:288-293 escape, search/page.tsx:88 텍스트"}
+  - {id: LLM06, text: "과도한 권한 (LLM이 도구·쓰기 실행)", status: 충족, evidence: "app/llm.py 모든 호출에 tools·function 없음, 출력은 값으로만"}
+  - {id: LLM07, text: "시스템 프롬프트 노출", status: 충족, evidence: "app/llm.py:62-75,135-136 프롬프트에 비밀·권한 규칙 없음, 키는 따로(:34-36)"}
+  - {id: LLM08, text: "벡터·임베딩 약점 (색인 오염·권한 없는 검색)", status: 충족, evidence: "Qdrant는 docflow만(k8s NetworkPolicy), 쓰기는 admin·reviewer만. Qdrant 키 없음 #48"}
+  - {id: LLM10, text: "무제한 소비 (비용)", status: 일부, evidence: "app/llm.py:49-52 사후 정산, :58 모르는 모델 0원, max_tokens 없음 https://github.com/reddol18/docflow/issues/7"}
