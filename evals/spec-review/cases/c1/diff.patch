@@ -1,5 +1,5 @@
 diff --git a/app/main.py b/app/main.py
-index 97e6d48..5c933e8 100644
+index 97e6d48..43103da 100644
 --- a/app/main.py
 +++ b/app/main.py
 @@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
@@ -7,7 +7,7 @@ index 97e6d48..5c933e8 100644
  
  import cv2
 -from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-+from fastapi import Query, Depends, FastAPI, File, HTTPException, Request, UploadFile
++from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
  from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
  from langgraph.checkpoint.postgres import PostgresSaver
  from langgraph.types import Command

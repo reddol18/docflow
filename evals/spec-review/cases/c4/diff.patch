@@ -13,21 +13,19 @@ index 9f3788a..23397eb 100644
  PENDING_SEC = 600  # OIDC 로그인 시작부터 콜백까지
  ID_TOKEN_ALGS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]  # none·HS*는 받지 않는다
 diff --git a/tests/test_auth.py b/tests/test_auth.py
-index 6491fd3..f9568d0 100644
+index 6491fd3..b22f6da 100644
 --- a/tests/test_auth.py
 +++ b/tests/test_auth.py
-@@ -239,3 +239,14 @@ def test_role_and_csrf_enforced(main_app, monkeypatch):
+@@ -239,3 +239,12 @@ def test_role_and_csrf_enforced(main_app, monkeypatch):
      # 쿠키로 온 바꾸는 요청은 CSRF 표시가 없으면 거절 (역할이 맞아도)
      c.cookies.set(auth.COOKIE, "r")
      assert c.post("/volumes/vol/timings", json=[]).status_code == 403
 +
 +
 +def test_lock_min_from_env(monkeypatch):
-+    import importlib
++    import importlib.util
 +    monkeypatch.setenv("LOGIN_LOCK_MIN", "30")
-+    m = importlib.reload(auth)
-+    try:
-+        assert m.LOCK_MIN == 30
-+    finally:
-+        monkeypatch.delenv("LOGIN_LOCK_MIN")
-+        importlib.reload(auth)
++    spec = importlib.util.spec_from_file_location("auth_copy", auth.__file__)  # app.auth는 건드리지 않고 복사본으로
++    m = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(m)
++    assert m.LOCK_MIN == 30 and auth.LOCK_MIN == 15
