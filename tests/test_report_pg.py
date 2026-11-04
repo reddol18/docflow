@@ -1,6 +1,6 @@
 """공정 리포트 SQL (app/report.py)을 실제 Postgres에 돌린다. TEST_PG_URL이 없으면 건너뛴다.
 
-CI는 postgres 서비스 컨테이너로 돌린다(.github/workflows/ci.yml). 로컬에서는 아무 빈 Postgres나:
+scripts/check.ps1이 PGlite를 띄워 돌린다. 직접 돌리려면 아무 빈 Postgres나:
   $env:TEST_PG_URL = "postgresql://postgres@127.0.0.1:5432/postgres"; pytest tests/test_report_pg.py
 표를 지우고 다시 채우므로 운영 DB에 대고 돌리지 말 것.
 """
@@ -10,20 +10,13 @@ import os
 
 import pytest
 
-PG = os.environ.get("TEST_PG_URL")
-pytestmark = pytest.mark.skipif(not PG, reason="TEST_PG_URL 없음")
+pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_PG_URL 없음")
 
 
 @pytest.fixture(scope="module")
-def mods():
-    os.environ["PG_URL"] = PG
-    from app import report, store
-    if os.environ.get("TEST_PG_NO_PREPARE"):  # PGlite 소켓 서버처럼 prepared statement에 약한 시험 서버용
-        store.pool.kwargs["prepare_threshold"] = None
-    store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True})()
-    store.init()
-    yield report, store
-    store.pool.close()
+def mods(pg_store):
+    from app import report
+    return report, pg_store
 
 
 def test_daily_report(mods):
