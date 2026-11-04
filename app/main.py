@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 from app import auth, llm, ocr, report, store
 from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
-from app.review_input import EDITABLE, clean_fixes
+from app.review_input import EDITABLE, changes, clean_fixes
 
 CellValue = Annotated[str, Field(max_length=500)]  # 색인 칸 하나 (제목도 이 안에 든다)
 VOL_RX = re.compile(r"^[\w.-]{1,80}$")
@@ -214,8 +214,9 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
         d["fields"]["serial"] = flow.layout.serial_of(fix["docno"])
     G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
     store.save_documents([d])
+    # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
+    store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
     store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
-    store.add_edits(vol, doc_id, [(k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
     store.event(vol, "edit", "end", doc_id, fields=list(fix), user=user.username)
     return d
 
@@ -295,9 +296,7 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
 def record_review(vol, flagged, fixes, user):
     """공정 리포트용: 표시된 문서·칸 수와 사람이 고친 칸 수 (https://github.com/reddol18/docflow/issues/11).
     수정 이력: 고친 칸마다 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/6)."""
-    cur = {d["doc_id"]: d["fields"] for d in flagged}
-    for did, f in fixes.items():
-        store.add_edits(vol, did, [(k, cur[did].get(k), v) for k, v in f.items()], user.id, "review")
+    store.add_edits(vol, changes(flagged, fixes), user.id, "review")
     store.event(vol, "review", "submit", None, docs=len(flagged),
                 cells=sum(len(d["flags"]) for d in flagged),
                 fixed_docs=len(fixes), fixed_cells=sum(len(v) for v in fixes.values()), user=user.username)

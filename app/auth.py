@@ -23,8 +23,10 @@ OIDC 설정 (oidc를 켤 때)
 
 그 밖에
   COOKIE_SECURE          기본 1(Secure 쿠키). http로 데모할 때만 0. https 콜백인데 0이면 시작을 거부한다
-  TRUST_PROXY            Next 프록시 뒤에서 1 → 로그인 시도 제한에 X-Forwarded-For 마지막 값을 쓴다
-  LOGIN_RATE_MAX         같은 IP에서 5분에 로그인·로그인 시작 몇 번까지 (기본 20)
+  LOGIN_RATE_USER        같은 계정 이름으로 5분에 로그인 몇 번까지 (기본 10)
+  LOGIN_RATE_ALL         전체 5분에 로그인·로그인 시작 몇 번까지 (기본 200)
+  TRUST_PROXY            X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 → IP별 창(LOGIN_RATE_MAX, 기본 20)도 쓴다.
+                         Next rewrites는 덮어쓰지 않으므로 지금 구성에서는 0
   OIDC_LABEL             로그인 버튼 글자 (기본 "SSO")
 """
 import base64
@@ -57,7 +59,7 @@ STATE_COOKIE = "docflow_oidc_state"
 SESSION_SEC = int(float(os.environ.get("SESSION_HOURS", "12")) * 3600)
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"  # 기본 Secure. http로 데모할 때만 명시적으로 0
 LOGIN_RATE = (int(os.environ.get("LOGIN_RATE_MAX", "20")), 300)  # 같은 IP에서 300초에 20번까지 (/auth/login, /auth/oidc/login)
-# Next 프록시 뒤에서만 1: X-Forwarded-For의 마지막 값(프록시가 본 주소)을 IP로 쓴다. 직접 노출된 서버에서 켜면 위조된다
+# X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 (Next rewrites는 클라이언트 값을 그대로 넘기므로 안 됨)
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "0") == "1"
 MAX_NEXT = 2048
 MAX_FAILS, LOCK_MIN = 5, 15
@@ -124,6 +126,11 @@ def _verify(h, pw):
 def login_local(username, password):
     """맞으면 User, 틀리거나 잠겼거나 없는 계정이면 None. 없는 계정에도 해시 검증을 한 번 돌려 시간 차를 줄인다."""
     with store.pool.connection() as c:
+        # 시도 자리를 잡은 뒤 요청이 죽으면(풀 오류·프로세스 종료) failed가 MAX_FAILS에 머문 채 locked_until이 비어
+        # 영원히 막힌다 → 그런 상태는 보통 잠금으로 바꿔 두어 LOCK_MIN 뒤 저절로 풀리게 한다
+        c.execute("UPDATE users SET failed = 0, locked_until = now() + make_interval(mins => %s) "
+                  "WHERE username = %s AND issuer IS NULL AND failed >= %s AND locked_until IS NULL",
+                  (LOCK_MIN, username, MAX_FAILS))
         # 검증 전에 시도 한 번을 원자적으로 잡는다 → 동시에 여러 요청을 보내도 잠금 전 MAX_FAILS번까지만 검증한다
         u = c.execute("UPDATE users SET failed = failed + 1 WHERE username = %s AND issuer IS NULL "
                       "AND NOT disabled AND password_hash IS NOT NULL AND (locked_until IS NULL OR locked_until < now()) "
@@ -145,10 +152,14 @@ def login_local(username, password):
     return User(u["id"], u["username"], u["name"] or u["username"], u["role"])
 
 
-# ---------- IP별 시도 제한 (인증 전 경로) ----------
+# ---------- 시도 제한 (인증 전 경로) ----------
+# 창 3개를 함께 본다: 계정 이름별(대입), 전체(이름을 바꿔 가며 뿌리기), IP별(TRUST_PROXY일 때만).
+# Next 프록시는 X-Forwarded-For를 덮어쓰지 않고 클라이언트가 보낸 값을 그대로 넘긴다 → Next 뒤에서는 TRUST_PROXY를 켜지 않는다.
 
 _hits: dict[str, collections.deque] = {}
 _hits_lock = threading.Lock()
+USER_RATE = (int(os.environ.get("LOGIN_RATE_USER", "10")), 300)
+ALL_RATE = (int(os.environ.get("LOGIN_RATE_ALL", "200")), 300)
 
 
 def client_ip(request):
@@ -159,20 +170,28 @@ def client_ip(request):
     return request.client.host if request.client else "?"
 
 
-def rate_limit(request):
-    """로그인 대입·로그인 시작 반복(DB 행·argon2 CPU)을 IP별로 막는다. 한 프로세스 안의 메모리 창."""
-    n, win = LOGIN_RATE
-    now, ip = time.monotonic(), client_ip(request)
+def rate_limit(request, username=None):
+    """로그인 대입·로그인 시작 반복(DB 행·argon2 CPU)을 막는다. 한 프로세스 안의 메모리 창."""
+    keys = [("all", ALL_RATE)]
+    if username is not None:
+        keys.append((f"user:{username.lower()}", USER_RATE))
+    if TRUST_PROXY:  # 앞단 프록시가 X-Forwarded-For를 덮어쓴다고 확인된 경우만 (Next는 아님)
+        keys.append((f"ip:{client_ip(request)}", LOGIN_RATE))
+    now = time.monotonic()
     with _hits_lock:
         if len(_hits) > 10000:
-            for k in [k for k, q in _hits.items() if not q or q[-1] < now - win]:
+            for k in [k for k, q in _hits.items() if not q or q[-1] < now - 3600]:
                 del _hits[k]
-        q = _hits.setdefault(ip, collections.deque())
-        while q and q[0] < now - win:
-            q.popleft()
-        if len(q) >= n:
-            raise HTTPException(429, "시도가 너무 많습니다. 잠시 뒤 다시 하세요")
-        q.append(now)
+        qs = []
+        for key, (n, win) in keys:
+            q = _hits.setdefault(key, collections.deque())
+            while q and q[0] < now - win:
+                q.popleft()
+            if len(q) >= n:
+                raise HTTPException(429, "시도가 너무 많습니다. 잠시 뒤 다시 하세요")
+            qs.append(q)
+        for q in qs:
+            q.append(now)
 
 
 # ---------- 세션 ----------
@@ -194,8 +213,9 @@ def session_user(token):
     with store.pool.connection() as c:
         r = c.execute("SELECT u.id, u.username, u.name, u.role FROM sessions s JOIN users u ON u.id = s.user_id "
                       "WHERE s.token_hash = %s AND s.expires_at > now() AND NOT u.disabled", (_h(token),)).fetchone()
-        if r:
-            c.execute("UPDATE sessions SET last_seen = now() WHERE token_hash = %s", (_h(token),))
+        if r:  # 이미지마다 쓰지 않도록 5분에 한 번만
+            c.execute("UPDATE sessions SET last_seen = now() WHERE token_hash = %s AND last_seen < now() - interval '5 minutes'",
+                      (_h(token),))
     return User(r["id"], r["username"], r["name"] or r["username"], r["role"]) if r else None
 
 
@@ -472,7 +492,7 @@ def login(body: LoginBody, request: Request):
     if "local" not in MODES:
         raise HTTPException(404)
     check_csrf(request)  # 로그인 CSRF(남의 계정으로 로그인시키기) 방지
-    rate_limit(request)
+    rate_limit(request, body.username)
     u = login_local(body.username, body.password)
     if not u:
         raise HTTPException(401, FAIL_MSG)
@@ -533,7 +553,9 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     if "oidc" not in MODES:
         raise HTTPException(404)
     if error:
-        return RedirectResponse("/login?error=oidc", status_code=303)
+        resp = RedirectResponse("/login?error=oidc", status_code=303)
+        resp.delete_cookie(STATE_COOKIE, path="/")
+        return resp
     mine = request.cookies.get(STATE_COOKIE)
     if not (code and state and mine and secrets.compare_digest(state, mine)):
         raise HTTPException(400, "로그인 요청이 맞지 않음 — 다시 시도")
@@ -542,13 +564,20 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
                       "RETURNING nonce, verifier, next", (state, PENDING_SEC)).fetchone()
     if not p:
         raise HTTPException(400, "로그인 요청이 만료됨 — 다시 시도")
-    d = discovery()
-    data = {"grant_type": "authorization_code", "code": code, "redirect_uri": OIDC.redirect_uri,
-            "client_id": OIDC.client_id, "code_verifier": p["verifier"]}
-    tok = _post_form(d["token_endpoint"], data, (OIDC.client_id, OIDC.client_secret) if OIDC.client_secret else None)
-    if "id_token" not in tok:
-        raise HTTPException(502, "OIDC 응답에 id_token 없음")
-    u = upsert_oidc_user(verify_id_token(tok["id_token"], d, p["nonce"]))
+    try:
+        d = discovery()
+        data = {"grant_type": "authorization_code", "code": code, "redirect_uri": OIDC.redirect_uri,
+                "client_id": OIDC.client_id, "code_verifier": p["verifier"]}
+        tok = _post_form(d["token_endpoint"], data, (OIDC.client_id, OIDC.client_secret) if OIDC.client_secret else None)
+        if "id_token" not in tok:
+            raise HTTPException(502, "OIDC 응답에 id_token 없음")
+        u = upsert_oidc_user(verify_id_token(tok["id_token"], d, p["nonce"]))
+    except (httpx.HTTPError, HTTPException, RuntimeError, ValueError) as e:
+        # 제공자 연결 실패·응답 오류·토큰 검증 실패 → 오류 화면 대신 로그인 화면으로 (원인은 서버 로그에만, 토큰은 남기지 않음)
+        print(f"OIDC 콜백 실패: {type(e).__name__}", flush=True)
+        resp = RedirectResponse("/login?error=oidc", status_code=303)
+        resp.delete_cookie(STATE_COOKIE, path="/")
+        return resp
     if u is None:
         resp = RedirectResponse("/login?error=role", status_code=303)
     else:

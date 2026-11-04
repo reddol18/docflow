@@ -135,12 +135,13 @@ def add_review_times(vol, rows, user_id=None):
                       (vol, r["doc_id"], r["mode"], r["active_ms"], r.get("opened_at"), r.get("fields_changed"), user_id))
 
 
-def add_edits(vol, doc_id, changes, user_id, source):
-    """수정 이력: changes = [(칸, 이전 값, 새 값)], source = review(검토 제출) | edit(색인 뒤 수정)."""
-    with pool.connection() as c:
-        for field, old, new in changes:
-            c.execute("INSERT INTO edits (vol, doc_id, field, old, new, user_id, source) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                      (vol, doc_id, field, old, new, user_id, source))
+def add_edits(vol, rows, user_id, source):
+    """수정 이력: rows = [(doc_id, 칸, 이전 값, 새 값)], source = review(검토 제출) | edit(색인 뒤 수정). 한 연결·한 트랜잭션."""
+    if not rows:
+        return
+    with pool.connection() as c, c.transaction(), c.cursor() as cur:
+        cur.executemany("INSERT INTO edits (vol, doc_id, field, old, new, user_id, source) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        [(vol, did, f, old, new, user_id, source) for did, f, old, new in rows])
 
 
 def edit_history(vol, doc_id):

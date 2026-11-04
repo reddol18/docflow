@@ -148,7 +148,6 @@ spec:
         - {name: AUTH_MODES, value: "local"}
         - {name: SESSION_HOURS, value: "12"}
         - {name: COOKIE_SECURE, value: "0"}  # 지금 데모는 http. https로 서비스하면 이 줄을 지운다 (코드 기본값이 Secure)
-        - {name: TRUST_PROXY, value: "1"}  # Next 프록시 뒤: 로그인 시도 제한에 X-Forwarded-For 마지막 값을 쓴다
         # OIDC를 켤 때 (AUTH_MODES에 oidc 추가). client secret은 Secret으로:
         #   kubectl create secret generic oidc -n docs --from-file=client-secret=<파일>
         # - {name: OIDC_ISSUER, value: "https://sso.example.go.kr/realms/docflow"}

@@ -10,7 +10,6 @@ const ERRORS: Record<string, string> = {
 };
 
 // 같은 사이트의 상대 경로만 (서버의 auth.safe_next와 같은 규칙)
-// eslint-disable-next-line no-control-regex -- 제어문자를 거르려는 것
 const CONTROL = /[\x00-\x1f]/;
 const safeNext = (n: string | null) =>
   n && n.length <= 2048 && n.startsWith("/") && !n.startsWith("//") && !n.includes("\\") && !CONTROL.test(n) ? n : "/";

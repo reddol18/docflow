@@ -13,3 +13,9 @@ def clean_fixes(flagged, pairs):
         if did in cur and k in EDITABLE and val != (cur[did].get(k) or ""):
             fixes.setdefault(did, {})[k] = val
     return fixes
+
+
+def changes(flagged, fixes):
+    """수정 이력용 [(doc_id, 칸, 이전 값, 새 값)]. 이전 값은 clean_fixes가 비교한 값과 같은 곳(검토 대기 문서)에서."""
+    cur = {d["doc_id"]: d["fields"] for d in flagged}
+    return [(did, k, cur[did].get(k), v) for did, f in fixes.items() for k, v in f.items()]

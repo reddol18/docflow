@@ -116,7 +116,9 @@ def test_oidc_config_check(monkeypatch):
 
 
 def test_rate_limit(monkeypatch):
-    monkeypatch.setattr(auth, "LOGIN_RATE", (3, 300))
+    monkeypatch.setattr(auth, "USER_RATE", (3, 300))
+    monkeypatch.setattr(auth, "ALL_RATE", (6, 300))
+    monkeypatch.setattr(auth, "LOGIN_RATE", (2, 300))
     monkeypatch.setattr(auth, "_hits", {})
 
     class R:
@@ -125,17 +127,19 @@ def test_rate_limit(monkeypatch):
             self.headers = {"x-forwarded-for": xff} if xff else {}
 
     for _ in range(3):
-        auth.rate_limit(R("10.0.0.1"))
+        auth.rate_limit(R("127.0.0.1"), "Admin")
     with pytest.raises(HTTPException) as e:
-        auth.rate_limit(R("10.0.0.1"))
+        auth.rate_limit(R("127.0.0.1", xff="1.2.3.4"), "admin")  # 대소문자·XFF를 바꿔도 같은 이름 창
     assert e.value.status_code == 429
-    auth.rate_limit(R("10.0.0.2"))  # 다른 IP는 따로 센다
-    # 프록시를 믿지 않으면 X-Forwarded-For를 무시한다 (위조로 우회 못 함)
+    for i in range(3):
+        auth.rate_limit(R("127.0.0.1", xff=f"9.9.9.{i}"), f"u{i}")  # 이름을 바꿔 가며
     with pytest.raises(HTTPException):
-        auth.rate_limit(R("10.0.0.1", xff="1.2.3.4"))
+        auth.rate_limit(R("127.0.0.1"), "u9")  # 전체 창(6) 초과
+    assert not any(k.startswith("ip:") for k in auth._hits)  # 프록시를 믿지 않으면 IP 창을 쓰지 않는다
+    monkeypatch.setattr(auth, "_hits", {})
     monkeypatch.setattr(auth, "TRUST_PROXY", True)
-    auth.rate_limit(R("127.0.0.1", xff="9.9.9.9, 10.0.0.9"))  # 마지막 값(프록시가 본 주소)
-    assert "10.0.0.9" in auth._hits and "9.9.9.9" not in auth._hits
+    auth.rate_limit(R("127.0.0.1", xff="9.9.9.9, 10.0.0.9"))
+    assert "ip:10.0.0.9" in auth._hits
 
 
 def test_docs_disabled(main_app):
