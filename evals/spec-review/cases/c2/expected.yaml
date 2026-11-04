@@ -1,0 +1,6 @@
+criteria:
+  - {n: 1, verdict: 충족, why: "report_csv 응답 headers에 Cache-Control: no-store"}
+  - {n: 2, verdict: 미충족, why: "diff에 시험이 없다"}
+out_of_scope: []
+merge: 보류
+note: "2026-11-04 다시 만듦. 처음 판(CSV BOM)은 `app/report.py`의 `to_csv`가 이미 BOM을 붙여 조건 1의 정답이 모호했다"

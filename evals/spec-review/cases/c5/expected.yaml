@@ -1,0 +1,5 @@
+criteria:
+  - {n: 1, verdict: [일부, 미충족], why: "vol == '..'만 막는다. '.'과 '...'는 VOL_RX를 통과"}
+  - {n: 2, verdict: [일부, 미충족], why: "시험은 '..'만"}
+out_of_scope: []
+merge: 보류

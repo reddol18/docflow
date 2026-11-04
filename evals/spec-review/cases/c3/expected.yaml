@@ -1,0 +1,6 @@
+criteria:
+  - {n: 1, verdict: 충족, why: "os.environ.get('APP_VERSION', 'dev')"}
+  - {n: 2, verdict: 충족, why: "test_healthz_version이 두 경우를 본다"}
+out_of_scope: []
+merge: 통과
+note: 대조군 — 거짓 경보(멀쩡한 PR을 보류)를 재는 칸

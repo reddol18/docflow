@@ -1,0 +1,14 @@
+diff --git a/app/main.py b/app/main.py
+index 97e6d48..430c582 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -382,7 +382,8 @@ def report_view(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | No
+ def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | None = None):
+     lo, hi = _range(day_from, day_to)
+     return Response(report.to_csv(report.daily(lo, hi)), media_type="text/csv; charset=utf-8",
+-                    headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
++                    headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"',
++                             "Cache-Control": "no-store"})
+ 
+ 
+ def hybrid(q, year_from=None, year_to=None, k=10):

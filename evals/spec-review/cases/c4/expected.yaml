@@ -1,0 +1,7 @@
+criteria:
+  - {n: 1, verdict: 충족, why: "LOCK_MIN = int(os.environ.get('LOGIN_LOCK_MIN', '15'))"}
+  - {n: 2, verdict: [충족, 일부], why: "시험은 설정값(상수)만 본다 — 실제 잠금 시간까지 안 본다고 '일부'로 봐도 맞다"}
+out_of_scope:
+  - {must_flag: true, what: "MAX_FAILS 5 → 10 (이슈가 범위 밖이라고 명시한 실패 횟수 기준 변경)"}
+merge: 보류
+note: 조건은 다 채웠지만 이슈가 명시한 범위 밖을 어겼다. MAX_FAILS를 적고 병합을 보류해야 잡은 것으로 센다
