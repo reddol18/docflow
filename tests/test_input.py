@@ -24,7 +24,7 @@ def _routes(main):
     return [r for r in main.app.routes if isinstance(r, APIRoute) and not r.path.startswith("/auth")]
 
 
-@pytest.mark.parametrize("bad", ["%2E", "%2E%2E", "%2E%2E%2E"])
+@pytest.mark.parametrize("bad", ["%2E", "%2E%2E", "%2E%2E%2E", "v1%0A"])  # 끝 줄바꿈: '$'는 그 앞에서도 맞는다
 def test_dot_volume_rejected_on_every_route(main, bad):
     """점만으로 된 철 이름으로 철 경로를 모두 부르면 400 — 본문이 필요한 경로(업로드 등)도 본문 검증보다 먼저."""
     c = TestClient(main.app)
@@ -46,9 +46,15 @@ def test_under_keeps_paths_inside(tmp_path, monkeypatch):
             store.under("pages", *parts)
 
 
+def test_volume_names_skips_bad_dirs(main, tmp_path):
+    for n in ("v1", "a b", "5350109-1999-0002"):
+        (tmp_path / "pages" / n).mkdir(parents=True)
+    assert main.volume_names() == ["5350109-1999-0002", "v1"]  # 규칙에 안 맞는 폴더 하나가 목록 전체를 막지 않는다
+
+
 def _review_ready(main, monkeypatch):
     doc = {"doc_id": "d1", "pages": ["p1"], "flags": {"title": ["확신도"]},
-           "fields": {"docno": "가-1", "date": "", "recipient": "", "title": "옛 제목"}, "hw": {}}
+           "fields": {"docno": "가-1", "date": "", "recipient": "긴" * 600, "title": "옛 제목"}, "hw": {}}
     snap = SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": [doc]})])
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snap))
     got = []
@@ -61,7 +67,9 @@ def test_review_form_value_limit(main, monkeypatch):
     c = TestClient(main.app)
     res = c.post("/review/v1", data={"d1__title": "가" * 501}, headers=ADMIN, follow_redirects=False)
     assert res.status_code == 422 and not got
-    res = c.post("/review/v1", data={"d1__title": "가" * 500}, headers=ADMIN, follow_redirects=False)
+    # 고치지 않은 칸은 기존 값이 500자를 넘어도(OCR·GPT가 낸 값) 막지 않는다 — 바뀐 값만 본다
+    res = c.post("/review/v1", data={"d1__title": "가" * 500, "d1__recipient": "긴" * 600}, headers=ADMIN,
+                 follow_redirects=False)
     assert res.status_code == 303 and got == [{"d1": {"title": "가" * 500}}]
 
 
@@ -91,6 +99,11 @@ def test_upload_requires_jpeg(main, tmp_path):
     assert res.status_code == 400
     res = c.post("/volumes/v1/pages", files=[("files", ("a.jpg", jpg, "image/jpeg"))], headers=ADMIN)
     assert res.status_code == 200 and (tmp_path / "pages" / "v1" / "a.jpg").read_bytes() == jpg
+    # 틀린 파일이 섞인 다시 올리기는 같은 이름의 기존 쪽을 건드리지 않고, 임시 파일도 남기지 않는다
+    res = c.post("/volumes/v1/pages", files=[("files", ("a.jpg", jpg + b"new", "image/jpeg")),
+                                             ("files", ("b.jpg", png, "image/jpeg"))], headers=ADMIN)
+    assert res.status_code == 400 and (tmp_path / "pages" / "v1" / "a.jpg").read_bytes() == jpg
+    assert sorted(p.name for p in (tmp_path / "pages" / "v1").iterdir()) == ["a.jpg"]
 
 
 def test_header_api_list_matches_routes(main):

@@ -23,11 +23,16 @@ class PathEscape(ValueError):
 
 
 def under(kind, *parts):
-    """DATA/kind 아래 경로. 합친 결과가 그 폴더(의 철 폴더) 밖이면 거부한다 — 철 이름·쪽 이름이 '..'·'/'로 새지 않게
-    (https://github.com/reddol18/docflow/issues/49, ASVS V12.3.1). 입력 형식 검사(main.check)에 더한 두 번째 방어."""
-    root = (DATA / kind).resolve()
-    p = (root / Path(*parts)).resolve()
-    if p == root or not p.is_relative_to(root) or p.relative_to(root).parts[0] != parts[0]:
+    """DATA/kind 아래 경로. 각 부분은 경로 한 칸이어야 하고('.'·'..'·구분자 없음), 합친 경로가 그 폴더 안이어야 한다
+    — 철 이름·쪽 이름이 '..'·'/'로 새지 않게 (https://github.com/reddol18/docflow/issues/49, ASVS V12.3.1).
+    입력 형식 검사(main.check)에 더한 두 번째 방어. 경로 정규화는 글자로만 한다(os.path.abspath) —
+    resolve()는 심볼릭 링크를 따라가 정상 폴더(링크로 붙인 데이터 폴더)를 밖으로 잘못 볼 수 있다."""
+    for part in parts:
+        if part in ("", ".", "..") or any(s in part for s in ("/", "\\", "\0")):
+            raise PathEscape(f"bad path part in {kind}: {parts!r}")
+    root = Path(os.path.abspath(DATA / kind))
+    p = Path(os.path.abspath(root.joinpath(*parts)))
+    if p == root or not p.is_relative_to(root):
         raise PathEscape(f"path escapes {kind}: {parts!r}")
     return DATA / kind / Path(*parts)
 
@@ -36,12 +41,24 @@ def pages_dir(vol):
     return under("pages", vol)
 
 
+def page_path(vol, page):
+    return under("pages", vol, f"{page}.jpg")
+
+
+def ocr_dir(vol):
+    return under("ocr", vol)
+
+
 def ocr_path(vol, page):
     return under("ocr", vol, f"{page}.json")
 
 
 def crop_path(vol, page, field):
     return under("crops", vol, f"{page}_{field}.png")
+
+
+def crop_file(vol, name):
+    return under("crops", vol, name)
 
 
 def load_ocr(vol, page):

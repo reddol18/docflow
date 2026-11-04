@@ -22,7 +22,7 @@
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
   GET   /report.csv                    같은 리포트 CSV
   /auth/*                              로그인·로그아웃·OIDC (app/auth.py)
-머리말 목록은 tests/test_input.py가 실제 라우트와 비교한다 (https://github.com/reddol18/docflow/issues/49).
+머리말 목록은 시험(`tests/test_input.py`)이 실제 라우트와 비교한다 (https://github.com/reddol18/docflow/issues/49).
 
 인증: /healthz와 로그인 경로를 빼고 모두 로그인 필요 (앱 전체 의존성 auth.guard, 기본 거부).
 역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정 reviewer, 업로드·실행 admin.
@@ -31,6 +31,7 @@ import datetime as dt
 import html
 import os
 import re
+import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -48,9 +49,11 @@ from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
 
-VOL_RX = re.compile(r"^(?!\.+$)[\w.-]{1,80}$")  # 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부
+# 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부. fullmatch + \Z — '$'는 끝 줄바꿈 앞에서도 맞아 'v1\n'이 지나간다
+VOL_RX = re.compile(r"(?!\.+\Z)[\w.-]{1,80}")
 Q_MAX = 200  # 검색어 길이 상한: 질의는 문서 제목(색인 칸 500자 안)보다 짧고, 임베딩·답변 입력 토큰을 묶는다
-CellValue = Annotated[str, Field(max_length=500)]  # 색인 칸 하나 (제목도 이 안에 든다)
+CELL_MAX = 500  # 색인 칸 하나의 길이 상한 (제목도 이 안에 든다) — JSON·폼 검토와 검토 화면 입력칸이 같이 쓴다
+CellValue = Annotated[str, Field(max_length=CELL_MAX)]
 JPEG_MAGIC = b"\xff\xd8\xff"
 runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
 running: dict[str, str] = {}  # vol -> 상태 문자열
@@ -116,7 +119,7 @@ def cfg(vol):
 
 
 def check(vol):
-    if not VOL_RX.match(vol):
+    if not VOL_RX.fullmatch(vol):
         raise HTTPException(400, "bad volume id")
 
 
@@ -152,26 +155,37 @@ def healthz():
 
 @app.post("/volumes/{vol}/pages")
 async def upload(vol: str, _: Admin, files: list[UploadFile] = File(...)):
-    check(vol)
     d = store.pages_dir(vol)
-    got = []
-    for f in files:  # 모두 확인한 뒤에 쓴다 — 하나라도 틀리면 아무것도 저장하지 않는다
+    names = []
+    for f in files:  # 1) 이름과 앞 3바이트만 모두 확인한다 (파일 전체를 메모리에 올리지 않는다)
         name = (f.filename or "").rsplit("/", 1)[-1]
         if not re.fullmatch(r"[\w.-]+\.jpg", name):
             raise HTTPException(400, f"bad file name {name}")
-        data = await f.read()
-        if not data.startswith(JPEG_MAGIC):
+        head = await f.read(len(JPEG_MAGIC))
+        await f.seek(0)
+        if head != JPEG_MAGIC:
             raise HTTPException(400, f"not a JPEG: {name}")
-        got.append((name, data))
+        names.append(name)
+    # 2) 임시 이름(.*.part — *.jpg 목록에 안 잡힘)으로 흘려 쓰고, 다 쓴 뒤에 한꺼번에 바꾼다
+    #    → 하나라도 틀리거나 쓰다 실패하면 저장되는 것이 없다 (같은 이름의 기존 쪽도 그대로)
     d.mkdir(parents=True, exist_ok=True)
-    for name, data in got:
-        (d / name).write_bytes(data)
-    return {"vol": vol, "saved": len(got), "total": len(list(d.glob("*.jpg")))}
+    parts = []
+    try:
+        for f, name in zip(files, names):
+            tmp = d / f".{name}.part"
+            parts.append(tmp)
+            with tmp.open("wb") as out:
+                shutil.copyfileobj(f.file, out)
+        for tmp, name in zip(parts, names):
+            os.replace(tmp, d / name)
+    finally:
+        for tmp in parts:
+            tmp.unlink(missing_ok=True)
+    return {"vol": vol, "saved": len(names), "total": len(list(d.glob("*.jpg")))}
 
 
 @app.post("/volumes/{vol}/run")
 def run(vol: str, _: Admin, review: str = "human"):
-    check(vol)
     if review not in ("human", "auto"):
         raise HTTPException(400, "review=human|auto")
     if not any(store.pages_dir(vol).glob("*.jpg")):
@@ -182,7 +196,6 @@ def run(vol: str, _: Admin, review: str = "human"):
 
 @app.post("/volumes/{vol}/resume")
 def resume(vol: str, _: Admin):
-    check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.next:
         raise HTTPException(409, "이어 갈 단계가 없음 (끝났거나 시작 안 함)")
@@ -215,7 +228,7 @@ def summary(vol):
         "next": list(snap.next),
         "waiting_review": bool(snap.interrupts),
         "pages": len(v.get("pages", [])),
-        "ocr_done": len(list(store.under("ocr", vol).glob("*.json"))),
+        "ocr_done": len(list(store.ocr_dir(vol).glob("*.json"))),
         "uploaded": len(list(store.pages_dir(vol).glob("*.jpg"))),
         "documents": len(docs),
         "orphans": v.get("orphans", []),
@@ -226,22 +239,25 @@ def summary(vol):
     }
 
 
+def volume_names():
+    """쪽 폴더 목록 중 철 이름 규칙에 맞는 것만 (규칙에 안 맞는 폴더 하나가 목록·리포트 전체를 400으로 만들지 않게)"""
+    root = store.DATA / "pages"
+    return sorted(p.name for p in root.iterdir() if p.is_dir() and VOL_RX.fullmatch(p.name)) if root.exists() else []
+
+
 @app.get("/volumes")
 def volumes(_: Viewer):
-    root = store.DATA / "pages"
-    vols = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    vols = volume_names()
     return [summary(v) for v in vols]
 
 
 @app.get("/volumes/{vol}")
 def status(vol: str, _: Viewer):
-    check(vol)
     return summary(vol)
 
 
 @app.get("/volumes/{vol}/events")
 def volume_events(vol: str, _: Viewer, after: int = 0):
-    check(vol)
     return store.events(vol, after)
 
 
@@ -249,7 +265,6 @@ def volume_events(vol: str, _: Viewer, after: int = 0):
 def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Reviewer):
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
-    check(vol)
     snap = G.get_state(cfg(vol))
     if snap.interrupts or vol in running:
         raise HTTPException(409, "실행 중이거나 검토 대기 중")
@@ -275,22 +290,19 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
 
 @app.get("/documents/{vol}/{doc_id}/edits")
 def document_edits(vol: str, doc_id: str, _: Viewer):
-    check(vol)
     return store.edit_history(vol, doc_id)
 
 
 @app.get("/volumes/{vol}/documents")
 def documents(vol: str, _: Viewer):
-    check(vol)
     return (G.get_state(cfg(vol)).values or {}).get("docs", [])
 
 
 @app.get("/crops/{vol}/{name}")
 def crop(vol: str, name: str, _: Viewer):
-    check(vol)
     if not re.fullmatch(r"[\w.-]+_(docno|date)\.png", name):
         raise HTTPException(400)
-    p = store.under("crops", vol, name)
+    p = store.crop_file(vol, name)
     if not p.exists():
         raise HTTPException(404)
     return Response(p.read_bytes(), media_type="image/png")
@@ -299,10 +311,9 @@ def crop(vol: str, name: str, _: Viewer):
 @app.get("/head/{vol}/{page}")
 def head(vol: str, page: str, _: Viewer):
     """검토용: 쪽 위 45%를 줄여서 보여 준다."""
-    check(vol)
     if not re.fullmatch(r"[\w.-]+", page):
         raise HTTPException(400)
-    img = ocr.read_image(store.under("pages", vol, f"{page}.jpg"))
+    img = ocr.read_image(store.page_path(vol, page))
     if img is None:
         raise HTTPException(404)
     h, w = img.shape[:2]
@@ -316,7 +327,6 @@ LABEL = {"docno": "문서번호", "date": "시행일자", "recipient": "수신",
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
 def review_page(vol: str, user: Viewer):
-    check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
         return f"<meta charset=utf-8><p>{html.escape(vol)}: 검토 대기 없음. <a href='/volumes/{vol}'>상태</a></p>"
@@ -339,7 +349,7 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
             fk = "serial" if k == "docno" else k
             fl = " ".join(d["flags"].get(fk, []))
             val = html.escape(d["fields"][k] or "")
-            out.append(f"<div class=f><label>{LABEL[k]}</label><input name='{did}__{k}' value=\"{val}\"{ro}>"
+            out.append(f"<div class=f><label>{LABEL[k]}</label><input name='{did}__{k}' value=\"{val}\" maxlength={CELL_MAX}{ro}>"
                        f" <span class=flag>{html.escape(fl)}</span></div>")
             if k in ("docno", "date") and d["hw"].get(k, {}).get("text") is not None:
                 # 인라인 onerror 대신 파일이 있을 때만 그린다 (CSP가 인라인 스크립트를 막는다)
@@ -370,15 +380,15 @@ def resume_review(vol, flagged, fixes, user):
 
 @app.post("/review/{vol}")
 async def review_submit(vol: str, request: Request, user: Reviewer):
-    check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
         raise HTTPException(409, "검토 대기 없음")
     form = await request.form()
-    if any(len(str(v)) > 500 for v in form.values()):  # JSON 경로(CellValue)와 같은 칸 값 상한
-        raise HTTPException(422, "칸 값은 500자까지")
     flagged = snap.interrupts[0].value["flagged"]
     fixes = clean_fixes(flagged, [(*key.rpartition("__")[::2], val) for key, val in form.items()])
+    # 바뀐 값만 본다 — 고치지 않은 칸은 기존 값(OCR·GPT가 낸 긴 값일 수 있음)이 그대로 다시 오므로 막지 않는다
+    if any(len(v) > CELL_MAX for f in fixes.values() for v in f.values()):  # JSON 경로(CellValue)와 같은 상한
+        raise HTTPException(422, f"칸 값은 {CELL_MAX}자까지")
     resume_review(vol, flagged, fixes, user)
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
@@ -386,7 +396,6 @@ async def review_submit(vol: str, request: Request, user: Reviewer):
 @app.post("/review/{vol}/json")
 def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field(max_length=1000)], user: Reviewer):
     """스크립트·검토 화면용: {doc_id: {칸: 값}} 으로 이어 가기. 검토 대기 문서의 바뀐 칸만 반영한다."""
-    check(vol)
     snap = G.get_state(cfg(vol))
     if not snap.interrupts:
         raise HTTPException(409, "검토 대기 없음")
@@ -408,7 +417,6 @@ class Timing(BaseModel):
 def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)], user: Reviewer):
     """검토 화면이 확정(검토 제출·문서 저장) 때 보내는 문서별 작업 시간 (자리 비움 제외).
     이 철에 없는 문서와 1초 미만(넘겨 보기만 한 것)은 버린다."""
-    check(vol)
     known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
     keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
     store.add_review_times(vol, keep, user.id)
@@ -428,8 +436,7 @@ def _range(day_from, day_to):
 def report_view(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | None = None):
     """공정·품질 리포트: 물량(철/건/면)·단계별 진척, 날짜별 처리량·검토 표시·수정률·검토 시간·비용."""
     lo, hi = _range(day_from, day_to)
-    root = store.DATA / "pages"
-    vols = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    vols = volume_names()
     return {"day_from": lo, "day_to": hi, "volume": report.volume_counts([summary(v) for v in vols]),
             "daily": report.daily(lo, hi), "review_time": report.review_time_summary(lo, hi),
             "columns": dict(report.COLUMNS)}

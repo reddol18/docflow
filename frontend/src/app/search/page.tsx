@@ -6,7 +6,8 @@ import { Suspense, useEffect, useState } from "react";
 import { api, type SearchHit } from "@/lib/api";
 import { Card } from "@/components/ui";
 
-const EXAMPLES = ["공장설립 변경 신고", "한국전력공사 송전철탑", "1997년 도로 점용 허가", "폐기물 처리 사업장"];
+const Q_MAX = 200; // 검색어 길이 상한 — 서버(`app/main.py`의 Q_MAX)와 같게
+const EXAMPLES =["공장설립 변경 신고", "한국전력공사 송전철탑", "1997년 도로 점용 허가", "폐기물 처리 사업장"];
 
 export default function SearchPage() {
   return (
@@ -18,7 +19,7 @@ export default function SearchPage() {
 
 function Search() {
   // ?q=… 로 열면 바로 검색 (링크 공유·캡처용)
-  const initial = useSearchParams().get("q") ?? "";
+  const initial = (useSearchParams().get("q") ?? "").slice(0, Q_MAX);
   const [q, setQ] = useState(initial);
   const [yf, setYf] = useState("");
   const [yt, setYt] = useState("");
@@ -62,7 +63,7 @@ function Search() {
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && run("search")}
             placeholder="예: 한국전력공사에 보낸 원상복구 통보"
-            maxLength={200} // 서버 상한 Q_MAX (app/main.py)와 같게
+            maxLength={Q_MAX}
             className="min-w-[320px] flex-1 rounded-md border border-slate-300 px-3 py-2"
           />
           <input value={yf} onChange={(e) => setYf(e.target.value)} placeholder="연도부터" className="w-24 rounded-md border border-slate-300 px-2" />
