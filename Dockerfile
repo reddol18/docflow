@@ -1,11 +1,14 @@
 FROM python:3.11.17-slim-bookworm
 # opencv(paddlex 의존)가 libGL·glib를, paddle이 OpenMP를 쓴다
-RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 \
+# upgrade: 기반 이미지 이후 나온 Debian 보안 갱신(openssl 등)을 받는다 (https://github.com/reddol18/docflow/issues/44)
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 app
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && pip freeze > /app/requirements.lock
+# 기반 이미지에 든 setuptools·wheel을 고친 판으로 (setuptools 안에 든 jaraco.context·wheel 취약점, #44)
+RUN pip install --no-cache-dir setuptools==84.2.1 wheel==0.48.0 \
+    && pip install --no-cache-dir -r requirements.txt && pip freeze > /app/requirements.lock
 # 모델은 빌드 때 받아 이미지에 넣는다 (실행 중 Pod는 외부 통신이 OpenAI 443뿐)
 ENV PADDLE_PDX_CACHE_HOME=/opt/paddlex PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 COPY app/__init__.py app/ocr.py app/warm.py app/

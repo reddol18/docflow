@@ -69,7 +69,7 @@ spec:
     spec:
       containers:
       - name: postgres
-        image: postgres:17.10-alpine
+        image: postgres:17.11-alpine
         env:
         - {name: POSTGRES_USER, value: docflow}
         - {name: POSTGRES_DB, value: docflow}
@@ -103,7 +103,7 @@ spec:
     spec:
       containers:
       - name: qdrant
-        image: qdrant/qdrant:v1.19.2
+        image: qdrant/qdrant:v1.20.0
         env: [{name: QDRANT__TELEMETRY_DISABLED, value: "true"}]
         ports: [{containerPort: 6333}]
         resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
