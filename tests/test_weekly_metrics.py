@@ -31,5 +31,6 @@ def test_non_code_paths():
     for f in ("requirements.lock", "requirements-test.txt", "docs/process/2026-W45.md", ".gitattributes",
               "frontend/package-lock.json"):
         assert wm.NON_CODE.search(f), f
-    for f in ("app/auth.py", "scripts/check.ps1", "scripts/mac/deploy.sh", "k8s/docs.yaml", "security/asvs.yaml"):
+    for f in ("app/auth.py", "scripts/check.ps1", "scripts/mac/deploy.sh", "k8s/docs.yaml", "security/asvs.yaml",
+              ".github/pull_request_template.md", ".claude/agents/spec-reviewer.md"):  # 절차를 바꾸는 .md는 코드
         assert not wm.NON_CODE.search(f), f
