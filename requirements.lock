@@ -15,7 +15,7 @@ crc32c==2.9.post0
 cryptography==50.0.2
 distro==1.9.0
 fastapi==0.162.0
-filelock==4.2.7
+filelock==4.2.8
 fsspec==2026.9.0
 future==1.0.0
 grpcio==1.85.1
@@ -32,7 +32,7 @@ hyperframe==6.1.0
 idna==3.20
 imagesize==2.0.1
 jiter==0.18.0
-jsonpatch==1.41
+jsonpatch==1.42
 jsonpointer==3.8
 langchain-core==1.7.4
 langchain-protocol==0.0.20
@@ -89,7 +89,7 @@ starlette==1.10.0
 tenacity==9.2.1
 tqdm==4.70.1
 truststore==0.10.5
-typing-inspection==0.4.4
+typing-inspection==0.4.5
 typing_extensions==4.16.0
 tzdata==2026.6
 ujson==6.1.0
