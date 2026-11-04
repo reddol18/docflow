@@ -55,10 +55,32 @@ def test_criteria_met_skips_template_row():
     assert wm.criteria_met(body) == (1, 2)
 
 
-def test_scope_changed():
-    assert wm.scope_changed("## 범위 밖 변경\n<!-- 설명 -->\n없음\n\n## 테스트\n") is False
-    assert wm.scope_changed("## 범위 밖 변경\n- PR 템플릿 주석 한 줄\n## 테스트\n") is True
-    assert wm.scope_changed("본문에 그 절이 없음") is None
+def test_extra_changes_and_scope_change():
+    assert wm.extra_changes("## 범위 밖 변경\n<!-- 설명 -->\n없음\n\n## 테스트\n") is False
+    assert wm.extra_changes("## 범위 밖 변경\n- PR 템플릿 주석 한 줄\n## 테스트\n") is True
+    assert wm.extra_changes("## 범위 밖 변경\n<!-- 설명 -->\n\n## 테스트\n") is None  # 안 채움
+    assert wm.extra_changes("본문에 그 절이 없음") is None
+    assert wm.needs_security("## 보안 영향\r\n- [x] 인증·세션 변경\r\n\r\n## 관련\r\n")  # CRLF 이슈 본문
+    assert not wm.needs_security("## 보안 영향\n- [ ] 인증·세션 변경\n")
+    assert wm.scope_change("- **범위 변경:** PR 대신 파일로") is True
+    assert wm.scope_change("## 범위 밖 변경\n- 주석 한 줄") is False  # 다른 개념
+
+
+def test_bold_cells_and_bug_fields():
+    body = "| 완료 조건 | 결과 |\n|---|---|\n| a | **충족** |\n| b | 해당 없음 |\n"
+    assert wm.criteria_met(body) == (1, 1)
+    assert wm.review_fixes("| 지적 | 반영 |\n|---|---|\n| x | **그대로** (이유) |\n") == (0, 0, 1)
+    bug = "### 재현\n1\n\n### 발견 단계\n\n운영\n\n### 원인 PR\n\nhttps://github.com/o/r/pull/38\n"
+    assert wm.bug_fields(bug) == ("운영", 38)
+    assert wm.bug_fields("형식 없음") == (None, None)
+
+
+def test_first_check_stops_at_table_end():
+    s = ("로컬 검사 `scripts/check.ps1` — 커밋 `a`\n| 검사 | 결과 |\n|---|---|\n| ruff | 통과 |\n\n"
+         "막는 검사 모두 통과\n- 수동: 로그인 **실패** 401 확인")
+    assert wm.first_check_passed([s]) is True
+    s2 = "로컬 검사 `scripts/check.ps1` — 커밋 `a`\n| 검사 | 결과 |\n|---|---|\n| ruff | **실패** |"
+    assert wm.first_check_passed([s2]) is False
 
 
 def test_first_check_passed_uses_first_summary():
