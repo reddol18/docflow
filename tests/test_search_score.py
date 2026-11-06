@@ -56,10 +56,27 @@ def test_query_set_shape():
 
 
 def test_rrf_matches_search(monkeypatch):
-    """채점기가 쓰는 합치기가 /search(hybrid)와 같은 함수다"""
+    """/search(hybrid)의 순위가 채점기가 부르는 main.ranked()의 순위와 같다 — 후보 수·연도·낱말 나누기까지"""
     from app import main
-    v = [{"doc_id": "a"}, {"doc_id": "b"}]
-    kw = [{"doc_id": "b"}]
-    s = main.rrf(v, kw)
-    assert s["b"] > s["a"]
     assert main.query_words("1997년 도로 점용 허가 가") == ["도로", "점용", "허가"]
+    calls = []
+
+    def vector_search(vec, yf, yt, limit):
+        calls.append(("v", yf, yt, limit))
+        return [{"doc_id": "a", "score": 0.9}, {"doc_id": "b", "score": 0.8}, {"doc_id": "c", "score": 0.7}]
+
+    def keyword_search(words, yf, yt, limit):
+        calls.append(("k", tuple(words), yf, yt, limit))
+        return [{"doc_id": "c"}, {"doc_id": "b"}]
+
+    monkeypatch.setattr(main.store, "vector_search", vector_search)
+    monkeypatch.setattr(main.store, "keyword_search", keyword_search)
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    row = {"vol": "v", "docno": "", "date": "", "recipient": "", "title": ""}
+    monkeypatch.setattr(main.store, "get_documents", lambda ids: {d: row for d in ids})
+    got = [h["doc_id"] for h in main.hybrid("1999년 공장 등록", 1999, 1999, k=3)]
+    *_, order = main.ranked("1999년 공장 등록", [0.0], 1999, 1999)
+    assert got == order[:3] == ["c", "b", "a"]  # 두 쪽에 다 있는 c(1/63+1/61)·b(2/62)가 앞
+    assert calls[0] == ("v", 1999, 1999, main.CANDIDATES)
+    assert calls[1] == ("k", ("공장", "등록"), 1999, 1999, main.CANDIDATES)
+    assert calls[:2] == calls[2:4]  # hybrid와 ranked가 같은 인자로 검색한다

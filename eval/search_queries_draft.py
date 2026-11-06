@@ -14,8 +14,12 @@ from pathlib import Path
 
 here = Path(sys.argv[1])
 out_jsonl, out_md = Path(sys.argv[2]), Path(sys.argv[3])
+REPO = Path(__file__).resolve().parent.parent
+for p in (here, out_md):  # 실제 제목·수신이 든 파일 — 저장소 안이면 커밋될 수 있어 거부
+    if p.resolve().is_relative_to(REPO):
+        sys.exit(f"저장소 밖 경로를 주세요 (제목이 든 파일): {p}")
 docs = [json.loads(line) for line in here.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
-docs = [d for d in docs if not d["vol"].startswith("test")]
+docs = [d for d in docs if not (d["vol"] or "").startswith("test")]  # 시험용 철(복제)은 채점에서도 뺀다
 T = {d["doc_id"]: d for d in docs}
 
 # (유형, 질의, 제목 정규식, 연도 또는 None, 제외 정규식 또는 None)
@@ -93,6 +97,10 @@ for d in docs:
 uniq = sorted(k for k, v in by_no.items() if len(v) == 1)
 for no in random.sample(uniq, 12):
     did = by_no[no][0]
+    # 낱말 검색은 부분 일치(ILIKE %낱말%)라 '회계 13330-804'가 '…-8040'에도 걸린다 — 표본은 그대로 두고 알린다
+    near = [k for k in by_no if k != no and no in k]
+    if near:
+        print("문서번호가 다른 번호의 앞부분:", no, "→", len(near), "건")
     rows.append({"type": "정확 조회", "q": no, "rule": f"문서번호 = {no}", "relevant": [did],
                  "answer": f"문서번호 {no} 문서는 1건이다.", "must_cite": [did]})  # 제목·원문은 저장소에 넣지 않는다
 for typ, q, rx, year, ex in TOPIC + COND:
@@ -116,7 +124,7 @@ with out_jsonl.open("w", encoding="utf-8", newline="\n") as f:
 
 md = ["| id | 유형 | 질의 | 판정 규칙 | 정답 수 | 정답 예 (제목) |", "|---|---|---|---|---|---|"]
 for r in rows:
-    sample = " / ".join(T[d]["title"] for d in r["relevant"][:3])
+    sample = " / ".join(T[d]["title"] or "(제목 없음)" for d in r["relevant"][:3])
     md.append(f"| {r['id']} | {r['type']} | {r['q']} | `{r['rule']}` | {len(r['relevant'])} | {sample} |")
 out_md.write_text("\n".join(md) + "\n", encoding="utf-8")
 print(len(rows), Counter(r["type"] for r in rows))
