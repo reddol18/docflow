@@ -1,0 +1,44 @@
+# 김해 인·허가 공문서(AI Hub 88, 1990년대) 기관 매핑 — 기본 스키마(isad_g.yaml) 칸에 잇는다
+# (https://github.com/reddol18/docflow/issues/9). 지금 운영 자료의 스키마라 FIELD_SCHEMA가 없을 때 쓴다.
+# 추출 지시문은 이 파일의 extract + 칸별 prompt로 만든다 — 바꾸면 김해 7개 철 점수(eval/score.py)를 다시 잰다.
+# 문서번호·일자는 손글씨 칸 판독과 LLM 값을 합치는 규칙(app/graph.py RULES), 수신은 LLM 값을 배치로 고치는 규칙.
+name: 김해 인·허가 4칸
+base: isad_g.yaml
+extract:
+  preamble: |-
+    입력은 1990년대 지방자치단체 공문서(기안문·시행문) 첫 쪽을 OCR로 줄 단위로 옮긴 텍스트다.
+    왼쪽 머리 칸(문서번호·시행일자·수신·제목)과 오른쪽 결재란(시장·부시장·과장·보존·취급·선결 등)이 한 줄에 섞여 있을 수 있다.
+  rules: |-
+    OCR 텍스트에는 글자를 잘못 읽은 곳이 많다 (예: '회담'→'회답', '필중'→'필증', '파른'→'따른', '실비'→'설비', '참유변상'→'장유면장'). 행정 문서 문맥상 명백한 오독은 바른 글자로 고쳐 적는다. 숫자·고유명사는 근거 없이 바꾸지 않는다.
+    제목은 '제목' 항목 줄의 끝까지 빠짐없이 적는다 (따옴표로 쓴 "건의", 괄호 안 내용 포함). 수신은 '수신' 항목의 값만 적고(주소·상호·'대표'까지), 결재란·담당자·참조 부서 글자는 넣지 않는다.
+    칸마다 confidence(0~1)를 붙인다. 결재란 단어(시장, 과장, 보존, 전결 등)는 값에 넣지 않는다. 텍스트에 없는 것을 지어내지 않는다.
+fields:
+  - name: docno
+    label: 문서번호
+    level: document
+    method: rule
+    rule: docno
+    isad: reference_code
+    flag_key: serial  # 검토 표시는 일련번호에 붙고 사람은 문서번호 칸을 고친다
+    prompt: '문서번호 (예: "지경 55142-1558"). 부서 약칭 + 분류번호 + "-" + 일련번호'
+  - {name: serial, label: 일련번호, level: document, method: hidden, rule: serial, derive_from: docno, isad: reference_code}
+  - name: date
+    label: 시행일자
+    level: document
+    method: rule
+    rule: date
+    isad: dates
+    prompt: '시행일자를 YYYY-MM-DD로. 2자리 연도는 1990년대/2000년대로 풀이. 일부가 없으면 아는 부분만 쓰고 확신도를 낮춘다 (예: "1997-03")'
+  - name: recipient
+    label: 수신
+    level: document
+    method: rule
+    rule: recipient
+    isad: scope_content
+    note: ISAD(G)에 수신 요소가 없어 범위와 내용(3.3.1)에 잇는다
+    prompt: '수신 (기관·사람·주소). "내부결재", "수신처 참조"도 그대로 값이다'
+  - {name: title, label: 제목, level: document, method: llm_extract, isad: title, prompt: 제목}
+search:
+  keyword: [title, recipient, docno]
+  embed: [title, recipient, docno, date]
+  year: date

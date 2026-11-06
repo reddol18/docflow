@@ -72,7 +72,7 @@ def test_rrf_matches_search(monkeypatch):
     monkeypatch.setattr(main.store, "vector_search", vector_search)
     monkeypatch.setattr(main.store, "keyword_search", keyword_search)
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
-    row = {"vol": "v", "docno": "", "date": "", "recipient": "", "title": ""}
+    row = {"vol": "v", "fields": {}}
     monkeypatch.setattr(main.store, "get_documents", lambda ids: {d: row for d in ids})
     got = [h["doc_id"] for h in main.hybrid("1999년 공장 등록", 1999, 1999, k=3)]
     *_, order = main.ranked("1999년 공장 등록", [0.0], 1999, 1999)

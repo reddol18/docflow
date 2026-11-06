@@ -6,13 +6,11 @@ import {
   api,
   can,
   cropImage,
-  EDIT_FIELDS,
-  FIELD_LABEL,
-  flagKey,
   headImage,
+  HW_FIELDS,
   type Doc,
-  type EditField,
   type Fields,
+  type Schema,
 } from "@/lib/api";
 import { usePoll } from "@/lib/usePoll";
 import { useMe } from "@/lib/useMe";
@@ -36,7 +34,22 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const [fixes, setFixes] = useState<Fixes>({});
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [schema, setSchema] = useState<Schema | null>(null);
   const reviewing = s?.stage === "review";
+
+  // 칸 목록·표시명은 서버의 색인 스키마에서 (https://github.com/reddol18/docflow/issues/9)
+  useEffect(() => {
+    let alive = true;
+    api
+      .schema()
+      .then((x) => alive && setSchema(x))
+      .catch((e) => alive && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const cells = (schema?.fields ?? []).filter((f) => f.level === "document");
+  const titleKey = cells.find((f) => f.isad === "title")?.name ?? cells[0]?.name;
   const editor = can(useMe(), "reviewer"); // 보기 역할은 고치기·검토 버튼을 숨긴다 (서버도 403으로 막음)
 
   // 철 상태가 바뀔 때(검토 대기 → 처리 중 → 완료) 문서를 다시 읽는다
@@ -66,8 +79,8 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   // 공정 리포트용 검토 시간: 지금 보고 있는 문서의 실제 작업 시간(자리 비움 제외)
   const timer = useReviewTimer(vol, cur?.doc_id, reviewing ? "review" : "edit", editor && (reviewing || s?.stage === "done"));
 
-  const value = (d: Doc, k: EditField) => fixes[d.doc_id]?.[k] ?? d.fields[k] ?? "";
-  const setValue = (d: Doc, k: EditField, v: string) =>
+  const value = (d: Doc, k: string) => fixes[d.doc_id]?.[k] ?? d.fields[k] ?? "";
+  const setValue = (d: Doc, k: string, v: string) =>
     setFixes((prev) => {
       const next = { ...prev, [d.doc_id]: { ...prev[d.doc_id] } };
       if (v === (d.fields[k] ?? "")) delete next[d.doc_id][k];
@@ -163,7 +176,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                       </span>
                     </div>
                     <div className={`truncate text-xs ${cur?.doc_id === d.doc_id ? "text-slate-300" : "text-slate-500"}`}>
-                      {d.fields.title || "(제목 없음)"}
+                      {(titleKey && d.fields[titleKey]) || "(제목 없음)"}
                     </div>
                   </button>
                 </li>
@@ -203,32 +216,35 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                 {MASK && <div className="mt-1 text-[11px] text-slate-400">공개 캡처용으로 원본을 흐리게 표시 (실명·직인 보호)</div>}
               </div>
               <div className="space-y-4">
-                {EDIT_FIELDS.map((k) => {
-                  const flags = cur.flags[flagKey(k)];
+                {cells.map((f) => {
+                  const k = f.name;
+                  const flags = cur.flags[f.flag_key];
                   const dirty = fixes[cur.doc_id]?.[k] !== undefined;
                   return (
                     <div key={k}>
                       <div className="mb-1 flex items-center gap-2 text-sm">
-                        <span className="w-16 font-medium">{FIELD_LABEL[k]}</span>
+                        <span className="w-16 font-medium">{f.label}</span>
                         <FlagChips flags={flags} />
                       </div>
                       <input
                         value={value(cur, k)}
                         onChange={(e) => setValue(cur, k, e.target.value)}
-                        disabled={!editor || (!reviewing && s?.stage !== "done")}
+                        disabled={!editor || !f.editable || (!reviewing && s?.stage !== "done")}
                         className={`w-full rounded-md border px-3 py-1.5 text-sm ${dirty ? "border-blue-500 bg-blue-50" : flags?.length ? "border-rose-300" : "border-slate-300"}`}
                       />
                       <div className="mt-1 space-y-1 text-xs text-slate-500">
-                        <div>
-                          GPT 텍스트 추출: <span className="font-mono">{cur.b[k]?.value || "–"}</span> (확신도 {conf(cur.b[k]?.confidence)})
-                          {k === "recipient" && cur.info.recipient_fix && <span className="ml-1 text-amber-700">· 규칙 보정: {cur.info.recipient_fix}</span>}
-                        </div>
-                        {(k === "docno" || k === "date") && (
+                        {cur.b[k] && (
+                          <div>
+                            GPT 텍스트 추출: <span className="font-mono">{cur.b[k]?.value || "–"}</span> (확신도 {conf(cur.b[k]?.confidence)})
+                            {k === "recipient" && cur.info.recipient_fix && <span className="ml-1 text-amber-700">· 규칙 보정: {cur.info.recipient_fix}</span>}
+                          </div>
+                        )}
+                        {HW_FIELDS.includes(k) && cur.hw[k] && (
                           <div>
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
                               src={cropImage(vol, cur.doc_id, k)}
-                              alt={`${FIELD_LABEL[k]} 손글씨 칸`}
+                              alt={`${f.label} 손글씨 칸`}
                               className="my-1 max-h-14 rounded border border-slate-200 bg-white"
                               onError={(e) => (e.currentTarget.style.display = "none")}
                             />

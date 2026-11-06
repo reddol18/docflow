@@ -11,8 +11,10 @@ from pathlib import Path
 
 import yaml
 
+from app import fields
+
 DEFAULT_TEMPLATE = Path(__file__).parent / "export_templates" / "aihub88.yaml"
-FIELDS = ("docno", "serial", "date", "recipient", "title")
+FIELDS = tuple(f["name"] for f in fields.doc_fields(fields.SCHEMA))  # 색인 스키마의 문서별 칸 (https://github.com/reddol18/docflow/issues/9)
 VOL_KEYS = ("pages", "docs")
 DOC_KEYS = ("seq", "first_page", "last_page", "pages")
 FORMATS = ("text", "int", "year", "date")

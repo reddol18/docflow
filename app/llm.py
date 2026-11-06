@@ -1,4 +1,4 @@
-"""OpenAI 호출: 색인 4칸 추출(텍스트), 손글씨 칸 판독(비전), 임베딩, 검색 답변.
+"""OpenAI 호출: 색인 칸 추출(텍스트, 칸은 app/fields.py 스키마), 손글씨 칸 판독(비전), 임베딩, 검색 답변.
 
 모든 호출은 store.usage 표에 토큰·비용을 남기고, 오늘 쓴 돈이 DAILY_BUDGET_USD를 넘으면 호출하지 않는다.
 동시에 여러 호출이 한도 직전에 통과하면 조금 넘을 수 있다 (예약 없이 사후 정산).
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from app import store
+from app import fields, store
 
 CHAT = os.environ.get("CHAT_MODEL", "gpt-4o-mini")  # 검색 답변
 # 4칸 추출: 1994-0001 철 정답 22건 비교에서 gpt-4.1-mini + OCR 오독 교정 지시문이 제목 18/22 (gpt-4o-mini 11~14/22),
@@ -59,37 +59,34 @@ def _log(vol, kind, model, usage):
     store.add_usage(vol, kind, model, tin, tout, (tin * pi + tout * po) / 1e6)
 
 
-EXTRACT_PROMPT = """입력은 1990년대 지방자치단체 공문서(기안문·시행문) 첫 쪽을 OCR로 줄 단위로 옮긴 텍스트다.
-왼쪽 머리 칸(문서번호·시행일자·수신·제목)과 오른쪽 결재란(시장·부시장·과장·보존·취급·선결 등)이 한 줄에 섞여 있을 수 있다.
-
-아래 4칸을 뽑는다.
-- docno: 문서번호 (예: "지경 55142-1558"). 부서 약칭 + 분류번호 + "-" + 일련번호
-- date: 시행일자를 YYYY-MM-DD로. 2자리 연도는 1990년대/2000년대로 풀이. 일부가 없으면 아는 부분만 쓰고 확신도를 낮춘다 (예: "1997-03")
-- recipient: 수신 (기관·사람·주소). "내부결재", "수신처 참조"도 그대로 값이다
-- title: 제목
-
-OCR 텍스트에는 글자를 잘못 읽은 곳이 많다 (예: '회담'→'회답', '필중'→'필증', '파른'→'따른', '실비'→'설비', '참유변상'→'장유면장'). 행정 문서 문맥상 명백한 오독은 바른 글자로 고쳐 적는다. 숫자·고유명사는 근거 없이 바꾸지 않는다.
-제목은 '제목' 항목 줄의 끝까지 빠짐없이 적는다 (따옴표로 쓴 "건의", 괄호 안 내용 포함). 수신은 '수신' 항목의 값만 적고(주소·상호·'대표'까지), 결재란·담당자·참조 부서 글자는 넣지 않는다.
-칸마다 confidence(0~1)를 붙인다. 결재란 단어(시장, 과장, 보존, 전결 등)는 값에 넣지 않는다. 텍스트에 없는 것을 지어내지 않는다.
-출력: JSON 객체 하나
-{"docno": {"value": "...", "confidence": 0.0}, "date": {...}, "recipient": {...}, "title": {...}}"""
-
-
-def extract(vol, lines):
-    """문서 첫 쪽 줄 텍스트 → 4칸 {value, confidence}."""
+def extract(vol, lines, schema=None):
+    """문서 첫 쪽 줄 텍스트 → 칸별 {value, confidence}. 칸 목록·지시문은 색인 스키마(app/fields.py)의 prompt 칸에서.
+    prompt 칸이 없는 스키마면 부르지 않고 빈 dict"""
+    schema = schema or fields.SCHEMA
+    prompt = fields.extract_prompt(schema)
+    if prompt is None:
+        return {}
     _guard()
     r = client().chat.completions.create(
         model=EXTRACT,
         temperature=0,
         response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": EXTRACT_PROMPT},
+        messages=[{"role": "system", "content": prompt},
                   {"role": "user", "content": "\n".join(lines[:80])}],
     )
     _log(vol, "extract", EXTRACT, r.usage)
     out = json.loads(r.choices[0].message.content)
-    return {k: {"value": str((out.get(k) or {}).get("value") or ""),
-                "confidence": float((out.get(k) or {}).get("confidence") or 0)}
-            for k in ["docno", "date", "recipient", "title"]}
+    if not isinstance(out, dict):
+        out = {}
+
+    def cell(v):
+        v = v if isinstance(v, dict) else {}
+        try:
+            conf = float(v.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {"value": str(v.get("value") or ""), "confidence": conf}
+    return {f["name"]: cell(out.get(f["name"])) for f in fields.prompt_fields(schema)}
 
 
 CELL_PROMPT = {
@@ -136,10 +133,13 @@ ANSWER_PROMPT = """너는 1990년대 공문서 기록물 검색 도우미다. �
 답의 근거가 된 문서는 [doc_id]로 표시한다. 목록에 답이 없으면 없다고 말한다. 짧게 답한다."""
 
 
-def answer(question, docs):
+def answer(question, docs, schema=None):
+    """docs = 검색 결과(보이는 칸 + body). 칸 표시명·순서는 색인 스키마에서"""
+    schema = schema or fields.SCHEMA
+    lab = fields.labels(schema)
     _guard()
     ctx = "\n\n".join(
-        f"[{d['doc_id']}] 문서번호 {d['docno']} / 시행일자 {d['date']} / 수신 {d['recipient']} / 제목 {d['title']}\n"
+        f"[{d['doc_id']}] " + " / ".join(f"{lab[k]} {d.get(k, '')}" for k in fields.shown(schema)) + "\n"
         f"본문 앞부분: {d['body'][:600]}" for d in docs)
     r = client().chat.completions.create(
         model=CHAT, temperature=0,

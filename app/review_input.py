@@ -1,6 +1,8 @@
-"""사람 검토 입력 거르기. 외부 의존 없음 → CI 0층에서 바로 시험한다."""
+"""사람 검토 입력 거르기. 외부 의존 없음(색인 스키마 YAML만) → CI 0층에서 바로 시험한다."""
+from app import fields
 
-EDITABLE = ("docno", "date", "recipient", "title")
+# 고칠 수 있는 칸 = 스키마에서 숨김·고정값이 아닌 건 단위 칸 (김해: 문서번호·시행일자·수신·제목)
+EDITABLE = fields.editable(fields.SCHEMA)
 
 
 def clean_fixes(flagged, pairs):
@@ -10,6 +12,8 @@ def clean_fixes(flagged, pairs):
     fixes = {}
     for did, k, val in pairs:
         val = str(val).strip()
+        if k in EDITABLE:
+            val = fields.normalize_input(fields.SCHEMA, {k: val})[k]  # LLM 값과 같은 표기 규칙
         if did in cur and k in EDITABLE and val != (cur[did].get(k) or ""):
             fixes.setdefault(did, {})[k] = val
     return fixes

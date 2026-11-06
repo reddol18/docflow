@@ -19,6 +19,8 @@ PyJWT[crypto]==2.15.1
 httpx==0.28.1
 # 납품 양식 엑셀 쓰기 (https://github.com/reddol18/docflow/issues/12)
 openpyxl==3.1.5
+# 색인 칸 스키마·납품 양식 YAML 읽기 — 시작할 때 필수라 간접 의존(lock)에 기대지 않고 직접 고정 (https://github.com/reddol18/docflow/issues/9)
+PyYAML==6.0.2
 # 기반 이미지에 든 판을 고친 판으로 (setuptools 안 jaraco.context 6.1.0·wheel 0.46.3, https://github.com/reddol18/docflow/issues/44)
 setuptools==84.2.1
 wheel==0.48.0

@@ -9,6 +9,8 @@ from pathlib import Path
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from app import fields
+
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 PG_URL = os.environ.get("PG_URL", "postgresql://docflow@postgres:5432/docflow")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -69,8 +71,11 @@ def load_ocr(vol, page):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
   doc_id text PRIMARY KEY, vol text NOT NULL, pages text[] NOT NULL,
-  docno text, serial text, date text, recipient text, title text,
+  fields jsonb NOT NULL DEFAULT '{}'::jsonb, search_text text, year int,
   flags jsonb, reviewed boolean DEFAULT false, updated_at timestamptz DEFAULT now());
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS fields jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_text text;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS year int;
 CREATE TABLE IF NOT EXISTS usage (
   id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), vol text, kind text, model text,
   tin int, tout int, usd numeric(12,8));
@@ -130,7 +135,34 @@ def init_db():
         for stmt in SCHEMA.split(";"):  # prepare_threshold=0이라 한 번에 한 문장만 실행할 수 있다
             if stmt.strip():
                 c.execute(stmt)
+        migrate_documents(c)
     prune_audit()
+
+
+LEGACY_COLUMNS = ("docno", "serial", "date", "recipient", "title")  # https://github.com/reddol18/docflow/issues/9 이전 고정 열
+
+
+def migrate_documents(c, schema=None):
+    """예전 고정 열 → fields jsonb + 검색용 열(search_text·year). 예전 열이 남아 있을 때만, 한 트랜잭션으로.
+    중간에 실패하면 되돌아가 예전 열이 그대로 남고 다음 시작 때 다시 한다. 옮긴 행 수"""
+    schema = schema or fields.SCHEMA
+    have = {r["column_name"] for r in c.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND table_name = 'documents'").fetchall()}
+    old = [k for k in LEGACY_COLUMNS if k in have]
+    if not old:
+        return 0
+    with c.transaction():
+        pairs = ", ".join(f"'{k}', coalesce({k}, '')" for k in old)
+        c.execute(f"UPDATE documents SET fields = jsonb_build_object({pairs}) || fields")  # noqa: S608 — 고정 열 이름
+        rows = c.execute("SELECT doc_id, fields FROM documents").fetchall()
+        with c.cursor() as cur:
+            cur.executemany("UPDATE documents SET search_text = %s, year = %s WHERE doc_id = %s",
+                            [(fields.search_text(schema, r["fields"]), fields.year_of(schema, r["fields"]), r["doc_id"])
+                             for r in rows])
+        c.execute("ALTER TABLE documents " + ", ".join(f"DROP COLUMN {k}" for k in old))
+    print(f"documents: 예전 고정 열 {old} → fields jsonb ({len(rows)}행)", flush=True)
+    return len(rows)
 
 
 AUDIT_KEEP = "1 year"  # 감사 로그 보존 기간 (2026-11-06 확정, README)
@@ -393,36 +425,40 @@ def purge_volume(vol, delete_thread):
     return out
 
 
-def save_documents(docs):
+def save_documents(docs, schema=None):
+    """칸 값은 fields jsonb 그대로, 검색용 열(search_text·year)은 스키마 search 설정으로 만든다"""
+    schema = schema or fields.SCHEMA
     with pool.connection() as c:
         for d in docs:
             f = d["fields"]
             c.execute(
-                """INSERT INTO documents (doc_id, vol, pages, docno, serial, date, recipient, title, flags, reviewed, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-                   ON CONFLICT (doc_id) DO UPDATE SET pages=EXCLUDED.pages, docno=EXCLUDED.docno, serial=EXCLUDED.serial,
-                     date=EXCLUDED.date, recipient=EXCLUDED.recipient, title=EXCLUDED.title, flags=EXCLUDED.flags,
+                """INSERT INTO documents (doc_id, vol, pages, fields, search_text, year, flags, reviewed, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+                   ON CONFLICT (doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
+                     search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
                      reviewed=EXCLUDED.reviewed, updated_at=now()""",
-                (d["doc_id"], d["vol"], d["pages"], f["docno"], f["serial"], f["date"], f["recipient"], f["title"],
+                (d["doc_id"], d["vol"], d["pages"], json.dumps(f, ensure_ascii=False),
+                 fields.search_text(schema, f), fields.year_of(schema, f),
                  json.dumps(d["flags"], ensure_ascii=False), d.get("reviewed", False)))
             if d.get("edited"):
                 c.execute("UPDATE documents SET edited = true WHERE doc_id = %s", (d["doc_id"],))
 
 
 def keyword_search(words, year_from=None, year_to=None, limit=20):
-    """제목·수신·문서번호에 든 낱말 수로 점수를 매긴다 (형태소 분석 없는 단순 부분 일치)."""
+    """검색 칸(스키마 search.keyword — 김해는 제목·수신·문서번호)에 든 낱말 수로 점수를 매긴다
+    (형태소 분석 없는 단순 부분 일치)."""
     if not words:
         return []
-    hay = "coalesce(title,'') || ' ' || coalesce(recipient,'') || ' ' || coalesce(docno,'')"
+    hay = "coalesce(search_text,'')"
     score = " + ".join(f"(CASE WHEN {hay} ILIKE %s THEN 1 ELSE 0 END)" for _ in words)
     sql = f"SELECT doc_id, ({score}) AS score FROM documents WHERE ({score}) > 0"  # noqa: S608 — 자리표시자만 끼움, 값은 매개변수
     args = [f"%{w}%" for w in words] * 2
     if year_from:
-        sql += " AND left(date,4) >= %s"
-        args.append(str(year_from))
+        sql += " AND year >= %s"
+        args.append(int(year_from))
     if year_to:
-        sql += " AND left(date,4) <= %s"
-        args.append(str(year_to))
+        sql += " AND year <= %s"
+        args.append(int(year_to))
     sql += " ORDER BY score DESC, doc_id LIMIT %s"
     args.append(limit)
     with pool.connection() as c:
@@ -450,15 +486,16 @@ def point_id(doc_id):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "docflow/" + doc_id))
 
 
-def upsert_vectors(docs, vectors):
+def upsert_vectors(docs, vectors, schema=None):
+    """payload: doc_id·vol·year(연도 필터) + 보이는 칸 값 (숨김 칸은 넣지 않는다)"""
     from qdrant_client.models import PointStruct
+    schema = schema or fields.SCHEMA
     pts = []
     for d, v in zip(docs, vectors):
         f = d["fields"]
-        year = int(f["date"][:4]) if f["date"][:4].isdigit() else None
         pts.append(PointStruct(id=point_id(d["doc_id"]), vector=v, payload={
-            "doc_id": d["doc_id"], "vol": d["vol"], "year": year, "date": f["date"],
-            "docno": f["docno"], "title": f["title"], "recipient": f["recipient"]}))
+            "doc_id": d["doc_id"], "vol": d["vol"], "year": fields.year_of(schema, f),
+            "fields": {k: f.get(k, "") for k in fields.shown(schema)}}))
     qdrant().upsert(COLLECTION, points=pts)
 
 

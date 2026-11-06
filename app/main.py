@@ -22,6 +22,7 @@
   GET   /search                        ?q=&year_from=&year_to=&k= 벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침
   GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다
   GET   /graph                         흐름 그림 (mermaid)
+  GET   /schema                        색인 칸 스키마 (보이는 칸: 이름·표시명·단위·추출 방식·고칠 수 있나) — 화면이 칸 목록을 여기서 받는다
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
   GET   /report.csv                    같은 리포트 CSV
   GET   /export/check                  납품 출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건
@@ -51,6 +52,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from app import auth, errors, export, inspection, llm, ocr, report, store
+from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app.auth import Admin, Inspector, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
@@ -330,13 +332,12 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     if doc_id not in docs:
         raise HTTPException(404)
     old = docs[doc_id]["fields"]
-    fix = {k: str(v).strip() for k, v in fields.items() if k in EDITABLE}
+    fix = schema_fields.normalize_input(schema_fields.SCHEMA,  # LLM 값과 같은 표기 규칙 (미상·연대·위치 등)
+                                        {k: str(v).strip() for k, v in fields.items() if k in EDITABLE})
     fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
     if not fix:
         return docs[doc_id], []
-    d = dict(docs[doc_id], fields={**old, **fix}, edited=True)
-    if "docno" in fix:
-        d["fields"]["serial"] = flow.layout.serial_of(fix["docno"])
+    d = dict(docs[doc_id], fields=flow.rederive({**old, **fix}, fix), edited=True)
     G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
     store.save_documents([d])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
@@ -481,8 +482,9 @@ def head(vol: str, page: str, _: Viewer):
     return Response(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes(), media_type="image/jpeg")
 
 
-LABEL = {"docno": "문서번호", "date": "시행일자", "recipient": "수신", "title": "제목", "serial": "일련번호"}
-FLAG_FIELD = {"serial": "docno"}  # 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
+LABEL = schema_fields.labels(schema_fields.SCHEMA)
+FLAG_FIELD = schema_fields.flag_keys(schema_fields.SCHEMA)  # 김해: 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
+FLAG_OF = {v: k for k, v in FLAG_FIELD.items()}
 
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
@@ -505,13 +507,12 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
         did = d["doc_id"]
         out.append(f"<div class=doc><img src='/head/{html.escape(vol)}/{html.escape(did)}' width=600>"
                    f"<div><b>{html.escape(did)}</b> ({len(d['pages'])}쪽)")
-        for k in ["docno", "date", "recipient", "title"]:
-            fk = "serial" if k == "docno" else k
-            fl = " ".join(d["flags"].get(fk, []))
-            val = html.escape(d["fields"][k] or "")
-            out.append(f"<div class=f><label>{LABEL[k]}</label><input name='{did}__{k}' value=\"{val}\" maxlength={CELL_MAX}{ro}>"
-                       f" <span class=flag>{html.escape(fl)}</span></div>")
-            if k in ("docno", "date") and d["hw"].get(k, {}).get("text") is not None:
+        for k in EDITABLE:
+            fl = " ".join(d["flags"].get(FLAG_OF.get(k, k), []))
+            val = html.escape(d["fields"].get(k) or "")
+            out.append(f"<div class=f><label>{html.escape(LABEL[k])}</label><input name='{did}__{k}' value=\"{val}\" "
+                       f"maxlength={CELL_MAX}{ro}> <span class=flag>{html.escape(fl)}</span></div>")
+            if k in ("docno", "date") and (d.get("hw") or {}).get(k, {}).get("text") is not None:
                 # 인라인 onerror 대신 파일이 있을 때만 그린다 (CSP가 인라인 스크립트를 막는다)
                 if store.crop_path(vol, did, k).exists():
                     out.append(f"<img class=crop src='/crops/{html.escape(vol)}/{html.escape(did)}_{k}.png'>")
@@ -733,8 +734,10 @@ def hybrid(q, year_from=None, year_to=None, k=10):
     rows = store.get_documents(top)
     vr = {r["doc_id"]: i + 1 for i, r in enumerate(v)}
     kr = {r["doc_id"]: i + 1 for i, r in enumerate(kw)}
+    shown = schema_fields.shown(schema_fields.SCHEMA)  # 김해: 문서번호·시행일자·수신·제목
     return [{"doc_id": d, "rrf": round(score[d], 5), "vector_rank": vr.get(d), "keyword_rank": kr.get(d),
-             **{c: rows[d][c] for c in ["vol", "docno", "date", "recipient", "title"]}} for d in top if d in rows]
+             "vol": rows[d]["vol"], **{c: (rows[d]["fields"] or {}).get(c, "") for c in shown}}
+            for d in top if d in rows]
 
 
 @app.get("/search")
@@ -755,3 +758,14 @@ def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], _: Viewer, yea
 @app.get("/graph", response_class=PlainTextResponse)
 def graph_view(_: Viewer):
     return G.get_graph(xray=True).draw_mermaid()
+
+
+@app.get("/schema")
+def schema_view(_: Viewer):
+    """화면용 칸 목록 — 숨김 칸·추출 지시문·고정값은 내보내지 않는다"""
+    s = schema_fields.SCHEMA
+    return {"name": s["name"], "fields": [
+        {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
+         "editable": f["name"] in EDITABLE, "flag_key": f.get("flag_key", f["name"]),
+         "isad": f.get("isad") or (f["name"] if "area" in f else None)}  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
+        for f in s["fields"] if f["name"] in schema_fields.shown(s)]}

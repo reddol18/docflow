@@ -20,7 +20,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import errors, flags, layout, llm, ocr, store
+from app import errors, fields, flags, layout, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -31,7 +31,43 @@ FLAG_CONFIG = {
     **json.loads(os.environ.get("FLAG_CONFIG") or "{}"),
 }
 HEAD_RATIOS = [0.40, 0.48, 0.56]  # 머리부가 쪽 위 몇 % 안에 있다고 볼지. PoC는 0.40 고정이라 창원 양식(41~43%)에서 놓쳤다
-FIELDS = ["docno", "date", "recipient", "title"]
+
+# 색인 칸은 스키마(app/fields.py, FIELD_SCHEMA)에서. 스키마의 rule 칸은 아래 규칙이 값을 만든다 (merge).
+# docno·serial·date는 김해 양식의 손글씨 칸 판독 + LLM 값, recipient는 LLM 값을 배치로 고친 값, pages는 쪽수.
+SCHEMA = fields.SCHEMA
+RULES = ("docno", "serial", "date", "recipient", "pages")
+HW_RULES = {"docno", "serial", "date"}  # 손글씨 칸(문서번호·시행일자)을 찾아 읽어야 하는 규칙
+# 사람이 원천 칸을 고치면 다시 계산하는 규칙 (스키마 derive_from)
+DERIVE = {"serial": layout.serial_of}  # 원천 칸(derive_from) 값 → 이 칸 값
+FLAG_FIELDS = {"docno", "serial", "date", "recipient", "title"}  # app/flags.py 규칙이 보는 칸
+fields.check_rules(SCHEMA, RULES)
+
+
+def check_derive(schema):
+    bad = sorted({f["rule"] for f in schema["fields"] if "derive_from" in f} - set(DERIVE))
+    if bad:
+        raise fields.SchemaError(f"다시 계산할 수 없는 rule {bad} (가능: {sorted(DERIVE)})")
+
+
+check_derive(SCHEMA)
+
+
+def rederive(values, changed, schema=None):
+    """사람이 고친 칸(changed)에서 나오는 칸을 다시 계산한다 (김해: 문서번호 → 일련번호). values를 바꿔서 돌려준다"""
+    for f in (schema or SCHEMA)["fields"]:
+        if f.get("derive_from") in changed:
+            values[f["name"]] = fields.normalize(f, DERIVE[f["rule"]](values.get(f["derive_from"]) or ""))
+    return values
+
+
+def uses_hw(schema):
+    return any(f.get("rule") in HW_RULES for f in schema["fields"])
+
+
+def _llm_of(b, rule, schema=None):
+    """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게)"""
+    name = next((f["name"] for f in (schema or SCHEMA)["fields"] if f.get("rule") == rule), rule)
+    return (b.get(name) or {}).get("value") or ""
 
 
 def traced(name, fn):
@@ -146,7 +182,9 @@ def fan_out(s: VolState):
 def validate(s: VolState):
     """검토 필요 표시. 앞뒤 문서·같은 분류번호 문서와 비교하는 규칙이 있어 철 단위로 한다 (규칙은 app/flags.py)."""
     docs = [dict(d) for d in s.get("docs", [])]
-    for d, fl in zip(docs, flags.flags(docs, FLAG_CONFIG)):
+    # 표시 규칙은 김해 칸(문서번호·일련번호·일자·수신·제목) 기준이다 — 그 칸이 없는 스키마면 표시하지 않는다
+    rated = FLAG_FIELDS <= set(fields.by_name(SCHEMA))
+    for d, fl in zip(docs, flags.flags(docs, FLAG_CONFIG) if rated else [{} for _ in docs]):
         d["flags"] = fl
     return {"docs": docs}
 
@@ -167,17 +205,16 @@ def review(s: VolState):
     docs = []
     for d in s["docs"]:
         if d["flags"]:
-            d = dict(d, fields={**d["fields"], **fixes.get(d["doc_id"], {})}, reviewed=True)
-            if "docno" in fixes.get(d["doc_id"], {}):
-                d["fields"]["serial"] = layout.serial_of(d["fields"]["docno"])
+            fix = fixes.get(d["doc_id"], {})
+            d = dict(d, fields=rederive({**d["fields"], **fix}, fix), reviewed=True)
         docs.append(d)
     return {"docs": docs}
 
 
 def doc_text(vol, d):
-    f = d["fields"]
+    """임베딩할 글: 스키마 search.embed 칸('표시명: 값' 줄) + 첫 쪽 본문"""
     body = " ".join(store.load_ocr(vol, d["pages"][0])["lines"][:60])
-    return f"제목: {f['title']}\n수신: {f['recipient']}\n문서번호: {f['docno']}\n시행일자: {f['date']}\n본문: {body}"
+    return f"{fields.embed_text(SCHEMA, d['fields'])}\n본문: {body}"
 
 
 def index(s: VolState):
@@ -193,12 +230,15 @@ def index(s: VolState):
 
 def extract(s: DocState):
     d = store.load_ocr(s["vol"], s["doc_id"])
-    b = llm.extract(s["vol"], d["lines"])
-    rec, why = layout.fix_recipient(d, b["recipient"]["value"])
+    b = llm.extract(s["vol"], d["lines"], SCHEMA)
+    rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
     return {"b": b, "recipient": rec, "recipient_fix": why}
 
 
 def locate(s: DocState):
+    """손글씨 칸 찾기 — 스키마에 손글씨 규칙 칸(docno·serial·date)이 없으면 찾지 않는다 (비전 호출도 없음)"""
+    if not uses_hw(SCHEMA):
+        return {"boxes": {}, "box_fail": {}}
     items = store.load_ocr(s["vol"], s["doc_id"])["items"]
     ratio = HEAD_RATIOS[s["ratio_i"]]
     boxes, fail = {}, {}
@@ -217,6 +257,8 @@ def widen(s: DocState):
 
 
 def read(s: DocState):
+    if not s["boxes"]:  # 손글씨 칸을 찾지 않는 스키마 — 쪽 이미지를 읽지 않는다
+        return {"hw": {}}
     img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg")
     H, W = img.shape[:2]
     hw = {}
@@ -235,10 +277,11 @@ def read(s: DocState):
 
 
 def merge(s: DocState):
-    """B 값에 손글씨 칸 판독을 끼워 넣는다 (PoC hw_flags.build와 같은 규칙)."""
-    b, hw = s["b"], s["hw"]
-    b_doc = b["docno"]["value"]
-    b_date = b["date"]["value"] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", b["date"]["value"]) else ""
+    """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
+    b = s["b"]
+    hw = {k: s["hw"].get(k) or {"text": "", "conf": 0.0} for k in ("docno", "date")}
+    b_doc = _llm_of(b, "docno")
+    b_date = _llm_of(b, "date") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", _llm_of(b, "date")) else ""
     doc_text_ = hw["docno"]["text"]
     s_doc = layout.serial_of(doc_text_) if re.search(r"[-~]", doc_text_) else ""
     # 문서번호 칸이 '-'로 끝나면 일련번호 빈칸 문서로 본다 (경찰서 통보 등)
@@ -255,11 +298,12 @@ def merge(s: DocState):
             head = f"{m.group(1)} {m.group(2)}"
             break
     docno = f"{head}-{serial}" if (head or serial) else ""
+    rule_values = {"docno": docno, "serial": serial, "date": date, "recipient": s["recipient"],
+                   "pages": str(len(s["pages"]))}
     return {"docs": [{
         "doc_id": s["doc_id"], "vol": s["vol"], "pages": s["pages"],
-        "fields": {"docno": docno, "serial": serial, "date": date, "recipient": s["recipient"],
-                   "title": b["title"]["value"]},
-        "b": b, "hw": hw,
+        "fields": fields.assemble(SCHEMA, b, rule_values),
+        "b": b, "hw": s["hw"],
         "info": {"prefix": layout.prefix_of(b_doc) or layout.prefix_of(doc_text_), "blank": blank,
                  "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
                  "b_serial": layout.serial_of(b_doc), "b_date": b_date,
