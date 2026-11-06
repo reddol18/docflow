@@ -3,6 +3,8 @@
 # 보통은 Windows에서 scripts/deploy.ps1로 부른다(복사 + 이 스크립트 + 배포 태그).
 set -e
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+# 빌드 전 디스크 여유 확인 (반드시). 모자라면 여기서 멈춘다 — scripts/mac/disk_check.sh
+sh ~/doc_platform/scripts/disk_check.sh
 sh ~/doc_platform/scripts/build_image.sh
 kubectl apply -f ~/doc_platform/k8s/docs.yaml >/dev/null
 # postgres·qdrant 이미지를 바꾸면 apply가 둘을 다시 띄운다(Recreate) — docflow는 시작할 때 DB에 붙으므로 먼저 기다린다

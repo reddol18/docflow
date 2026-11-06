@@ -7,7 +7,7 @@
   .\scripts\deploy.ps1 -NoTag          # 시험 배포 (태그 없음)
   .\scripts\deploy.ps1 -NoCheck        # 로컬 검사 건너뜀 (방금 돌렸을 때만)
 
-순서: 커밋 안 된 변경 확인 → 로컬 검사(scripts/check.ps1) → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기)
+순서: 커밋 안 된 변경 확인 → 로컬 검사(scripts/check.ps1) → 맥 디스크 여유 확인(scripts/mac/disk_check.sh, 모자라면 중단) → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기)
       → 태그 deploy-YYYYMMDD-HHMM push
 (맥에는 git 저장소가 없어서 태그는 이 스크립트가 남긴다)
 프런트엔드는 k3s가 아니라 이 PC에서 next로 돈다(배포 대상 아님).
@@ -32,9 +32,15 @@ try {
         if ($LASTEXITCODE) { throw "로컬 검사 실패. 배포하지 않습니다." }
     }
 
-    Write-Host "== 복사 ($sha → $Mac)"
+    Write-Host "== 디스크 여유 확인"
+    # 반드시: 모자란 채로 빌드하면 kubelet이 운영 파드를 내쫓는다 (2026-11-07). 맥 쪽 deploy.sh도 빌드 전에 한 번 더 본다
     ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s"
     if ($LASTEXITCODE) { throw "맥 접속 실패" }
+    scp -q scripts/mac/disk_check.sh "${Mac}:doc_platform/scripts/"
+    ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/disk_check.sh"
+    if ($LASTEXITCODE) { throw "디스크 여유가 모자랍니다. 정리한 뒤 배포하세요 (위 메시지)." }
+
+    Write-Host "== 복사 ($sha → $Mac)"
     scp -q -r Dockerfile requirements.txt app "${Mac}:doc_platform/"
     if ($LASTEXITCODE) { throw "복사 실패 (app)" }
     scp -q k8s/docs.yaml "${Mac}:doc_platform/k8s/"

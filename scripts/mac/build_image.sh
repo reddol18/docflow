@@ -3,6 +3,8 @@
 set -e
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 cd ~/doc_platform
+# 빌드 전 디스크 여유 확인 (반드시, 따로 불러도) — scripts/mac/disk_check.sh
+sh ~/doc_platform/scripts/disk_check.sh
 # --pull: 기반 이미지 태그를 다시 받아 그 사이 나온 갱신을 쓴다.
 # APT_REFRESH(ISO 주): apt 갱신 층의 캐시를 주 1회 깬다 — 그대로 두면 처음 빌드한 층이 계속 재사용돼
 # 그 뒤 나온 Debian 보안 갱신이 들어오지 않는다 (https://github.com/reddol18/docflow/issues/44)
