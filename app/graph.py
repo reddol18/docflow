@@ -9,8 +9,14 @@
 
 PoC에서 스크립트를 차례로 돌리던 단계(run_ocr → gt_draft → 추출 → recipient_fix → crop_fields → hw_read → hw_flags)를
 노드로 옮겼다. OCR 결과는 쪽마다 파일로 남겨, 중간에 Pod가 죽어도 다시 돌리면 이미 읽은 쪽은 건너뛴다.
+
+LLM_PROVIDER=off (app/llm.py)면 추출·판독·임베딩을 부르지 않고 건너뛴다: 추출 칸은 빈 값·확신도 0, 손글씨 칸은 못 읽음,
+벡터는 넣지 않고 그 문서의 예전 벡터는 지운다. 건너뛴 단계는 문서 info.llm_skipped와
+events(extract·read의 skipped, index의 embedded)로 드러난다. 건너뛴 문서는 스키마와 상관없이(app/flags.py 규칙과 별도로)
+LLM이 채울 칸에 'LLM 꺼짐' 검토 표시가 붙고, review_mode가 auto여도 사람 검토(review)에서 멈춘다.
 """
 import json
+import operator
 import os
 import re
 import time
@@ -64,6 +70,27 @@ def uses_hw(schema):
     return any(f.get("rule") in HW_RULES for f in schema["fields"])
 
 
+def llm_kinds(schema):
+    """이 스키마로 흐름·검색이 쓰는 LLM 기능 (local 제공자의 모델 이름 확인용)"""
+    return ({"embed", "chat"} | ({"extract"} if fields.extract_prompt(schema) else set())
+            | ({"cell"} if uses_hw(schema) else set()))
+
+
+llm.require_models(llm_kinds(SCHEMA))  # local인데 쓰는 기능의 모델 이름이 없으면 시작할 때 멈춘다
+OFF_FLAG = "LLM 꺼짐"
+
+
+def off_flags(d, schema=None):
+    """LLM을 건너뛴 문서의 검토 표시 {flag_key: ['LLM 꺼짐']} — 추출 칸(스키마 prompt 칸)·손글씨 규칙 칸(판독)마다"""
+    schema = schema or SCHEMA
+    skipped = set((d.get("info") or {}).get("llm_skipped") or ())
+    names = {f["name"] for f in fields.prompt_fields(schema)} if "extract" in skipped else set()
+    if "read" in skipped:
+        names |= {f["name"] for f in schema["fields"] if f.get("rule") in HW_RULES}
+    keys = {f.get("flag_key", f["name"]) for f in schema["fields"] if f["name"] in names}
+    return {k: [OFF_FLAG] for k in sorted(keys)}
+
+
 def _llm_of(b, rule, schema=None):
     """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게)"""
     name = next((f["name"] for f in (schema or SCHEMA)["fields"] if f.get("rule") == rule), rule)
@@ -97,10 +124,12 @@ def _brief(name, out):
         return {"flagged": sum(bool(d["flags"]) for d in out["docs"])}
     if name == "locate":
         return {"missing": [k for k, b in out["boxes"].items() if b is None]}
+    if name in ("extract", "read") and out.get("skipped"):
+        return {"skipped": "llm_off"}
     if name == "read":
         return {k: v["text"] for k, v in out["hw"].items()}
     if name == "index":
-        return {"indexed": out["indexed"]}
+        return {"indexed": out["indexed"], "embedded": out.get("embedded", out["indexed"])}
     return {}
 
 
@@ -120,12 +149,14 @@ class VolState(TypedDict, total=False):
     orphans: list[str]  # 첫 시작 쪽 앞에 있어 어느 문서에도 못 붙인 쪽
     docs: Annotated[list[dict], merge_docs]
     indexed: int
+    embedded: int  # 벡터를 넣은 문서 수 (LLM_PROVIDER=off면 0)
 
 
 class DocState(TypedDict, total=False):
     vol: str
     doc_id: str
     pages: list[str]
+    skipped: Annotated[list[str], operator.add]  # LLM_PROVIDER=off로 건너뛴 단계 (extract·read)
     b: dict  # GPT 텍스트 추출 (PoC의 B 갈래)
     recipient: str
     recipient_fix: str
@@ -185,12 +216,21 @@ def validate(s: VolState):
     # 표시 규칙은 김해 칸(문서번호·일련번호·일자·수신·제목) 기준이다 — 그 칸이 없는 스키마면 표시하지 않는다
     rated = FLAG_FIELDS <= set(fields.by_name(SCHEMA))
     for d, fl in zip(docs, flags.flags(docs, FLAG_CONFIG) if rated else [{} for _ in docs]):
+        for k, v in off_flags(d).items():  # LLM을 건너뛴 문서는 스키마와 상관없이 표시
+            fl[k] = [*fl.get(k, []), *v]
         d["flags"] = fl
     return {"docs": docs}
 
 
+def skipped_llm(d):
+    return bool((d.get("info") or {}).get("llm_skipped"))
+
+
 def route_review(s: VolState):
-    if s.get("review_mode", "human") == "human" and any(d["flags"] for d in s.get("docs", [])):
+    docs = s.get("docs", [])
+    if any(skipped_llm(d) for d in docs):  # LLM을 건너뛴 문서는 auto여도 사람이 본다
+        return "review"
+    if s.get("review_mode", "human") == "human" and any(d["flags"] for d in docs):
         return "review"
     return "index"
 
@@ -220,19 +260,25 @@ def doc_text(vol, d):
 def index(s: VolState):
     docs = s.get("docs", [])
     store.save_documents(docs)
+    if not llm.enabled():  # LLM_PROVIDER=off: 문서는 저장하고 벡터는 넣지 않는다. 다시 돌린 철의 예전 벡터도 지운다
+        store.delete_doc_vectors([d["doc_id"] for d in docs])
+        return {"indexed": len(docs), "embedded": 0}
     for i in range(0, len(docs), 64):
         chunk = docs[i:i + 64]
         store.upsert_vectors(chunk, llm.embed(s["vol"], [doc_text(s["vol"], d) for d in chunk]))
-    return {"indexed": len(docs)}
+    return {"indexed": len(docs), "embedded": len(docs)}
 
 
 # ---------- 문서 하위 그래프 ----------
 
 def extract(s: DocState):
     d = store.load_ocr(s["vol"], s["doc_id"])
-    b = llm.extract(s["vol"], d["lines"], SCHEMA)
+    try:
+        b, skipped = llm.extract(s["vol"], d["lines"], SCHEMA), []
+    except llm.LLMOff:  # 추출 칸은 빈 값·확신도 0 (가짜 값 없음) → 검토 표시로 사람에게
+        b, skipped = fields.parse_extract(SCHEMA, "{}"), ["extract"]  # LLMOff는 prompt 칸이 있을 때만 난다
     rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
-    return {"b": b, "recipient": rec, "recipient_fix": why}
+    return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped}
 
 
 def locate(s: DocState):
@@ -261,7 +307,7 @@ def read(s: DocState):
         return {"hw": {}}
     img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg")
     H, W = img.shape[:2]
-    hw = {}
+    hw, skipped = {}, []
     for k, b in s["boxes"].items():
         if not b:
             hw[k] = {"text": "", "conf": 0.0}
@@ -270,10 +316,13 @@ def read(s: DocState):
         ok, buf = cv2.imencode(".png", img[y0:y1, x0:x1])
         p = store.crop_path(s["vol"], s["doc_id"], k)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(buf.tobytes())
-        text, conf = llm.read_cell(s["vol"], k, buf.tobytes())
+        p.write_bytes(buf.tobytes())  # 잘라낸 칸은 남긴다 — 검토 화면에서 사람이 읽는다
+        try:
+            text, conf = llm.read_cell(s["vol"], k, buf.tobytes())
+        except llm.LLMOff:  # 못 읽은 칸과 같게 (빈 글자·확신도 0)
+            text, conf, skipped = "", 0.0, ["read"]
         hw[k] = {"text": text, "conf": conf}
-    return {"hw": hw}
+    return {"hw": hw, "skipped": skipped}
 
 
 def merge(s: DocState):
@@ -308,7 +357,7 @@ def merge(s: DocState):
                  "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
                  "b_serial": layout.serial_of(b_doc), "b_date": b_date,
                  "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
-                 "box_fail": s["box_fail"]},
+                 "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or []},
         "flags": {},
     }]}
 

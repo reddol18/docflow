@@ -2,7 +2,7 @@
 # 값을 null로 두면 그 기준은 보지 않는다. 기준을 어긴 후보가 하나라도 있으면 gate.py는 종료 코드 1.
 # 정한 날: 2026-11-07 (https://github.com/reddol18/docflow/issues/22, 이슈 예시대로)
 
-baseline:              # 지금 운영 기본값 (app/llm.py EXTRACT, 색인 스키마 지시문)
+baseline:              # 지금 운영 기본값 (app/llm.py OPENAI_MODELS["extract"] = EXTRACT_MODEL 기본값, 색인 스키마 지시문)
   provider: gpt-4.1-mini
   prompt: current
 
