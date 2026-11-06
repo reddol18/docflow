@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rescore import load_gt, ok_field  # noqa: E402
 
 from app.inspection import sample_size  # noqa: E402
+from app.review_input import EDITABLE as FIELDS  # noqa: E402
 
-FIELDS = ["docno", "date", "recipient", "title"]
 RATES = [0.03, 0.05, 0.10, 0.20]
 
 

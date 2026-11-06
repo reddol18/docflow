@@ -113,7 +113,9 @@ CREATE TABLE IF NOT EXISTS inspection_plan (
 CREATE TABLE IF NOT EXISTS inspection (
   vol text NOT NULL, doc_id text NOT NULL, reason text NOT NULL,
   inspected_by bigint, inspected_at timestamptz, fixed_fields text[],
-  PRIMARY KEY (vol, doc_id))
+  PRIMARY KEY (vol, doc_id));
+CREATE TABLE IF NOT EXISTS review_submitters (
+  vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id))
 """
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
@@ -223,8 +225,18 @@ def create_inspection(vol, summary, rows, user_id):
 
 
 def inspection_plan(vol):
+    """화면용 — 시드·만든 사람 id는 내보내지 않는다"""
     with pool.connection() as c:
-        return c.execute("SELECT * FROM inspection_plan WHERE vol = %s", (vol,)).fetchone()
+        return c.execute("SELECT vol, rate::float AS rate, fields100, flagged, unflagged, sample, created_at "
+                         "FROM inspection_plan WHERE vol = %s", (vol,)).fetchone()
+
+
+def add_review_submitter(vol, user_id):
+    """검토를 제출한 사람 — 교차검사의 근거. 감사 로그(실패해도 넘어감)와 달리 실패하면 검토 제출도 실패한다"""
+    if user_id is None:
+        return
+    with pool.connection() as c:
+        c.execute("INSERT INTO review_submitters (vol, user_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (vol, user_id))
 
 
 def inspection_rows(vol):
@@ -239,31 +251,74 @@ def inspection_row(vol, doc_id):
         return c.execute("SELECT * FROM inspection WHERE vol = %s AND doc_id = %s", (vol, doc_id)).fetchone()
 
 
-def entrants(vol, doc_id):
-    """이 문서의 입력 단계에 손댄 사용자 id: 칸을 고친 사람(edits review·edit) + 이 철의 검토를 제출한 사람(audit review ok)"""
-    with pool.connection() as c:
-        rows = c.execute("SELECT user_id FROM edits WHERE vol = %s AND doc_id = %s AND source IN ('review','edit') "
-                         "UNION SELECT user_id FROM audit WHERE vol = %s AND action = 'review' AND result = 'ok'",
-                         (vol, doc_id, vol)).fetchall()
-    return {r["user_id"] for r in rows if r["user_id"] is not None}
+_VOL_ENTRANTS = ("SELECT user_id FROM review_submitters WHERE vol = %(vol)s "
+                 "UNION SELECT user_id FROM audit WHERE vol = %(vol)s AND action = 'review' AND result = 'ok' "
+                 # review_submitters·audit 이전(https://github.com/reddol18/docflow/issues/28 이전)에 검토한 철: 이벤트의 사용자 이름
+                 "UNION SELECT u.id FROM events e JOIN users u ON u.username = e.info->>'user' "
+                 "WHERE e.vol = %(vol)s AND e.node = 'review' AND e.phase = 'submit'")
 
 
-def mark_inspected(vol, doc_id, user_id, fixed_fields):
-    """검사 끝 표시. 이미 누가 검사했으면 False (동시에 두 번 제출 막기)"""
+def entered(vol, user_id):
+    """이 사용자가 입력 단계에 손댄 범위: (철 전체를 검토 제출했나, 칸을 고친 문서 id 집합). 교차검사용 — 한 번에 센다"""
     with pool.connection() as c:
-        cur = c.execute("UPDATE inspection SET inspected_by = %s, inspected_at = now(), fixed_fields = %s "
-                        "WHERE vol = %s AND doc_id = %s AND inspected_by IS NULL", (user_id, fixed_fields, vol, doc_id))
+        whole = c.execute(f"SELECT 1 FROM ({_VOL_ENTRANTS}) t WHERE user_id = %(uid)s LIMIT 1",  # noqa: S608 — 상수 SQL
+                          {"vol": vol, "uid": user_id}).fetchone() is not None
+        docs = {r["doc_id"] for r in c.execute("SELECT DISTINCT doc_id FROM edits WHERE vol = %s AND user_id = %s "
+                                                "AND source IN ('review','edit')", (vol, user_id)).fetchall()}
+    return whole, docs
+
+
+def is_entrant(vol, doc_id, user_id):
+    whole, docs = entered(vol, user_id)
+    return whole or doc_id in docs
+
+
+def claim_inspection(vol, doc_id, user_id):
+    """검사할 문서를 먼저 차지한다 (동시에 두 사람이 고치지 않게). 이미 누가 차지했으면 False.
+    판단은 inspected_at으로 — 사용자 id가 없을 때(인증 끈 개발 모드)도 두 번 검사되지 않게"""
+    with pool.connection() as c:
+        cur = c.execute("UPDATE inspection SET inspected_by = %s, inspected_at = now() "
+                        "WHERE vol = %s AND doc_id = %s AND inspected_at IS NULL", (user_id, vol, doc_id))
         return cur.rowcount == 1
 
 
-def inspection_stats():
-    """철별 표본 검사 결과: 표본 수, 검사 끝난 표본 n, 그중 고친 k, 추정 오류율 k/n"""
+def inspected_fields(vol, doc_id):
+    """검사 단계에서 고친 칸 (이력 기준)"""
     with pool.connection() as c:
-        rows = c.execute("SELECT p.vol, p.sample, p.rate::float AS rate, "
-                         "count(i.inspected_at) FILTER (WHERE i.reason = 'sample') AS inspected, "
-                         "count(*) FILTER (WHERE i.reason = 'sample' AND cardinality(i.fixed_fields) > 0) AS fixed "
+        return sorted(r["field"] for r in c.execute(
+            "SELECT DISTINCT field FROM edits WHERE vol = %s AND doc_id = %s AND source = 'inspect'", (vol, doc_id)).fetchall())
+
+
+def reset_inspection(vol):
+    """철을 처음부터 다시 돌릴 때 예전 검사 목록을 지운다. 지운 것이 있으면 True"""
+    with pool.connection() as c, c.transaction():
+        c.execute("DELETE FROM inspection WHERE vol = %s", (vol,))
+        return c.execute("DELETE FROM inspection_plan WHERE vol = %s", (vol,)).rowcount > 0
+
+
+def finish_inspection(vol, doc_id, fixed_fields):
+    with pool.connection() as c:
+        c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s", (fixed_fields, vol, doc_id))
+
+
+def release_inspection(vol, doc_id):
+    """고치다 실패하면 차지를 푼다"""
+    with pool.connection() as c:
+        c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
+                  "WHERE vol = %s AND doc_id = %s", (vol, doc_id))
+
+
+def inspection_stats(start=None, end=None):
+    """철별 표본 검사 결과: 표본 수, 검사 끝난 표본 n, 그중 고친 k, 추정 오류율 k/n.
+    start·end(시각)를 주면 그 기간에 검사한 것만 센다 (리포트 기간과 맞춤). 끝나지 않은(차지만 한) 검사는 세지 않는다"""
+    done = "i.reason = 'sample' AND i.fixed_fields IS NOT NULL"
+    period = " AND i.inspected_at >= %(start)s AND i.inspected_at < %(end)s" if start and end else ""
+    with pool.connection() as c:
+        rows = c.execute("SELECT p.vol, p.sample, p.rate::float AS rate, "  # noqa: S608 — 상수 조각만 끼움
+                         f"count(*) FILTER (WHERE {done}{period}) AS inspected, "
+                         f"count(*) FILTER (WHERE {done}{period} AND cardinality(i.fixed_fields) > 0) AS fixed "
                          "FROM inspection_plan p LEFT JOIN inspection i ON i.vol = p.vol GROUP BY p.vol, p.sample, p.rate "
-                         "ORDER BY p.vol").fetchall()
+                         "ORDER BY p.vol", {"start": start, "end": end}).fetchall()
     for r in rows:
         r["error_rate"] = round(r["fixed"] / r["inspected"], 4) if r["inspected"] else None
     return rows

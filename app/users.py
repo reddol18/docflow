@@ -2,7 +2,7 @@
 
   python -m app.users add 이름 --role admin [--display 표시이름]   비밀번호를 두 번 묻는다
   python -m app.users passwd 이름          비밀번호 바꾸기 (그 계정의 세션을 모두 끊는다)
-  python -m app.users role 이름 reviewer   역할 바꾸기 (viewer / reviewer / admin)
+  python -m app.users role 이름 reviewer   역할 바꾸기 (viewer / reviewer / inspector / admin)
   python -m app.users disable|enable 이름  끄기·켜기 (끄면 세션도 끊는다)
   python -m app.users unlock 이름          로그인 실패 잠금 풀기
   python -m app.users logout 이름          그 계정의 세션을 모두 끊기
