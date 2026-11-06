@@ -1,8 +1,9 @@
 """납품 형식 출력 — 기관 엑셀 일괄등록 양식 (https://github.com/reddol18/docflow/issues/12).
 
-양식은 YAML 매핑(app/export_templates/*.yaml): 양식 열 ↔ 원천(철·건·색인 칸·고정값) ↔ 형식 변환.
+양식은 YAML 매핑(`app/export_templates/*.yaml`): 양식 열 ↔ 원천(철·건·색인 칸·고정값) ↔ 형식 변환.
 철 목록 시트와 건 색인 시트를 따로 내고, 건은 철 안 쪽 순서(원질서)대로 둔다.
 출력 전 검증은 필수 열 빈칸·형식 위반·검토 안 끝난 건을 센다."""
+import datetime as dt
 import io
 import os
 import re
@@ -17,7 +18,8 @@ DOC_KEYS = ("seq", "first_page", "last_page", "pages")
 FORMATS = ("text", "int", "year", "date")
 DATE_OUT = {"YYYY-MM-DD": "{y}-{m}-{d}", "YYYYMMDD": "{y}{m}{d}", "YYYY.MM.DD": "{y}.{m}.{d}"}
 SHEETS = ("volumes", "documents")
-CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")  # XML 1.0이 못 담는 글자
+SHEET_BAD = re.compile(r"[\[\]:*?/\\]")  # 엑셀 시트 이름에 못 쓰는 글자 (31자까지)
 PROBLEMS_MAX = 200  # 응답에 싣는 문제 목록 상한 (건수는 모두 센다)
 
 
@@ -57,6 +59,8 @@ def parse_template(t):
         s = t["sheets"].get(sheet)
         if not isinstance(s, dict) or not s.get("title") or not isinstance(s.get("columns"), list) or not s["columns"]:
             raise TemplateError(f"{sheet}: title·columns 필요")
+        if len(str(s["title"])) > 31 or SHEET_BAD.search(str(s["title"])):
+            raise TemplateError(f"{sheet}: 시트 이름은 31자까지, []:*?/\\ 못 씀")
         cols = []
         for c in s["columns"]:
             if not isinstance(c, dict) or not c.get("name") or not c.get("source"):
@@ -76,7 +80,7 @@ def parse_template(t):
         if len(set(names)) != len(names):
             raise TemplateError(f"{sheet}: 열 이름 중복")
         sheets[sheet] = {"title": str(s["title"]), "columns": cols}
-    if sheets["volumes"]["title"] == sheets["documents"]["title"]:
+    if sheets["volumes"]["title"].casefold() == sheets["documents"]["title"].casefold():  # 엑셀은 대소문자를 안 가린다
         raise TemplateError("두 시트 이름이 같음")
     return {"name": t.get("name", ""), "volume_id": rx, "sheets": sheets}
 
@@ -87,15 +91,19 @@ def convert(value, col):
     if not v:
         return "", False
     fmt = col["format"]
-    if fmt == "int":
-        return (int(v), False) if v.isdigit() else (v, True)
+    if fmt == "int":  # ASCII 숫자만 ('①'·'²'는 isdigit()이 참이지만 int()가 못 읽는다)
+        return (int(v), False) if re.fullmatch(r"[0-9]+", v) else (v, True)
     if fmt == "year":
-        return (v, False) if re.fullmatch(r"\d{4}", v) else (v, True)
+        return (v, False) if re.fullmatch(r"[0-9]{4}", v) and v != "0000" else (v, True)
     if fmt == "date":
-        m = re.fullmatch(r"(\d{4})[-.]?(\d{2})[-.]?(\d{2})", v)
-        if not m or not (1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31):
+        m = re.fullmatch(r"([0-9]{4})([-.]?)([0-9]{2})\2([0-9]{2})", v)  # 구분자는 한 가지로
+        try:
+            dt.date(int(m.group(1)), int(m.group(3)), int(m.group(4))) if m else None
+        except ValueError:
+            m = None  # 없는 날짜 (02-30, 04-31, 0000년)
+        if not m:
             return v, True  # 일부만 읽은 날짜(예: 1997-03)도 위반 — 사람이 채워야 한다
-        return DATE_OUT[col["out"]].format(y=m.group(1), m=m.group(2), d=m.group(3)), False
+        return DATE_OUT[col["out"]].format(y=m.group(1), m=m.group(3), d=m.group(4)), False
     return v, False
 
 

@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 
 from app import export
 
-T = export.load_template()  # 기본 예시 양식 (app/export_templates/aihub88.yaml)
+T = export.load_template()  # 기본 예시 양식 (`app/export_templates/aihub88.yaml`)
 
 
 def doc(did, pages, date="1995-03-07", title="가상 제목", docno="가나 100-1", flags=None, reviewed=False):
@@ -96,3 +96,24 @@ def test_date_out_formats():
     assert export.convert("19950307", col) == ("1995.03.07", False)
     assert export.convert("1995-13-07", col)[1] is True
     assert export.convert("", col) == ("", False)
+    for bad in ("1995-02-30", "1995-04-31", "0000-01-01", "1995-0307", "1997-03"):  # 없는 날짜·섞인 구분자·일부만
+        assert export.convert(bad, col)[1] is True, bad
+    assert export.convert("1996-02-29", col) == ("1996.02.29", False)
+
+
+def test_int_only_ascii_digits():
+    col = {"format": "int"}
+    assert export.convert("12", col) == (12, False)
+    assert export.convert("①", col) == ("①", True) and export.convert("²", col) == ("²", True)  # 500이 아니라 형식 위반
+
+
+def test_xml_forbidden_chars_dropped():
+    assert export.convert("가￾나￿", {"format": "text"}) == ("가나", False)
+
+
+@pytest.mark.parametrize("vt, dt_", [("건/색인", "b"), ("a" * 32, "b"), ("목록", "목록"), ("Sheet", "sheet")])
+def test_template_rejects_bad_sheet_names(vt, dt_):
+    t = {"sheets": {"volumes": {"title": vt, "columns": [{"name": "x", "source": "vol"}]},
+                    "documents": {"title": dt_, "columns": [{"name": "x", "source": "vol"}]}}}
+    with pytest.raises(export.TemplateError):
+        export.parse_template(t)

@@ -626,6 +626,7 @@ VolList = Annotated[list[str], Query(default_factory=list)]
 
 def _export_volumes(vols, need_done):
     """[(vol, 쪽 목록, 문서 목록)]. 철을 안 고르면 끝난 철 전부. need_done이면 안 끝난 철은 409"""
+    vols = list(dict.fromkeys(vols))  # 같은 철을 두 번 주면 두 번 나가지 않게 (순서는 지킴)
     if len(vols) > EXPORT_VOLS_MAX:
         raise HTTPException(400, f"철은 {EXPORT_VOLS_MAX}개까지")
     for v in vols:
@@ -665,7 +666,8 @@ def export_xlsx(user: Admin, vol: VolList):
         sheets, problems = export.build(EXPORT_TEMPLATE, volumes)
         body = export.to_xlsx(sheets)
         info.update(volumes=len(volumes), problems=len(problems))
-    for v, _, docs in volumes:  # 철마다 한 줄 — 일괄 삭제는 내보낸 철만 받는다
+    for v, _, docs in volumes:  # 철마다 출력 기록 — 일괄 삭제는 지금 내용을 문제 없이 내보낸 철만 받는다
+        store.add_export(v, sum(p["vol"] == v for p in problems), user.id)
         audit_safe(user, "export", v, None, "ok", docs=len(docs))
     name = f"docflow_export_{dt.datetime.now(store.KST):%Y%m%d_%H%M}.xlsx"
     return Response(body, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -673,17 +675,28 @@ def export_xlsx(user: Admin, vol: VolList):
 
 
 @app.delete("/volumes/{vol}")
-def purge(vol: str, user: Admin, confirm: str = ""):
+def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False):
     """납품 뒤 사업 데이터 일괄 삭제: 쪽 이미지·OCR·잘라낸 칸, 문서·이력·이벤트·검사 행, LangGraph 체크포인트, Qdrant 벡터.
-    비용 장부·감사 로그·작업 시간은 남긴다 (값 없음). 실수를 막으려고 confirm에 철 이름을 다시 받고, 내보낸 철만 지운다"""
-    with audited(user, "purge", vol) as info:
+    비용 장부·감사 로그·작업 시간·출력 기록은 남긴다 (값 없음). 실수를 막으려고 confirm에 철 이름을 다시 받는다.
+    마지막 출력 뒤에 내용이 바뀌었으면(다시 올림·실행·검토·수정·검사) 409. 그 출력에 검증 문제가 있었으면
+    allow_problems=true를 따로 줘야 지운다 (고칠 근거인 쪽 이미지가 사라지므로)"""
+    with audited(user, "purge", vol, allow_problems=allow_problems) as info:
         if confirm != vol:
             raise HTTPException(400, "confirm에 철 이름을 그대로 넣어야 함")
         if vol in running:
             raise HTTPException(409, "실행 중인 철")
-        if not store.exported(vol):
+        last = store.last_export(vol)
+        if not last:
             raise HTTPException(409, "납품 형식으로 내보낸 적 없는 철 (/export.xlsx 먼저)")
-        info.update(store.purge_volume(vol))
+        if not last["current"]:
+            raise HTTPException(409, "내보낸 뒤 내용이 바뀐 철 — 다시 내보낸 뒤 지운다")
+        if last["problems"] and not allow_problems:
+            raise HTTPException(409, f"마지막 출력에 검증 문제 {last['problems']}건 (지우려면 allow_problems=true)")
+        running[vol] = "purging"  # 지우는 동안 같은 철 실행(/run·/resume)은 409
+        try:
+            info.update(store.purge_volume(vol, G.checkpointer.delete_thread))
+        finally:
+            running.pop(vol, None)
     return {"vol": vol, "deleted": info}
 
 

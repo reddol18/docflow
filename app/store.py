@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS inspection (
   inspected_by bigint, inspected_at timestamptz, fixed_fields text[],
   PRIMARY KEY (vol, doc_id));
 CREATE TABLE IF NOT EXISTS review_submitters (
-  vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id))
+  vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id));
+CREATE TABLE IF NOT EXISTS exports (
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), vol text NOT NULL, problems int NOT NULL, user_id bigint)
 """
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
@@ -346,29 +348,37 @@ def edit_history(vol, doc_id):
                          (vol, doc_id)).fetchall()
 
 
-def exported(vol):
-    """이 철을 납품 형식으로 낸 적이 있나 (감사 로그 기준) — 일괄 삭제의 전제"""
+def add_export(vol, problems, user_id):
+    """납품 출력 기록 (감사 로그와 따로 — 감사 로그 보존 기간 정리가 일괄 삭제의 근거를 지우지 않게)"""
     with pool.connection() as c:
-        return c.execute("SELECT 1 FROM audit WHERE vol = %s AND action = 'export' AND result = 'ok' LIMIT 1",
-                         (vol,)).fetchone() is not None
+        c.execute("INSERT INTO exports (vol, problems, user_id) VALUES (%s,%s,%s)", (vol, problems, user_id))
+
+
+def last_export(vol):
+    """마지막 출력이 철의 지금 내용과 같은가. None(내보낸 적 없음) 또는 {ts, problems, current}.
+    current: 출력 뒤에 색인이 바뀌지 않았고(documents.updated_at — 실행·검토·수정·검사가 모두 여기를 바꾼다)
+    쪽을 다시 올리거나 다시 돌리지 않았음(감사 로그 upload·run·resume)"""
+    with pool.connection() as c:
+        e = c.execute("SELECT ts, problems FROM exports WHERE vol = %s ORDER BY id DESC LIMIT 1", (vol,)).fetchone()
+        if not e:
+            return None
+        changed = c.execute(
+            "SELECT greatest((SELECT max(updated_at) FROM documents WHERE vol = %(v)s), "
+            "(SELECT max(ts) FROM audit WHERE vol = %(v)s AND action IN ('upload','run','resume') AND result = 'ok')) AS t",
+            {"v": vol}).fetchone()["t"]
+    return {**e, "current": changed is None or changed < e["ts"]}
 
 
 # 납품 뒤 지우는 사업 데이터 (https://github.com/reddol18/docflow/issues/12): 값·원문이 든 표.
-# 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간) — 개수·시각만 있고 값은 없다
+# 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간)·exports(출력 기록) — 개수·시각만 있고 값은 없다
 PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters")
-CHECKPOINT_TABLES = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")  # LangGraph PostgresSaver, thread_id = 철
 
 
-def purge_volume(vol):
-    """철 하나의 사업 데이터를 지운다: Postgres 행(한 트랜잭션) → Qdrant 벡터 → 파일. 지운 개수를 돌려준다"""
-    out = {}
-    with pool.connection() as c, c.transaction():
-        for t in PURGE_TABLES:
-            out[t] = c.execute(f"DELETE FROM {t} WHERE vol = %s", (vol,)).rowcount  # noqa: S608 — 고정된 표 이름
-        for t in CHECKPOINT_TABLES:
-            if c.execute("SELECT to_regclass(%s) AS r", (t,)).fetchone()["r"]:
-                out[t] = c.execute(f"DELETE FROM {t} WHERE thread_id = %s", (vol,)).rowcount  # noqa: S608
-    out["vectors"] = delete_vectors(vol)
+def purge_volume(vol, delete_thread):
+    """철 하나의 사업 데이터를 지운다: Qdrant 벡터 → 파일 → LangGraph 체크포인트 → Postgres 행(한 트랜잭션).
+    바깥 저장소를 먼저 지운다 — 중간에 실패해도 출력 기록(exports)과 문서 행이 남아 다시 부르면 이어서 지운다.
+    체크포인트는 저장기의 delete_thread로 (내부 표 목록을 이 코드가 따라가지 않게). 지운 개수를 돌려준다"""
+    out = {"vectors": delete_vectors(vol)}
     files = 0
     for kind in ("pages", "ocr", "crops"):
         d = under(kind, vol)
@@ -376,6 +386,10 @@ def purge_volume(vol):
             files += sum(1 for p in d.rglob("*") if p.is_file())
             shutil.rmtree(d)
     out["files"] = files
+    delete_thread(vol)
+    with pool.connection() as c, c.transaction():
+        for t in PURGE_TABLES:
+            out[t] = c.execute(f"DELETE FROM {t} WHERE vol = %s", (vol,)).rowcount  # noqa: S608 — 고정된 표 이름
     return out
 
 

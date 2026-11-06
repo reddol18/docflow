@@ -14,6 +14,7 @@ from app import auth, store
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_PG_URL 없음")
 USERS = {"v": (2, "viewer"), "a": (1, "admin")}
 VOL, OTHER = "1234567-1995-0001", "1234567-1995-0002"
+CHECKPOINT_TABLES = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")  # 확인용 — 지우기는 PostgresSaver.delete_thread
 
 
 def h(name):
@@ -36,7 +37,7 @@ def env(pg_store, monkeypatch, tmp_path):
     saver = PostgresSaver(store.pool)
     saver.setup()
     with store.pool.connection() as c:
-        for t in store.PURGE_TABLES + store.CHECKPOINT_TABLES + ("usage", "audit", "sessions", "review_time", "users"):
+        for t in store.PURGE_TABLES + CHECKPOINT_TABLES + ("exports", "usage", "audit", "sessions", "review_time", "users"):
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
         for name, (uid, role) in USERS.items():
             c.execute("INSERT INTO users (id, username, role) VALUES (%s, %s, %s)", (uid, name, role))
@@ -73,9 +74,9 @@ def env(pg_store, monkeypatch, tmp_path):
                                     for j, d in enumerate((pages[0], pages[2]))])
         graph.invoke({"x": 0}, {"configurable": {"thread_id": vol}})
 
-    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: SimpleNamespace(
+    monkeypatch.setattr(main, "G", SimpleNamespace(checkpointer=saver, get_state=lambda cfg: SimpleNamespace(
         next=(), interrupts=[], values=states[cfg["configurable"]["thread_id"]])))
-    return SimpleNamespace(main=main, q=q)
+    return SimpleNamespace(main=main, q=q, states=states)
 
 
 def counts(vol):
@@ -83,7 +84,7 @@ def counts(vol):
         out = {t: c.execute(f"SELECT count(*) AS n FROM {t} WHERE vol = %s", (vol,)).fetchone()["n"]  # noqa: S608
                for t in store.PURGE_TABLES + ("usage", "audit")}
         out |= {t: c.execute(f"SELECT count(*) AS n FROM {t} WHERE thread_id = %s", (vol,)).fetchone()["n"]  # noqa: S608
-                for t in store.CHECKPOINT_TABLES}
+                for t in CHECKPOINT_TABLES}
     out["vectors"] = store.count_vectors(vol)
     out["files"] = sum(1 for k in ("pages", "ocr", "crops") if store.under(k, vol).exists())
     return out
@@ -96,16 +97,21 @@ def test_check_export_then_purge(env):
     assert c.get(f"/export.xlsx?vol={VOL}", headers=h("v")).status_code == 403  # 엑셀 출력은 관리자만
     assert c.delete(f"/volumes/{VOL}?confirm={VOL}", headers=h("a")).status_code == 409  # 내보내기 전에는 못 지움
 
-    r = c.get(f"/export.xlsx?vol={VOL}", headers=h("a"))
+    r = c.get(f"/export.xlsx?vol={VOL}&vol={VOL}", headers=h("a"))  # 같은 철을 두 번 줘도 한 번만
     assert r.status_code == 200 and r.headers["content-disposition"].startswith("attachment")
     wb = load_workbook(io.BytesIO(r.content))
+    assert wb.worksheets[0].max_row == 2
     docs = [list(x) for x in wb.worksheets[1].iter_rows(values_only=True)][1:]
     assert [(x[1], x[6]) for x in docs] == [(1, "p01"), (2, "p03")]  # 쪽 순서
 
     assert c.delete(f"/volumes/{VOL}?confirm=다른철", headers=h("a")).status_code == 400
+    assert c.delete(f"/volumes/{VOL}?confirm={VOL}", headers=h("a")).status_code == 409  # 출력에 빈칸 1건이 있었다
+    store.save_documents(env.states[VOL]["docs"][:1])  # 내보낸 뒤 고침 (updated_at)
+    assert "바뀐" in c.delete(f"/volumes/{VOL}?confirm={VOL}&allow_problems=true", headers=h("a")).json()["detail"]
+    assert c.get(f"/export.xlsx?vol={VOL}", headers=h("a")).status_code == 200  # 다시 내보냄
     before = counts(VOL)
     assert all(before[k] > 0 for k in before)
-    r = c.delete(f"/volumes/{VOL}?confirm={VOL}", headers=h("a"))
+    r = c.delete(f"/volumes/{VOL}?confirm={VOL}&allow_problems=true", headers=h("a"))
     assert r.status_code == 200, r.text
     after = counts(VOL)
     gone = {k: v for k, v in after.items() if k not in ("usage", "audit")}
@@ -115,7 +121,7 @@ def test_check_export_then_purge(env):
     assert all(v > 0 for k, v in other.items() if k != "audit"), other  # 다른 철은 그대로
     with store.pool.connection() as cn:
         rows = cn.execute("SELECT result, info FROM audit WHERE action = 'purge' AND vol = %s ORDER BY id", (VOL,)).fetchall()
-    assert [r["result"] for r in rows] == ["rejected_409", "rejected_400", "ok"]
+    assert [r["result"] for r in rows] == ["rejected_409", "rejected_400", "rejected_409", "rejected_409", "ok"]
     assert rows[-1]["info"]["vectors"] == 2 and rows[-1]["info"]["documents"] == 2
 
 
@@ -127,6 +133,17 @@ def test_export_refuses_unfinished_volume(env, monkeypatch):
     assert c.get(f"/export.xlsx?vol={VOL}", headers=h("a")).status_code == 409
     chk = c.get(f"/export/check?vol={VOL}", headers=h("v")).json()  # 검토 대기 철도 검증은 한다
     assert chk["not_reviewed"] == 1 and chk["volumes"][0]["stage"] == "review"
+
+
+def test_check_response_counts_all_three(env, monkeypatch):
+    """빈칸·형식 위반·검토 대기를 한 철에 넣고 /export/check 응답의 세 건수를 본다"""
+    vals = {"pages": ["p1", "p2", "p3"], "indexed": 3,
+            "docs": [doc("p1", ["p1"], title=""), doc("p2", ["p2"], date="1997-03"),
+                     doc("p3", ["p3"]) | {"flags": {"title": ["확신도"]}}]}
+    monkeypatch.setattr(env.main, "G", SimpleNamespace(get_state=lambda cfg: SimpleNamespace(
+        next=(), interrupts=[], values=vals)))
+    chk = TestClient(env.main.app).get(f"/export/check?vol={VOL}", headers=h("v")).json()
+    assert (chk["required_blank"], chk["format"], chk["not_reviewed"]) == (1, 1, 1)
 
 
 def test_audit_older_than_a_year_pruned(env):
