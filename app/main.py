@@ -40,13 +40,14 @@ import os
 import re
 import secrets
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from typing import Annotated, Literal
 
 import cv2
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -104,6 +105,13 @@ SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosn
 @app.exception_handler(store.PathEscape)
 async def path_escape(request: Request, exc: store.PathEscape):
     return PlainTextResponse("bad path", status_code=400)
+
+
+@app.exception_handler(llm.LLMOff)
+async def llm_off(request: Request, exc: llm.LLMOff):
+    """LLM을 쓰지 않는 설치(LLM_PROVIDER=off)에서 LLM이 필요한 요청 — 화면엔 errors 공개 문구만, 설정 이름은 서버 로그에"""
+    print(f"[llm_off] {request.method} {request.url.path}: {exc}", file=sys.stderr, flush=True)
+    return JSONResponse(errors.public(exc), status_code=503)
 
 
 @app.middleware("http")
@@ -342,8 +350,10 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     store.save_documents([d])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
-    if llm.enabled():  # LLM_PROVIDER=off면 벡터는 그대로 (색인 때도 넣지 않았다)
+    if llm.enabled():
         store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
+    else:  # LLM_PROVIDER=off: 예전 값으로 만든 벡터를 남기지 않는다
+        store.delete_doc_vectors([doc_id])
     store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
     return d, list(fix)
 
@@ -728,13 +738,8 @@ def ranked(q, vec, year_from=None, year_to=None):
     return v, kw, score, sorted(score, key=score.get, reverse=True)
 
 
-LLM_OFF = "LLM이 꺼져 있어(LLM_PROVIDER=off) 검색·답변을 쓸 수 없음"
-
-
 def hybrid(q, year_from=None, year_to=None, k=10):
-    # LLM_PROVIDER=off: 질의 임베딩이 없다. 낱말 검색만으로 답할지는 정하지 않았다 — 그때까지 사용 불가로 둔다
-    if not llm.enabled():
-        raise HTTPException(503, LLM_OFF)
+    # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다
     vec = llm.embed("-", [q])[0]
     v, kw, score, order = ranked(q, vec, year_from, year_to)
     top = order[:k]

@@ -1,5 +1,6 @@
 # 공문서 처리 플랫폼: docs 네임스페이스 하나에 docflow(API + LangGraph + PaddleOCR), Postgres, Qdrant.
-# 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → OpenAI(공인 IP 443)만.
+# 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → 공인 IP 443만 (LLM_PROVIDER=openai일 때 OpenAI API용).
+# LLM_PROVIDER=local(현장 내부 서버)·off면 이 443 규칙은 쓰지 않는다 — 외부 송신 0을 막는 정책은 https://github.com/reddol18/docflow/issues/13 마지막 완료 조건.
 apiVersion: v1
 kind: Namespace
 metadata: {name: docs, labels: {purpose: doc-platform}}
@@ -143,10 +144,21 @@ spec:
         - {name: OCR_THREADS, value: "4"}
         - {name: DAILY_BUDGET_USD, value: "3.0"}
         # LLM·임베딩 제공자 (app/llm.py 머리말, https://github.com/reddol18/docflow/issues/13): openai / local / off
-        # local(Ollama·vLLM 등 OpenAI 호환): LLM_BASE_URL과 쓰는 기능의 모델 이름(EXTRACT_MODEL·CELL_MODEL·EMBED_MODEL·CHAT_MODEL)
-        # off: 추출·판독·임베딩을 건너뛰고(빈 칸은 검토로) /search·/ask는 503
+        # local = 현장 내부 서버 전용 (Ollama·vLLM 등 OpenAI 호환). LLM_BASE_URL 호스트는 루프백·사설 IP·클러스터 내부 이름만
+        #   (공인 주소면 시작할 때 멈춤). 모델 이름 4개(EXTRACT_MODEL·CELL_MODEL·EMBED_MODEL·CHAT_MODEL)도 필수 — 빠지면 시작할 때 멈춤.
+        #   임베딩 모델은 Qdrant 모음 차원(1536)과 같아야 한다. 다르면 넣을 때 Qdrant가 거절해 색인이 실패한다
+        #   (로컬 임베딩 교체는 완료 조건 4에서).
+        #   주의: 위 docflow-egress는 사설 IP로 나가는 것을 막아서 local 서버 주소도 막힌다. 열 때는 그 서버만 좁게:
+        #     - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: llm}}, podSelector: {matchLabels: {app: ollama}}}]
+        #       ports: [{protocol: TCP, port: 11434}]
+        #   (클러스터 밖 GPU 서버면 ipBlock {cidr: <서버 IP>/32} + 그 포트). 사설 대역 전체나 모든 포트를 열지 않는다.
+        #   키가 필요한 서버면: kubectl create secret generic llm-key -n docs --from-file=api-key=<파일>,
+        #   env {name: LLM_API_KEY_FILE, value: /etc/llm/api-key}, volumeMounts {name: llm-key, mountPath: /etc/llm, readOnly: true},
+        #   volumes {name: llm-key, secret: {secretName: llm-key}} (LLM_API_KEY_FILE을 줬는데 파일이 없으면 시작할 때 멈춤)
+        # off: OCR 뒤 추출·판독·임베딩을 건너뛴다. 건너뛴 문서는 스키마와 상관없이 검토 표시('LLM 꺼짐')가 붙어
+        #   사람 검토에서 멈추고(화면 실행 = human 모드), 그 문서의 벡터는 지운다. /search·/ask는 503
         - {name: LLM_PROVIDER, value: "openai"}
-        # - {name: LLM_BASE_URL, value: "http://ollama:11434/v1"}
+        # - {name: LLM_BASE_URL, value: "http://ollama.llm.svc.cluster.local:11434/v1"}
         - {name: PYTHONUNBUFFERED, value: "1"}
         # 인증 (app/auth.py 머리말). 설치 환경마다: local / oidc / local,oidc
         # 첫 관리자: kubectl exec -it -n docs deploy/docflow -- python -m app.users add admin --role admin

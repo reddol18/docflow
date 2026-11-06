@@ -10,6 +10,17 @@ import pytest
 PG = os.environ.get("TEST_PG_URL")
 if PG:
     os.environ["PG_URL"] = PG
+# LLM 제공자는 openai 기본값으로 고정 — 셸의 LLM_PROVIDER·LLM_BASE_URL에 시험 결과가 흔들리지 않게 (app.llm은 불러올 때 읽는다)
+os.environ["LLM_PROVIDER"] = "openai"
+
+
+@pytest.fixture(autouse=True)
+def llm_provider_default(monkeypatch):
+    """시험마다 제공자를 openai 기본값(모델 환경변수 무시)으로. 바꾸는 시험은 그 안에서 다시 바꾼다"""
+    from app import llm
+    monkeypatch.setattr(llm, "PROVIDER", llm.load_provider({}))
+    monkeypatch.setattr(llm, "_client", None)
+
 
 @pytest.fixture(scope="session")
 def pg_store():

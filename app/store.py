@@ -517,6 +517,13 @@ def delete_vectors(vol):
     return n
 
 
+def delete_doc_vectors(doc_ids):
+    """문서들의 벡터를 지운다 (LLM_PROVIDER=off로 다시 색인·수정한 문서 — 예전 값의 벡터를 남기지 않는다)"""
+    from qdrant_client.models import PointIdsList
+    if doc_ids:
+        qdrant().delete(COLLECTION, points_selector=PointIdsList(points=[point_id(d) for d in doc_ids]), wait=True)
+
+
 def vector_search(vec, year_from=None, year_to=None, limit=20):
     from qdrant_client.models import FieldCondition, Filter, Range
     flt = None
