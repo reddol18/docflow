@@ -52,12 +52,12 @@ items:
   - {id: V3.4.4, level: 1, text: "__Host- 쿠키 접두어", status: 미충족, evidence: "app/auth.py:56-57 접두어 없음. https 전환 때 https://github.com/reddol18/docflow/issues/48"}
 
   # ---------- V4 접근 제어 ----------
-  - {id: V4.1.1, level: 1, text: "권한은 서버에서 강제", status: 충족, evidence: "app/main.py:61 guard, app/auth.py:274-292 require, tests/test_auth.py 경로 순회"}
+  - {id: V4.1.1, level: 1, text: "권한은 서버에서 강제", status: 충족, evidence: "app/main.py:61 guard, app/auth.py:274-292 require, tests/test_auth.py 경로 순회(ADMIN_ROUTES에 /export.xlsx·DELETE /volumes/{vol}, https://github.com/reddol18/docflow/pull/67)"}
   - {id: V4.1.3, level: 1, text: "최소 권한", status: 충족, evidence: "app/auth.py:54 3단 역할, OIDC 기본 거절(:319,325), viewer는 읽기 전용"}
   - {id: V4.1.5, level: 1, text: "실패하면 막힌다 (기본 거부)", status: 충족, evidence: "app/auth.py:238 PUBLIC 정확히 일치, :274-278 그 밖은 401"}
   - {id: V4.2.1, level: 1, text: "다른 사람 객체 접근 방지 (IDOR)", status: 해당없음, evidence: "소유권 없는 설계(app/main.py:177-181). 기관 분리가 필요하면 새 이슈"}
   - {id: V4.2.2, level: 1, text: "CSRF 방지", status: 충족, evidence: "app/auth.py:248-254,268-269,494 check_csrf, frontend/src/lib/api.ts:145"}
-  - {id: V4.3.1, level: 1, text: "관리 기능 다중 인증", status: 미충족, evidence: "app/auth.py:490-502 local admin도 비밀번호만. https://github.com/reddol18/docflow/issues/40 (risk-accepted)"}
+  - {id: V4.3.1, level: 1, text: "관리 기능 다중 인증", status: 미충족, evidence: "app/auth.py:490-502 local admin도 비밀번호만 — 되돌릴 수 없는 DELETE /volumes/{vol}(https://github.com/reddol18/docflow/pull/67)도 같음, confirm 재입력은 실수 방지일 뿐. https://github.com/reddol18/docflow/issues/40 (risk-accepted)"}
 
   # ---------- V5 입력 검증·출력 인코딩 ----------
   - {id: V5.1.3, level: 1, text: "입력은 허용 목록·형식으로 검증", status: 충족, evidence: "app/main.py VOL_RX(fullmatch, 점만·끝 줄바꿈 거부)·vol_guard, 폼 바뀐 값 CELL_MAX(review_submit), q 1~Q_MAX·k 1~50(search·ask), 업로드 JPEG 매직(upload). tests/test_input.py (https://github.com/reddol18/docflow/issues/49)"}
@@ -87,7 +87,7 @@ items:
   - {id: V13.2.3, level: 1, text: "쿠키 쓰는 API의 CSRF", status: 충족, evidence: "V4.2.2와 같음, tests/test_auth.py:240-241"}
 
   # ---------- V14 설정 ----------
-  - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 미충족, evidence: "osv 깨끗(lock에 setuptools·wheel·pip 포함). 고칠 수 있던 것은 해소(https://github.com/reddol18/docflow/issues/44 재스캔 https://github.com/reddol18/docflow/issues/44#issuecomment-6633106877). 남은 HIGH·CRITICAL은 고친 판 없음 또는 외부 이미지 재빌드 필요 → 위험 수용 https://github.com/reddol18/docflow/issues/59. 다이제스트 고정·배포 때 스캔 https://github.com/reddol18/docflow/issues/46, 해시 잠금 https://github.com/reddol18/docflow/issues/33"}
+  - {id: V14.2.1, level: 1, text: "의존성 최신·취약점 없음", status: 미충족, evidence: "osv 깨끗(lock에 setuptools·wheel·pip 포함, openpyxl 3.1.5·et_xmlfile 2.0.0 추가 뒤도 깨끗 https://github.com/reddol18/docflow/pull/67). 고칠 수 있던 것은 해소(https://github.com/reddol18/docflow/issues/44 재스캔 https://github.com/reddol18/docflow/issues/44#issuecomment-6633106877). 남은 HIGH·CRITICAL은 고친 판 없음 또는 외부 이미지 재빌드 필요 → 위험 수용 https://github.com/reddol18/docflow/issues/59. 다이제스트 고정·배포 때 스캔 https://github.com/reddol18/docflow/issues/46, 해시 잠금 https://github.com/reddol18/docflow/issues/33"}
   - {id: V14.3.2, level: 1, text: "디버그·문서 화면 끔", status: 일부, evidence: "API는 꺼짐(app/main.py:60-62). 프런트 운영 실행 방식 없음(README next dev) https://github.com/reddol18/docflow/issues/48"}
   - {id: V14.4.1, level: 1, text: "Content-Type과 문자셋", status: 충족, evidence: "app/main.py:244,259,384 명시, HTML·텍스트는 Starlette가 charset=utf-8"}
   - {id: V14.4.3, level: 1, text: "CSP", status: 충족, evidence: "app/main.py API_CSP default-src 'none'·HTML_CSP(/review, 스크립트 없음), frontend/src/proxy.ts 요청별 nonce + strict-dynamic. 남음: next dev 운영 때 'unsafe-eval' https://github.com/reddol18/docflow/issues/48 (https://github.com/reddol18/docflow/issues/47)"}
@@ -100,7 +100,7 @@ items:
   - {id: API2, text: "인증 깨짐", status: 일부, evidence: "기본 구조 튼튼(app/auth.py:126-151,397-415). V2.2.1·V3.4.1·V4.3.1 남음"}
   - {id: API3, text: "객체 속성 수준 권한 (과다 노출·대량 할당)", status: 일부, evidence: "수정은 EDITABLE만(app/main.py _edit_document). events의 예외 원문 노출은 해소(https://github.com/reddol18/docflow/issues/28). 남음: /documents는 상태 전체"}
   - {id: API4, text: "자원 소모 무제한", status: 일부, evidence: "로그인 제한·LLM 예산, q·k·폼 칸 상한(https://github.com/reddol18/docflow/issues/49). 업로드 크기·개수 무제한 https://github.com/reddol18/docflow/issues/26 , /search·/ask 호출 제한 없음 https://github.com/reddol18/docflow/issues/7"}
-  - {id: API5, text: "기능 수준 권한", status: 충족, evidence: "app/auth.py:281-297 require(role), tests/test_auth.py 경로 순회"}
+  - {id: API5, text: "기능 수준 권한", status: 충족, evidence: "app/auth.py:281-297 require(role), tests/test_auth.py 경로 순회(ADMIN_ROUTES에 /export.xlsx·DELETE /volumes/{vol}, https://github.com/reddol18/docflow/pull/67)"}
   - {id: API6, text: "민감한 업무 흐름 남용", status: 미충족, evidence: "/ask·/search 사용자별 제한 없음, 색인과 전역 예산 공유(store.py:101-104) https://github.com/reddol18/docflow/issues/7"}
   - {id: API7, text: "SSRF", status: 일부, evidence: "issuer는 설정값, jwks·token 주소는 discovery 문서에서(auth.py:390,544,571). 차단 목록에 169.254·127·100.64 없음 https://github.com/reddol18/docflow/issues/48"}
   - {id: API8, text: "보안 설정 오류", status: 일부, evidence: "보안 헤더·캐시 금지는 해소(https://github.com/reddol18/docflow/issues/47). 남음: COOKIE_SECURE=0·http https://github.com/reddol18/docflow/issues/48 , trivy config 경고 https://github.com/reddol18/docflow/issues/29"}

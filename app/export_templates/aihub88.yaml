@@ -1,0 +1,37 @@
+# 예시 납품 양식 — 기관 엑셀 일괄등록 양식의 열 매핑 (https://github.com/reddol18/docflow/issues/12)
+# 공개 데이터(AI Hub #88) 라벨 기준: 철 단위로 생산기관코드·생산연도, 건 단위로 docflow가 뽑은 4칸.
+# 실제 기관 양식은 이 파일을 복사해 열 이름·순서·형식만 바꾼다 (EXPORT_TEMPLATE=경로).
+#
+# source  vol            철 이름
+#         vol.<이름>      철 이름을 volume_id 정규식으로 나눈 조각 (이름 있는 그룹)
+#         vol.pages      철의 쪽 수            vol.docs  철의 건 수
+#         doc.seq        철 안 건 순번(1부터, 쪽 순서)
+#         doc.first_page / doc.last_page / doc.pages   건의 시작 쪽·끝 쪽 이름, 쪽 수
+#         field.<칸>     색인 칸 (docno, serial, date, recipient, title — https://github.com/reddol18/docflow/issues/9 에서 스키마로)
+#         const          value에 적은 고정값 (사업 단위 고정값)
+# format  text(기본) | int | year(YYYY) | date (out: YYYY-MM-DD | YYYYMMDD | YYYY.MM.DD)
+# required: true면 빈칸을 출력 전 검증에서 센다
+name: 예시 일괄등록 양식 (AI Hub 88 공개 라벨 기준)
+volume_id: '^(?P<agency>\d{7})-(?P<year>\d{4})-(?P<seq>\d{4})$'
+sheets:
+  volumes:
+    title: 철목록
+    columns:
+      - {name: 철번호, source: vol, required: true}
+      - {name: 생산기관코드, source: vol.agency, required: true}
+      - {name: 생산연도, source: vol.year, format: year, required: true}
+      - {name: 기록물분류, source: const, value: ""}
+      - {name: 쪽수, source: vol.pages, format: int}
+      - {name: 건수, source: vol.docs, format: int}
+  documents:
+    title: 건색인
+    columns:
+      - {name: 철번호, source: vol, required: true}
+      - {name: 건순번, source: doc.seq, format: int, required: true}
+      - {name: 문서번호, source: field.docno, required: true}
+      - {name: 생산일자, source: field.date, format: date, out: YYYYMMDD, required: true}
+      - {name: 수신, source: field.recipient}
+      - {name: 제목, source: field.title, required: true}
+      - {name: 시작쪽, source: doc.first_page}
+      - {name: 끝쪽, source: doc.last_page}
+      - {name: 쪽수, source: doc.pages, format: int}

@@ -2,6 +2,7 @@
 import datetime as dt
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -115,7 +116,9 @@ CREATE TABLE IF NOT EXISTS inspection (
   inspected_by bigint, inspected_at timestamptz, fixed_fields text[],
   PRIMARY KEY (vol, doc_id));
 CREATE TABLE IF NOT EXISTS review_submitters (
-  vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id))
+  vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id));
+CREATE TABLE IF NOT EXISTS exports (
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), vol text NOT NULL, problems int NOT NULL, user_id bigint)
 """
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
@@ -127,6 +130,16 @@ def init_db():
         for stmt in SCHEMA.split(";"):  # prepare_threshold=0이라 한 번에 한 문장만 실행할 수 있다
             if stmt.strip():
                 c.execute(stmt)
+    prune_audit()
+
+
+AUDIT_KEEP = "1 year"  # 감사 로그 보존 기간 (2026-11-06 확정, README)
+
+
+def prune_audit():
+    """보존 기간이 지난 감사 로그 행을 지운다 — 시작할 때마다 (배포·재시작). 지운 행 수"""
+    with pool.connection() as c:
+        return c.execute("DELETE FROM audit WHERE ts < now() - %s::interval", (AUDIT_KEEP,)).rowcount
 
 
 def init():
@@ -335,6 +348,51 @@ def edit_history(vol, doc_id):
                          (vol, doc_id)).fetchall()
 
 
+def add_export(vol, problems, user_id):
+    """납품 출력 기록 (감사 로그와 따로 — 감사 로그 보존 기간 정리가 일괄 삭제의 근거를 지우지 않게)"""
+    with pool.connection() as c:
+        c.execute("INSERT INTO exports (vol, problems, user_id) VALUES (%s,%s,%s)", (vol, problems, user_id))
+
+
+def last_export(vol):
+    """마지막 출력이 철의 지금 내용과 같은가. None(내보낸 적 없음) 또는 {ts, problems, current}.
+    current: 출력 뒤에 색인이 바뀌지 않았고(documents.updated_at — 실행·검토·수정·검사가 모두 여기를 바꾼다)
+    쪽을 다시 올리거나 다시 돌리지 않았음(감사 로그 upload·run·resume)"""
+    with pool.connection() as c:
+        e = c.execute("SELECT ts, problems FROM exports WHERE vol = %s ORDER BY id DESC LIMIT 1", (vol,)).fetchone()
+        if not e:
+            return None
+        changed = c.execute(
+            "SELECT greatest((SELECT max(updated_at) FROM documents WHERE vol = %(v)s), "
+            "(SELECT max(ts) FROM audit WHERE vol = %(v)s AND action IN ('upload','run','resume') AND result = 'ok')) AS t",
+            {"v": vol}).fetchone()["t"]
+    return {**e, "current": changed is None or changed < e["ts"]}
+
+
+# 납품 뒤 지우는 사업 데이터 (https://github.com/reddol18/docflow/issues/12): 값·원문이 든 표.
+# 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간)·exports(출력 기록) — 개수·시각만 있고 값은 없다
+PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters")
+
+
+def purge_volume(vol, delete_thread):
+    """철 하나의 사업 데이터를 지운다: Qdrant 벡터 → 파일 → LangGraph 체크포인트 → Postgres 행(한 트랜잭션).
+    바깥 저장소를 먼저 지운다 — 중간에 실패해도 출력 기록(exports)과 문서 행이 남아 다시 부르면 이어서 지운다.
+    체크포인트는 저장기의 delete_thread로 (내부 표 목록을 이 코드가 따라가지 않게). 지운 개수를 돌려준다"""
+    out = {"vectors": delete_vectors(vol)}
+    files = 0
+    for kind in ("pages", "ocr", "crops"):
+        d = under(kind, vol)
+        if d.exists():
+            files += sum(1 for p in d.rglob("*") if p.is_file())
+            shutil.rmtree(d)
+    out["files"] = files
+    delete_thread(vol)
+    with pool.connection() as c, c.transaction():
+        for t in PURGE_TABLES:
+            out[t] = c.execute(f"DELETE FROM {t} WHERE vol = %s", (vol,)).rowcount  # noqa: S608 — 고정된 표 이름
+    return out
+
+
 def save_documents(docs):
     with pool.connection() as c:
         for d in docs:
@@ -402,6 +460,24 @@ def upsert_vectors(docs, vectors):
             "doc_id": d["doc_id"], "vol": d["vol"], "year": year, "date": f["date"],
             "docno": f["docno"], "title": f["title"], "recipient": f["recipient"]}))
     qdrant().upsert(COLLECTION, points=pts)
+
+
+def _vol_filter(vol):
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    return Filter(must=[FieldCondition(key="vol", match=MatchValue(value=vol))])
+
+
+def count_vectors(vol):
+    return qdrant().count(COLLECTION, count_filter=_vol_filter(vol), exact=True).count
+
+
+def delete_vectors(vol):
+    """철의 벡터를 모두 지운다. 지운 개수(지우기 전 센 값)"""
+    from qdrant_client.models import FilterSelector
+    n = count_vectors(vol)
+    if n:
+        qdrant().delete(COLLECTION, points_selector=FilterSelector(filter=_vol_filter(vol)), wait=True)
+    return n
 
 
 def vector_search(vec, year_from=None, year_to=None, limit=20):
