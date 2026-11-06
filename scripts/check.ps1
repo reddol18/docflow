@@ -117,7 +117,7 @@ try {
         # requirements.txt도 본다: 새로 고정한 패키지는 배포해서 잠금 파일을 받아 오기 전까지 lock에 없다 (PyJWT 2.10.1이 그렇게 지나갔다)
         & $osv scan source --no-resolve --config osv-scanner.toml --lockfile requirements.txt:requirements.lock `
             --lockfile requirements.txt:requirements.txt --lockfile requirements.txt:requirements-test.txt `
-            --lockfile frontend/package-lock.json
+            --lockfile frontend/package-lock.json --lockfile eval/promptfoo/package-lock.json   # 평가 하네스(개발 PC 전용) 의존성
     }
 
     Step "semgrep" $true {

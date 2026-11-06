@@ -113,6 +113,51 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 - **약점 — 수신:** 1990년대 표 양식이라 OCR 줄에 수신 칸과 결재란('국장', '과장')이 섞이고, 텍스트만 보는 GPT가 가려내지 못한다.
   다음 단계는 머리부 이미지를 비전으로 함께 보게 하는 것.
 
+### 모델·지시문 비교 하네스 (https://github.com/reddol18/docflow/issues/22)
+
+모델이나 추출 지시문을 바꿀 때 같은 데이터셋(7개 철 450건)·같은 통과 기준으로 비교한다. promptfoo 0.125.0(`eval/promptfoo/package-lock.json` 고정)으로
+후보 × 지시문 판 × 문서 행렬을 돌리고, `eval/promptfoo/gate.py`가 후보 응답으로 철마다 `app/graph.py` merge·validate를 다시 돌려 `eval/score.py` `metrics()`로 채점한다.
+
+```powershell
+.\eval\promptfoo\run.ps1                       # gpt-4.1-mini(기준)·gpt-4o-mini × 지시문 current·before_ocr_fix × 7개 철 (1800회, 약 20분·$0.66)
+.\eval\promptfoo\run.ps1 -Local -Vols 5350109-1999-0002   # + 로컬 모델(이 PC의 Ollama, 기본 llama3.1:8b). 꺼져 있으면 켜고, 켠 것만 끈다
+.\eval\promptfoo\run.ps1 -Replay               # LLM 호출 없이 저장된 추출 값으로 채점 연결만 확인 (eval/score.py와 같은 숫자)
+.\eval\promptfoo\run.ps1 -View                 # 마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
+```
+
+종료 코드: 0 통과, 1 기준을 어긴 후보 있음, 2 입력 문제. 통과 기준은 `eval/promptfoo/criteria.yaml` — 기준 후보(gpt-4.1-mini·current) 대비
+표시 없이 틀린 문서 +1.0%p 초과, 칸별 정답률 −3.0%p 초과, 응답 읽기 실패 1건 이상이면 실패.
+
+전체 행렬 결과 (2026-11-07, 7개 철 450건, 정답 164건):
+
+| 후보 | 판 | docno | date | recipient | title | 일련번호 표시 재현율 | 일자 표시 재현율 | 표시 없이 틀림 | 읽기 실패 | 건당 비용 | 평균 지연 | p95 지연 | 판정 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gpt-4.1-mini | before_ocr_fix | 63.4% | 78.7% | 46.3% | 87.2% | 98.2% | 54.3% | 1.8% | 0 | $0.00048 | 1.4s | 1.8s | 통과 |
+| gpt-4.1-mini | current | 64.0% | 78.7% | 47.0% | 87.2% | 100.0% | 57.1% | 1.8% | 0 | $0.00055 | 1.4s | 1.8s | 기준 |
+| gpt-4o-mini | before_ocr_fix | 63.4% | 78.0% | 50.6% | 81.7% | 98.2% | 38.9% | 3.7% | 1 | $0.00020 | 2.5s | 3.2s | 실패: 표시 없이 틀림 +1.9%p, title −5.5%p, 읽기 실패 1 |
+| gpt-4o-mini | current | 63.4% | 78.0% | 56.1% | 77.4% | 98.2% | 41.7% | 7.3% | 1 | $0.00023 | 2.5s | 3.5s | 실패: 표시 없이 틀림 +5.5%p, title −9.8%p, 읽기 실패 1 |
+
+- **열:** docno~title = 칸별 최종 정답률(손글씨 판독·검토 표시 규칙까지 거친 값), 표시 재현율 = 틀린 칸 중 검토 표시가 붙은 비율,
+  표시 없이 틀림 = 검토 표시 없이 한 칸이라도 틀린 문서 비율, 읽기 실패 = 응답이 JSON으로 안 읽힌 문서 수, 건당 비용 = 토큰 × `app/llm.py` PRICE,
+  지연 = promptfoo가 잰 호출 시간(`-Cache`로 다시 쓴 응답은 빼고).
+  후보마다 LLM 추출 값만 바꾸고 손글씨 판독 등은 저장 값을 쓴 채 지금 코드의 검토 표시 규칙으로 다시 조립한다.
+  위 '측정 결과' 표(표시 없이 틀림 10%)는 그 뒤 바뀐 표시 규칙 전의 저장 결과라 숫자가 다르다.
+- **채점 연결 확인:** `-Replay`(저장된 추출 값, LLM 호출 없음)의 점수는 저장된 b·hw를 지금 코드로 다시 조립한 결과(`eval/schema_replay.py` `replay()`, 후보와 같은 길)와 같고,
+  `eval/score.py`를 같은 문서에 단독으로 돌린 숫자(docno 64.0%, date 78.7%, recipient 45.7%, title 88.4%, 표시 재현율 100%·57.1%)와도 같다.
+- **로컬 모델:** 이 Windows PC의 Ollama만 쓴다(맥은 배포 시험 환경이라 실험에 쓰지 않는다). 띄우기 전에 모델 폴더 드라이브 여유 10GB를 확인한다.
+  연결만 확인했다 — llama3.1:8b는 작은 철(6건)에서 제목이 기준보다 크게 떨어져 실패, 건당 지연 약 9초·비용 0. 채택 측정은 https://github.com/reddol18/docflow/issues/13.
+- **답변 채점(Ragas·쌍별 승률)은 아직 없다:** `criteria.yaml`의 `answer:` 칸은 자리만 있다 → https://github.com/reddol18/docflow/issues/21.
+- **결과·개인정보:** 실제 문서 글자가 담긴 결과(`results.json`, 다시 조립한 문서, promptfoo 결과 DB)는 저장소 밖 `work/promptfoo/`에만 쓴다.
+  promptfoo 공유·원격 생성·사용 통계·업데이트 확인은 끈다(`PROMPTFOO_DISABLE_*`, `--no-share`). 단, promptfoo 0.125.0은 사용 통계를 꺼도
+  'telemetry disabled' 이벤트 한 번을 r.promptfoo.app으로 보낸다(문서 글자·결과는 없음).
+  비교 화면(`-View`)은 `eval/promptfoo/localhost_only.cjs`로 127.0.0.1에만 묶고, Host·Origin이 `127.0.0.1:15500`/`localhost:15500`이 아닌 요청은
+  403, 응답의 `Access-Control-Allow-Origin`은 지운다(promptfoo 기본은 모든 인터페이스·모든 출처 허용). 시험(`tests/test_model_harness.py`)은 지어낸 값만 쓴다.
+- **키·비용:** OpenAI 키는 Windows 사용자 환경변수에서 읽어 promptfoo를 부르는 동안만 프로세스 환경에 둔다(Ollama·`gate.py`는 물려받지 않음).
+  월 한도를 건 이 하네스 전용 OpenAI 프로젝트 키를 권한다. 응답마다 `max_tokens: 512`(정상 응답 최대 310토큰),
+  단가(`app/llm.py` PRICE)를 모르는 원격 모델이 섞이면 0원으로 치지 않고 종료 코드 2.
+- **로컬 모델 주소:** `run.ps1 -Local`이 켜는 Ollama는 `OLLAMA_HOST=127.0.0.1:11434`로 켠다(이 PC의 Machine 환경변수 `0.0.0.0:11434`를 덮음,
+  켠 뒤 듣는 주소를 확인하고 127.0.0.1 밖이면 멈춤). 이미 켜 둔 Ollama는 건드리지 않고, 모든 인터페이스에서 듣고 있으면 경고만 한다.
+
 ## 부하 시뮬레이션 (breakscale_wrap)
 
 200쪽짜리 철이 한꺼번에 올라오면 어떻게 되는지를 직접 만든 시뮬레이터 [breakscale_wrap](https://github.com/reddol18/breakscale_wrap)으로 돌렸습니다.
@@ -173,6 +218,6 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 | `app/` | FastAPI · LangGraph 흐름(`graph.py`) · OCR · 규칙(`layout.py`) · GPT 호출(`llm.py`) · 저장소 |
 | `frontend/` | Next.js 16 대시보드 (업로드 · 진행 단계 · 검토 에디터 · 검색) |
 | `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow |
-| `eval/` | 정답 채점(`score.py`), 모델·지시문 비교(`cell_variants.py`, `extract_variants.py`). 정답 데이터와 채점 규칙은 이전 PoC 폴더에 있어 이 레포만으로는 돌지 않음 |
+| `eval/` | 정답 채점(`score.py`), 모델·지시문 비교 하네스(`promptfoo/`, 예전 일회성 `cell_variants.py`, `extract_variants.py`). 정답 데이터와 채점 규칙은 이전 PoC 폴더에 있어 이 레포만으로는 돌지 않음 |
 | `sim/` | breakscale_wrap 부하 시나리오 (지금 구성 / 클라우드)와 실행기 |
 | `docs/` | 설계(`design.md`), 실습 기록(`lab_log.md`), 화면 캡처·시뮬레이션 영상 |

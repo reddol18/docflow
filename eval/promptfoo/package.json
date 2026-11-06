@@ -1,0 +1,8 @@
+{
+  "name": "docflow-model-harness",
+  "private": true,
+  "description": "모델·지시문 비교 하네스 (https://github.com/reddol18/docflow/issues/22). 실행은 run.ps1",
+  "dependencies": {
+    "promptfoo": "0.125.0"
+  }
+}
