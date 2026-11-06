@@ -54,6 +54,19 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 **왜 LangGraph인가:** 사람 검토에서 몇 시간 멈췄다 이어 가야 하고(체크포인트), 문서마다 병렬로 돌리고(Send + reducer),
 칸을 못 찾으면 다시 찾는 순환이 있고, 어떤 경로를 지났는지가 남아야 자동 처리율을 잴 수 있기 때문입니다.
 
+### 감사 로그·오류 (https://github.com/reddol18/docflow/issues/28)
+
+| 남는 곳 | 내용 | 원문 값 |
+|---|---|---|
+| `audit` 표 | 업로드·실행·이어 가기·검토 저장·문서 수정마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름 | 없음 |
+| `edits` 표 | 고친 칸의 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/10) | 있음 |
+| `events` 표 (진행 화면) | 노드 시작·끝·오류. 오류는 분류 코드(`budget`·`llm`·`db`·`vector`·`storage`·`internal`)와 짧은 문구만 | 없음 |
+| 서버 로그 (표준 오류) | 오류 traceback. 키·비밀번호·Bearer 꼴 문자열은 `***`로 가림 (`app/errors.py`) | 예외 문구에 들어 있으면 남음 |
+
+- 로그인 안 함(401)·권한 없음(403)·입력 형식 오류(422)는 처리 함수 앞에서 막혀 `audit`에 남지 않는다.
+- **보존:** `audit`은 1년. 기간이 지난 행을 지우는 작업은 납품 후 삭제 절차(https://github.com/reddol18/docflow/issues/12)와 함께 만든다.
+- **납품 후 삭제 범위:** 쪽 이미지·OCR 결과·색인(`documents`)·벡터·`edits`(원문 값이 있음)·`events`는 지운다. `audit`은 원문 값이 없어 보존 기간까지 남긴다(누가 언제 무엇을 했는지는 납품 뒤에도 확인할 수 있어야 하므로).
+
 ## 측정 결과
 
 7개 철 680쪽 → 문서 450건. 사람이 만든 정답 164건(문서 시작 쪽 86 + 색인 칸)으로 채점 (`eval/score.py`).
