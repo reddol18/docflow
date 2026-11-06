@@ -32,9 +32,9 @@ huggingface_hub==2.4.0
 hyperframe==6.1.0
 idna==3.20
 imagesize==2.0.1
-jiter==0.18.0
-jsonpatch==1.43
-jsonpointer==3.9
+jiter==0.19.0
+jsonpatch==1.44
+jsonpointer==3.10
 langchain-core==1.7.6
 langchain-protocol==0.0.21
 langgraph==1.2.18
@@ -75,7 +75,7 @@ pycryptodome==4.3.0
 pydantic==2.14.3
 pydantic_core==2.50.4
 PyJWT==2.15.1
-pypdfium2==5.14.0
+pypdfium2==5.15.0
 python-bidi==0.6.12
 python-dateutil==4.0.0
 python-multipart==0.0.32
