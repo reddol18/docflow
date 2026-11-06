@@ -21,15 +21,26 @@ export type VolumeSummary = {
   spent_today_usd: number;
 };
 
-export type Fields = { docno: string; serial: string; date: string; recipient: string; title: string };
+// 색인 칸은 서버의 스키마(GET /schema, app/field_schemas/*.yaml)가 정한다 (https://github.com/reddol18/docflow/issues/9)
+export type Fields = Record<string, string>;
+export type FieldDef = {
+  name: string;
+  label: string;
+  level: "volume" | "document";
+  method: string;
+  editable: boolean;
+  flag_key: string; // 이 칸의 검토 표시가 붙는 키 (김해 문서번호 → serial)
+  isad: string | null;
+};
+export type Schema = { name: string; fields: FieldDef[] };
 
 export type Doc = {
   doc_id: string;
   vol: string;
   pages: string[];
   fields: Fields;
-  b: Record<"docno" | "date" | "recipient" | "title", { value: string; confidence: number }>;
-  hw: Record<"docno" | "date", { text: string; conf: number }>;
+  b: Partial<Record<string, { value: string; confidence: number }>>; // LLM 추출 (스키마의 prompt 칸)
+  hw: Partial<Record<string, { text: string; conf: number }>>; // 손글씨 칸 판독 (김해 규칙)
   info: {
     prefix: string;
     blank: boolean;
@@ -41,7 +52,7 @@ export type Doc = {
     head_ratio: number;
     box_fail: Record<string, string>;
   };
-  flags: Partial<Record<"serial" | "date" | "recipient" | "title", string[]>>;
+  flags: Partial<Record<string, string[]>>;
   reviewed?: boolean;
   edited?: boolean;
 };
@@ -167,6 +178,7 @@ const enc = encodeURIComponent;
 export const api = {
   volumes: () => call<VolumeSummary[]>("/volumes"),
   volume: (vol: string) => call<VolumeSummary>(`/volumes/${enc(vol)}`),
+  schema: () => call<Schema>("/schema"),
   documents: (vol: string) => call<Doc[]>(`/volumes/${enc(vol)}/documents`),
   events: (vol: string, after: number) => call<GraphEvent[]>(`/volumes/${enc(vol)}/events?after=${after}`),
   upload: (vol: string, files: File[]) => {
@@ -227,7 +239,7 @@ const reportQuery = (dayFrom?: string, dayTo?: string) => {
 export const reportCsv = (dayFrom?: string, dayTo?: string) => `/api/report.csv?${reportQuery(dayFrom, dayTo)}`;
 
 export const headImage = (vol: string, page: string) => `/api/head/${enc(vol)}/${enc(page)}`;
-export const cropImage = (vol: string, docId: string, field: "docno" | "date") =>
+export const cropImage = (vol: string, docId: string, field: string) =>
   `/api/crops/${enc(vol)}/${enc(docId)}_${field}.png`;
 
 export const STAGE_LABEL: Record<Stage, string> = {
@@ -239,9 +251,5 @@ export const STAGE_LABEL: Record<Stage, string> = {
   stopped: "중단됨",
 };
 
-export const FIELD_LABEL = { docno: "문서번호", date: "시행일자", recipient: "수신", title: "제목" } as const;
-export type EditField = keyof typeof FIELD_LABEL;
-export const EDIT_FIELDS = Object.keys(FIELD_LABEL) as EditField[];
-
-// 문서번호 칸의 검토 표시는 'serial'(일련번호) 키로 온다
-export const flagKey = (f: EditField) => (f === "docno" ? "serial" : f);
+// 손글씨 칸을 잘라 둔 칸 (김해 양식 규칙 — app/graph.py HW_RULES). 칸 목록·표시명은 api.schema()
+export const HW_FIELDS = ["docno", "date"];

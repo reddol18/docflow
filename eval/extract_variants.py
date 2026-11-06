@@ -10,11 +10,12 @@ from pathlib import Path
 sys.path.insert(0, "/app")
 from openai import OpenAI  # noqa: E402
 
-from app import layout, llm  # noqa: E402
+from app import fields, layout  # noqa: E402
 
-# OLD = 처음 지시문 (지금 app/llm.py의 EXTRACT_PROMPT는 NEW를 반영한 것)
-OLD = llm.EXTRACT_PROMPT.split("OCR 텍스트에는")[0] + "칸마다 confidence(0~1)를 붙인다. 결재란 단어" + \
-    llm.EXTRACT_PROMPT.split("칸마다 confidence(0~1)를 붙인다. 결재란 단어", 1)[1]
+# OLD = 처음 지시문 (지금 색인 스키마(app/field_schemas/gimhae.yaml)로 만드는 지시문은 NEW를 반영한 것)
+PROMPT = fields.extract_prompt(fields.load(fields.DIR / "gimhae.yaml"))
+OLD = PROMPT.split("OCR 텍스트에는")[0] + "칸마다 confidence(0~1)를 붙인다. 결재란 단어" + \
+    PROMPT.split("칸마다 confidence(0~1)를 붙인다. 결재란 단어", 1)[1]
 NEW = OLD.replace(
     "칸마다 confidence(0~1)를 붙인다.",
     "OCR 텍스트에는 글자를 잘못 읽은 곳이 많다 (예: '회담'→'회답', '필중'→'필증', '파른'→'따른', '실비'→'설비', '참유변상'→'장유면장'). "

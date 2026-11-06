@@ -44,7 +44,7 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 |---|---|
 | ocr | 쪽 이미지 → 단어 상자·줄 텍스트. 쪽마다 결과를 저장해 재실행 시 건너뜀 |
 | split | 규칙으로 문서 시작 쪽 판별 (머리부 기관명·우편번호 + 문서번호/시행일자) |
-| extract | 첫 쪽 텍스트 → GPT가 4칸 + 확신도. OCR 오독은 문맥으로 교정, 수신은 규칙 보정 |
+| extract | 첫 쪽 텍스트 → GPT가 색인 칸(스키마의 `prompt` 칸, 김해는 4칸) + 확신도. OCR 오독은 문맥으로 교정, 수신은 규칙 보정 |
 | locate / widen | 인쇄된 '문서번호'·'시행일자' 옆 손글씨 칸 위치. 못 찾으면 머리부 범위 40→48→56% |
 | read | 손글씨 칸 이미지를 GPT 비전으로 판독. 확신도 = 토큰 확률 기하평균(logprobs) |
 | validate | 검토 필요 표시: 형식·범위·흐름(같은 철 앞뒤 문서와 비교)·확신도 |
@@ -75,6 +75,18 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 3. `DELETE /volumes/{vol}?confirm={vol}` (관리자) — 내보낸 철만. 쪽 이미지·OCR·잘라낸 칸(`DATA_DIR`), `documents`·`edits`·`events`·검사 표·LangGraph 체크포인트, Qdrant 벡터를 지운다. `usage`(비용)·`audit`·`review_time`은 값이 없어 남긴다. 지운 개수는 감사 로그(`purge`)에.
 
 양식 열 매핑은 YAML (`app/export_templates/aihub88.yaml`, 바꾸려면 `EXPORT_TEMPLATE=경로`): 열 이름 ↔ 원천(철 이름 조각·쪽 수, 건 순번·쪽, 색인 칸, 고정값) ↔ 형식(`text`·`int`·`year`·`date`+출력 모양). 기본은 AI Hub 88 공개 라벨 기준 예시(철번호·생산기관코드·생산연도 / 문서번호·생산일자 `YYYYMMDD`·수신·제목·시작쪽·끝쪽). 매핑이 틀리면 앱이 시작하지 않는다.
+
+### 색인 칸 스키마 (https://github.com/reddol18/docflow/issues/9)
+
+색인 칸은 코드가 아니라 YAML(`app/field_schemas/`)이 정한다. 쓰는 파일은 `FIELD_SCHEMA=경로`, 없으면 김해 매핑.
+
+- **기본 스키마** `isad_g.yaml` — ISAD(G) 요소(참조코드·제목·일자·기술계층·쪽수·생산부서·내용 요약·보존기간·공개구분·저작권·이용조건·언어·위치·주기 …). 칸마다 ISAD(G) 영역(`area`)이 있다.
+- **기관 매핑** `gimhae.yaml` — 지금 운영 자료(김해 인·허가)의 4칸(문서번호·시행일자·수신·제목)과 숨김 칸 일련번호. 칸마다 `isad:`로 기본 스키마 칸에 잇는다. 추출 지시문(`extract` + 칸별 `prompt`)도 여기 있다 — 바꾸면 점수를 다시 잰다.
+- 칸 항목: 이름, 표시명(`label`), 단위(`level`: `document` 건 / `volume` 철), 추출 방식(`method`: `rule` 규칙 · `llm_extract` LLM 추출 · `llm_generate` LLM 문장 생성 · `vocab` 통제어휘 선택 · `fixed` 사업 고정값 · `manual` 사람 입력 · `hidden` 숨김), 표기 규칙(`normalize`). 빠진 항목·모르는 방식·모르는 키가 있으면 앱이 시작하지 않는다.
+- 표기 규칙: `date_unknown`(미상 → `9999-99-99`), `decade`(`1950년대` → `1950-00-00 ~ 1959-00-00`), `location`(→ `서고-서가-층-열`), `hanja_hangul`(한자 → 한글 음, Unicode Unihan 표 `hanja_hangul.tsv` — 글자마다 대표 음 하나라 지명·성의 金(김) 같은 예외는 못 가림), `strip`.
+- 사업 고정값(`fixed`, 예: 상위계층·저작권·공개구분·이용조건)은 스키마에 한 번 적으면 모든 건에 들어간다. 철 단위 칸은 지금 고정값·사람 입력만 된다.
+- 저장: `documents.fields`(jsonb)에 칸 값 전부, 검색용 열 `search_text`(스키마 `search.keyword` 칸)·`year`(`search.year` 칸 앞 네 자리, 미상 제외). 예전 고정 열은 앱이 시작할 때 한 번 옮기고 지운다(`store.migrate_documents`).
+- 지금 코드에 묶인 것: 손글씨 칸 판독(문서번호·시행일자)과 검토 표시 규칙(`app/flags.py`)은 김해 양식 기준이다. 그 칸이 없는 스키마에서는 손글씨 판독·검토 표시를 하지 않는다.
 
 ## 측정 결과
 

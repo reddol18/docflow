@@ -63,7 +63,7 @@ items:
   - {id: V5.1.3, level: 1, text: "입력은 허용 목록·형식으로 검증", status: 충족, evidence: "app/main.py VOL_RX(fullmatch, 점만·끝 줄바꿈 거부)·vol_guard, 폼 바뀐 값 CELL_MAX(review_submit), q 1~Q_MAX·k 1~50(search·ask), 업로드 JPEG 매직(upload). tests/test_input.py (https://github.com/reddol18/docflow/issues/49)"}
   - {id: V5.1.5, level: 1, text: "리다이렉트 주소는 허용 목록", status: 충족, evidence: "app/auth.py:462-467 safe_next(:539 저장, :585 사용), login/page.tsx:14-15"}
   - {id: V5.3.3, level: 1, text: "HTML 출력 이스케이프 (XSS)", status: 일부, evidence: "app/main.py:270,284,289,292 vol·doc_id 미이스케이프, 허용 목록으로 지금은 악용 불가. https://github.com/reddol18/docflow/issues/40"}
-  - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 충족, evidence: "app/store.py 전 쿼리 %s(keyword_search :177-189는 자리표시자만), report.py 상수만, auth·users %s"}
+  - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 충족, evidence: "app/store.py 전 쿼리 %s(keyword_search :447-463은 자리표시자만, 칸 값은 fields jsonb 매개변수), report.py 상수만, auth·users %s"}
 
   # ---------- V7 오류·로그 ----------
   - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "앱은 예외 종류만(app/auth.py:577), 오류 traceback은 키·비밀번호·Bearer 꼴을 가림(app/errors.py mask, https://github.com/reddol18/docflow/issues/28). uvicorn 접근 로그에 OIDC code·state 쿼리 https://github.com/reddol18/docflow/issues/40"}
@@ -105,13 +105,13 @@ items:
   - {id: API7, text: "SSRF", status: 일부, evidence: "issuer는 설정값, jwks·token 주소는 discovery 문서에서(auth.py:390,544,571). 차단 목록에 169.254·127·100.64 없음 https://github.com/reddol18/docflow/issues/48"}
   - {id: API8, text: "보안 설정 오류", status: 일부, evidence: "보안 헤더·캐시 금지는 해소(https://github.com/reddol18/docflow/issues/47). 남음: COOKIE_SECURE=0·http https://github.com/reddol18/docflow/issues/48 , trivy config 경고 https://github.com/reddol18/docflow/issues/29"}
   - {id: API9, text: "API 목록 관리", status: 충족, evidence: "app/main.py 머리말 목록 21개 = 실제 라우트, tests/test_input.py test_header_api_list_matches_routes가 app.routes와 양방향 비교 (https://github.com/reddol18/docflow/issues/49)"}
-  - {id: API10, text: "외부 API 응답을 믿음", status: 일부, evidence: "OIDC 서명·aud·nonce 확인, 출력 이스케이프. OpenAI 추출은 모양이 다르면 예외로 철 실행이 멈춤(llm.py:89-92) https://github.com/reddol18/docflow/issues/27"}
+  - {id: API10, text: "외부 API 응답을 믿음", status: 일부, evidence: "OIDC 서명·aud·nonce 확인, 출력 이스케이프. OpenAI 추출은 스키마 칸만 받고 모양이 다르면 빈 값·확신도 0(llm.py:79-89, https://github.com/reddol18/docflow/issues/9). 비전·답변 응답은 그대로 https://github.com/reddol18/docflow/issues/27"}
 
   # ---------- LLM Top 10 ----------
-  - {id: LLM01, text: "프롬프트 인젝션 (OCR 본문을 통한 간접 포함)", status: 미충족, evidence: "app/llm.py:141-147, :85-86 본문을 구분·무시 지시 없이 연결. https://github.com/reddol18/docflow/issues/27"}
+  - {id: LLM01, text: "프롬프트 인젝션 (OCR 본문을 통한 간접 포함)", status: 미충족, evidence: "app/llm.py:138-147, :74-75 본문을 구분·무시 지시 없이 연결 (추출 지시문은 app/field_schemas/*.yaml에서 만듦). https://github.com/reddol18/docflow/issues/27"}
   - {id: LLM02, text: "민감 정보 노출 (답변·로그)", status: 충족, evidence: "app/llm.py:55-59 토큰·비용만 기록, 답변 근거는 viewer가 볼 수 있는 문서뿐. OCR 본문이 OpenAI로 감(정책)"}
-  - {id: LLM05, text: "LLM 출력을 그대로 씀 (HTML·SQL·명령)", status: 충족, evidence: "app/llm.py:89-92 형 변환, store.py 매개변수, main.py:288-293 escape, search/page.tsx:88 텍스트"}
+  - {id: LLM05, text: "LLM 출력을 그대로 씀 (HTML·SQL·명령)", status: 충족, evidence: "app/llm.py:82-89 형 변환(스키마 칸만), store.py 매개변수, main.py:288-293 escape, search/page.tsx:88 텍스트"}
   - {id: LLM06, text: "과도한 권한 (LLM이 도구·쓰기 실행)", status: 충족, evidence: "app/llm.py 모든 호출에 tools·function 없음, 출력은 값으로만"}
-  - {id: LLM07, text: "시스템 프롬프트 노출", status: 충족, evidence: "app/llm.py:62-75,135-136 프롬프트에 비밀·권한 규칙 없음, 키는 따로(:34-36)"}
+  - {id: LLM07, text: "시스템 프롬프트 노출", status: 충족, evidence: "app/field_schemas/*.yaml(추출 지시문)·app/llm.py:132-133 프롬프트에 비밀·권한 규칙 없음, GET /schema는 지시문을 내보내지 않음, 키는 따로(:34-36)"}
   - {id: LLM08, text: "벡터·임베딩 약점 (색인 오염·권한 없는 검색)", status: 일부, evidence: "Qdrant는 docflow만, 쓰기는 admin·reviewer만. 다른 철 같은 이름이 색인을 덮어씀 https://github.com/reddol18/docflow/issues/50 , Qdrant 키 없음 https://github.com/reddol18/docflow/issues/48"}
   - {id: LLM10, text: "무제한 소비 (비용)", status: 일부, evidence: "app/llm.py:49-52 사후 정산, :58 모르는 모델 0원, extract·answer에 max_tokens 없음(read_cell은 40) https://github.com/reddol18/docflow/issues/7"}

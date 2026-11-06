@@ -16,9 +16,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(1, str(Path(__file__).resolve().parents[1]))  # doc_platform (색인 스키마)
 from rescore import gt_serial, load_gt, match, ok_field, pct, pdate  # noqa: E402
 
-FIELDS = ["docno", "date", "recipient", "title"]
+from app import fields  # noqa: E402
+
+# 채점 칸 = 김해 매핑에서 사람이 고칠 수 있는 칸 (https://github.com/reddol18/docflow/issues/9). 정답은 이 4칸만 있다
+FIELDS = list(fields.editable(fields.load(fields.DIR / "gimhae.yaml")))
 
 
 def main():

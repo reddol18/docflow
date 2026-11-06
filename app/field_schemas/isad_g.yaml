@@ -1,0 +1,62 @@
+# 기본 색인 스키마 — ISAD(G) 2판 요소에 맞춘 칸 (https://github.com/reddol18/docflow/issues/9)
+# 칸마다 area = ISAD(G) 영역: identity 식별 / context 배경 / content 내용과 구조 / access 열람과 이용 조건 /
+#   allied 관련 자료 / notes 주기 / control 기술 통제. 번호(3.x.x)는 note에 적는다.
+# 기관마다 이 칸들에 잇는 매핑 파일을 따로 둔다 (예: gimhae.yaml). 이 파일을 그대로 FIELD_SCHEMA로 써도 된다.
+# 사업 고정값(fixed)의 value는 사업마다 채운다 — 비워 두면 빈 값이 모든 건에 들어간다.
+name: ISAD(G) 기본
+note: 표기 규칙 예 — 생산시기 미상 9999-99-99, '1950년대' 1950-00-00 ~ 1959-00-00, 위치 서고-서가-층-열, 한자는 한글로
+extract:
+  preamble: |-
+    입력은 기록물 한 건의 첫 쪽을 OCR로 줄 단위로 옮긴 텍스트다.
+  rules: |-
+    칸마다 confidence(0~1)를 붙인다. 텍스트에 없는 것을 지어내지 않는다. 한자는 보이는 대로 옮긴다 (한글 변환은 후처리).
+fields:
+  - {name: reference_code, label: 참조코드, level: document, method: manual, area: identity, note: 3.1.1}
+  - name: title
+    label: 제목
+    level: document
+    method: llm_extract
+    area: identity
+    note: 3.1.2
+    prompt: 제목. 문서에 적힌 제목 줄을 빠짐없이
+    normalize: [strip, hanja_hangul]
+  - name: dates
+    label: 생산일자
+    level: document
+    method: llm_extract
+    area: identity
+    note: 3.1.3
+    prompt: 생산(시행)일자를 YYYY-MM-DD로. 모르면 "미상", 연대만 있으면 "1950년대"처럼 적는다
+    normalize: [strip, date_unknown, decade]
+  - {name: level_of_description, label: 기술계층, level: document, method: fixed, value: 건, area: identity, note: 3.1.4}
+  - {name: extent, label: 쪽수, level: document, method: rule, rule: pages, area: identity, note: 3.1.5}
+  - {name: parent_unit, label: 상위계층, level: volume, method: fixed, value: '', area: identity,
+     note: 3.1.4 기술계층의 위 단위 (사업 고정값)}
+  - name: creator
+    label: 생산부서
+    level: document
+    method: llm_extract
+    area: context
+    note: 3.2.1
+    prompt: 생산부서(문서를 만든 기관·부서) 이름
+    normalize: [strip, hanja_hangul]
+  - name: scope_content
+    label: 내용 요약
+    level: document
+    method: llm_generate
+    area: content
+    note: 3.3.1
+    prompt: 내용을 한 문장으로 요약한다 (텍스트에 있는 사실만)
+  - {name: retention, label: 보존기간, level: document, method: manual, area: content, note: 3.3.2}
+  - {name: access_conditions, label: 공개구분, level: volume, method: fixed, value: '', area: access, note: 3.4.1 (사업 고정값)}
+  - {name: copyright, label: 저작권, level: volume, method: fixed, value: '', area: access, note: 3.4.2 (사업 고정값)}
+  - {name: use_conditions, label: 이용조건, level: volume, method: fixed, value: '', area: access, note: 3.4.2 (사업 고정값)}
+  - {name: language, label: 언어, level: document, method: fixed, value: 한국어, area: access, note: 3.4.3}
+  - {name: location, label: 위치, level: document, method: manual, area: allied, normalize: [strip, location],
+     note: 3.5.1 원본 소재 — 서고-서가-층-열}
+  - {name: notes, label: 주기, level: document, method: manual, area: notes, note: 3.6.1}
+  - {name: description_date, label: 기술일자, level: document, method: manual, area: control, note: 3.7.3}
+search:
+  keyword: [title, creator, scope_content]
+  embed: [title, creator, dates, scope_content]
+  year: dates
