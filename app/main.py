@@ -449,16 +449,36 @@ def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | Non
                     headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
 
 
-def hybrid(q, year_from=None, year_to=None, k=10):
-    vec = llm.embed("-", [q])[0]
-    v = store.vector_search(vec, year_from, year_to, limit=30)
-    words = [w for w in re.split(r"\s+", q) if len(w) >= 2 and not re.fullmatch(r"\d{4}년?", w)]
-    kw = store.keyword_search(words, year_from, year_to, limit=30)
+def query_words(q):
+    """낱말 검색에 넣을 낱말: 두 글자 이상, 연도(1997·1997년)는 뺀다"""
+    return [w for w in re.split(r"\s+", q) if len(w) >= 2 and not re.fullmatch(r"\d{4}년?", w)]
+
+
+def rrf(*lists):
+    """Reciprocal Rank Fusion 점수 {doc_id: 점수}. 검색 평가(`eval/search_score.py`)도 이 함수를 쓴다"""
     score = {}
-    for lst in (v, kw):  # Reciprocal Rank Fusion
+    for lst in lists:
         for rank, r in enumerate(lst):
             score[r["doc_id"]] = score.get(r["doc_id"], 0) + 1 / (60 + rank + 1)
-    top = sorted(score, key=score.get, reverse=True)[:k]
+    return score
+
+
+CANDIDATES = 30  # 방식마다 가져오는 후보 수
+
+
+def ranked(q, vec, year_from=None, year_to=None):
+    """/search의 순위 계산(질의 임베딩 뒤) → (벡터 결과, 낱말 결과, RRF 점수, RRF 순 doc_id).
+    검색 평가(`eval/search_score.py`)도 이 함수를 그대로 부른다"""
+    v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
+    kw = store.keyword_search(query_words(q), year_from, year_to, limit=CANDIDATES)
+    score = rrf(v, kw)
+    return v, kw, score, sorted(score, key=score.get, reverse=True)
+
+
+def hybrid(q, year_from=None, year_to=None, k=10):
+    vec = llm.embed("-", [q])[0]
+    v, kw, score, order = ranked(q, vec, year_from, year_to)
+    top = order[:k]
     rows = store.get_documents(top)
     vr = {r["doc_id"]: i + 1 for i, r in enumerate(v)}
     kr = {r["doc_id"]: i + 1 for i, r in enumerate(kw)}

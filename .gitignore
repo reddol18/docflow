@@ -1,6 +1,10 @@
 # 원본 쪽 이미지·OCR 결과·채점 결과는 공개하지 않는다 (실명·서명·직인)
 work/
 data/
+# 검색 평가 질의 세트만 연다 — 질의·정답 문서 id·참고 답뿐, 원문 없음 (https://github.com/reddol18/docflow/issues/20)
+!eval/data/
+eval/data/*
+!eval/data/search_queries.jsonl
 *.jpg
 *.jpeg
 *.tif
