@@ -1,0 +1,16 @@
+# 통과 기준 — gate.py가 읽는다. 기준 후보(baseline)와 같은 철·같은 문서에서 비교한다.
+# 값을 null로 두면 그 기준은 보지 않는다. 기준을 어긴 후보가 하나라도 있으면 gate.py는 종료 코드 1.
+# 정한 날: 2026-11-07 (https://github.com/reddol18/docflow/issues/22, 이슈 예시대로)
+
+baseline:              # 지금 운영 기본값 (app/llm.py EXTRACT, 색인 스키마 지시문)
+  provider: gpt-4.1-mini
+  prompt: current
+
+extract:
+  silent_wrong_pp_max: 1.0   # 검토 표시 없이 틀린 문서 비율이 기준보다 1%p 넘게 늘면 실패
+  field_drop_pp_max: 3.0     # 칸별 최종 정답률(문서번호·시행일자·수신·제목) 중 하나라도 3%p 넘게 떨어지면 실패
+  parse_error_max: 0         # 응답이 JSON으로 읽히지 않은 문서가 있으면 실패
+
+answer:                # 검색 답변 채점 — Ragas 지표·심판 승률은 https://github.com/reddol18/docflow/issues/21 에서 채운다
+  faithfulness_min: null     # 근거 충실도가 이 값보다 낮으면 실패
+  win_rate_min: null         # 기준 모델과 나란히 놓고 심판이 고른 승률이 이 값보다 낮으면 실패

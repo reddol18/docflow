@@ -1,0 +1,34 @@
+# 모델·지시문 비교 행렬 (https://github.com/reddol18/docflow/issues/22) — 실행은 run.ps1 (환경변수·결과 위치·통과 기준 판정까지)
+# 제공자 × 지시문 판 × 문서. 문서 데이터는 저장소 밖 work/ 에서 읽는다 (common.py).
+description: docflow 색인 4칸 추출 — 모델·지시문 비교
+
+prompts:
+  - id: file://prompts.py:current
+    label: current
+  - id: file://prompts.py:before_ocr_fix
+    label: before_ocr_fix
+
+providers:
+  - id: openai:chat:gpt-4.1-mini       # 운영 기본값 (기준)
+    label: gpt-4.1-mini
+    config: &json {temperature: 0, response_format: {type: json_object}}
+  - id: openai:chat:gpt-4o-mini
+    label: gpt-4o-mini
+    config: *json
+  # 로컬 모델 (이 Windows PC의 Ollama, OpenAI 호환). run.ps1 -Local 이 켜고 끝나면 끈다. 맥은 배포 환경이라 실험에 쓰지 않는다.
+  # 모델은 run.ps1 -LocalModel → 환경변수 DOCFLOW_LOCAL_MODEL. 채택 측정은 https://github.com/reddol18/docflow/issues/13
+  - id: "openai:chat:{{ env.DOCFLOW_LOCAL_MODEL }}"
+    label: local-ollama
+    config: {temperature: 0, response_format: {type: json_object}, apiBaseUrl: "http://127.0.0.1:11434/v1", apiKey: ollama}
+  - id: file://replay.py              # LLM 호출 없음 — 저장된 추출 값을 돌려준다 (채점 연결 확인, run.ps1 -Replay)
+    label: replay
+
+tests: file://dataset.py:generate_tests
+
+defaultTest:
+  assert:
+    - type: python
+      value: file://check.py
+
+evaluateOptions:
+  maxConcurrency: 4
