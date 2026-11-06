@@ -9,8 +9,13 @@
 
 PoC에서 스크립트를 차례로 돌리던 단계(run_ocr → gt_draft → 추출 → recipient_fix → crop_fields → hw_read → hw_flags)를
 노드로 옮겼다. OCR 결과는 쪽마다 파일로 남겨, 중간에 Pod가 죽어도 다시 돌리면 이미 읽은 쪽은 건너뛴다.
+
+LLM_PROVIDER=off (app/llm.py)면 추출·판독·임베딩을 부르지 않고 건너뛴다: 추출 칸은 빈 값·확신도 0, 손글씨 칸은 못 읽음,
+벡터는 넣지 않는다. 건너뛴 단계는 문서 info.llm_skipped와 events(extract·read의 skipped, index의 embedded)로 드러난다.
+빈 칸은 검토 표시 규칙(app/flags.py)에 걸려 사람 검토로 간다.
 """
 import json
+import operator
 import os
 import re
 import time
@@ -97,10 +102,12 @@ def _brief(name, out):
         return {"flagged": sum(bool(d["flags"]) for d in out["docs"])}
     if name == "locate":
         return {"missing": [k for k, b in out["boxes"].items() if b is None]}
+    if name in ("extract", "read") and out.get("skipped"):
+        return {"skipped": "llm_off"}
     if name == "read":
         return {k: v["text"] for k, v in out["hw"].items()}
     if name == "index":
-        return {"indexed": out["indexed"]}
+        return {"indexed": out["indexed"], "embedded": out.get("embedded", out["indexed"])}
     return {}
 
 
@@ -120,12 +127,14 @@ class VolState(TypedDict, total=False):
     orphans: list[str]  # 첫 시작 쪽 앞에 있어 어느 문서에도 못 붙인 쪽
     docs: Annotated[list[dict], merge_docs]
     indexed: int
+    embedded: int  # 벡터를 넣은 문서 수 (LLM_PROVIDER=off면 0)
 
 
 class DocState(TypedDict, total=False):
     vol: str
     doc_id: str
     pages: list[str]
+    skipped: Annotated[list[str], operator.add]  # LLM_PROVIDER=off로 건너뛴 단계 (extract·read)
     b: dict  # GPT 텍스트 추출 (PoC의 B 갈래)
     recipient: str
     recipient_fix: str
@@ -220,19 +229,24 @@ def doc_text(vol, d):
 def index(s: VolState):
     docs = s.get("docs", [])
     store.save_documents(docs)
+    if not llm.enabled():  # LLM_PROVIDER=off: 문서는 저장하고 벡터는 넣지 않는다 (의미 검색 대상 아님)
+        return {"indexed": len(docs), "embedded": 0}
     for i in range(0, len(docs), 64):
         chunk = docs[i:i + 64]
         store.upsert_vectors(chunk, llm.embed(s["vol"], [doc_text(s["vol"], d) for d in chunk]))
-    return {"indexed": len(docs)}
+    return {"indexed": len(docs), "embedded": len(docs)}
 
 
 # ---------- 문서 하위 그래프 ----------
 
 def extract(s: DocState):
     d = store.load_ocr(s["vol"], s["doc_id"])
-    b = llm.extract(s["vol"], d["lines"], SCHEMA)
+    try:
+        b, skipped = llm.extract(s["vol"], d["lines"], SCHEMA), []
+    except llm.LLMOff:  # 추출 칸은 빈 값·확신도 0 (가짜 값 없음) → 검토 표시로 사람에게
+        b, skipped = (fields.parse_extract(SCHEMA, "{}") if fields.extract_prompt(SCHEMA) else {}), ["extract"]
     rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
-    return {"b": b, "recipient": rec, "recipient_fix": why}
+    return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped}
 
 
 def locate(s: DocState):
@@ -261,7 +275,7 @@ def read(s: DocState):
         return {"hw": {}}
     img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg")
     H, W = img.shape[:2]
-    hw = {}
+    hw, skipped = {}, []
     for k, b in s["boxes"].items():
         if not b:
             hw[k] = {"text": "", "conf": 0.0}
@@ -270,10 +284,13 @@ def read(s: DocState):
         ok, buf = cv2.imencode(".png", img[y0:y1, x0:x1])
         p = store.crop_path(s["vol"], s["doc_id"], k)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(buf.tobytes())
-        text, conf = llm.read_cell(s["vol"], k, buf.tobytes())
+        p.write_bytes(buf.tobytes())  # 잘라낸 칸은 남긴다 — 검토 화면에서 사람이 읽는다
+        try:
+            text, conf = llm.read_cell(s["vol"], k, buf.tobytes())
+        except llm.LLMOff:  # 못 읽은 칸과 같게 (빈 글자·확신도 0)
+            text, conf, skipped = "", 0.0, ["read"]
         hw[k] = {"text": text, "conf": conf}
-    return {"hw": hw}
+    return {"hw": hw, "skipped": skipped}
 
 
 def merge(s: DocState):
@@ -308,7 +325,7 @@ def merge(s: DocState):
                  "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
                  "b_serial": layout.serial_of(b_doc), "b_date": b_date,
                  "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
-                 "box_fail": s["box_fail"]},
+                 "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or []},
         "flags": {},
     }]}
 

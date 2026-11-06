@@ -342,7 +342,8 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     store.save_documents([d])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
-    store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
+    if llm.enabled():  # LLM_PROVIDER=off면 벡터는 그대로 (색인 때도 넣지 않았다)
+        store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
     store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
     return d, list(fix)
 
@@ -727,7 +728,13 @@ def ranked(q, vec, year_from=None, year_to=None):
     return v, kw, score, sorted(score, key=score.get, reverse=True)
 
 
+LLM_OFF = "LLM이 꺼져 있어(LLM_PROVIDER=off) 검색·답변을 쓸 수 없음"
+
+
 def hybrid(q, year_from=None, year_to=None, k=10):
+    # LLM_PROVIDER=off: 질의 임베딩이 없다. 낱말 검색만으로 답할지는 정하지 않았다 — 그때까지 사용 불가로 둔다
+    if not llm.enabled():
+        raise HTTPException(503, LLM_OFF)
     vec = llm.embed("-", [q])[0]
     v, kw, score, order = ranked(q, vec, year_from, year_to)
     top = order[:k]

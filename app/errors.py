@@ -10,6 +10,7 @@ import traceback
 MESSAGES = {
     "budget": "오늘 LLM 사용 한도에 걸려 멈췄습니다",
     "llm": "LLM·임베딩 호출이 실패했습니다",
+    "llm_off": "LLM이 꺼져 있어(LLM_PROVIDER=off) 이 단계를 쓸 수 없습니다",
     "db": "데이터베이스 처리에 실패했습니다",
     "vector": "벡터 색인 처리에 실패했습니다",
     "network": "외부 연결에 실패했습니다",
@@ -19,9 +20,11 @@ MESSAGES = {
 
 
 def code_of(e):
-    from app.llm import BudgetExceeded
+    from app.llm import BudgetExceeded, LLMOff
     if isinstance(e, BudgetExceeded):
         return "budget"
+    if isinstance(e, LLMOff):
+        return "llm_off"
     mod = type(e).__module__ or ""
     if mod.startswith("openai"):
         return "llm"

@@ -142,6 +142,11 @@ spec:
         - {name: QDRANT_URL, value: "http://qdrant:6333"}
         - {name: OCR_THREADS, value: "4"}
         - {name: DAILY_BUDGET_USD, value: "3.0"}
+        # LLM·임베딩 제공자 (app/llm.py 머리말, https://github.com/reddol18/docflow/issues/13): openai / local / off
+        # local(Ollama·vLLM 등 OpenAI 호환): LLM_BASE_URL과 쓰는 기능의 모델 이름(EXTRACT_MODEL·CELL_MODEL·EMBED_MODEL·CHAT_MODEL)
+        # off: 추출·판독·임베딩을 건너뛰고(빈 칸은 검토로) /search·/ask는 503
+        - {name: LLM_PROVIDER, value: "openai"}
+        # - {name: LLM_BASE_URL, value: "http://ollama:11434/v1"}
         - {name: PYTHONUNBUFFERED, value: "1"}
         # 인증 (app/auth.py 머리말). 설치 환경마다: local / oidc / local,oidc
         # 첫 관리자: kubectl exec -it -n docs deploy/docflow -- python -m app.users add admin --role admin
