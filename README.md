@@ -58,12 +58,13 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 
 | 남는 곳 | 내용 | 원문 값 |
 |---|---|---|
-| `audit` 표 | 업로드·실행·이어 가기·검토 저장·문서 수정마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름 | 없음 |
+| `audit` 표 | 업로드·실행·이어 가기·검토 저장·문서 수정·작업 시간 보내기마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름. 뒤에서 돈 실행의 끝(`run_done`: `ok` / `review_waiting` / `error`)도 시작한 사람으로 | 없음 |
 | `edits` 표 | 고친 칸의 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/10) | 있음 |
-| `events` 표 (진행 화면) | 노드 시작·끝·오류. 오류는 분류 코드(`budget`·`llm`·`db`·`vector`·`storage`·`internal`)와 짧은 문구만 | 없음 |
-| 서버 로그 (표준 오류) | 오류 traceback. 키·비밀번호·Bearer 꼴 문자열은 `***`로 가림 (`app/errors.py`) | 예외 문구에 들어 있으면 남음 |
+| `events` 표 (진행 화면) | 노드 시작·끝·오류. 오류는 분류 코드(`budget`·`llm`·`db`·`vector`·`network`·`storage`·`internal`)와 짧은 문구만 | 일부 있음 — 손글씨 판독 값(문서번호·일자), 사용자 이름 |
+| 서버 로그 (표준 오류) | 오류 traceback. 키·Bearer/Basic·JWT, 이름이 key·secret·token·password로 끝나는 값, 주소 속 비밀번호는 `***`로 가림 (`app/errors.py`) | 예외 문구에 실명 등이 들어 있으면 남음 |
 
-- 로그인 안 함(401)·권한 없음(403)·입력 형식 오류(422)는 처리 함수 앞에서 막혀 `audit`에 남지 않는다.
+- 로그인 안 함(401)·권한 없음(403)·요청 형식 검증 실패(422, FastAPI가 처리 함수 앞에서 막음)는 `audit`에 남지 않는다. 로그인·로그아웃도 아직 남기지 않는다.
+- 감사 기록 저장이 실패해도 요청은 원래 결과대로 끝나고, 실패는 서버 로그에 남는다.
 - **보존:** `audit`은 1년. 기간이 지난 행을 지우는 작업은 납품 후 삭제 절차(https://github.com/reddol18/docflow/issues/12)와 함께 만든다.
 - **납품 후 삭제 범위:** 쪽 이미지·OCR 결과·색인(`documents`)·벡터·`edits`(원문 값이 있음)·`events`는 지운다. `audit`은 원문 값이 없어 보존 기간까지 남긴다(누가 언제 무엇을 했는지는 납품 뒤에도 확인할 수 있어야 하므로).
 

@@ -74,7 +74,10 @@ def test_audit_four_actions_and_no_leak(main, monkeypatch, capsys):
     assert c.patch("/documents/v1/d1", headers=ADMIN, json={"recipient": FAKE_NAME}).status_code == 200
 
     rows = store.audit_log()
-    assert sorted(r["action"] for r in rows) == ["edit", "review", "run", "upload"]
+    assert sorted(r["action"] for r in rows) == ["edit", "review", "run", "run_done", "run_done", "upload"]
+    # 실행 실패, 검토 뒤 이어 간 실행(가짜 그래프가 여전히 검토 대기를 돌려줌)
+    assert {r["result"] for r in rows if r["action"] == "run_done"} == {"error", "review_waiting"}
+    rows = [r for r in rows if r["action"] != "run_done"]
     for r in rows:  # 각 행에 시각·사용자·행위·대상·결과
         assert r["ts"] and r["user_id"] == 1 and r["username"] == "a" and r["vol"] == "v1" and r["result"] == "ok"
     assert next(r for r in rows if r["action"] == "edit")["doc_id"] == "d1"
@@ -106,16 +109,46 @@ def test_rejected_request_is_audited(main, monkeypatch):
 
 def test_legacy_error_events_hidden(main):
     store.event("v3", "run", "error", None, error="OperationalError: connection to /var/run/x failed")
-    ev = store.events("v3")
-    assert ev[0]["info"] == {"code": "internal"}
+    assert store.events("v3")[0]["info"] == {"code": "internal"}  # 읽을 때도 거르고
+    store.init_db()  # 시작할 때 표에서 지운다
+    with store.pool.connection() as c:
+        raw = c.execute("SELECT info FROM events WHERE vol = 'v3'").fetchone()["info"]
+    assert raw == {"code": "internal"}
+
+
+def test_audit_failure_does_not_break_request(main, monkeypatch):
+    monkeypatch.setattr(main, "G", fake_graph())
+    monkeypatch.setattr(store, "audit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("pool timeout")))
+    c = TestClient(main.app)
+    assert c.post("/volumes/v4/run", headers=ADMIN).status_code == 404  # 원래 거절이 그대로 (500이 아니라)
+
+
+def test_run_outcome_audited(main, monkeypatch):
+    (store.pages_dir("v5")).mkdir(parents=True)
+    (store.pages_dir("v5") / "p.jpg").write_bytes(JPG)
+    monkeypatch.setattr(main, "G", fake_graph(invoke=lambda arg, cfg: (_ for _ in ()).throw(KeyError("x"))))
+    c = TestClient(main.app)
+    assert c.post("/volumes/v5/run?review=bogus-value-xyz", headers=ADMIN).status_code == 400
+    assert c.post("/volumes/v5/run", headers=ADMIN).status_code == 200
+    wait_idle(main, "v5")
+    rows = {(r["action"], r["result"]): r for r in store.audit_log()}
+    assert rows[("run", "rejected_400")]["info"]["review"] == "invalid"  # 사용자가 넣은 문자열은 남기지 않음
+    assert rows[("run_done", "error")]["info"] == {"code": "internal"} and rows[("run_done", "error")]["username"] == "a"
 
 
 def test_error_codes_and_mask():
     from app.llm import BudgetExceeded
     assert errors.code_of(BudgetExceeded("x")) == "budget"
     assert errors.code_of(FileNotFoundError("x")) == "storage"
+    assert errors.code_of(ConnectionRefusedError("x")) == "network"
     assert errors.code_of(KeyError("x")) == "internal"
     assert set(errors.public(KeyError("x"))) == {"code", "message"}
-    s = errors.mask(f"key {FAKE_KEY}; Authorization: Bearer abcdefgh12345678; password=hunter2xyz api_key='zzz'")
-    for bad in (FAKE_KEY, "abcdefgh12345678", "hunter2xyz", "zzz"):
+    s = errors.mask(f"key {FAKE_KEY}; Authorization: Bearer abcdefgh12345678; password=hunter2xyz api_key='zzz' "
+                    "client_secret=cs111 access_token: at222 openai_api_key=ok333 "
+                    "postgresql://docflow:pgpw444@postgres:5432/docflow jwt eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl")
+    for bad in (FAKE_KEY, "abcdefgh12345678", "hunter2xyz", "zzz", "cs111", "at222", "ok333", "pgpw444", "c2lnbmF0dXJl"):
+        assert bad not in s
+    assert "postgresql://docflow:***@postgres" in s and "client_secret=***" in s
+    s = errors.mask("Authorization: Basic dXNlcjpwYXNzd29yZA== {'password': 'a b c'} PGPASSWORD=hunter2 QDRANT_API_KEY=qd-1")
+    for bad in ("dXNlcjpwYXNzd29yZA", "a b c", "b c", "hunter2", "qd-1"):
         assert bad not in s

@@ -104,8 +104,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS attempt_at timestamptz;
 CREATE TABLE IF NOT EXISTS audit (
   id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), user_id bigint, username text,
   action text NOT NULL, vol text, doc_id text, result text NOT NULL, info jsonb);
-CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts)
+CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
+UPDATE events SET info = (info - 'error') || jsonb_build_object('code', 'internal') WHERE info ? 'error'
 """
+# ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
 
 def init_db():

@@ -129,15 +129,24 @@ def audited(user, action, vol=None, doc_id=None, **info):
     try:
         yield info
     except HTTPException as e:
-        store.audit(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
+        audit_safe(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
         raise
     except Exception as e:
-        store.audit(user, action, vol, doc_id, "error", code=errors.code_of(e), **info)
+        audit_safe(user, action, vol, doc_id, "error", code=errors.code_of(e), **info)
         raise
-    store.audit(user, action, vol, doc_id, "ok", **info)
+    audit_safe(user, action, vol, doc_id, "ok", **info)
 
 
-def submit(vol, arg):
+def audit_safe(*args, **kw):
+    """감사 기록이 실패해도 이미 끝난 처리를 500으로 바꾸거나 원래 거절(409 등)을 가리지 않는다 — 실패는 서버 로그로"""
+    try:
+        store.audit(*args, **kw)
+    except Exception:
+        errors.log_exception(f"audit {args[1]} {args[2]}")
+
+
+def submit(vol, arg, user=None):
+    """철 흐름을 뒤에서 돌린다. 끝난 결과도 감사 로그에 남긴다(run_done: ok / review_waiting / error+분류 코드)."""
     if vol in running:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     running[vol] = "queued"
@@ -151,11 +160,14 @@ def submit(vol, arg):
             print(f"run {vol} stopped/finished: next={snap.next}", flush=True)
             if snap.interrupts:
                 store.event(vol, "review", "waiting", None, flagged=len(snap.interrupts[0].value["flagged"]))
+                audit_safe(user, "run_done", vol, None, "review_waiting")
             else:
                 store.event(vol, "run", "end", None)
+                audit_safe(user, "run_done", vol, None, "ok")
         except Exception as e:
             errors.log_exception(f"run {vol}")  # 상세는 서버 로그에만 (키 꼴 문자열은 가림)
             store.event(vol, "run", "error", None, **errors.public(e))  # 화면엔 분류 코드만
+            audit_safe(user, "run_done", vol, None, "error", code=errors.code_of(e))
         finally:
             running.pop(vol, None)
 
@@ -207,12 +219,13 @@ async def _upload(vol, files):
 
 @app.post("/volumes/{vol}/run")
 def run(vol: str, user: Admin, review: str = "human"):
-    with audited(user, "run", vol, review=review[:10]):
-        if review not in ("human", "auto"):
+    ok_mode = review in ("human", "auto")
+    with audited(user, "run", vol, review=review if ok_mode else "invalid"):  # 사용자가 넣은 임의 문자열은 남기지 않는다
+        if not ok_mode:
             raise HTTPException(400, "review=human|auto")
         if not any(store.pages_dir(vol).glob("*.jpg")):
             raise HTTPException(404, "올린 쪽이 없음")
-        submit(vol, {"vol": vol, "review_mode": review})
+        submit(vol, {"vol": vol, "review_mode": review}, user)
     return {"vol": vol, "started": True}
 
 
@@ -224,7 +237,7 @@ def resume(vol: str, user: Admin):
             raise HTTPException(409, "이어 갈 단계가 없음 (끝났거나 시작 안 함)")
         if snap.interrupts:
             raise HTTPException(409, "사람 검토 대기 중 → /review 에서 이어 감")
-        submit(vol, None)
+        submit(vol, None, user)
     return {"vol": vol, "resumed_at": list(snap.next)}
 
 
@@ -405,7 +418,7 @@ def resume_review(vol, flagged, fixes, user):
     if vol in running:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     record_review(vol, flagged, fixes, user)
-    submit(vol, Command(resume=fixes))
+    submit(vol, Command(resume=fixes), user)
 
 
 @app.post("/review/{vol}")
@@ -451,9 +464,11 @@ class Timing(BaseModel):
 def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)], user: Reviewer):
     """검토 화면이 확정(검토 제출·문서 저장) 때 보내는 문서별 작업 시간 (자리 비움 제외).
     이 철에 없는 문서와 1초 미만(넘겨 보기만 한 것)은 버린다."""
-    known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
-    keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
-    store.add_review_times(vol, keep, user.id)
+    with audited(user, "timings", vol, rows=len(rows)) as info:
+        known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
+        keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
+        store.add_review_times(vol, keep, user.id)
+        info["saved"] = len(keep)
     return {"saved": len(keep), "dropped": len(rows) - len(keep)}
 
 
