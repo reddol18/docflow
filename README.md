@@ -65,8 +65,16 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 
 - 로그인 안 함(401)·권한 없음(403)·요청 형식 검증 실패(422, FastAPI가 처리 함수 앞에서 막음)는 `audit`에 남지 않는다. 로그인·로그아웃도 아직 남기지 않는다.
 - 감사 기록 저장이 실패해도 요청은 원래 결과대로 끝나고, 실패는 서버 로그에 남는다.
-- **보존:** `audit`은 1년 (2026-11-06 확정). 기간이 지난 행을 지우는 작업은 납품 후 삭제 절차(https://github.com/reddol18/docflow/issues/12)와 함께 만든다.
+- **보존:** `audit`은 1년 (2026-11-06 확정). 앱이 시작할 때마다(배포·재시작) 1년 지난 행을 지운다 (`store.prune_audit`).
 - **납품 후 삭제 범위:** 쪽 이미지·OCR 결과·색인(`documents`)·벡터·`edits`(원문 값이 있음)·`events`는 지운다. `audit`은 원문 값이 없어 보존 기간까지 남긴다(누가 언제 무엇을 했는지는 납품 뒤에도 확인할 수 있어야 하므로).
+
+### 납품 형식 출력·일괄 삭제 (https://github.com/reddol18/docflow/issues/12)
+
+1. `GET /export/check?vol=…` — 출력 전 검증. 필수 열 빈칸·형식 위반(예: 일부만 읽은 날짜)·검토 안 끝난 건(검토 표시가 있는데 사람 검토 전) 수와 어느 문서·열인지. 철을 안 고르면 끝난 철 전부.
+2. `GET /export.xlsx?vol=…` (관리자) — 철 목록 시트 + 건 색인 시트. 건은 철 안 쪽 순서(원질서)대로, 철마다 순번 1부터. 글자 칸은 모두 문자열로 써서 `=`로 시작하는 값이 수식이 되지 않는다.
+3. `DELETE /volumes/{vol}?confirm={vol}` (관리자) — 내보낸 철만. 쪽 이미지·OCR·잘라낸 칸(`DATA_DIR`), `documents`·`edits`·`events`·검사 표·LangGraph 체크포인트, Qdrant 벡터를 지운다. `usage`(비용)·`audit`·`review_time`은 값이 없어 남긴다. 지운 개수는 감사 로그(`purge`)에.
+
+양식 열 매핑은 YAML (`app/export_templates/aihub88.yaml`, 바꾸려면 `EXPORT_TEMPLATE=경로`): 열 이름 ↔ 원천(철 이름 조각·쪽 수, 건 순번·쪽, 색인 칸, 고정값) ↔ 형식(`text`·`int`·`year`·`date`+출력 모양). 기본은 AI Hub 88 공개 라벨 기준 예시(철번호·생산기관코드·생산연도 / 문서번호·생산일자 `YYYYMMDD`·수신·제목·시작쪽·끝쪽). 매핑이 틀리면 앱이 시작하지 않는다.
 
 ## 측정 결과
 

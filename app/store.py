@@ -2,6 +2,7 @@
 import datetime as dt
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -127,6 +128,16 @@ def init_db():
         for stmt in SCHEMA.split(";"):  # prepare_threshold=0이라 한 번에 한 문장만 실행할 수 있다
             if stmt.strip():
                 c.execute(stmt)
+    prune_audit()
+
+
+AUDIT_KEEP = "1 year"  # 감사 로그 보존 기간 (2026-11-06 확정, README)
+
+
+def prune_audit():
+    """보존 기간이 지난 감사 로그 행을 지운다 — 시작할 때마다 (배포·재시작). 지운 행 수"""
+    with pool.connection() as c:
+        return c.execute("DELETE FROM audit WHERE ts < now() - %s::interval", (AUDIT_KEEP,)).rowcount
 
 
 def init():
@@ -335,6 +346,39 @@ def edit_history(vol, doc_id):
                          (vol, doc_id)).fetchall()
 
 
+def exported(vol):
+    """이 철을 납품 형식으로 낸 적이 있나 (감사 로그 기준) — 일괄 삭제의 전제"""
+    with pool.connection() as c:
+        return c.execute("SELECT 1 FROM audit WHERE vol = %s AND action = 'export' AND result = 'ok' LIMIT 1",
+                         (vol,)).fetchone() is not None
+
+
+# 납품 뒤 지우는 사업 데이터 (https://github.com/reddol18/docflow/issues/12): 값·원문이 든 표.
+# 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간) — 개수·시각만 있고 값은 없다
+PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters")
+CHECKPOINT_TABLES = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")  # LangGraph PostgresSaver, thread_id = 철
+
+
+def purge_volume(vol):
+    """철 하나의 사업 데이터를 지운다: Postgres 행(한 트랜잭션) → Qdrant 벡터 → 파일. 지운 개수를 돌려준다"""
+    out = {}
+    with pool.connection() as c, c.transaction():
+        for t in PURGE_TABLES:
+            out[t] = c.execute(f"DELETE FROM {t} WHERE vol = %s", (vol,)).rowcount  # noqa: S608 — 고정된 표 이름
+        for t in CHECKPOINT_TABLES:
+            if c.execute("SELECT to_regclass(%s) AS r", (t,)).fetchone()["r"]:
+                out[t] = c.execute(f"DELETE FROM {t} WHERE thread_id = %s", (vol,)).rowcount  # noqa: S608
+    out["vectors"] = delete_vectors(vol)
+    files = 0
+    for kind in ("pages", "ocr", "crops"):
+        d = under(kind, vol)
+        if d.exists():
+            files += sum(1 for p in d.rglob("*") if p.is_file())
+            shutil.rmtree(d)
+    out["files"] = files
+    return out
+
+
 def save_documents(docs):
     with pool.connection() as c:
         for d in docs:
@@ -402,6 +446,24 @@ def upsert_vectors(docs, vectors):
             "doc_id": d["doc_id"], "vol": d["vol"], "year": year, "date": f["date"],
             "docno": f["docno"], "title": f["title"], "recipient": f["recipient"]}))
     qdrant().upsert(COLLECTION, points=pts)
+
+
+def _vol_filter(vol):
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    return Filter(must=[FieldCondition(key="vol", match=MatchValue(value=vol))])
+
+
+def count_vectors(vol):
+    return qdrant().count(COLLECTION, count_filter=_vol_filter(vol), exact=True).count
+
+
+def delete_vectors(vol):
+    """철의 벡터를 모두 지운다. 지운 개수(지우기 전 센 값)"""
+    from qdrant_client.models import FilterSelector
+    n = count_vectors(vol)
+    if n:
+        qdrant().delete(COLLECTION, points_selector=FilterSelector(filter=_vol_filter(vol)), wait=True)
+    return n
 
 
 def vector_search(vec, year_from=None, year_to=None, limit=20):

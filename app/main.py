@@ -24,6 +24,9 @@
   GET   /graph                         흐름 그림 (mermaid)
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
   GET   /report.csv                    같은 리포트 CSV
+  GET   /export/check                  납품 출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건
+  GET   /export.xlsx                   납품 양식 엑셀 (철 목록·건 색인 시트, 쪽 순서 유지) — 관리자
+  DELETE /volumes/{vol}                납품 뒤 사업 데이터 일괄 삭제 (?confirm=철 이름, 내보낸 철만) — 관리자
   /auth/*                              로그인·로그아웃·OIDC (app/auth.py)
 머리말 목록은 시험(`tests/test_input.py`)이 실제 라우트와 비교한다 (https://github.com/reddol18/docflow/issues/49).
 
@@ -47,7 +50,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, errors, inspection, llm, ocr, report, store
+from app import auth, errors, export, inspection, llm, ocr, report, store
 from app import graph as flow
 from app.auth import Admin, Inspector, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
@@ -613,6 +616,75 @@ def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | Non
     body = report.to_csv(report.daily(lo, hi)) + report.inspection_csv(store.inspection_stats(*report._bounds(lo, hi)))
     return Response(body, media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
+
+
+# ---------- 납품 형식 출력·일괄 삭제 (https://github.com/reddol18/docflow/issues/12) ----------
+EXPORT_TEMPLATE = export.load_template()  # 양식 매핑이 틀리면 시작할 때 멈춘다 (EXPORT_TEMPLATE=경로, 기본 AI Hub 88 예시)
+EXPORT_VOLS_MAX = 200
+VolList = Annotated[list[str], Query(default_factory=list)]
+
+
+def _export_volumes(vols, need_done):
+    """[(vol, 쪽 목록, 문서 목록)]. 철을 안 고르면 끝난 철 전부. need_done이면 안 끝난 철은 409"""
+    if len(vols) > EXPORT_VOLS_MAX:
+        raise HTTPException(400, f"철은 {EXPORT_VOLS_MAX}개까지")
+    for v in vols:
+        check(v)
+    out, stages = [], {}
+    for v in vols or volume_names():
+        snap = G.get_state(cfg(v))
+        stage = _stage(v, snap)
+        stages[v] = stage
+        if stage != "done":
+            if need_done and vols:
+                raise HTTPException(409, f"색인이 끝나지 않은 철: {v} ({stage})")
+            if not vols or stage not in ("review", "stopped"):
+                continue  # 고르지 않았으면 끝난 철만, 골랐으면 문서가 있는 단계만 (검토 대기 건을 세려고)
+        vals = snap.values or {}
+        out.append((v, vals.get("pages", []), vals.get("docs", [])))
+    if not out:
+        raise HTTPException(404, "내보낼 철 없음")
+    return out, stages
+
+
+@app.get("/export/check")
+def export_check(_: Viewer, vol: VolList):
+    """출력 전 검증: 필수 열 빈칸·형식 위반·검토 안 끝난 건 수와 어느 문서·열인지"""
+    volumes, stages = _export_volumes(vol, need_done=False)
+    _, problems = export.build(EXPORT_TEMPLATE, volumes)
+    return {"template": EXPORT_TEMPLATE["name"], "volumes": [{"vol": v, "stage": stages[v], "docs": len(d)}
+                                                             for v, _, d in volumes],
+            **export.summary(problems)}
+
+
+@app.get("/export.xlsx")
+def export_xlsx(user: Admin, vol: VolList):
+    """납품 양식 엑셀. 검증 문제가 있어도 낸다 (빈칸은 빈칸으로) — 먼저 /export/check로 확인한다"""
+    with audited(user, "export_request", None, vols=len(vol)) as info:
+        volumes, _ = _export_volumes(vol, need_done=True)
+        sheets, problems = export.build(EXPORT_TEMPLATE, volumes)
+        body = export.to_xlsx(sheets)
+        info.update(volumes=len(volumes), problems=len(problems))
+    for v, _, docs in volumes:  # 철마다 한 줄 — 일괄 삭제는 내보낸 철만 받는다
+        audit_safe(user, "export", v, None, "ok", docs=len(docs))
+    name = f"docflow_export_{dt.datetime.now(store.KST):%Y%m%d_%H%M}.xlsx"
+    return Response(body, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.delete("/volumes/{vol}")
+def purge(vol: str, user: Admin, confirm: str = ""):
+    """납품 뒤 사업 데이터 일괄 삭제: 쪽 이미지·OCR·잘라낸 칸, 문서·이력·이벤트·검사 행, LangGraph 체크포인트, Qdrant 벡터.
+    비용 장부·감사 로그·작업 시간은 남긴다 (값 없음). 실수를 막으려고 confirm에 철 이름을 다시 받고, 내보낸 철만 지운다"""
+    with audited(user, "purge", vol) as info:
+        if confirm != vol:
+            raise HTTPException(400, "confirm에 철 이름을 그대로 넣어야 함")
+        if vol in running:
+            raise HTTPException(409, "실행 중인 철")
+        if not store.exported(vol):
+            raise HTTPException(409, "납품 형식으로 내보낸 적 없는 철 (/export.xlsx 먼저)")
+        info.update(store.purge_volume(vol))
+    return {"vol": vol, "deleted": info}
 
 
 def query_words(q):
