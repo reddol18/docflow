@@ -10,7 +10,10 @@
   GET   /volumes/{vol}/documents       문서별 결과 (B 값·손글씨 판독·표시 포함)
   POST  /volumes/{vol}/timings         검토 화면이 잰 문서별 작업 시간
   PATCH /documents/{vol}/{doc_id}      완료된 문서의 색인 칸 고치기 (재색인)
-  GET   /documents/{vol}/{doc_id}/edits  수정 이력 (칸·이전 값·새 값·사용자·시각)
+  GET   /documents/{vol}/{doc_id}/edits  수정 이력 (칸·이전 값·새 값·사용자·시각·단계 입력/검사)
+  POST  /volumes/{vol}/inspection      검사 목록 만들기 (표시 문서 전부 + 표본 + 100% 검수 칸) — 검사자
+  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부)
+  POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
   GET   /crops/{vol}/{name}            손글씨 칸을 잘라 둔 이미지
   GET   /head/{vol}/{page}             쪽 위 45% 줄인 이미지 (검토용)
   GET   /review/{vol}                  사람 검토 화면 → 아래 POST로 고친 값을 넣으면 흐름이 이어진다
@@ -25,12 +28,13 @@
 머리말 목록은 시험(`tests/test_input.py`)이 실제 라우트와 비교한다 (https://github.com/reddol18/docflow/issues/49).
 
 인증: /healthz와 로그인 경로를 빼고 모두 로그인 필요 (앱 전체 의존성 auth.guard, 기본 거부).
-역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정 reviewer, 업로드·실행 admin.
+역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정(입력) reviewer, 검사 inspector, 업로드·실행 admin.
 """
 import datetime as dt
 import html
 import os
 import re
+import secrets
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
@@ -43,9 +47,9 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, errors, llm, ocr, report, store
+from app import auth, errors, inspection, llm, ocr, report, store
 from app import graph as flow
-from app.auth import Admin, Reviewer, Viewer
+from app.auth import Admin, Inspector, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
 
 # 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부. fullmatch + \Z — '$'는 끝 줄바꿈 앞에서도 맞아 'v1\n'이 지나간다
@@ -225,6 +229,8 @@ def run(vol: str, user: Admin, review: str = "human"):
             raise HTTPException(400, "review=human|auto")
         if not any(store.pages_dir(vol).glob("*.jpg")):
             raise HTTPException(404, "올린 쪽이 없음")
+        if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
+            store.event(vol, "inspection", "reset", None, user=user.username)
         submit(vol, {"vol": vol, "review_mode": review}, user)
     return {"vol": vol, "started": True}
 
@@ -241,25 +247,28 @@ def resume(vol: str, user: Admin):
     return {"vol": vol, "resumed_at": list(snap.next)}
 
 
+def _stage(vol, snap):
+    v = snap.values or {}
+    if running.get(vol) == "queued":
+        return "queued"
+    if snap.interrupts:
+        return "review"
+    if vol in running:
+        return "running"
+    if v.get("indexed") is not None and not snap.next:
+        return "done"
+    if snap.next:
+        return "stopped"  # Pod 재시작 등으로 끊김 → /resume
+    return "new"
+
+
 def summary(vol):
     snap = G.get_state(cfg(vol))
     v = snap.values or {}
     docs = v.get("docs", [])
-    if running.get(vol) == "queued":
-        stage = "queued"
-    elif snap.interrupts:
-        stage = "review"
-    elif vol in running:
-        stage = "running"
-    elif v.get("indexed") is not None and not snap.next:
-        stage = "done"
-    elif snap.next:
-        stage = "stopped"  # Pod 재시작 등으로 끊김 → /resume
-    else:
-        stage = "new"
     return {
         "vol": vol,
-        "stage": stage,
+        "stage": _stage(vol, snap),
         "running": running.get(vol),
         "next": list(snap.next),
         "waiting_review": bool(snap.interrupts),
@@ -302,12 +311,15 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
     with audited(user, "edit", vol, doc_id) as info:
+        row = store.inspection_row(vol, doc_id)
+        if row and row["inspected_at"] is not None:  # 검사가 끝난 문서를 입력 경로로 바꾸면 검사 결과가 무의미해진다
+            raise HTTPException(409, "검사가 끝난 문서는 고칠 수 없음")
         d, changed = _edit_document(vol, doc_id, fields, user)
         info["fields"] = changed  # 칸 이름만 (값은 edits 표)
     return d
 
 
-def _edit_document(vol, doc_id, fields, user):
+def _edit_document(vol, doc_id, fields, user, source="edit"):
     snap = G.get_state(cfg(vol))
     if snap.interrupts or vol in running:
         raise HTTPException(409, "실행 중이거나 검토 대기 중")
@@ -325,9 +337,9 @@ def _edit_document(vol, doc_id, fields, user):
     G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
     store.save_documents([d])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
-    store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
+    store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
     store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
-    store.event(vol, "edit", "end", doc_id, fields=list(fix), user=user.username)
+    store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
     return d, list(fix)
 
 
@@ -335,6 +347,107 @@ def _edit_document(vol, doc_id, fields, user):
 def document_edits(vol: str, doc_id: str, _: Viewer):
     return store.edit_history(vol, doc_id)
 
+
+# ---------- 2단계 검증: 검사 (https://github.com/reddol18/docflow/issues/10) ----------
+def _inspect_rate():
+    raw = os.environ.get("INSPECT_RATE", "0.05")
+    try:
+        rate = float(raw)
+    except ValueError:
+        raise RuntimeError(f"INSPECT_RATE는 0~1 사이 소수 (예: 0.05): {raw!r}") from None
+    if not 0 < rate <= 1:
+        raise RuntimeError(f"INSPECT_RATE는 0~1 사이 소수 (예: 0.05): {raw!r}")
+    return rate
+
+
+INSPECT_RATE = _inspect_rate()  # 표시 없는 문서 표본 비율 — 기본값이자 하한 (관리자만 낮출 수 있다)
+FIELD = Literal[EDITABLE]
+
+
+class InspectionPlanIn(BaseModel):
+    rate: float = Field(INSPECT_RATE, ge=0, le=1)
+    fields100: list[FIELD] = Field(default_factory=list, max_length=len(EDITABLE))  # 100% 검수 칸
+    seed: int | None = Field(None, ge=0, le=2**31 - 1)  # 관리자만: 같은 표본을 다시 만들 때 (시험·재현)
+
+
+class InspectIn(BaseModel):
+    fields: dict[str, CellValue] = Field(default_factory=dict, max_length=10)  # 고친 칸만. 비우면 '이상 없음'
+
+
+def _done_docs(vol):
+    snap = G.get_state(cfg(vol))
+    if _stage(vol, snap) != "done":
+        raise HTTPException(409, "색인이 끝난 철만 검사한다")
+    return (snap.values or {}).get("docs", [])
+
+
+def _check_fields(doc, reason, fields100):
+    """검사자가 볼 칸: 표시 문서는 표시 붙은 칸, 표본은 4칸 전부, 그리고 100% 검수 칸"""
+    if reason == "sample":
+        return list(EDITABLE)
+    flagged = {FLAG_FIELD.get(k, k) for k in (doc.get("flags") or {})} if reason == "flagged" else set()
+    return sorted((flagged | set(fields100)) & set(EDITABLE))
+
+
+@app.post("/volumes/{vol}/inspection")
+def inspection_create(vol: str, body: InspectionPlanIn, user: Inspector):
+    """검사 목록을 만든다. 표본이 치우치지 않게 시드는 서버가 정하고(관리자만 지정), 비율은 INSPECT_RATE 아래로 못 내린다
+    (관리자 빼고). 이 철의 검토를 제출한 사람은 만들 수 없다."""
+    with audited(user, "inspection_plan", vol, rate=body.rate, fields100=body.fields100) as info:
+        admin = auth.role_at_least(user.role, "admin")
+        if not admin and (body.seed is not None or body.rate < INSPECT_RATE):
+            raise HTTPException(403, f"시드 지정과 {INSPECT_RATE} 미만 비율은 관리자만")
+        if user.id is not None and store.entered(vol, user.id)[0]:
+            raise HTTPException(403, "이 철의 검토를 제출한 사람은 검사 목록을 만들 수 없음 (교차검사)")
+        docs = _done_docs(vol)
+        seed = body.seed if body.seed is not None else secrets.randbelow(2**31)
+        rows, summary = inspection.plan(docs, body.rate, body.fields100, seed)
+        if not store.create_inspection(vol, summary, rows, user.id):
+            raise HTTPException(409, "이미 검사 목록이 있음")
+        info.update(docs=len(rows), sample=summary["sample"])
+    return {"plan": {k: v for k, v in summary.items() if k != "seed"}, "docs": len(rows)}
+
+
+@app.get("/volumes/{vol}/inspection")
+def inspection_view(vol: str, user: Viewer):
+    plan = store.inspection_plan(vol)
+    if not plan:
+        raise HTTPException(404, "검사 목록 없음")
+    docs = {d["doc_id"]: d for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
+    inspector = auth.role_at_least(user.role, "inspector")
+    whole, mine = store.entered(vol, user.id) if inspector and user.id is not None else (False, set())
+    out = []
+    for r in store.inspection_rows(vol):
+        d = docs.get(r["doc_id"], {})
+        out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
+                    "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
+                    "can_inspect": inspector and r["inspected_at"] is None and not whole and r["doc_id"] not in mine})
+    return {"plan": plan, "docs": out}
+
+
+@app.post("/inspection/{vol}/{doc_id}")
+def inspect_document(vol: str, doc_id: str, body: InspectIn, user: Inspector):
+    """검사 결과. 문서를 먼저 차지하고(동시 제출 막기) 고친 칸은 문서 수정과 같은 길(그래프 상태·Postgres·Qdrant)로
+    반영한다. 이력 단계는 inspect. 고치다 실패하면 차지를 풀어 다시 검사할 수 있게 한다.
+    교차검사: 이 문서를 입력 단계에서 고쳤거나 이 철의 검토를 제출한 사람은 검사할 수 없다."""
+    with audited(user, "inspect", vol, doc_id) as info:
+        _done_docs(vol)
+        if not store.inspection_row(vol, doc_id):
+            raise HTTPException(404, "검사 목록에 없는 문서")
+        if user.id is None or store.is_entrant(vol, doc_id, user.id):
+            raise HTTPException(403, "자기가 입력·수정한 문서는 검사할 수 없음 (교차검사)")
+        if not store.claim_inspection(vol, doc_id, user.id):
+            raise HTTPException(409, "이미 검사함")
+        try:
+            _, changed = _edit_document(vol, doc_id, body.fields, user, source="inspect")
+        except BaseException:
+            store.release_inspection(vol, doc_id)
+            raise
+        # 고친 칸은 이력에서 센다 — 앞선 시도가 저장 뒤(임베딩 등)에서 실패해 이번 제출에 차이가 없어도 빠지지 않게
+        fixed = store.inspected_fields(vol, doc_id)
+        store.finish_inspection(vol, doc_id, fixed)
+        info["fields"] = fixed
+    return {"doc_id": doc_id, "fixed_fields": fixed}
 
 @app.get("/volumes/{vol}/documents")
 def documents(vol: str, _: Viewer):
@@ -366,6 +479,7 @@ def head(vol: str, page: str, _: Viewer):
 
 
 LABEL = {"docno": "문서번호", "date": "시행일자", "recipient": "수신", "title": "제목", "serial": "일련번호"}
+FLAG_FIELD = {"serial": "docno"}  # 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
 
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
@@ -407,6 +521,7 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
 def record_review(vol, flagged, fixes, user):
     """공정 리포트용: 표시된 문서·칸 수와 사람이 고친 칸 수 (https://github.com/reddol18/docflow/issues/11).
     수정 이력: 고친 칸마다 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/6)."""
+    store.add_review_submitter(vol, user.id)  # 교차검사 근거 — 실패하면 검토 제출도 실패
     store.add_edits(vol, changes(flagged, fixes), user.id, "review")
     store.event(vol, "review", "submit", None, docs=len(flagged),
                 cells=sum(len(d["flags"]) for d in flagged),
@@ -488,13 +603,15 @@ def report_view(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | No
     vols = volume_names()
     return {"day_from": lo, "day_to": hi, "volume": report.volume_counts([summary(v) for v in vols]),
             "daily": report.daily(lo, hi), "review_time": report.review_time_summary(lo, hi),
+            "inspection": store.inspection_stats(*report._bounds(lo, hi)),  # 철별 표본 검사·추정 오류율 (https://github.com/reddol18/docflow/issues/10)
             "columns": dict(report.COLUMNS)}
 
 
 @app.get("/report.csv")
 def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | None = None):
     lo, hi = _range(day_from, day_to)
-    return Response(report.to_csv(report.daily(lo, hi)), media_type="text/csv; charset=utf-8",
+    body = report.to_csv(report.daily(lo, hi)) + report.inspection_csv(store.inspection_stats(*report._bounds(lo, hi)))
+    return Response(body, media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="docflow_report_{lo}_{hi}.csv"'})
 
 

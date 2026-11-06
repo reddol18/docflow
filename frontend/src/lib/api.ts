@@ -115,14 +115,17 @@ export type Report = {
   columns: Record<string, string>;
 };
 
-export type Role = "viewer" | "reviewer" | "admin";
+export type Role = "viewer" | "reviewer" | "inspector" | "admin";
 export type Me = { username: string; name: string; role: Role };
 export type AuthConfig = { modes: ("local" | "oidc")[]; off: boolean; oidc_label: string | null };
-export type EditRow = { ts: string; field: string; old: string | null; new: string; source: "review" | "edit"; username: string | null; name: string | null };
+export type EditRow = {
+  ts: string; field: string; old: string | null; new: string; source: "review" | "edit" | "inspect"; stage: "entry" | "inspect";
+  username: string | null; name: string | null;
+};
 
-const ROLE_ORDER: Role[] = ["viewer", "reviewer", "admin"];
+const ROLE_ORDER: Role[] = ["viewer", "reviewer", "inspector", "admin"];
 export const can = (me: Me | null | undefined, need: Role) => !!me && ROLE_ORDER.indexOf(me.role) >= ROLE_ORDER.indexOf(need);
-export const ROLE_LABEL: Record<Role, string> = { viewer: "보기", reviewer: "검토", admin: "관리" };
+export const ROLE_LABEL: Record<Role, string> = { viewer: "보기", reviewer: "검토", inspector: "검사", admin: "관리" };
 
 export const loginUrl = () => {
   const here = window.location.pathname + window.location.search;

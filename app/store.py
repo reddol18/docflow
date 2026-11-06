@@ -105,7 +105,17 @@ CREATE TABLE IF NOT EXISTS audit (
   id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), user_id bigint, username text,
   action text NOT NULL, vol text, doc_id text, result text NOT NULL, info jsonb);
 CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
-UPDATE events SET info = (info - 'error') || jsonb_build_object('code', 'internal') WHERE info ? 'error'
+UPDATE events SET info = (info - 'error') || jsonb_build_object('code', 'internal') WHERE info ? 'error';
+CREATE TABLE IF NOT EXISTS inspection_plan (
+  vol text PRIMARY KEY, rate numeric NOT NULL, fields100 text[] NOT NULL, seed bigint NOT NULL,
+  flagged int NOT NULL, unflagged int NOT NULL, sample int NOT NULL,
+  created_by bigint, created_at timestamptz DEFAULT now());
+CREATE TABLE IF NOT EXISTS inspection (
+  vol text NOT NULL, doc_id text NOT NULL, reason text NOT NULL,
+  inspected_by bigint, inspected_at timestamptz, fixed_fields text[],
+  PRIMARY KEY (vol, doc_id));
+CREATE TABLE IF NOT EXISTS review_submitters (
+  vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id))
 """
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
@@ -200,10 +210,127 @@ def add_edits(vol, rows, user_id, source):
                         [(vol, did, f, old, new, user_id, source) for did, f, old, new in rows])
 
 
+def create_inspection(vol, summary, rows, user_id):
+    """검사 목록을 한 번에 만든다 (한 트랜잭션). 이미 있으면 False"""
+    with pool.connection() as c, c.transaction(), c.cursor() as cur:
+        cur.execute("INSERT INTO inspection_plan (vol, rate, fields100, seed, flagged, unflagged, sample, created_by) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (vol) DO NOTHING",
+                    (vol, summary["rate"], summary["fields100"], summary["seed"], summary["flagged"],
+                     summary["unflagged"], summary["sample"], user_id))
+        if cur.rowcount == 0:
+            return False
+        cur.executemany("INSERT INTO inspection (vol, doc_id, reason) VALUES (%s,%s,%s)",
+                        [(vol, d, r) for d, r in sorted(rows.items())])
+    return True
+
+
+def inspection_plan(vol):
+    """화면용 — 시드·만든 사람 id는 내보내지 않는다"""
+    with pool.connection() as c:
+        return c.execute("SELECT vol, rate::float AS rate, fields100, flagged, unflagged, sample, created_at "
+                         "FROM inspection_plan WHERE vol = %s", (vol,)).fetchone()
+
+
+def add_review_submitter(vol, user_id):
+    """검토를 제출한 사람 — 교차검사의 근거. 감사 로그(실패해도 넘어감)와 달리 실패하면 검토 제출도 실패한다"""
+    if user_id is None:
+        return
+    with pool.connection() as c:
+        c.execute("INSERT INTO review_submitters (vol, user_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (vol, user_id))
+
+
+def inspection_rows(vol):
+    with pool.connection() as c:
+        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, u.username AS inspected_by "
+                         "FROM inspection i LEFT JOIN users u ON u.id = i.inspected_by WHERE i.vol = %s ORDER BY i.doc_id",
+                         (vol,)).fetchall()
+
+
+def inspection_row(vol, doc_id):
+    with pool.connection() as c:
+        return c.execute("SELECT * FROM inspection WHERE vol = %s AND doc_id = %s", (vol, doc_id)).fetchone()
+
+
+_VOL_ENTRANTS = ("SELECT user_id FROM review_submitters WHERE vol = %(vol)s "
+                 "UNION SELECT user_id FROM audit WHERE vol = %(vol)s AND action = 'review' AND result = 'ok' "
+                 # review_submitters·audit 이전(https://github.com/reddol18/docflow/issues/28 이전)에 검토한 철: 이벤트의 사용자 이름
+                 "UNION SELECT u.id FROM events e JOIN users u ON u.username = e.info->>'user' "
+                 "WHERE e.vol = %(vol)s AND e.node = 'review' AND e.phase = 'submit'")
+
+
+def entered(vol, user_id):
+    """이 사용자가 입력 단계에 손댄 범위: (철 전체를 검토 제출했나, 칸을 고친 문서 id 집합). 교차검사용 — 한 번에 센다"""
+    with pool.connection() as c:
+        whole = c.execute(f"SELECT 1 FROM ({_VOL_ENTRANTS}) t WHERE user_id = %(uid)s LIMIT 1",  # noqa: S608 — 상수 SQL
+                          {"vol": vol, "uid": user_id}).fetchone() is not None
+        docs = {r["doc_id"] for r in c.execute("SELECT DISTINCT doc_id FROM edits WHERE vol = %s AND user_id = %s "
+                                                "AND source IN ('review','edit')", (vol, user_id)).fetchall()}
+    return whole, docs
+
+
+def is_entrant(vol, doc_id, user_id):
+    whole, docs = entered(vol, user_id)
+    return whole or doc_id in docs
+
+
+def claim_inspection(vol, doc_id, user_id):
+    """검사할 문서를 먼저 차지한다 (동시에 두 사람이 고치지 않게). 이미 누가 차지했으면 False.
+    판단은 inspected_at으로 — 사용자 id가 없을 때(인증 끈 개발 모드)도 두 번 검사되지 않게"""
+    with pool.connection() as c:
+        cur = c.execute("UPDATE inspection SET inspected_by = %s, inspected_at = now() "
+                        "WHERE vol = %s AND doc_id = %s AND inspected_at IS NULL", (user_id, vol, doc_id))
+        return cur.rowcount == 1
+
+
+def inspected_fields(vol, doc_id):
+    """검사 단계에서 고친 칸 (이력 기준)"""
+    with pool.connection() as c:
+        return sorted(r["field"] for r in c.execute(
+            "SELECT DISTINCT field FROM edits WHERE vol = %s AND doc_id = %s AND source = 'inspect'", (vol, doc_id)).fetchall())
+
+
+def reset_inspection(vol):
+    """철을 처음부터 다시 돌릴 때 예전 검사 목록을 지운다. 지운 것이 있으면 True"""
+    with pool.connection() as c, c.transaction():
+        c.execute("DELETE FROM inspection WHERE vol = %s", (vol,))
+        return c.execute("DELETE FROM inspection_plan WHERE vol = %s", (vol,)).rowcount > 0
+
+
+def finish_inspection(vol, doc_id, fixed_fields):
+    with pool.connection() as c:
+        c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s", (fixed_fields, vol, doc_id))
+
+
+def release_inspection(vol, doc_id):
+    """고치다 실패하면 차지를 푼다"""
+    with pool.connection() as c:
+        c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
+                  "WHERE vol = %s AND doc_id = %s", (vol, doc_id))
+
+
+def inspection_stats(start=None, end=None):
+    """철별 표본 검사 결과: 표본 수, 검사 끝난 표본 n, 그중 고친 k, 추정 오류율 k/n.
+    start·end(시각)를 주면 그 기간에 검사한 것만 센다 (리포트 기간과 맞춤). 끝나지 않은(차지만 한) 검사는 세지 않는다"""
+    done = "i.reason = 'sample' AND i.fixed_fields IS NOT NULL"
+    period = " AND i.inspected_at >= %(start)s AND i.inspected_at < %(end)s" if start and end else ""
+    with pool.connection() as c:
+        rows = c.execute("SELECT p.vol, p.sample, p.rate::float AS rate, "  # noqa: S608 — 상수 조각만 끼움
+                         f"count(*) FILTER (WHERE {done}{period}) AS inspected, "
+                         f"count(*) FILTER (WHERE {done}{period} AND cardinality(i.fixed_fields) > 0) AS fixed "
+                         "FROM inspection_plan p LEFT JOIN inspection i ON i.vol = p.vol GROUP BY p.vol, p.sample, p.rate "
+                         "ORDER BY p.vol", {"start": start, "end": end}).fetchall()
+    for r in rows:
+        r["error_rate"] = round(r["fixed"] / r["inspected"], 4) if r["inspected"] else None
+    return rows
+
+
 def edit_history(vol, doc_id):
     with pool.connection() as c:
         # sso: SSO 사용자는 이름을 제공자가 정하므로 local 계정과 이름이 같을 수 있다 → 구별해서 보여 준다
-        return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, u.username, u.name, u.issuer IS NOT NULL AS sso FROM edits e "
+        # stage: 입력(검토 제출·색인 뒤 수정) / 검사 (https://github.com/reddol18/docflow/issues/10)
+        return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, "
+                         "CASE WHEN e.source = 'inspect' THEN 'inspect' ELSE 'entry' END AS stage, "
+                         "u.username, u.name, u.issuer IS NOT NULL AS sso FROM edits e "
                          "LEFT JOIN users u ON u.id = e.user_id WHERE e.vol = %s AND e.doc_id = %s ORDER BY e.id",
                          (vol, doc_id)).fetchall()
 
