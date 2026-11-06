@@ -21,6 +21,8 @@ ENV PADDLE_PDX_CACHE_HOME=/opt/paddlex PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=Tru
 COPY app/__init__.py app/ocr.py app/warm.py app/
 RUN python -m app.warm && chown -R app /opt/paddlex
 COPY app/ app/
+# Windows에서 scp로 올린 새 폴더는 700이라 app 사용자가 못 읽는다 (export_templates, https://github.com/reddol18/docflow/issues/12 배포 실패)
+RUN chmod -R a+rX app
 USER app
 ENV DATA_DIR=/data
 EXPOSE 8000
