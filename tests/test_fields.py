@@ -184,6 +184,9 @@ def test_schema_endpoint():
     assert body["fields"][0] == {"name": "docno", "label": "문서번호", "level": "document", "method": "rule",
                                  "editable": True, "flag_key": "serial", "isad": "reference_code"}
     assert "prompt" not in json.dumps(body)
+    # 내보내는 키를 정확히 — 지시문·고정값·주기가 새지 않게
+    assert set(body) == {"name", "fields"}
+    assert all(set(f) == {"name", "label", "level", "method", "editable", "flag_key", "isad"} for f in body["fields"])
 
 
 # ---------- 표기 규칙 ----------
@@ -256,6 +259,44 @@ def test_fixed_values_fill_every_document(tmp_path, monkeypatch):
         assert {k: d["fields"][k] for k in vals} == vals
         assert d["fields"]["date"] == "1999-03-04" and d["fields"]["serial"] == "7"
     assert len(saved) == 3 and all(d["fields"]["copyright"] == "가상시" for d in saved)
+
+
+def test_renamed_rule_fields(monkeypatch):
+    """매핑에서 칸 이름을 바꿔도 규칙은 rule 이름으로 재료를 찾고, 다시 계산은 derive_from 칸에서 (버그 리뷰 지적)"""
+    from app import graph
+    s = gimhae_raw()
+    ren = {"docno": "doc_number", "recipient": "addressee"}
+    for f in s["fields"]:
+        f["name"] = ren.get(f["name"], f["name"])
+        if f.get("derive_from") == "docno":
+            f["derive_from"] = "doc_number"
+        if f.get("flag_key"):
+            f.pop("flag_key")
+    s["search"] = {"keyword": ["title", "addressee", "doc_number"], "embed": ["title"], "year": "date"}
+    schema = fields.parse(s, base())
+    monkeypatch.setattr(graph, "SCHEMA", schema)
+    b = {"doc_number": {"value": "가상 12345-9"}, "addressee": {"value": "가상시장"}}
+    assert graph._llm_of(b, "docno") == "가상 12345-9" and graph._llm_of(b, "recipient") == "가상시장"
+    v = graph.rederive({"doc_number": "가상 12345-42", "serial": "9"}, {"doc_number": "가상 12345-42"})
+    assert v["serial"] == "42"
+
+
+def test_human_input_normalized(monkeypatch):
+    s = other()
+    assert fields.normalize_input(s, {"made": " 미상 ", "shelf": "x", "nope": "y"}) == {"made": "9999-99-99", "shelf": "x",
+                                                                                       "nope": "y"}
+    from app import review_input
+    monkeypatch.setattr(fields, "SCHEMA", s)
+    monkeypatch.setattr(review_input, "EDITABLE", fields.editable(s))
+    flagged = [{"doc_id": "d", "fields": {"made": "9999-99-99", "subject": "가"}}]
+    assert review_input.clean_fixes(flagged, [("d", "made", "미상"), ("d", "subject", "나")]) == {"d": {"subject": "나"}}
+
+
+def test_schema_endpoint_isad_for_base(monkeypatch):
+    from app import main
+    monkeypatch.setattr(main.schema_fields, "SCHEMA", base())
+    body = main.schema_view(None)
+    assert next(f for f in body["fields"] if f["name"] == "title")["isad"] == "title"
 
 
 def test_rederive_serial_on_edit():

@@ -80,12 +80,13 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 
 색인 칸은 코드가 아니라 YAML(`app/field_schemas/`)이 정한다. 쓰는 파일은 `FIELD_SCHEMA=경로`, 없으면 김해 매핑.
 
-- **기본 스키마** `isad_g.yaml` — ISAD(G) 요소(참조코드·제목·일자·기술계층·쪽수·생산부서·내용 요약·보존기간·공개구분·저작권·이용조건·언어·위치·주기 …). 칸마다 ISAD(G) 영역(`area`)이 있다.
+- **기본 스키마** `isad_g.yaml` — ISAD(G) 요소(참조코드·제목·일자·기술계층·쪽수·생산부서·내용 요약·보존기간·공개구분·저작권·이용조건·언어·위치·주기 …). 칸마다 ISAD(G) 영역(`area`)이 있다. 그대로 쓰려면 납품 양식(`EXPORT_TEMPLATE`)도 이 칸 이름에 맞춘 것을 줘야 한다 (기본 양식은 김해 칸 이름).
 - **기관 매핑** `gimhae.yaml` — 지금 운영 자료(김해 인·허가)의 4칸(문서번호·시행일자·수신·제목)과 숨김 칸 일련번호. 칸마다 `isad:`로 기본 스키마 칸에 잇는다. 추출 지시문(`extract` + 칸별 `prompt`)도 여기 있다 — 바꾸면 점수를 다시 잰다.
 - 칸 항목: 이름, 표시명(`label`), 단위(`level`: `document` 건 / `volume` 철), 추출 방식(`method`: `rule` 규칙 · `llm_extract` LLM 추출 · `llm_generate` LLM 문장 생성 · `vocab` 통제어휘 선택 · `fixed` 사업 고정값 · `manual` 사람 입력 · `hidden` 숨김), 표기 규칙(`normalize`). 빠진 항목·모르는 방식·모르는 키가 있으면 앱이 시작하지 않는다.
 - 표기 규칙: `date_unknown`(미상 → `9999-99-99`), `decade`(`1950년대` → `1950-00-00 ~ 1959-00-00`), `location`(→ `서고-서가-층-열`), `hanja_hangul`(한자 → 한글 음, Unicode Unihan 표 `hanja_hangul.tsv` — 글자마다 대표 음 하나라 지명·성의 金(김) 같은 예외는 못 가림), `strip`.
 - 사업 고정값(`fixed`, 예: 상위계층·저작권·공개구분·이용조건)은 스키마에 한 번 적으면 모든 건에 들어간다. 철 단위 칸은 지금 고정값·사람 입력만 된다.
-- 저장: `documents.fields`(jsonb)에 칸 값 전부, 검색용 열 `search_text`(스키마 `search.keyword` 칸)·`year`(`search.year` 칸 앞 네 자리, 미상 제외). 예전 고정 열은 앱이 시작할 때 한 번 옮기고 지운다(`store.migrate_documents`).
+- 저장: `documents.fields`(jsonb)에 칸 값 전부, 검색용 열 `search_text`(스키마 `search.keyword` 칸)·`year`(`search.year` 칸 앞 네 자리, 미상 제외). 예전 고정 열은 앱이 시작할 때 한 번 옮기고 지운다(`store.migrate_documents`, 한 트랜잭션). 열을 지우면 되돌릴 수 없으므로 이 판을 처음 배포하기 전에 Postgres를 백업한다(`pg_dump`). 이전 이미지로 되돌릴 때는 그 백업을 복원한다 (예전 코드는 새 열 구성을 읽지 못한다).
+- 사람이 고친 값(검토·수정·검사)에도 같은 표기 규칙을 적용한다.
 - 지금 코드에 묶인 것: 손글씨 칸 판독(문서번호·시행일자)과 검토 표시 규칙(`app/flags.py`)은 김해 양식 기준이다. 그 칸이 없는 스키마에서는 손글씨 판독·검토 표시를 하지 않는다.
 
 ## 측정 결과

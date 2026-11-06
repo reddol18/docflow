@@ -1,7 +1,9 @@
 # 기본 색인 스키마 — ISAD(G) 2판 요소에 맞춘 칸 (https://github.com/reddol18/docflow/issues/9)
 # 칸마다 area = ISAD(G) 영역: identity 식별 / context 배경 / content 내용과 구조 / access 열람과 이용 조건 /
 #   allied 관련 자료 / notes 주기 / control 기술 통제. 번호(3.x.x)는 note에 적는다.
-# 기관마다 이 칸들에 잇는 매핑 파일을 따로 둔다 (예: gimhae.yaml). 이 파일을 그대로 FIELD_SCHEMA로 써도 된다.
+# 기관마다 이 칸들에 잇는 매핑 파일을 따로 둔다 (예: gimhae.yaml). 이 파일을 그대로 FIELD_SCHEMA로 쓸 수도 있지만,
+# 그때는 납품 양식(EXPORT_TEMPLATE)도 이 칸 이름(field.title·field.dates …)으로 맞춘 것을 줘야 앱이 시작한다
+# (기본 양식 aihub88.yaml은 김해 칸 이름을 쓴다).
 # 사업 고정값(fixed)의 value는 사업마다 채운다 — 비워 두면 빈 값이 모든 건에 들어간다.
 name: ISAD(G) 기본
 note: 표기 규칙 예 — 생산시기 미상 9999-99-99, '1950년대' 1950-00-00 ~ 1959-00-00, 위치 서고-서가-층-열, 한자는 한글로

@@ -51,7 +51,8 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, errors, export, fields, inspection, llm, ocr, report, store
+from app import auth, errors, export, inspection, llm, ocr, report, store
+from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app.auth import Admin, Inspector, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
@@ -331,7 +332,8 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     if doc_id not in docs:
         raise HTTPException(404)
     old = docs[doc_id]["fields"]
-    fix = {k: str(v).strip() for k, v in fields.items() if k in EDITABLE}
+    fix = schema_fields.normalize_input(schema_fields.SCHEMA,  # LLM 값과 같은 표기 규칙 (미상·연대·위치 등)
+                                        {k: str(v).strip() for k, v in fields.items() if k in EDITABLE})
     fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
     if not fix:
         return docs[doc_id], []
@@ -480,8 +482,8 @@ def head(vol: str, page: str, _: Viewer):
     return Response(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes(), media_type="image/jpeg")
 
 
-LABEL = fields.labels(fields.SCHEMA)
-FLAG_FIELD = fields.flag_keys(fields.SCHEMA)  # 김해: 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
+LABEL = schema_fields.labels(schema_fields.SCHEMA)
+FLAG_FIELD = schema_fields.flag_keys(schema_fields.SCHEMA)  # 김해: 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
 FLAG_OF = {v: k for k, v in FLAG_FIELD.items()}
 
 
@@ -732,7 +734,7 @@ def hybrid(q, year_from=None, year_to=None, k=10):
     rows = store.get_documents(top)
     vr = {r["doc_id"]: i + 1 for i, r in enumerate(v)}
     kr = {r["doc_id"]: i + 1 for i, r in enumerate(kw)}
-    shown = fields.shown(fields.SCHEMA)  # 김해: 문서번호·시행일자·수신·제목
+    shown = schema_fields.shown(schema_fields.SCHEMA)  # 김해: 문서번호·시행일자·수신·제목
     return [{"doc_id": d, "rrf": round(score[d], 5), "vector_rank": vr.get(d), "keyword_rank": kr.get(d),
              "vol": rows[d]["vol"], **{c: (rows[d]["fields"] or {}).get(c, "") for c in shown}}
             for d in top if d in rows]
@@ -761,8 +763,9 @@ def graph_view(_: Viewer):
 @app.get("/schema")
 def schema_view(_: Viewer):
     """화면용 칸 목록 — 숨김 칸·추출 지시문·고정값은 내보내지 않는다"""
-    s = fields.SCHEMA
+    s = schema_fields.SCHEMA
     return {"name": s["name"], "fields": [
         {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
-         "editable": f["name"] in EDITABLE, "flag_key": f.get("flag_key", f["name"]), "isad": f.get("isad")}
-        for f in s["fields"] if f["name"] in fields.shown(s)]}
+         "editable": f["name"] in EDITABLE, "flag_key": f.get("flag_key", f["name"]),
+         "isad": f.get("isad") or (f["name"] if "area" in f else None)}  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
+        for f in s["fields"] if f["name"] in schema_fields.shown(s)]}

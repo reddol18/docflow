@@ -12,6 +12,8 @@ def clean_fixes(flagged, pairs):
     fixes = {}
     for did, k, val in pairs:
         val = str(val).strip()
+        if k in EDITABLE:
+            val = fields.normalize_input(fields.SCHEMA, {k: val})[k]  # LLM 값과 같은 표기 규칙
         if did in cur and k in EDITABLE and val != (cur[did].get(k) or ""):
             fixes.setdefault(did, {})[k] = val
     return fixes

@@ -38,7 +38,7 @@ SCHEMA = fields.SCHEMA
 RULES = ("docno", "serial", "date", "recipient", "pages")
 HW_RULES = {"docno", "serial", "date"}  # 손글씨 칸(문서번호·시행일자)을 찾아 읽어야 하는 규칙
 # 사람이 원천 칸을 고치면 다시 계산하는 규칙 (스키마 derive_from)
-DERIVE = {"serial": lambda v: layout.serial_of(v.get("docno") or "")}
+DERIVE = {"serial": layout.serial_of}  # 원천 칸(derive_from) 값 → 이 칸 값
 FLAG_FIELDS = {"docno", "serial", "date", "recipient", "title"}  # app/flags.py 규칙이 보는 칸
 fields.check_rules(SCHEMA, RULES)
 
@@ -56,12 +56,18 @@ def rederive(values, changed, schema=None):
     """사람이 고친 칸(changed)에서 나오는 칸을 다시 계산한다 (김해: 문서번호 → 일련번호). values를 바꿔서 돌려준다"""
     for f in (schema or SCHEMA)["fields"]:
         if f.get("derive_from") in changed:
-            values[f["name"]] = fields.normalize(f, DERIVE[f["rule"]](values))
+            values[f["name"]] = fields.normalize(f, DERIVE[f["rule"]](values.get(f["derive_from"]) or ""))
     return values
 
 
 def uses_hw(schema):
     return any(f.get("rule") in HW_RULES for f in schema["fields"])
+
+
+def _llm_of(b, rule, schema=None):
+    """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게)"""
+    name = next((f["name"] for f in (schema or SCHEMA)["fields"] if f.get("rule") == rule), rule)
+    return (b.get(name) or {}).get("value") or ""
 
 
 def traced(name, fn):
@@ -222,14 +228,10 @@ def index(s: VolState):
 
 # ---------- 문서 하위 그래프 ----------
 
-def _bv(b, k):
-    return (b.get(k) or {}).get("value") or ""
-
-
 def extract(s: DocState):
     d = store.load_ocr(s["vol"], s["doc_id"])
     b = llm.extract(s["vol"], d["lines"], SCHEMA)
-    rec, why = layout.fix_recipient(d, _bv(b, "recipient"))
+    rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
     return {"b": b, "recipient": rec, "recipient_fix": why}
 
 
@@ -255,6 +257,8 @@ def widen(s: DocState):
 
 
 def read(s: DocState):
+    if not s["boxes"]:  # 손글씨 칸을 찾지 않는 스키마 — 쪽 이미지를 읽지 않는다
+        return {"hw": {}}
     img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg")
     H, W = img.shape[:2]
     hw = {}
@@ -276,8 +280,8 @@ def merge(s: DocState):
     """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
     b = s["b"]
     hw = {k: s["hw"].get(k) or {"text": "", "conf": 0.0} for k in ("docno", "date")}
-    b_doc = _bv(b, "docno")
-    b_date = _bv(b, "date") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", _bv(b, "date")) else ""
+    b_doc = _llm_of(b, "docno")
+    b_date = _llm_of(b, "date") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", _llm_of(b, "date")) else ""
     doc_text_ = hw["docno"]["text"]
     s_doc = layout.serial_of(doc_text_) if re.search(r"[-~]", doc_text_) else ""
     # 문서번호 칸이 '-'로 끝나면 일련번호 빈칸 문서로 본다 (경찰서 통보 등)

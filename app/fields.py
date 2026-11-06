@@ -77,12 +77,13 @@ _hanja = None
 def hanja_hangul(v):
     """한자 → 한글 음 (글자마다 대표 음 하나, 두음법칙 없음). 표에 없는 글자는 그대로 둔다"""
     global _hanja
-    if _hanja is None:
-        _hanja = {}
+    if _hanja is None:  # 다 만든 뒤 한 번에 넣는다 — 문서 하위 그래프가 여러 스레드에서 돌 때 덜 찬 표를 보지 않게
+        table = {}
         for line in HANJA_TABLE.read_text(encoding="utf-8").splitlines():
             if line and not line.startswith("#"):
                 h, k = line.split("\t")
-                _hanja[ord(h)] = k
+                table[ord(h)] = k
+        _hanja = table
     return v.translate(_hanja)
 
 
@@ -95,6 +96,12 @@ def normalize(field, value):
     for n in field.get("normalize", ()):
         v = NORMALIZE[n](v)
     return v
+
+
+def normalize_input(s, values):
+    """사람이 고친 값 {칸: 값}에도 같은 표기 규칙을 적용한다 (검토·수정·검사 입력). 모르는 칸은 그대로"""
+    by = by_name(s)
+    return {k: normalize(by[k], v) if k in by else v for k, v in values.items()}
 
 
 # ---------- 읽기·검사 ----------
@@ -182,8 +189,9 @@ def parse(s, base=None):
         raise SchemaError("search는 keyword·embed·year만")
     for k in ("keyword", "embed"):
         v = se.setdefault(k, shown)
-        if not isinstance(v, list) or not v or any(n not in by for n in v):
-            raise SchemaError(f"search.{k}: 칸 이름 목록이어야 함")
+        # 숨김·철 단위 칸은 넣지 않는다 — 검색 순위로 숨긴 값이 드러나지 않게
+        if not isinstance(v, list) or not v or any(n not in shown for n in v):
+            raise SchemaError(f"search.{k}: 보이는 건 단위 칸 이름 목록이어야 함")
     if se.get("year") is not None and se["year"] not in by:
         raise SchemaError(f"search.year: 없는 칸 {se['year']!r}")
     se.setdefault("year", None)
