@@ -51,7 +51,7 @@ from pydantic import BaseModel, Field
 
 from app import store
 
-ROLES = ("viewer", "reviewer", "admin")  # 뒤로 갈수록 넓다. admin ⊃ reviewer ⊃ viewer
+ROLES = ("viewer", "reviewer", "inspector", "admin")  # 뒤로 갈수록 넓다. reviewer=입력자, inspector=검사자 (https://github.com/reddol18/docflow/issues/10)
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 COOKIE = "docflow_session"
 STATE_COOKIE = "docflow_oidc_state"
@@ -294,6 +294,7 @@ def require(role):
 
 Viewer = Annotated[User, require("viewer")]
 Reviewer = Annotated[User, require("reviewer")]
+Inspector = Annotated[User, require("inspector")]
 Admin = Annotated[User, require("admin")]
 
 

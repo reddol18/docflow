@@ -133,6 +133,21 @@ def review_time_summary(day_from: dt.date, day_to: dt.date):
                         "total_min": round(float(r["total"]) / 60000, 1)} for r in rows}
 
 
+INSPECTION_COLUMNS = [("vol", "철"), ("rate", "표본 비율"), ("sample", "표본 수"), ("inspected", "검사한 표본"),
+                      ("fixed", "검사에서 고친 표본"), ("error_rate", "추정 오류율")]
+
+
+def inspection_csv(stats):
+    """철별 표본 검사 결과 (https://github.com/reddol18/docflow/issues/10) — 날짜별 표 아래에 빈 줄을 두고 붙인다"""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([])
+    w.writerow([label for _, label in INSPECTION_COLUMNS])
+    for r in stats:
+        w.writerow(["" if r[k] is None else r[k] for k, _ in INSPECTION_COLUMNS])
+    return buf.getvalue()
+
+
 def to_csv(rows):
     """엑셀에서 한글이 깨지지 않게 BOM을 붙인다."""
     buf = io.StringIO()
