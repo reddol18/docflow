@@ -2,28 +2,23 @@
 
 사용: python extract_variants.py <vol> <정답 json> [변형,...]   정답 = {doc_id: {docno, date, recipient, title}}
 채점은 PoC 규칙(공백·구분기호 무시)으로 칸별 일치 수를 센다. 수신은 규칙 보정 전 값이다.
+파드에서 돌릴 때는 eval/prompt_versions.py를 이 파일과 같은 폴더에 함께 복사한다 (지시문 판을 거기서 읽는다.
+scripts/mac/pod_run.sh가 tmp/ 파일을 다 복사). python -I로 돌려도 이 파일의 폴더에서 찾는다.
 """
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, "/app")
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I는 스크립트 폴더를 sys.path에 넣지 않는다
 from openai import OpenAI  # noqa: E402
 
-# OLD = 처음 지시문 (지금 색인 스키마(app/field_schemas/gimhae.yaml)로 만드는 지시문은 NEW를 반영한 것).
-# 파드에서 돌릴 때는 eval/prompt_versions.py도 같은 폴더에 둔다 (scripts/mac/pod_run.sh가 tmp/ 파일을 다 복사)
-from prompt_versions import OLD  # noqa: E402
+# OLD = 처음 지시문, NEW = 지금 운영 지시문(색인 스키마 app/field_schemas/gimhae.yaml로 만든 것). 정의는 prompt_versions 한 곳
+# (예전 이 파일의 OLD.replace(...)로 만든 NEW와 바이트 단위로 같음을 2026-11-07 확인하고 옮김)
+from prompt_versions import NEW, OLD  # noqa: E402
 
 from app import layout  # noqa: E402
 
-NEW = OLD.replace(
-    "칸마다 confidence(0~1)를 붙인다.",
-    "OCR 텍스트에는 글자를 잘못 읽은 곳이 많다 (예: '회담'→'회답', '필중'→'필증', '파른'→'따른', '실비'→'설비', '참유변상'→'장유면장'). "
-    "행정 문서 문맥상 명백한 오독은 바른 글자로 고쳐 적는다. 숫자·고유명사는 근거 없이 바꾸지 않는다.\n"
-    "제목은 '제목' 항목 줄의 끝까지 빠짐없이 적는다 (따옴표로 쓴 \"건의\", 괄호 안 내용 포함). "
-    "수신은 '수신' 항목의 값만 적고(주소·상호·'대표'까지), 결재란·담당자·참조 부서 글자는 넣지 않는다.\n"
-    "칸마다 confidence(0~1)를 붙인다.",
-)
 VARIANTS = {"old_4omini": (OLD, "gpt-4o-mini"), "new_4omini": (NEW, "gpt-4o-mini"),
             "new_41mini": (NEW, "gpt-4.1-mini"), "new_41": (NEW, "gpt-4.1")}
 PRICE = {"gpt-4o-mini": (0.15e-6, 0.60e-6), "gpt-4.1-mini": (0.4e-6, 1.6e-6), "gpt-4.1": (2e-6, 8e-6)}

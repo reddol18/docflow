@@ -91,7 +91,8 @@ def test_main_exit_codes(gate, tmp_path, monkeypatch):
                                                        _row("gpt-4o-mini", "current", "d1")]}}), encoding="utf-8")
     good = {"silent": 1.0, "fields": {f: 80.0 for f in gate.FIELDS}, "b_fields": {}, "flag_recall": {}, "all_ok": 0}
     bad = dict(good, silent=5.0)
-    monkeypatch.setattr(gate, "rebuild", lambda res_, vols: ({}, {}, 0))
+    monkeypatch.setattr(gate.common, "load_vol", lambda vol: ([], {}))
+    monkeypatch.setattr(gate, "rebuild", lambda res_, data: ({}, {}, 0))
     monkeypatch.setattr(gate, "metrics", lambda docs: {"n_gt": 1, "n_docs": 1})
     which = iter([good, bad])
     monkeypatch.setattr(gate, "summary", lambda m: next(which))
@@ -108,6 +109,55 @@ def test_main_exit_codes(gate, tmp_path, monkeypatch):
     which = iter([good])
     assert gate.main() == 2
 
+    # 단가 모르는 원격 모델이 섞이면 0원으로 치지 않고 2 (채점 전에 멈춘다)
+    res.write_text(json.dumps({"results": {"results": [_row("gpt-4.1-mini", "current", "d1"),
+                                                       _row("가상-모델", "current", "d1")]}}), encoding="utf-8")
+    which = iter([good, good])
+    assert gate.main() == 2
+
+
+def test_price_of(gate):
+    """모델 = 'openai:chat:' 뒤 전부, 로컬·replay = 0, 모르는 원격 모델 = None"""
+    assert gate.price_of(_row("gpt-4.1-mini", "current", "d1")) == (0.40, 1.60)
+    # ':'가 든 원격 모델 이름은 끝 조각(예전 split(':')[-1])으로 단가를 찾지 않는다
+    assert gate.price_of(_row("x", "current", "d1", pid="openai:chat:ft:gpt-4.1-mini:가상조직::abc")) is None
+    assert gate.price_of(_row("x", "current", "d1", pid="openai:chat:gpt-4.1-mini:가상")) is None
+    local = _row("내-로컬", "current", "d1", pid="openai:chat:llama3.1:8b")
+    assert gate.price_of(local) is None  # label도 주소도 로컬이라는 표시가 없으면 모름
+    assert gate.price_of(local, {"내-로컬": {"apiBaseUrl": "http://127.0.0.1:11434/v1"}}) == (0, 0)
+    assert gate.price_of(local, {"내-로컬": {"apiBaseUrl": "http://localhost:8080/v1"}}) == (0, 0)
+    assert gate.price_of(local, {"내-로컬": {"apiBaseUrl": "https://가상.example/v1"}}) is None
+    assert gate.price_of(_row("local-ollama", "current", "d1", pid="openai:chat:qwen2.5:7b")) == (0, 0)
+    assert gate.price_of(_row("replay", "current", "d1", pid="file://replay.py")) == (0, 0)
+    assert gate.price_of(_row("x", "current", "d1", pid="anthropic:messages:가상")) is None
+    assert gate.unpriced([_row("gpt-4o-mini", "current", "d1"), local]) == ["openai:chat:llama3.1:8b"]
+    with pytest.raises(ValueError):
+        gate.cost_latency({"d1": local})
+
+
+def test_response_kept_when_assertion_fails(gate, monkeypatch):
+    """promptfoo는 단언(check.py) 실패·예외에도 error를 채운다 → 응답이 있으면 읽고, 제공자 오류·응답 없음만 읽기 실패"""
+    good = json.dumps({"docno": {"value": "가상 12345-7", "confidence": 0.9}})
+    rows = {
+        "d1": dict(_row("m", "current", "d1", out=good), error="Python 단언 예외 (가상)", failureReason=1),
+        "d2": dict(_row("m", "current", "d2", out=None), error="API 오류 (가상)", failureReason=2),
+        "d3": dict(_row("m", "current", "d3"), response={"error": "가상 시간 초과", "output": "{}"}, failureReason=2),
+        "d4": dict(_row("m", "current", "d4", out='{"docno": {"value": "끊긴'), error="JSON 아님", failureReason=1),
+    }
+    assert gate.response_of(rows["d1"]) == good
+    assert gate.response_of(rows["d2"]) is None and gate.response_of(rows["d3"]) is None
+    assert gate.assert_failed(rows) == 2  # d1(응답 읽힘)·d4(응답은 있으나 JSON 아님)
+
+    def fake_assemble(data, b_of):
+        docs = {d: b_of({"doc_id": d}) for d in ["d1", "d2", "d3", "d4", "d5"]}  # d5 = 결과 줄 없음
+        return docs, {}
+
+    monkeypatch.setattr(gate, "assemble", fake_assemble)
+    docs, _, errors = gate.rebuild(rows, {})
+    assert docs["d1"]["docno"]["value"] == "가상 12345-7"  # 단언이 실패해도 좋은 응답은 그대로 채점
+    assert errors == 4  # d2·d3 제공자 오류, d4 JSON 아님, d5 응답 없음
+    assert docs["d2"] == gate.EMPTY
+
 
 def test_config_matrix():
     cfg = yaml.safe_load((PF / "promptfooconfig.yaml").read_text(encoding="utf-8"))
@@ -116,6 +166,7 @@ def test_config_matrix():
     assert [p["label"] for p in cfg["prompts"]] == ["current", "before_ocr_fix"]
     for p in cfg["providers"][:3]:
         assert p["config"]["temperature"] == 0 and p["config"]["response_format"] == {"type": "json_object"}
+        assert p["config"]["max_tokens"] == 512  # 건당 출력 상한 (정상 응답 최대 310토큰)
     assert cfg["providers"][2]["config"]["apiBaseUrl"].startswith("http://127.0.0.1:")  # 로컬 모델은 이 PC에서만
 
 

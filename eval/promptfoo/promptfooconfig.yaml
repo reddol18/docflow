@@ -8,18 +8,22 @@ prompts:
   - id: file://prompts.py:before_ocr_fix
     label: before_ocr_fix
 
+# max_tokens 512: 건당 출력 상한(비용·폭주 응답 막기). 2026-11-07 전체 행렬·로컬 실행에서 정상 응답(finish stop) 최대 310토큰
+# (gpt-4o-mini), 넘친 응답은 promptfoo 기본 상한 1024에서 잘린 반복 1건뿐 → 512면 정상 응답은 잘리지 않는다.
 providers:
   - id: openai:chat:gpt-4.1-mini       # 운영 기본값 (기준)
     label: gpt-4.1-mini
-    config: &json {temperature: 0, response_format: {type: json_object}}
+    config: &json {temperature: 0, max_tokens: 512, response_format: {type: json_object}}
   - id: openai:chat:gpt-4o-mini
     label: gpt-4o-mini
     config: *json
-  # 로컬 모델 (이 Windows PC의 Ollama, OpenAI 호환). run.ps1 -Local 이 켜고 끝나면 끈다. 맥은 배포 환경이라 실험에 쓰지 않는다.
+  # 로컬 모델 (이 Windows PC의 Ollama, OpenAI 호환). run.ps1 -Local 이 OLLAMA_HOST=127.0.0.1:11434로 켜고 끝나면 끈다
+  # (미리 켜 둔 Ollama는 그 설정대로 — 모든 인터페이스면 run.ps1이 경고). 맥은 배포 환경이라 실험에 쓰지 않는다.
   # 모델은 run.ps1 -LocalModel → 환경변수 DOCFLOW_LOCAL_MODEL. 채택 측정은 https://github.com/reddol18/docflow/issues/13
   - id: "openai:chat:{{ env.DOCFLOW_LOCAL_MODEL }}"
     label: local-ollama
-    config: {temperature: 0, response_format: {type: json_object}, apiBaseUrl: "http://127.0.0.1:11434/v1", apiKey: ollama}
+    config: {temperature: 0, max_tokens: 512, response_format: {type: json_object}, apiBaseUrl: "http://127.0.0.1:11434/v1",
+             apiKey: ollama}
   - id: file://replay.py              # LLM 호출 없음 — 저장된 추출 값을 돌려준다 (채점 연결 확인, run.ps1 -Replay)
     label: replay
 

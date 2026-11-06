@@ -142,14 +142,21 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
   지연 = promptfoo가 잰 호출 시간(`-Cache`로 다시 쓴 응답은 빼고).
   후보마다 LLM 추출 값만 바꾸고 손글씨 판독 등은 저장 값을 쓴 채 지금 코드의 검토 표시 규칙으로 다시 조립한다.
   위 '측정 결과' 표(표시 없이 틀림 10%)는 그 뒤 바뀐 표시 규칙 전의 저장 결과라 숫자가 다르다.
-- **채점 연결 확인:** `-Replay`(저장된 추출 값, LLM 호출 없음)의 점수는 저장된 b·hw를 지금 코드로 다시 조립한 결과(`eval/schema_replay.py`)와 같고,
+- **채점 연결 확인:** `-Replay`(저장된 추출 값, LLM 호출 없음)의 점수는 저장된 b·hw를 지금 코드로 다시 조립한 결과(`eval/schema_replay.py` `replay()`, 후보와 같은 길)와 같고,
   `eval/score.py`를 같은 문서에 단독으로 돌린 숫자(docno 64.0%, date 78.7%, recipient 45.7%, title 88.4%, 표시 재현율 100%·57.1%)와도 같다.
 - **로컬 모델:** 이 Windows PC의 Ollama만 쓴다(맥은 배포 시험 환경이라 실험에 쓰지 않는다). 띄우기 전에 모델 폴더 드라이브 여유 10GB를 확인한다.
   연결만 확인했다 — llama3.1:8b는 작은 철(6건)에서 제목이 기준보다 크게 떨어져 실패, 건당 지연 약 9초·비용 0. 채택 측정은 https://github.com/reddol18/docflow/issues/13.
 - **답변 채점(Ragas·쌍별 승률)은 아직 없다:** `criteria.yaml`의 `answer:` 칸은 자리만 있다 → https://github.com/reddol18/docflow/issues/21.
 - **결과·개인정보:** 실제 문서 글자가 담긴 결과(`results.json`, 다시 조립한 문서, promptfoo 결과 DB)는 저장소 밖 `work/promptfoo/`에만 쓴다.
-  promptfoo 공유·원격 생성·사용 통계·업데이트 확인은 끄고(`PROMPTFOO_DISABLE_*`, `--no-share`), 비교 화면은 127.0.0.1에만 연다.
-  OpenAI 키는 Windows 사용자 환경변수에서 promptfoo 프로세스로만 넘긴다. 시험(`tests/test_model_harness.py`)은 지어낸 값만 쓴다.
+  promptfoo 공유·원격 생성·사용 통계·업데이트 확인은 끈다(`PROMPTFOO_DISABLE_*`, `--no-share`). 단, promptfoo 0.125.0은 사용 통계를 꺼도
+  'telemetry disabled' 이벤트 한 번을 r.promptfoo.app으로 보낸다(문서 글자·결과는 없음).
+  비교 화면(`-View`)은 `eval/promptfoo/localhost_only.cjs`로 127.0.0.1에만 묶고, Host·Origin이 `127.0.0.1:15500`/`localhost:15500`이 아닌 요청은
+  403, 응답의 `Access-Control-Allow-Origin`은 지운다(promptfoo 기본은 모든 인터페이스·모든 출처 허용). 시험(`tests/test_model_harness.py`)은 지어낸 값만 쓴다.
+- **키·비용:** OpenAI 키는 Windows 사용자 환경변수에서 읽어 promptfoo를 부르는 동안만 프로세스 환경에 둔다(Ollama·`gate.py`는 물려받지 않음).
+  월 한도를 건 이 하네스 전용 OpenAI 프로젝트 키를 권한다. 응답마다 `max_tokens: 512`(정상 응답 최대 310토큰),
+  단가(`app/llm.py` PRICE)를 모르는 원격 모델이 섞이면 0원으로 치지 않고 종료 코드 2.
+- **로컬 모델 주소:** `run.ps1 -Local`이 켜는 Ollama는 `OLLAMA_HOST=127.0.0.1:11434`로 켠다(이 PC의 Machine 환경변수 `0.0.0.0:11434`를 덮음,
+  켠 뒤 듣는 주소를 확인하고 127.0.0.1 밖이면 멈춤). 이미 켜 둔 Ollama는 건드리지 않고, 모든 인터페이스에서 듣고 있으면 경고만 한다.
 
 ## 부하 시뮬레이션 (breakscale_wrap)
 

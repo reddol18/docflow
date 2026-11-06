@@ -12,12 +12,19 @@ import sys
 from pathlib import Path
 
 
-def replay(graph, docs):
-    """한 철의 저장 결과 → 지금 코드의 merge·validate로 다시 조립한 문서 목록"""
+def replay(graph, docs, b_of=None, recipient_of=None):
+    """한 철의 저장 결과 → 지금 코드의 merge·validate로 다시 조립한 문서 목록.
+
+    b_of(d) → b         저장된 LLM 추출 값 d["b"] 대신 쓸 값 (모델 비교 하네스가 후보 응답을 넣는다). 없으면 저장 값
+    recipient_of(d, b) → (수신, 보정 사유)  수신을 b로 다시 보정 (app/graph.py extract와 같은 layout.fix_recipient).
+                        없으면 저장된 수신·보정 사유 — b를 바꿀 때는 꼭 넘긴다 (수신 보정은 b의 수신 값에서 나온다)
+    """
     merged = []
     for d in docs:
-        s = {"vol": d["vol"], "doc_id": d["doc_id"], "pages": d["pages"], "b": d["b"], "hw": d["hw"],
-             "recipient": d["fields"]["recipient"], "recipient_fix": d["info"]["recipient_fix"],
+        b = b_of(d) if b_of else d["b"]
+        rec, why = recipient_of(d, b) if recipient_of else (d["fields"]["recipient"], d["info"]["recipient_fix"])
+        s = {"vol": d["vol"], "doc_id": d["doc_id"], "pages": d["pages"], "b": b, "hw": d["hw"],
+             "recipient": rec, "recipient_fix": why,
              "ratio_i": graph.HEAD_RATIOS.index(d["info"]["head_ratio"]), "box_fail": d["info"]["box_fail"]}
         merged.extend(graph.merge(s)["docs"])
     return graph.validate({"docs": merged})["docs"]
