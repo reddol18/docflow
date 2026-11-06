@@ -1,2 +1,3 @@
 # 시험용 가짜 값 (tests/test_audit_pg.py 마스킹 시험, https://github.com/reddol18/docflow/issues/28) — 실제 비밀값 아님
 458dee85b8f44477fd1ac668691f3fd0b58a7427:tests/test_audit_pg.py:generic-api-key:120
+07d9a665b3c53c0353ea2f20629d30656b98ef63:tests/test_audit_pg.py:generic-api-key:149
