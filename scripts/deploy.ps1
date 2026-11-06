@@ -36,9 +36,14 @@ try {
     ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s"
     if ($LASTEXITCODE) { throw "맥 접속 실패" }
     scp -q -r Dockerfile requirements.txt app "${Mac}:doc_platform/"
+    if ($LASTEXITCODE) { throw "복사 실패 (app)" }
     scp -q k8s/docs.yaml "${Mac}:doc_platform/k8s/"
+    if ($LASTEXITCODE) { throw "복사 실패 (k8s)" }
     scp -q (Get-ChildItem scripts/mac/*.sh).FullName "${Mac}:doc_platform/scripts/"
-    if ($LASTEXITCODE) { throw "복사 실패" }
+    if ($LASTEXITCODE) { throw "복사 실패 (scripts)" }
+    # Windows scp가 새로 만든 폴더는 700 — 이미지 안 app 사용자가 못 읽는다 (Dockerfile chmod와 이중으로)
+    ssh -o BatchMode=yes $Mac "chmod -R a+rX ~/doc_platform/app"
+    if ($LASTEXITCODE) { throw "권한 고치기 실패" }
 
     Write-Host "== 빌드·재시작"
     ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/deploy.sh"
