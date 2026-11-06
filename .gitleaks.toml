@@ -1,13 +1,12 @@
-# gitleaks 설정: 기본 규칙 + 시험용 가짜 값 허용 (https://github.com/reddol18/docflow/issues/28)
-# 커밋 지문(.gitleaksignore)은 squash 병합으로 커밋이 바뀌면 다시 걸려서, 값 자체로 허용한다.
+# gitleaks 설정: 기본 규칙 + 시험용 가짜 값 1건 허용 (https://github.com/reddol18/docflow/issues/28)
+# 커밋 지문(.gitleaksignore)은 squash 병합으로 커밋이 바뀌면 다시 걸려서, 경로·규칙·값이 모두 맞을 때만 허용한다.
 [extend]
 useDefault = true
 
-[allowlist]
-description = "tests/test_audit_pg.py 마스킹 시험의 가짜 값 (실제 비밀값 아님)"
-regexTarget = "match"
-regexes = [
-  '''FAKEkey0000000000000000TEST''',
-  '''abcdefgh12345678''',
-  '''(api_key|client_secret|access_token|openai_api_key|PGPASSWORD|QDRANT_API_KEY|password)\s*[=:]\s*['"]?(zzz|cs111|at222|ok333|hunter2xyz|hunter2|qd-1)\b''',
-]
+[[allowlists]]
+description = "tests/test_audit_pg.py 마스킹 시험의 가짜 Bearer 값 (실제 비밀값 아님)"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/test_audit_pg\.py$''']
+regexTarget = "secret"
+regexes = ['''^abcdefgh12345678$''']
