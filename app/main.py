@@ -32,9 +32,8 @@ import html
 import os
 import re
 import shutil
-import traceback
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Annotated, Literal
 
 import cv2
@@ -44,7 +43,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, llm, ocr, report, store
+from app import auth, errors, llm, ocr, report, store
 from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
@@ -103,7 +102,7 @@ async def security_headers(request: Request, call_next):
     try:
         res = await call_next(request)
     except Exception:  # 처리 안 된 예외의 500은 이 미들웨어 바깥(ServerErrorMiddleware)에서 만들어져 헤더가 빠진다 → 여기서 만든다
-        traceback.print_exc()
+        errors.log_exception(f"{request.method} {request.url.path}")
         res = PlainTextResponse("Internal Server Error", status_code=500)
     for k, v in SECURITY_HEADERS.items():
         res.headers[k] = v  # 민감 응답(색인·쪽 이미지·리포트)이 브라우저·중간 캐시에 남지 않게 모두 no-store
@@ -123,7 +122,31 @@ def check(vol):
         raise HTTPException(400, "bad volume id")
 
 
-def submit(vol, arg):
+@contextmanager
+def audited(user, action, vol=None, doc_id=None, **info):
+    """감사 로그 한 줄 (https://github.com/reddol18/docflow/issues/28): 성공 ok, 요청 거절 rejected_<상태>, 예외 error(분류 코드).
+    처리 중에 yield된 info에 개수·칸 이름 같은 요약을 더할 수 있다 — 값·원문은 넣지 않는다."""
+    try:
+        yield info
+    except HTTPException as e:
+        audit_safe(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
+        raise
+    except Exception as e:
+        audit_safe(user, action, vol, doc_id, "error", code=errors.code_of(e), **info)
+        raise
+    audit_safe(user, action, vol, doc_id, "ok", **info)
+
+
+def audit_safe(*args, **kw):
+    """감사 기록이 실패해도 이미 끝난 처리를 500으로 바꾸거나 원래 거절(409 등)을 가리지 않는다 — 실패는 서버 로그로"""
+    try:
+        store.audit(*args, **kw)
+    except Exception:
+        errors.log_exception(f"audit {args[1]} {args[2]}")
+
+
+def submit(vol, arg, user=None):
+    """철 흐름을 뒤에서 돌린다. 끝난 결과도 감사 로그에 남긴다(run_done: ok / review_waiting / error+분류 코드)."""
     if vol in running:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     running[vol] = "queued"
@@ -137,11 +160,14 @@ def submit(vol, arg):
             print(f"run {vol} stopped/finished: next={snap.next}", flush=True)
             if snap.interrupts:
                 store.event(vol, "review", "waiting", None, flagged=len(snap.interrupts[0].value["flagged"]))
+                audit_safe(user, "run_done", vol, None, "review_waiting")
             else:
                 store.event(vol, "run", "end", None)
+                audit_safe(user, "run_done", vol, None, "ok")
         except Exception as e:
-            traceback.print_exc()
-            store.event(vol, "run", "error", None, error=f"{type(e).__name__}: {e}"[:300])
+            errors.log_exception(f"run {vol}")  # 상세는 서버 로그에만 (키 꼴 문자열은 가림)
+            store.event(vol, "run", "error", None, **errors.public(e))  # 화면엔 분류 코드만
+            audit_safe(user, "run_done", vol, None, "error", code=errors.code_of(e))
         finally:
             running.pop(vol, None)
 
@@ -154,7 +180,14 @@ def healthz():
 
 
 @app.post("/volumes/{vol}/pages")
-async def upload(vol: str, _: Admin, files: list[UploadFile] = File(...)):
+async def upload(vol: str, user: Admin, files: list[UploadFile] = File(...)):
+    with audited(user, "upload", vol, files=len(files)) as info:
+        out = await _upload(vol, files)
+        info["saved"] = out["saved"]
+    return out
+
+
+async def _upload(vol, files):
     d = store.pages_dir(vol)
     names = []
     for f in files:  # 1) 이름과 앞 3바이트만 모두 확인한다 (파일 전체를 메모리에 올리지 않는다)
@@ -185,23 +218,26 @@ async def upload(vol: str, _: Admin, files: list[UploadFile] = File(...)):
 
 
 @app.post("/volumes/{vol}/run")
-def run(vol: str, _: Admin, review: str = "human"):
-    if review not in ("human", "auto"):
-        raise HTTPException(400, "review=human|auto")
-    if not any(store.pages_dir(vol).glob("*.jpg")):
-        raise HTTPException(404, "올린 쪽이 없음")
-    submit(vol, {"vol": vol, "review_mode": review})
+def run(vol: str, user: Admin, review: str = "human"):
+    ok_mode = review in ("human", "auto")
+    with audited(user, "run", vol, review=review if ok_mode else "invalid"):  # 사용자가 넣은 임의 문자열은 남기지 않는다
+        if not ok_mode:
+            raise HTTPException(400, "review=human|auto")
+        if not any(store.pages_dir(vol).glob("*.jpg")):
+            raise HTTPException(404, "올린 쪽이 없음")
+        submit(vol, {"vol": vol, "review_mode": review}, user)
     return {"vol": vol, "started": True}
 
 
 @app.post("/volumes/{vol}/resume")
-def resume(vol: str, _: Admin):
-    snap = G.get_state(cfg(vol))
-    if not snap.next:
-        raise HTTPException(409, "이어 갈 단계가 없음 (끝났거나 시작 안 함)")
-    if snap.interrupts:
-        raise HTTPException(409, "사람 검토 대기 중 → /review 에서 이어 감")
-    submit(vol, None)
+def resume(vol: str, user: Admin):
+    with audited(user, "resume", vol):
+        snap = G.get_state(cfg(vol))
+        if not snap.next:
+            raise HTTPException(409, "이어 갈 단계가 없음 (끝났거나 시작 안 함)")
+        if snap.interrupts:
+            raise HTTPException(409, "사람 검토 대기 중 → /review 에서 이어 감")
+        submit(vol, None, user)
     return {"vol": vol, "resumed_at": list(snap.next)}
 
 
@@ -265,6 +301,13 @@ def volume_events(vol: str, _: Viewer, after: int = 0):
 def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Reviewer):
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
+    with audited(user, "edit", vol, doc_id) as info:
+        d, changed = _edit_document(vol, doc_id, fields, user)
+        info["fields"] = changed  # 칸 이름만 (값은 edits 표)
+    return d
+
+
+def _edit_document(vol, doc_id, fields, user):
     snap = G.get_state(cfg(vol))
     if snap.interrupts or vol in running:
         raise HTTPException(409, "실행 중이거나 검토 대기 중")
@@ -275,7 +318,7 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
     fix = {k: str(v).strip() for k, v in fields.items() if k in EDITABLE}
     fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
     if not fix:
-        return docs[doc_id]
+        return docs[doc_id], []
     d = dict(docs[doc_id], fields={**old, **fix}, edited=True)
     if "docno" in fix:
         d["fields"]["serial"] = flow.layout.serial_of(fix["docno"])
@@ -285,7 +328,7 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, "edit")
     store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
     store.event(vol, "edit", "end", doc_id, fields=list(fix), user=user.username)
-    return d
+    return d, list(fix)
 
 
 @app.get("/documents/{vol}/{doc_id}/edits")
@@ -375,33 +418,37 @@ def resume_review(vol, flagged, fixes, user):
     if vol in running:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     record_review(vol, flagged, fixes, user)
-    submit(vol, Command(resume=fixes))
+    submit(vol, Command(resume=fixes), user)
 
 
 @app.post("/review/{vol}")
 async def review_submit(vol: str, request: Request, user: Reviewer):
-    snap = G.get_state(cfg(vol))
-    if not snap.interrupts:
-        raise HTTPException(409, "검토 대기 없음")
-    form = await request.form()
-    flagged = snap.interrupts[0].value["flagged"]
-    fixes = clean_fixes(flagged, [(*key.rpartition("__")[::2], val) for key, val in form.items()])
-    # 바뀐 값만 본다 — 고치지 않은 칸은 기존 값(OCR·GPT가 낸 긴 값일 수 있음)이 그대로 다시 오므로 막지 않는다
-    if any(len(v) > CELL_MAX for f in fixes.values() for v in f.values()):  # JSON 경로(CellValue)와 같은 상한
-        raise HTTPException(422, f"칸 값은 {CELL_MAX}자까지")
-    resume_review(vol, flagged, fixes, user)
+    with audited(user, "review", vol, via="form") as info:
+        snap = G.get_state(cfg(vol))
+        if not snap.interrupts:
+            raise HTTPException(409, "검토 대기 없음")
+        form = await request.form()
+        flagged = snap.interrupts[0].value["flagged"]
+        fixes = clean_fixes(flagged, [(*key.rpartition("__")[::2], val) for key, val in form.items()])
+        # 바뀐 값만 본다 — 고치지 않은 칸은 기존 값(OCR·GPT가 낸 긴 값일 수 있음)이 그대로 다시 오므로 막지 않는다
+        if any(len(v) > CELL_MAX for f in fixes.values() for v in f.values()):  # JSON 경로(CellValue)와 같은 상한
+            raise HTTPException(422, f"칸 값은 {CELL_MAX}자까지")
+        resume_review(vol, flagged, fixes, user)
+        info.update(docs=len(flagged), fixed_cells=sum(len(v) for v in fixes.values()))
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
 
 @app.post("/review/{vol}/json")
 def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field(max_length=1000)], user: Reviewer):
     """스크립트·검토 화면용: {doc_id: {칸: 값}} 으로 이어 가기. 검토 대기 문서의 바뀐 칸만 반영한다."""
-    snap = G.get_state(cfg(vol))
-    if not snap.interrupts:
-        raise HTTPException(409, "검토 대기 없음")
-    flagged = snap.interrupts[0].value["flagged"]
-    fixes = clean_fixes(flagged, [(did, k, v) for did, f in body.items() for k, v in f.items()])
-    resume_review(vol, flagged, fixes, user)
+    with audited(user, "review", vol, via="json") as info:
+        snap = G.get_state(cfg(vol))
+        if not snap.interrupts:
+            raise HTTPException(409, "검토 대기 없음")
+        flagged = snap.interrupts[0].value["flagged"]
+        fixes = clean_fixes(flagged, [(did, k, v) for did, f in body.items() for k, v in f.items()])
+        resume_review(vol, flagged, fixes, user)
+        info.update(docs=len(flagged), fixed_cells=sum(len(v) for v in fixes.values()))
     return {"vol": vol, "fixed": {k: list(v) for k, v in fixes.items()}}
 
 
@@ -417,9 +464,11 @@ class Timing(BaseModel):
 def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)], user: Reviewer):
     """검토 화면이 확정(검토 제출·문서 저장) 때 보내는 문서별 작업 시간 (자리 비움 제외).
     이 철에 없는 문서와 1초 미만(넘겨 보기만 한 것)은 버린다."""
-    known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
-    keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
-    store.add_review_times(vol, keep, user.id)
+    with audited(user, "timings", vol, rows=len(rows)) as info:
+        known = {d["doc_id"] for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
+        keep = [r.model_dump() for r in rows if r.active_ms >= 1000 and r.doc_id in known]
+        store.add_review_times(vol, keep, user.id)
+        info["saved"] = len(keep)
     return {"saved": len(keep), "dropped": len(rows) - len(keep)}
 
 

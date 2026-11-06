@@ -100,8 +100,14 @@ CREATE TABLE IF NOT EXISTS edits (
   old text, new text, user_id bigint REFERENCES users (id), source text NOT NULL);
 CREATE INDEX IF NOT EXISTS edits_doc ON edits (vol, doc_id);
 ALTER TABLE review_time ADD COLUMN IF NOT EXISTS user_id bigint;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS attempt_at timestamptz
+ALTER TABLE users ADD COLUMN IF NOT EXISTS attempt_at timestamptz;
+CREATE TABLE IF NOT EXISTS audit (
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT now(), user_id bigint, username text,
+  action text NOT NULL, vol text, doc_id text, result text NOT NULL, info jsonb);
+CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
+UPDATE events SET info = (info - 'error') || jsonb_build_object('code', 'internal') WHERE info ? 'error'
 """
+# ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
 
 def init_db():
@@ -154,8 +160,26 @@ def event(vol, node, phase, doc_id=None, **info):
 
 def events(vol, after=0, limit=500):
     with pool.connection() as c:
-        return c.execute("SELECT id, ts, node, phase, doc_id, info FROM events WHERE vol = %s AND id > %s "
+        rows = c.execute("SELECT id, ts, node, phase, doc_id, info FROM events WHERE vol = %s AND id > %s "
                          "ORDER BY id LIMIT %s", (vol, after, limit)).fetchall()
+    for r in rows:  # 예전 판(https://github.com/reddol18/docflow/issues/28 이전)은 예외 문구를 info.error에 저장했다 → 내보내지 않는다
+        if r["info"] and "error" in r["info"]:
+            r["info"] = {k: v for k, v in r["info"].items() if k != "error"} | {"code": r["info"].get("code", "internal")}
+    return rows
+
+
+def audit(user, action, vol=None, doc_id=None, result="ok", **info):
+    """감사 로그: 누가·언제·무엇을(행위·철·문서)·결과. info에는 개수·칸 이름 같은 요약만 — 값·원문은 넣지 않는다
+    (값 이력은 edits 표). user는 auth.User 또는 None."""
+    with pool.connection() as c:
+        c.execute("INSERT INTO audit (user_id, username, action, vol, doc_id, result, info) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                  (getattr(user, "id", None), getattr(user, "username", None), action, vol, doc_id, result,
+                   json.dumps(info, ensure_ascii=False) if info else None))
+
+
+def audit_log(limit=500):
+    with pool.connection() as c:
+        return c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
 
 
 def add_review_times(vol, rows, user_id=None):

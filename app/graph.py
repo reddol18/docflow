@@ -20,7 +20,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import flags, layout, llm, ocr, store
+from app import errors, flags, layout, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -43,7 +43,7 @@ def traced(name, fn):
         try:
             out = fn(s)
         except Exception as e:
-            store.event(vol, name, "error", doc, error=f"{type(e).__name__}: {e}"[:300])
+            store.event(vol, name, "error", doc, **errors.public(e))  # 화면엔 분류 코드만, 상세는 main.submit이 서버 로그로
             raise
         store.event(vol, name, "end", doc, seconds=round(time.time() - t0, 2), **_brief(name, out))
         return out
