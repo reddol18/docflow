@@ -17,6 +17,7 @@ rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 �
 
 표기 규칙(normalize)은 칸 값에 차례로 적용하는 후처리다 (NORMALIZE).
 """
+import json
 import os
 import re
 from pathlib import Path
@@ -268,6 +269,23 @@ def extract_prompt(s):
     ex = s["extract"]
     return (f"{ex['preamble'].strip()}\n\n아래 {len(items)}칸을 뽑는다.\n" + "\n".join(lines)
             + f"\n\n{ex['rules'].strip()}\n출력: JSON 객체 하나\n{example}")
+
+
+def parse_extract(s, content):
+    """추출 응답 JSON 글자 → prompt 칸별 {value, confidence}. 모양이 틀린 칸은 빈 값·확신도 0, JSON 자체가 깨지면 ValueError.
+    app/llm.extract와 모델 비교 하네스(eval/promptfoo/)가 같이 쓴다 (여기 두는 이유: openai를 불러오지 않는 가벼운 모듈)"""
+    out = json.loads(content)
+    if not isinstance(out, dict):
+        out = {}
+
+    def cell(v):
+        v = v if isinstance(v, dict) else {}
+        try:
+            conf = float(v.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {"value": str(v.get("value") or ""), "confidence": conf}
+    return {f["name"]: cell(out.get(f["name"])) for f in prompt_fields(s)}
 
 
 def assemble(s, llm_out, rule_values):

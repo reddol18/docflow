@@ -5,7 +5,6 @@
 429·5xx·시간 초과는 SDK가 지수 백오프로 재시도한다 (max_retries).
 """
 import base64
-import json
 import math
 import os
 from pathlib import Path
@@ -75,18 +74,7 @@ def extract(vol, lines, schema=None):
                   {"role": "user", "content": "\n".join(lines[:80])}],
     )
     _log(vol, "extract", EXTRACT, r.usage)
-    out = json.loads(r.choices[0].message.content)
-    if not isinstance(out, dict):
-        out = {}
-
-    def cell(v):
-        v = v if isinstance(v, dict) else {}
-        try:
-            conf = float(v.get("confidence") or 0)
-        except (TypeError, ValueError):
-            conf = 0.0
-        return {"value": str(v.get("value") or ""), "confidence": conf}
-    return {f["name"]: cell(out.get(f["name"])) for f in fields.prompt_fields(schema)}
+    return fields.parse_extract(schema, r.choices[0].message.content)
 
 
 CELL_PROMPT = {

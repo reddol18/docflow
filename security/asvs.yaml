@@ -74,7 +74,7 @@ items:
   - {id: V8.3.1, level: 1, text: "민감 데이터는 URL이 아닌 본문으로", status: 일부, evidence: "자격 증명은 본문(app/auth.py:485-491). 검색어 q가 URL에(app/main.py:405-411)"}
 
   # ---------- V9 통신 ----------
-  - {id: V9.1.1, level: 1, text: "모든 통신 TLS", status: 미충족, evidence: "next.config.ts:5 http, PG sslmode 없음, Qdrant http. 데모는 ssh 터널. https://github.com/reddol18/docflow/issues/48"}
+  - {id: V9.1.1, level: 1, text: "모든 통신 TLS", status: 미충족, evidence: "next.config.ts:5 http, PG sslmode 없음, Qdrant http. 데모는 ssh 터널. https://github.com/reddol18/docflow/issues/48. 평가 하네스(eval/promptfoo/, 개발 PC)는 api.openai.com https, 로컬 모델은 127.0.0.1:11434만, 비교 화면(-View)은 127.0.0.1:15500에만 묶음(localhost_only.cjs — promptfoo 기본은 모든 인터페이스), promptfoo 공유·원격 생성·사용 통계 끔(run.ps1 PROMPTFOO_DISABLE_*, --no-share)"}
 
   # ---------- V12 파일 ----------
   - {id: V12.1.1, level: 1, text: "업로드 크기·개수 상한", status: 미충족, evidence: "app/main.py upload 크기·개수 상한 없음(파일은 흘려 씀). 위험 수용 https://github.com/reddol18/docflow/issues/26"}
@@ -105,13 +105,13 @@ items:
   - {id: API7, text: "SSRF", status: 일부, evidence: "issuer는 설정값, jwks·token 주소는 discovery 문서에서(auth.py:390,544,571). 차단 목록에 169.254·127·100.64 없음 https://github.com/reddol18/docflow/issues/48"}
   - {id: API8, text: "보안 설정 오류", status: 일부, evidence: "보안 헤더·캐시 금지는 해소(https://github.com/reddol18/docflow/issues/47). 남음: COOKIE_SECURE=0·http https://github.com/reddol18/docflow/issues/48 , trivy config 경고 https://github.com/reddol18/docflow/issues/29"}
   - {id: API9, text: "API 목록 관리", status: 충족, evidence: "app/main.py 머리말 목록 22개(GET /schema 추가) = 실제 라우트, tests/test_input.py test_header_api_list_matches_routes가 app.routes와 양방향 비교 (https://github.com/reddol18/docflow/issues/49)"}
-  - {id: API10, text: "외부 API 응답을 믿음", status: 일부, evidence: "OIDC 서명·aud·nonce 확인, 출력 이스케이프. OpenAI 추출은 스키마 칸만 받고 dict·칸 모양이 다르면 빈 값·확신도 0(app/llm.py:78-89, https://github.com/reddol18/docflow/issues/9), JSON 자체가 깨지면 예외로 철 실행이 멈춤. 비전·답변 응답은 그대로 https://github.com/reddol18/docflow/issues/27"}
+  - {id: API10, text: "외부 API 응답을 믿음", status: 일부, evidence: "OIDC 서명·aud·nonce 확인, 출력 이스케이프. OpenAI 추출은 스키마 칸만 받고 dict·칸 모양이 다르면 빈 값·확신도 0(app/fields.py:274-289 parse_extract, app/llm.py:77·평가 하네스 eval/promptfoo/gate.py가 같이 씀, https://github.com/reddol18/docflow/issues/9), JSON 자체가 깨지면 예외로 철 실행이 멈춤. 비전·답변 응답은 그대로 https://github.com/reddol18/docflow/issues/27"}
 
   # ---------- LLM Top 10 ----------
-  - {id: LLM01, text: "프롬프트 인젝션 (OCR 본문을 통한 간접 포함)", status: 미충족, evidence: "app/llm.py:141-147, :74-75 본문을 구분·무시 지시 없이 연결 (추출 지시문은 app/fields.py extract_prompt가 app/field_schemas/*.yaml에서 조립). llm_generate 칸 값이 /ask 문맥에 다시 들어감. https://github.com/reddol18/docflow/issues/27"}
-  - {id: LLM02, text: "민감 정보 노출 (답변·로그)", status: 충족, evidence: "app/llm.py:55-59 토큰·비용만 기록, 답변 근거는 viewer가 볼 수 있는 문서뿐. OCR 본문이 OpenAI로 감(정책)"}
-  - {id: LLM05, text: "LLM 출력을 그대로 씀 (HTML·SQL·명령)", status: 충족, evidence: "app/llm.py:78-89 형 변환(스키마 칸만), app/fields.py assemble vocab·normalize, store.py 매개변수, main.py:506-517 escape, search/page.tsx:90 텍스트"}
+  - {id: LLM01, text: "프롬프트 인젝션 (OCR 본문을 통한 간접 포함)", status: 미충족, evidence: "app/llm.py:129-135, :73-74 본문을 구분·무시 지시 없이 연결 (추출 지시문은 app/fields.py extract_prompt가 app/field_schemas/*.yaml에서 조립). llm_generate 칸 값이 /ask 문맥에 다시 들어감. https://github.com/reddol18/docflow/issues/27"}
+  - {id: LLM02, text: "민감 정보 노출 (답변·로그)", status: 충족, evidence: "app/llm.py:54-58 토큰·비용만 기록, 답변 근거는 viewer가 볼 수 있는 문서뿐. OCR 본문이 OpenAI로 감(정책)"}
+  - {id: LLM05, text: "LLM 출력을 그대로 씀 (HTML·SQL·명령)", status: 충족, evidence: "app/fields.py:274-289 parse_extract 형 변환(스키마 칸만), app/fields.py assemble vocab·normalize, store.py 매개변수, main.py:506-517 escape, search/page.tsx:90 텍스트"}
   - {id: LLM06, text: "과도한 권한 (LLM이 도구·쓰기 실행)", status: 충족, evidence: "app/llm.py 모든 호출에 tools·function 없음, 출력은 값으로만"}
-  - {id: LLM07, text: "시스템 프롬프트 노출", status: 충족, evidence: "app/field_schemas/*.yaml(추출 지시문)·app/llm.py:132-133 프롬프트에 비밀·권한 규칙 없음, GET /schema(app/main.py:761-768)는 지시문·고정값을 내보내지 않음(tests/test_fields.py test_schema_endpoint), 키는 따로(:34-36)"}
+  - {id: LLM07, text: "시스템 프롬프트 노출", status: 충족, evidence: "app/field_schemas/*.yaml(추출 지시문)·app/llm.py:120-121 프롬프트에 비밀·권한 규칙 없음, GET /schema(app/main.py:761-768)는 지시문·고정값을 내보내지 않음(tests/test_fields.py test_schema_endpoint), 키는 따로(:33-35)"}
   - {id: LLM08, text: "벡터·임베딩 약점 (색인 오염·권한 없는 검색)", status: 일부, evidence: "Qdrant는 docflow만, 쓰기는 admin·reviewer만. 다른 철 같은 이름이 색인을 덮어씀 https://github.com/reddol18/docflow/issues/50 , Qdrant 키 없음 https://github.com/reddol18/docflow/issues/48"}
-  - {id: LLM10, text: "무제한 소비 (비용)", status: 일부, evidence: "app/llm.py:49-52 사후 정산, :58 모르는 모델 0원, extract·answer에 max_tokens 없음(read_cell은 40) https://github.com/reddol18/docflow/issues/7"}
+  - {id: LLM10, text: "무제한 소비 (비용)", status: 일부, evidence: "app/llm.py:48-51 사후 정산, :57 모르는 모델 0원, extract·answer에 max_tokens 없음(read_cell은 40) https://github.com/reddol18/docflow/issues/7. 평가 하네스(eval/promptfoo/run.ps1)는 운영 예산 밖에서 개발 PC가 손으로 돌린다 — 전체 행렬 1800회 약 $0.66, 건당 비용을 결과 표에 기록(gate.py cost_latency, 로컬 모델은 0원) (https://github.com/reddol18/docflow/issues/22)"}
