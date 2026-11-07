@@ -121,6 +121,8 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 ```powershell
 .\eval\promptfoo\run.ps1                       # gpt-4.1-mini(기준)·gpt-4o-mini × 지시문 current·before_ocr_fix × 7개 철 (1800회, 약 20분·$0.66)
 .\eval\promptfoo\run.ps1 -Local -Vols 5350109-1999-0002   # + 로컬 모델(이 PC의 Ollama, 기본 llama3.1:8b). 꺼져 있으면 켜고, 켠 것만 끈다
+.\eval\promptfoo\run.ps1 -Local -LocalModel qwen2.5:7b -BaselineFrom ..\work\promptfoo\results_full_20261107.json
+                                               # 로컬 모델만 돌리고 기준(gpt-4.1-mini·current) 줄은 지난 결과에서 가져온다 (OpenAI 호출 0, 키 불필요)
 .\eval\promptfoo\run.ps1 -Replay               # LLM 호출 없이 저장된 추출 값으로 채점 연결만 확인 (eval/score.py와 같은 숫자)
 .\eval\promptfoo\run.ps1 -View                 # 마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
 ```
@@ -145,7 +147,15 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 - **채점 연결 확인:** `-Replay`(저장된 추출 값, LLM 호출 없음)의 점수는 저장된 b·hw를 지금 코드로 다시 조립한 결과(`eval/schema_replay.py` `replay()`, 후보와 같은 길)와 같고,
   `eval/score.py`를 같은 문서에 단독으로 돌린 숫자(docno 64.0%, date 78.7%, recipient 45.7%, title 88.4%, 표시 재현율 100%·57.1%)와도 같다.
 - **로컬 모델:** 이 Windows PC의 Ollama만 쓴다(맥은 배포 시험 환경이라 실험에 쓰지 않는다). 띄우기 전에 모델 폴더 드라이브 여유 10GB를 확인한다.
-  연결만 확인했다 — llama3.1:8b는 작은 철(6건)에서 제목이 기준보다 크게 떨어져 실패, 건당 지연 약 9초·비용 0. 채택 측정은 https://github.com/reddol18/docflow/issues/13.
+  llama3.1:8b는 작은 철(6건)에서 제목이 기준보다 크게 떨어져 실패, 건당 지연 약 9초·비용 0. 한국어 소형 모델 3개의 전체 450건 측정은
+  `docs/design.md` "로컬 텍스트 모델 4칸 추출" (https://github.com/reddol18/docflow/issues/13).
+- **기준 다시 쓰기(`-BaselineFrom`, `-Local`과 함께, `-Replay`와는 같이 못 씀):** 로컬 모델만 비교할 때 기준 모델을 다시 부르지 않는다.
+  기본 후보 `^local-ollama$`, 판 `^current$`. promptfoo를 부르기 전에 `eval/promptfoo/plan.py`가 promptfoo와 같은 규칙(제공자 id·label에
+  대소문자 구분 정규식)으로 걸러질 후보를 세어, 기준(`criteria.yaml` baseline)과 겹치면 멈추고(돈 쓰고 버리는 호출 방지), OpenAI 후보가
+  없으면 키를 읽지 않는다. 기준 파일은 `work/promptfoo/` 아래 사본을 `gate.py --baseline-results`에 넘긴다(끝나면 지움).
+  `gate.py`는 기준 줄만 이번 결과의 철에 맞춰 가져오고, 기준 모델 id·temperature·response_format·apiBaseUrl이 이번 설정과 다르거나,
+  같은 판 후보의 지시문(`prompt.raw`)이 문서마다 기준과 다르거나, 문서 묶음이 다르면 종료 코드 2. `max_tokens` 같은 그 밖의 차이는 gate.md에 경고.
+  `gate.md`에는 판정 표 아래 텍스트 추출(B)만 칸별 정답률 표가 붙는다.
 - **답변 채점(Ragas·쌍별 승률)은 아직 없다:** `criteria.yaml`의 `answer:` 칸은 자리만 있다 → https://github.com/reddol18/docflow/issues/21.
 - **결과·개인정보:** 실제 문서 글자가 담긴 결과(`results.json`, 다시 조립한 문서, promptfoo 결과 DB)는 저장소 밖 `work/promptfoo/`에만 쓴다.
   promptfoo 공유·원격 생성·사용 통계·업데이트 확인은 끈다(`PROMPTFOO_DISABLE_*`, `--no-share`). 단, promptfoo 0.125.0은 사용 통계를 꺼도
