@@ -9,6 +9,9 @@
 실험 실행은 이 Windows PC 자원만 쓴다. 맥(colima k3s)은 클라우드 배포를 로컬에서 시험하는 배포 환경이라 실험에 쓰지 않는다
 (2026-11-07 맥에서 Ollama를 띄웠다가 디스크 부족으로 운영 파드가 축출된 뒤 정함). 로컬 모델 채택 측정은 https://github.com/reddol18/docflow/issues/13.
 로컬 모델을 띄우기 전에 모델 폴더 드라이브의 디스크 여유(10GB)를 먼저 확인하고, 모자라면 멈춘다.
+  .\eval\promptfoo\run.ps1 -Local -LocalModel qwen2.5:7b -BaselineFrom ..\work\promptfoo\results_full_20261107.json
+                                                로컬 모델만 돌리고 기준(gpt-4.1-mini·current)은 지난 결과에서 가져온다 — OpenAI 호출 0, 키 불필요
+                                                (https://github.com/reddol18/docflow/issues/13). 기본 후보 '^local-ollama$', 판 '^current$'
   .\eval\promptfoo\run.ps1 -Replay              LLM 호출 없이 저장 결과로 채점 연결만 확인 (eval/score.py와 같아야 함)
   .\eval\promptfoo\run.ps1 -View                마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
 
@@ -31,7 +34,8 @@ param(
     [switch]$View,
     [string]$Prompts = '',
     [string]$Providers = '',
-    [string]$LocalModel = 'llama3.1:8b'
+    [string]$LocalModel = 'llama3.1:8b',
+    [string]$BaselineFrom = ''   # 기준 후보 줄을 가져올 지난 results.json (기준 모델을 다시 부르지 않는다)
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -87,9 +91,18 @@ if ($Replay) {
     $providers = '^replay$'
     if (-not $Prompts) { $Prompts = '^current$' }
 } else {
+    if ($BaselineFrom) {   # 기준은 지난 결과에서 → 이번엔 로컬 모델만 (기준을 거르지 않으면 gate.py가 종료 코드 2)
+        if (-not (Test-Path $BaselineFrom)) { if ($prevKey) { $env:OPENAI_API_KEY = $prevKey }; throw "기준 결과가 없다: $BaselineFrom" }
+        $BaselineFrom = (Resolve-Path $BaselineFrom).Path
+        if (-not $Providers) { $Providers = '^local-ollama$' }
+        if (-not $Prompts) { $Prompts = '^current$' }
+    }
     $providers = if ($Providers) { $Providers } elseif ($Local) { '^(gpt-4\.1-mini|gpt-4o-mini|local-ollama)$' } else { '^(gpt-4\.1-mini|gpt-4o-mini)$' }
-    $key = if ($prevKey) { $prevKey } else { [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User') }
-    if (-not $key) { if ($prevKey) { $env:OPENAI_API_KEY = $prevKey }; throw 'OPENAI_API_KEY가 없다 — Windows 사용자 환경변수에 넣는다' }
+    # 키는 OpenAI 후보가 걸러질 때만 (로컬 모델만이면 키를 읽지도 넣지도 않는다)
+    if (@('gpt-4.1-mini', 'gpt-4o-mini') | Where-Object { $_ -match $providers }) {
+        $key = if ($prevKey) { $prevKey } else { [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User') }
+        if (-not $key) { if ($prevKey) { $env:OPENAI_API_KEY = $prevKey }; throw 'OPENAI_API_KEY가 없다 — Windows 사용자 환경변수에 넣는다' }
+    }
 }
 
 function Test-Ollama {
@@ -144,6 +157,7 @@ try {
         if ($LocalModel -notin $tags.models.name) { throw "Ollama에 모델 $LocalModel 이 없다 — 먼저 ollama pull (디스크 여유 확인 뒤)" }
     }
     $res = Join-Path $out 'results.json'
+    if ($BaselineFrom -and $BaselineFrom -eq [IO.Path]::GetFullPath($res)) { throw '기준 결과로 results.json을 쓰면 이번 실행이 지운다 — 다른 이름으로 복사해 넘긴다' }
     Remove-Item $res -ErrorAction SilentlyContinue   # 실패한 실행이 지난 결과로 판정되지 않게
     $args_ = @('eval', '-c', (Join-Path $here 'promptfooconfig.yaml'), '-o', $res, '--filter-providers', $providers,
                '--no-share', '--no-table', '--no-progress-bar')
@@ -163,6 +177,7 @@ try {
     if (($pcode -ne 0 -and $pcode -ne 100) -or -not (Test-Path $res)) { Write-Output "promptfoo 실패 (종료 코드 $pcode)"; exit 2 }
     $gate = @((Join-Path $here 'gate.py'), $res, '--out', $out)
     if ($Replay) { $gate += '--expect-stored' }
+    if ($BaselineFrom -and -not $Replay) { $gate += @('--baseline-results', $BaselineFrom) }
     Push-Location $app
     & $py -I -X utf8 @gate
     $code = $LASTEXITCODE

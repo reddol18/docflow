@@ -116,6 +116,54 @@ def test_main_exit_codes(gate, tmp_path, monkeypatch):
     assert gate.main() == 2
 
 
+def test_baseline_from_stored_results(gate, tmp_path, monkeypatch):
+    """--baseline-results: 기준 줄을 지난 결과에서 가져온다 (이번 결과의 철만, 문서 묶음이 같아야, 기준이 이미 있으면 2)"""
+    def vrow(prov, doc, vol, **kw):
+        r = _row(prov, "current", doc, **kw)
+        r["vars"]["vol"] = vol
+        return r
+
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"config": {"providers": [{"id": "openai:chat:gpt-4.1-mini", "label": "gpt-4.1-mini",
+                                                         "config": {"temperature": 0}}]},
+                               "results": {"results": [vrow("gpt-4.1-mini", "d1", "가상-0001"),
+                                                       vrow("gpt-4.1-mini", "d2", "가상-0001"),
+                                                       vrow("gpt-4.1-mini", "d9", "가상-0002"),
+                                                       vrow("gpt-4o-mini", "d1", "가상-0001")]}}), encoding="utf-8")
+    want = ("gpt-4.1-mini", "current")
+    loc = [vrow("local-ollama", d, "가상-0001", pid="openai:chat:가상:7b") for d in ("d1", "d2")]
+    rows, cfg, err = gate.add_baseline(loc, {}, old, want)
+    assert err is None
+    g = gate.group(rows)
+    assert set(g) == {want, ("local-ollama", "current")}  # 기준만 가져오고 다른 후보(gpt-4o-mini)는 뺀다
+    assert set(g[want]) == {"d1", "d2"}  # 이번 결과에 없는 철(가상-0002)은 뺀다
+    assert cfg["gpt-4.1-mini"] == {"temperature": 0}
+    assert gate.unpriced(rows, cfg) == []
+
+    _, _, err = gate.add_baseline(loc[:1], {}, old, want)  # 문서 묶음이 다르면 비교하지 않는다
+    assert err and "다르다" in err
+    _, _, err = gate.add_baseline(loc + [vrow("gpt-4.1-mini", "d1", "가상-0001")], {}, old, want)
+    assert err and "이미" in err
+    _, _, err = gate.add_baseline([vrow("local-ollama", "d1", "가상-0003")], {}, old, want)
+    assert err and "없다" in err
+
+    # main: 기준 없이 돌린 결과 + --baseline-results → 판정, gate.md에 B 표와 가져온 파일 이름
+    res = tmp_path / "results.json"
+    res.write_text(json.dumps({"results": {"results": loc}}), encoding="utf-8")
+    s = {"silent": 1.0, "fields": {f: 80.0 for f in gate.FIELDS}, "b_fields": {f: 50.0 for f in gate.FIELDS},
+         "flag_recall": {"serial": None, "date": None}, "all_ok": 0}
+    monkeypatch.setattr(gate.common, "load_vol", lambda vol: ([], {}))
+    monkeypatch.setattr(gate, "rebuild", lambda res_, data: ({}, {}, 0))
+    monkeypatch.setattr(gate, "metrics", lambda docs: {"n_gt": 1, "n_docs": 2})
+    monkeypatch.setattr(gate, "summary", lambda m: s)
+    monkeypatch.setattr(sys, "argv", ["gate.py", str(res), "--out", str(tmp_path), "--baseline-results", str(old)])
+    assert gate.main() == 0
+    out = json.loads((tmp_path / "gate.json").read_text(encoding="utf-8"))
+    assert [(r["provider"], r["verdict"]) for r in out] == [("gpt-4.1-mini", "기준"), ("local-ollama", "통과")]
+    md = (tmp_path / "gate.md").read_text(encoding="utf-8")
+    assert "텍스트 추출(B)만" in md and "| local-ollama | current | 50.0% |" in md and "old.json" in md
+
+
 def test_price_of(gate):
     """모델 = 'openai:chat:' 뒤 전부, 로컬·replay = 0, 모르는 원격 모델 = None"""
     assert gate.price_of(_row("gpt-4.1-mini", "current", "d1")) == (0.40, 1.60)

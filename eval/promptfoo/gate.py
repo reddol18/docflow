@@ -9,6 +9,9 @@
 그래서 칸별 최종 정답률·검토 표시 재현율·표시 없이 틀린 비율이 eval/score.py 단독 실행과 같은 정의다.
   --expect-stored  점수가 저장된 b·hw를 같은 길(replay + 수신 다시 보정)로 다시 조립한 결과의 점수와 같은지 확인
                    (replay 제공자로 채점 연결 검사 — 다른 점은 응답 글자를 읽는 부분뿐)
+  --baseline-results <지난 결과.json>  기준 후보(criteria.yaml baseline) 줄을 지난 실행 결과에서 가져온다 → 기준 모델을 다시 부르지 않고
+                   로컬 모델만 돌려 비교 (https://github.com/reddol18/docflow/issues/13). 이번 결과에 있는 철만 가져오고,
+                   후보마다 문서 묶음이 기준과 같아야 한다(다르면 종료 코드 2). 이번 결과에 기준이 이미 있으면 종료 코드 2.
 건당 비용: openai:chat:<모델>의 모델이 app/llm.py PRICE에 있으면 그 단가, 로컬 모델(apiBaseUrl이 127.0.0.1·localhost,
 또는 label local-ollama)·replay는 0. 그 밖의 단가 모르는 모델이 있으면 0원으로 치지 않고 종료 코드 2.
 종료 코드: 0 모두 통과, 1 기준을 어긴 후보가 있음(또는 --expect-stored 불일치), 2 입력 문제(기준 후보 없음·단가 모름 등)
@@ -189,6 +192,38 @@ def judge(cand, base, crit):
     return why
 
 
+def add_baseline(rows, cfg, path, want):
+    """지난 결과(path)에서 기준 후보 want=(제공자 label, 판) 줄만 가져와 rows에 붙인다 (이번 결과에 있는 철만).
+    반환: (rows, cfg, 오류 글 또는 None)"""
+    if any(key_of(r) == want for r in rows):
+        return rows, cfg, f"이번 결과에 기준 {want}이 이미 있다 — --baseline-results를 빼거나 기준을 거르고 돌린다"
+    vols = {r["vars"]["vol"] for r in rows}
+    brows, bcfg = load_results(path)
+    extra = [r for r in brows if key_of(r) == want and r["vars"]["vol"] in vols]
+    if not extra:
+        return rows, cfg, f"{path}에 기준 {want} 결과가 없다 (철 {sorted(vols)})"
+    cfg = dict(cfg)
+    if want[0] in bcfg:  # 기준 제공자 설정(apiBaseUrl 등)도 지난 결과에서 — 단가 판정에 쓴다
+        cfg.setdefault(want[0], bcfg[want[0]])
+    rows = rows + extra
+    ref = {r["vars"]["doc_id"] for r in extra}
+    for k, g in group(rows).items():
+        if set(g) != ref:  # 같은 문서끼리가 아니면 비교가 틀린다
+            return rows, cfg, f"후보 {k}의 문서 {len(g)}건이 기준 문서 {len(ref)}건과 다르다"
+    return rows, cfg, None
+
+
+def b_table(rows):
+    """텍스트 추출(B)만의 칸별 정답률 — 손글씨 판독·규칙 합침 전 (docs/design.md '전체 680쪽' 표의 B 열과 같은 정의)"""
+    head = ["후보", "판"] + FIELDS
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for r in rows:
+        b = r["s"].get("b_fields") or {}
+        lines.append("| " + " | ".join([r["provider"], r["prompt"]] +
+                                       ["-" if b.get(f) is None else f"{b[f]:.1f}%" for f in FIELDS]) + " |")
+    return "\n".join(lines)
+
+
 def fmt_ms(x):
     return "-" if x is None else f"{x / 1000:.1f}s"
 
@@ -213,9 +248,16 @@ def main():
     ap.add_argument("--criteria", default=str(common.HERE / "criteria.yaml"))
     ap.add_argument("--out", default=str(common.WORK / "promptfoo"))
     ap.add_argument("--expect-stored", action="store_true")
+    ap.add_argument("--baseline-results", default="")
     a = ap.parse_args()
     crit = yaml.safe_load(Path(a.criteria).read_text(encoding="utf-8"))
     rows_, cfg = load_results(a.results)
+    if a.baseline_results and rows_:
+        b = crit.get("baseline") or {}
+        rows_, cfg, err = add_baseline(rows_, cfg, a.baseline_results, (b.get("provider"), b.get("prompt")))
+        if err:
+            print(err, file=sys.stderr)
+            return 2
     groups = group(rows_)
     if not groups:
         print("결과가 비었다", file=sys.stderr)
@@ -260,7 +302,9 @@ def main():
             why = judge(r, base, crit)
             r["verdict"] = "통과" if not why else "실패: " + "; ".join(why)
             code |= 1 if why else 0
-    md = table(rows)
+    md = table(rows) + "\n\n텍스트 추출(B)만 칸별 정답률 (손글씨 판독·규칙 합침 전, 판정과 별개):\n\n" + b_table(rows)
+    if a.baseline_results:
+        md += f"\n\n기준 줄은 지난 결과에서 가져옴 (다시 부르지 않음): {Path(a.baseline_results).name}"
     ans = (crit.get("answer") or {})
     note = ("\n\n답변 채점(Ragas·쌍별 승률): " + ("기준 " + json.dumps(ans, ensure_ascii=False)
                                            if any(v is not None for v in ans.values()) else
