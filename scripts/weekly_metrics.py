@@ -10,7 +10,8 @@
     로컬 검사   `scripts/check.ps1`가 출력하는 요약 줄 "로컬 검사 `scripts/check.ps1` — 커밋 ..."
     계약 리뷰   "spec-reviewer" 또는 "spec-review"
     버그 리뷰   "code-review"
-    보안 리뷰   "security-reviewer" — 닫는 이슈의 '보안 영향' 칸에 체크가 있을 때만 필요
+    보안 리뷰   "security-reviewer" — 닫거나 가리키는 이슈(닫는 이슈·제목의 #N·본문 Refs #N)의 '보안 영향' 칸에 체크가 있을 때만 필요
+  (병합 전 검사 `scripts/merge_gate.py`가 같은 규칙·함수를 쓴다: evidence_texts·check_blocks·issue_refs·is_no_code·needs_security)
     배포        병합 뒤 deploy-* 태그가 이 PR의 병합 커밋을 포함하는지
   흔적이 없을 때 구분:
     늦게 #M     나중 PR의 **제목**에 "PR #N"이 있고(예: "PR #38 버그 리뷰 반영") 그 PR에 그 리뷰 흔적이 있음.
@@ -97,9 +98,30 @@ def evidence(body):
                      if not re.match(r"\s*- \[ \]", ln) and _norm(ln) not in TEMPLATE)
 
 
+def evidence_texts(body, comments, reviews):
+    """흔적을 찾는 글들: PR 본문(템플릿 줄 뺌)·댓글·리뷰 본문·줄 댓글. `scripts/merge_gate.py`도 쓴다"""
+    return [evidence(body)] + list(comments) + list(reviews)
+
+
 def needs_security(issue_body):
     s = section(issue_body, "보안 영향")
     return bool(s and re.search(r"- \[[xX]\]", s))
+
+
+REFS = re.compile(r"\b(?:Refs?|Closes|Fixes|Resolves)\s+((?:#\d+[\s,]*)+)", re.I)
+
+
+def issue_refs(title, body, closing):
+    """PR이 닫거나 가리키는 번호 후보: 닫는 이슈 + 제목의 #N + 본문의 'Refs #N'. 이슈인지(PR 번호가 아닌지)는 부르는 쪽이 거른다"""
+    out = set(closing) | {int(n) for n in re.findall(r"#(\d+)", title or "")}
+    for m in REFS.finditer(re.sub(r"<!--.*?-->", "", body or "", flags=re.S)):
+        out |= {int(n) for n in re.findall(r"#(\d+)", m.group(1))}
+    return out
+
+
+def is_no_code(files):
+    """`docs/`·README·잠금 파일·의존성 목록만 바꾼 PR (계약·버그 리뷰는 볼 것이 없다). 목록이 상한이면 잘렸을 수 있어 코드로 본다"""
+    return 0 < len(files) < FILES_CAP and all(NON_CODE.search(f) for f in files)
 
 
 def deploy_tags():
@@ -124,7 +146,7 @@ def pr_extra(n):
 
 def pr_marks(p):
     commits, files, reviews = pr_extra(p["number"])
-    text = "\n\n".join([evidence(p["body"])] + [c["body"] for c in p["comments"]] + reviews)  # 빈 줄로 이어 표끼리 붙지 않게
+    text = "\n\n".join(evidence_texts(p["body"], [c["body"] for c in p["comments"]], reviews))  # 빈 줄로 이어 표끼리 붙지 않게
     return commits, files, text, {k: bool(rx.search(text)) for k, rx in MARKS.items()}
 
 
@@ -202,23 +224,38 @@ def scope_change(body):
     return bool(SCOPE_CHANGE.search(re.sub(r"<!--.*?-->", "", body or "", flags=re.S)))
 
 
+CHECK_HEAD = re.compile(r"로컬 검사 `scripts/check\.ps1` — 커밋 `([0-9a-fA-F]+)`(.*)")
+
+
+def check_blocks(text):
+    """글 안의 로컬 검사 요약들 → [(요약 첫 줄의 match, 요약 덩어리)]. 덩어리는 요약 표가 끝나는 곳까지
+    (뒤따르는 '실패: …' 한 줄은 넣는다). `scripts/merge_gate.py`도 쓴다"""
+    out, lines = [], (text or "").splitlines()
+    for i, ln in enumerate(lines):
+        if not MARKS["로컬 검사"].search(ln):
+            continue
+        block, started = [ln], False
+        for nxt in lines[i + 1:]:
+            if nxt.strip().startswith("|"):
+                started = True
+            elif started or len(block) > 3:
+                if nxt.strip().startswith("실패:"):
+                    block.append(nxt)
+                break
+            block.append(nxt)
+        out.append((CHECK_HEAD.search(ln), "\n".join(block)))
+    return out
+
+
+def block_failed(block):
+    return "**실패**" in block or "실패:" in block
+
+
 def first_check_passed(texts):
     """시간 순 글들에서 처음 나온 로컬 검사 요약 표가 통과였나 (없으면 None). 표가 끝나는 곳까지만 본다"""
     for t in texts:
-        lines = (t or "").splitlines()
-        for i, ln in enumerate(lines):
-            if MARKS["로컬 검사"].search(ln):
-                block, started = [ln], False
-                for nxt in lines[i + 1:]:
-                    if nxt.strip().startswith("|"):
-                        started = True
-                    elif started or len(block) > 3:
-                        if nxt.strip().startswith("실패:"):
-                            block.append(nxt)
-                        break
-                    block.append(nxt)
-                text = "\n".join(block)
-                return "**실패**" not in text and "실패:" not in text
+        for _, block in check_blocks(t):
+            return not block_failed(block)
     return None
 
 
@@ -297,13 +334,13 @@ def collect(start, end):
     for p in sorted(prs, key=lambda p: p["number"]):
         commits, files, _, marks = info(p)
         closes = [c["number"] for c in p["closingIssuesReferences"]]
-        # 제목의 (#N)도 관련 이슈로 보되, 이슈인 번호만 ("PR #38"의 38은 PR)
-        refs = {n for n in set(closes) | {int(n) for n in re.findall(r"#(\d+)", p["title"])} if n in by_no}
+        # 제목의 (#N)·본문의 Refs #N도 관련 이슈로 보되, 이슈인 번호만 ("PR #38"의 38은 PR)
+        refs = {n for n in issue_refs(p["title"], p["body"], closes) if n in by_no}
         sec = any(needs_security(by_no[n].get("body")) for n in refs)
         marks = dict(marks)
         if not sec:
             marks["보안 리뷰"] = None  # 필요 없으면 세지 않음
-        no_code = 0 < len(files) < FILES_CAP and all(NON_CODE.search(f) for f in files)
+        no_code = is_no_code(files)
         merged = parse_ts(p["mergedAt"])
         before_rules = parse_ts(p["createdAt"]) < RULES_SINCE and merged < RULES_SINCE + RULES_GRACE
         for k, v in marks.items():

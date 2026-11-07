@@ -27,6 +27,9 @@ Closes #
 - 자동 검사: gitleaks / osv-scanner / semgrep / trivy
 - 위험 수용 (남기고 병합하는 미충족 + 사유 + 이슈):
 
+## 병합
+<!-- 병합은 `scripts/merge.ps1 <PR>`로만 한다 (먼저 -DryRun). 위 로컬 검사 요약(head 커밋)·리뷰 결과 댓글이 없으면 병합하지 않는다. 실제 병합은 사용자 승인 뒤에만 -->
+
 ## 배포
 - [ ] 배포 태그: `deploy-YYYYMMDD-HHMM`
 - [ ] 배포 후 확인:

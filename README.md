@@ -221,6 +221,14 @@ kubectl port-forward -n docs svc/docflow 8000:8000
 cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFLOW_URL 기본 http://127.0.0.1:8000)
 ```
 
+## 개발 절차
+
+- 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).
+- **병합은 `scripts/merge.ps1`로만** 한다 (https://github.com/reddol18/docflow/issues/83). `.\scripts\merge.ps1 <PR> -DryRun`으로 먼저 확인한다.
+  PR head 커밋의 로컬 검사 요약(실패 없음)·계약 리뷰·버그 리뷰 결과 댓글('| 지적 | 반영 |' 표)·보안 영향 칸에 체크가 있으면 보안 리뷰 결과 댓글이
+  있어야 squash 병합(제목 끝 `(#N)`)한다. `docs/`·README·잠금 파일만 바꾼 PR은 리뷰 흔적을 요구하지 않는다.
+  실제 병합은 사용자 승인 뒤에만. 판정 규칙은 주간 지표 `scripts/weekly_metrics.py`와 같다.
+
 ## 폴더
 
 | | |
