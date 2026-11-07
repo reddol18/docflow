@@ -41,8 +41,11 @@ def test_no_code_and_issue_refs_shared_with_merge_gate():
     assert not wm.is_no_code(["docs/a.md", "app/main.py"])
     assert not wm.is_no_code([])
     assert not wm.is_no_code([f"docs/{i}.md" for i in range(wm.FILES_CAP)])  # 잘렸을 수 있으면 코드로
-    body = "Refs #13, #14\n<!-- Refs #99 -->\n본문의 #50 언급은 아님\n예: #76은 `Refs #22`로 (글 속 인용)\nCloses #7"
-    assert wm.issue_refs("기능 (#12)", body, [7]) == {7, 12, 13, 14}
+    body = ("Refs #13, #14\n<!-- Refs #99 -->\n본문의 #50 언급은 아님\n예: #76은 `Refs #22`로 (글 속 인용)\nCloses #7\n"
+            "Refs: https://github.com/reddol18/docflow/issues/15\nRefs https://github.com/other/repo/issues/16\n")
+    assert wm.body_refs(body) == {7, 13, 14, 15}  # 다른 저장소 URL·주석·글 속 인용은 뺌
+    assert wm.issue_refs("기능 (#12)", body, [7]) == {7, 12, 13, 14, 15}
+    assert wm.linked_issues("기능 (#12)", [7]) == {7, 12}  # 리드타임·'닫는 이슈' 칸은 Refs를 넣지 않는다
 
 
 def test_review_fixes_counts_table_rows():
