@@ -27,7 +27,7 @@ try {
     uv run --quiet --no-project python -I $py $PR
     $code = $LASTEXITCODE
     if ($code -ne 0) {
-        Write-Host "병합하지 않습니다." -ForegroundColor Red
+        # 빠진 것·상태는 merge_gate.py가 출력했다
     } elseif ($DryRun) {
         Write-Host "(-DryRun: 병합하지 않음)"
     } else {

@@ -108,7 +108,7 @@ def needs_security(issue_body):
     return bool(s and re.search(r"- \[[xX]\]", s))
 
 
-REFS = re.compile(r"\b(?:Refs?|Closes|Fixes|Resolves)\s+((?:#\d+[\s,]*)+)", re.I)
+REFS = re.compile(r"^[ \t]*(?:Refs?|Closes|Fixes|Resolves)[ \t]+((?:#\d+[ \t,]*)+)", re.I | re.M)  # 줄 머리만 (글 속 인용은 아님)
 
 
 def issue_refs(title, body, closing):
