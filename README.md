@@ -149,9 +149,12 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 - **로컬 모델:** 이 Windows PC의 Ollama만 쓴다(맥은 배포 시험 환경이라 실험에 쓰지 않는다). 띄우기 전에 모델 폴더 드라이브 여유 10GB를 확인한다.
   llama3.1:8b는 작은 철(6건)에서 제목이 기준보다 크게 떨어져 실패, 건당 지연 약 9초·비용 0. 한국어 소형 모델 3개의 전체 450건 측정은
   `docs/design.md` "로컬 텍스트 모델 4칸 추출" (https://github.com/reddol18/docflow/issues/13).
-- **기준 다시 쓰기(`-BaselineFrom`):** 로컬 모델만 비교할 때 기준 모델을 다시 부르지 않는다. `gate.py --baseline-results`가 지난 결과에서
-  기준 후보 줄만 이번 결과의 철에 맞춰 가져오고, 후보마다 문서 묶음이 기준과 같지 않으면 종료 코드 2. 기본 후보는 `^local-ollama$`,
-  판은 `^current$`이고, 걸러진 후보에 OpenAI 모델이 없으면 키를 읽지 않는다. `results.json`은 실행마다 지우므로 기준 파일은 다른 이름으로 둔다.
+- **기준 다시 쓰기(`-BaselineFrom`, `-Local`과 함께, `-Replay`와는 같이 못 씀):** 로컬 모델만 비교할 때 기준 모델을 다시 부르지 않는다.
+  기본 후보 `^local-ollama$`, 판 `^current$`. promptfoo를 부르기 전에 `eval/promptfoo/plan.py`가 promptfoo와 같은 규칙(제공자 id·label에
+  대소문자 구분 정규식)으로 걸러질 후보를 세어, 기준(`criteria.yaml` baseline)과 겹치면 멈추고(돈 쓰고 버리는 호출 방지), OpenAI 후보가
+  없으면 키를 읽지 않는다. 기준 파일은 `work/promptfoo/` 아래 사본을 `gate.py --baseline-results`에 넘긴다(끝나면 지움).
+  `gate.py`는 기준 줄만 이번 결과의 철에 맞춰 가져오고, 기준 모델 id·temperature·response_format·apiBaseUrl이 이번 설정과 다르거나,
+  같은 판 후보의 지시문(`prompt.raw`)이 문서마다 기준과 다르거나, 문서 묶음이 다르면 종료 코드 2. `max_tokens` 같은 그 밖의 차이는 gate.md에 경고.
   `gate.md`에는 판정 표 아래 텍스트 추출(B)만 칸별 정답률 표가 붙는다.
 - **답변 채점(Ragas·쌍별 승률)은 아직 없다:** `criteria.yaml`의 `answer:` 칸은 자리만 있다 → https://github.com/reddol18/docflow/issues/21.
 - **결과·개인정보:** 실제 문서 글자가 담긴 결과(`results.json`, 다시 조립한 문서, promptfoo 결과 DB)는 저장소 밖 `work/promptfoo/`에만 쓴다.

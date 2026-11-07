@@ -89,7 +89,8 @@ def test_main_exit_codes(gate, tmp_path, monkeypatch):
     res = tmp_path / "results.json"
     res.write_text(json.dumps({"results": {"results": [_row("gpt-4.1-mini", "current", "d1"),
                                                        _row("gpt-4o-mini", "current", "d1")]}}), encoding="utf-8")
-    good = {"silent": 1.0, "fields": {f: 80.0 for f in gate.FIELDS}, "b_fields": {}, "flag_recall": {}, "all_ok": 0}
+    good = {"silent": 1.0, "fields": {f: 80.0 for f in gate.FIELDS}, "b_fields": {f: 50.0 for f in gate.FIELDS},
+            "flag_recall": {}, "all_ok": 0}
     bad = dict(good, silent=5.0)
     monkeypatch.setattr(gate.common, "load_vol", lambda vol: ([], {}))
     monkeypatch.setattr(gate, "rebuild", lambda res_, data: ({}, {}, 0))
@@ -116,40 +117,90 @@ def test_main_exit_codes(gate, tmp_path, monkeypatch):
     assert gate.main() == 2
 
 
-def test_baseline_from_stored_results(gate, tmp_path, monkeypatch):
-    """--baseline-results: 기준 줄을 지난 결과에서 가져온다 (이번 결과의 철만, 문서 묶음이 같아야, 기준이 이미 있으면 2)"""
-    def vrow(prov, doc, vol, **kw):
-        r = _row(prov, "current", doc, **kw)
-        r["vars"]["vol"] = vol
-        return r
+JSON_FMT = {"type": "json_object"}
+OLD_BASE_CFG = {"temperature": 0, "response_format": JSON_FMT}  # 지난 기준 파일처럼 max_tokens 없음 (promptfoo 기본)
+NOW_CFG = [  # 실제 results.json처럼 config.providers에는 거른 제공자도 모두 들어 있다
+    {"id": "openai:chat:gpt-4.1-mini", "label": "gpt-4.1-mini", "config": dict(OLD_BASE_CFG, max_tokens=512)},
+    {"id": "openai:chat:가상:7b", "label": "local-ollama",
+     "config": dict(OLD_BASE_CFG, max_tokens=512, apiBaseUrl="http://127.0.0.1:11434/v1")}]
 
+
+def _vrow(prov, doc, vol, raw=None, **kw):
+    r = _row(prov, "current", doc, **kw)
+    r["vars"]["vol"] = vol
+    r["prompt"]["raw"] = raw if raw is not None else f"지시문+가상 글자 {doc}"
+    return r
+
+
+def _old_results(tmp_path, base_cfg=OLD_BASE_CFG, base_pid=None):
     old = tmp_path / "old.json"
-    old.write_text(json.dumps({"config": {"providers": [{"id": "openai:chat:gpt-4.1-mini", "label": "gpt-4.1-mini",
-                                                         "config": {"temperature": 0}}]},
-                               "results": {"results": [vrow("gpt-4.1-mini", "d1", "가상-0001"),
-                                                       vrow("gpt-4.1-mini", "d2", "가상-0001"),
-                                                       vrow("gpt-4.1-mini", "d9", "가상-0002"),
-                                                       vrow("gpt-4o-mini", "d1", "가상-0001")]}}), encoding="utf-8")
+    pid = base_pid or "openai:chat:gpt-4.1-mini"
+    old.write_text(json.dumps({"config": {"providers": [{"id": pid, "label": "gpt-4.1-mini", "config": base_cfg}]},
+                               "results": {"results": [_vrow("gpt-4.1-mini", "d1", "가상-0001", pid=pid),
+                                                       _vrow("gpt-4.1-mini", "d2", "가상-0001", pid=pid),
+                                                       _vrow("gpt-4.1-mini", "d9", "가상-0002", pid=pid),
+                                                       _vrow("gpt-4o-mini", "d1", "가상-0001")]}}), encoding="utf-8")
+    return old
+
+
+def _now(rows):
+    return {"config": {"providers": NOW_CFG}, "results": {"results": rows}}
+
+
+def _local(docs=("d1", "d2"), vol="가상-0001", raw=None):
+    return [_vrow("local-ollama", d, vol, raw=raw, pid="openai:chat:가상:7b") for d in docs]
+
+
+def test_baseline_from_stored_results(gate, tmp_path):
+    """--baseline-results: 기준 줄만·이번 결과의 철만 가져오고, 설정 차이 max_tokens는 경고"""
+    old = _old_results(tmp_path)
     want = ("gpt-4.1-mini", "current")
-    loc = [vrow("local-ollama", d, "가상-0001", pid="openai:chat:가상:7b") for d in ("d1", "d2")]
-    rows, cfg, err = gate.add_baseline(loc, {}, old, want)
+    res = tmp_path / "now.json"
+    res.write_text(json.dumps(_now(_local())), encoding="utf-8")
+    rows, cfg, ids = gate.load_results(res)
+    assert ids == {"gpt-4.1-mini": "openai:chat:gpt-4.1-mini", "local-ollama": "openai:chat:가상:7b"}
+    g, warns, err = gate.add_baseline(gate.group(rows), cfg, ids, old, want)
     assert err is None
-    g = gate.group(rows)
     assert set(g) == {want, ("local-ollama", "current")}  # 기준만 가져오고 다른 후보(gpt-4o-mini)는 뺀다
     assert set(g[want]) == {"d1", "d2"}  # 이번 결과에 없는 철(가상-0002)은 뺀다
-    assert cfg["gpt-4.1-mini"] == {"temperature": 0}
-    assert gate.unpriced(rows, cfg) == []
+    assert len(warns) == 1 and "max_tokens" in warns[0] and "promptfoo 기본" in warns[0]
+    assert gate.unpriced([r for x in g.values() for r in x.values()], cfg) == []  # 기준 단가는 이번 설정으로
 
-    _, _, err = gate.add_baseline(loc[:1], {}, old, want)  # 문서 묶음이 다르면 비교하지 않는다
-    assert err and "다르다" in err
-    _, _, err = gate.add_baseline(loc + [vrow("gpt-4.1-mini", "d1", "가상-0001")], {}, old, want)
-    assert err and "이미" in err
-    _, _, err = gate.add_baseline([vrow("local-ollama", "d1", "가상-0003")], {}, old, want)
-    assert err and "없다" in err
 
-    # main: 기준 없이 돌린 결과 + --baseline-results → 판정, gate.md에 B 표와 가져온 파일 이름
+@pytest.mark.parametrize("case, want_err", [
+    ("already", "이미"), ("no_vol", "없다"), ("docs", "문서 1건"), ("prompt_raw", "지시문"),
+    ("model", "기준 모델"), ("temperature", "temperature"), ("response_format", "response_format")])
+def test_baseline_rejects(gate, tmp_path, case, want_err):
+    """기준과 같은 조건이 아니면 비교하지 않는다 (main은 종료 코드 2)"""
+    want = ("gpt-4.1-mini", "current")
+    base_cfg, base_pid, rows = OLD_BASE_CFG, None, _local()
+    if case == "already":
+        rows = rows + [_vrow("gpt-4.1-mini", "d1", "가상-0001")]
+    elif case == "no_vol":
+        rows = _local(vol="가상-0003")
+    elif case == "docs":
+        rows = _local(docs=("d1",))
+    elif case == "prompt_raw":  # 지시문·문서 글자가 바뀐 뒤의 후보
+        rows = _local(raw="바뀐 지시문")
+    elif case == "model":
+        base_pid = "openai:chat:가상-다른-모델"
+    elif case == "temperature":
+        base_cfg = dict(OLD_BASE_CFG, temperature=0.7)
+    else:
+        base_cfg = {"temperature": 0}
+    old = _old_results(tmp_path, base_cfg, base_pid)
+    res = tmp_path / "now.json"
+    res.write_text(json.dumps(_now(rows)), encoding="utf-8")
+    rows_, cfg, ids = gate.load_results(res)
+    _, _, err = gate.add_baseline(gate.group(rows_), cfg, ids, old, want)
+    assert err and want_err in err
+
+
+def test_baseline_main(gate, tmp_path, monkeypatch):
+    """main: 기준 없이 돌린 결과 + --baseline-results → 판정, gate.md에 B 표·가져온 파일 이름·경고. 어긋나면 2"""
+    old = _old_results(tmp_path)
     res = tmp_path / "results.json"
-    res.write_text(json.dumps({"results": {"results": loc}}), encoding="utf-8")
+    res.write_text(json.dumps(_now(_local())), encoding="utf-8")
     s = {"silent": 1.0, "fields": {f: 80.0 for f in gate.FIELDS}, "b_fields": {f: 50.0 for f in gate.FIELDS},
          "flag_recall": {"serial": None, "date": None}, "all_ok": 0}
     monkeypatch.setattr(gate.common, "load_vol", lambda vol: ([], {}))
@@ -162,6 +213,36 @@ def test_baseline_from_stored_results(gate, tmp_path, monkeypatch):
     assert [(r["provider"], r["verdict"]) for r in out] == [("gpt-4.1-mini", "기준"), ("local-ollama", "통과")]
     md = (tmp_path / "gate.md").read_text(encoding="utf-8")
     assert "텍스트 추출(B)만" in md and "| local-ollama | current | 50.0% |" in md and "old.json" in md
+    assert "경고: 기준 설정 max_tokens" in md
+
+    res.write_text(json.dumps(_now(_local(raw="바뀐 지시문"))), encoding="utf-8")
+    assert gate.main() == 2
+
+
+@pytest.fixture(scope="module")
+def plan():
+    return _load("plan")
+
+
+def _plan(plan, providers="", prompts="", model="가상:7b"):
+    read = lambda n: yaml.safe_load((PF / n).read_text(encoding="utf-8"))  # noqa: E731
+    return plan.plan(read("promptfooconfig.yaml"), read("criteria.yaml"), providers, prompts, model)
+
+
+def test_plan_filters_like_promptfoo(plan):
+    """run.ps1이 promptfoo 부르기 전에: 걸러질 후보(id·label, 대소문자 구분), 키 필요 여부, 기준과 겹침"""
+    p = _plan(plan, "^local-ollama$", "^current$")
+    assert p == {"providers": ["local-ollama"], "prompts": ["current"], "need_key": False, "baseline_overlap": False}
+    p = _plan(plan, "^openai:chat:가상:7b$")  # id로도 걸린다 (로컬 모델 이름은 채워서 본다)
+    assert p["providers"] == ["local-ollama"] and not p["need_key"]
+    assert _plan(plan, "GPT-4o")["providers"] == []  # 대소문자 구분 (promptfoo RegExp와 같게)
+    p = _plan(plan, "gpt-4o-mini|local")
+    assert p["providers"] == ["gpt-4o-mini", "local-ollama"] and p["need_key"] and not p["baseline_overlap"]
+    p = _plan(plan, "mini", "^current$")  # 기준(gpt-4.1-mini·current)이 걸림 → run.ps1 -BaselineFrom이면 부르기 전에 멈춘다
+    assert p["need_key"] and p["baseline_overlap"]
+    assert not _plan(plan, "mini", "^before_ocr_fix$")["baseline_overlap"]  # 판이 다르면 겹치지 않는다
+    assert _plan(plan, "", "")["baseline_overlap"]  # 빈 정규식 = 모두
+    assert _plan(plan, "openai:chat:gpt-4\\.1")["providers"] == ["gpt-4.1-mini"]
 
 
 def test_price_of(gate):

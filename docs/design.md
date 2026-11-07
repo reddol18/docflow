@@ -102,12 +102,17 @@ Windows ─(ssh 터널 → kubectl port-forward)→ docs 네임스페이스 (k3s
 | qwen3:4b-instruct | Apache 2.0 | 18.3% | 57.3% | 34.8% | 72.6% | 62.8% | 78.0% | 34.8% | 72.6% | 98.2% | 80.6% | 7.3% | 0 | 6.3s | 7.2s | 탈락 (표시 없이 틀림 +5.5%p, 수신 −12.2%p, 제목 −14.6%p) |
 
 - **결론:** 세 후보 모두 탈락. 공통으로 수신(−12~−23%p)과 제목이 크게 떨어진다. 문서번호·시행일자 최종값은 손글씨 판독·규칙 합침이 메워
-  기준과 1%p 안팎이지만, B만 보면 문서번호가 exaone 11.0%·qwen3 18.3%로 낮다. 지금 지시문(current) 그대로 7B 이하 로컬 모델로 바꿀 수는 없다.
+  기준과 1%p 안팎이지만, B만 보면 문서번호가 exaone 11.0%·qwen3 18.3%로 낮다. 지금 지시문(current) 그대로는 시험한 4B~7.8B 로컬 모델
+  (9B 이하 후보군)로 바꿀 수 없다. 9B보다 큰 모델·지시문 조정은 재지 않았다.
 - **고른 이유:** 12GB VRAM에 올라가는 9B 이하 지시 모델 중 한국어가 되는 것. qwen2.5:7b(다국어·JSON 출력이 안정적, Apache 2.0),
   exaone3.5:7.8b(LG, 한국어 특화 — 비상업 라이선스라 성능 참고용), qwen3:4b-instruct(추론 모드 없는 Qwen3 지시 판, Apache 2.0).
   gemma3:4b는 Ollama 0.13.2에서 받기가 거부되어(레지스트리 412 "newer version of Ollama") 빼고 qwen3:4b-instruct로 바꿨다.
 - **읽기 실패:** qwen2.5:7b 2건은 JSON 문법이 깨진 응답(출력 상한 512토큰에 잘린 것 아님). 입력 최대 약 1,530토큰 + 출력 512 < 문맥 4,096이라 입력 잘림 없음.
-- **실행 환경:** 이 Windows PC, Ollama 0.13.2, GPU GTX TITAN X 12GB(Maxwell). 세 모델 모두 GPU에 전부 올라감(`/api/ps` size_vram = size, 문맥 4,096,
+  문맥 4,096은 하네스가 정한 값이 아니라 Ollama 0.13.2 기본값을 `/api/ps` context_length로 관찰한 것이다(`num_ctx`를 주지 않음).
+- **출력 상한 차이:** 기준 파일은 `max_tokens`를 주기 전에 돌려 promptfoo 기본 1024, 후보는 512(`promptfooconfig.yaml`).
+  기준 gpt-4.1-mini·current 450건의 출력은 최대 138토큰, 450건 모두 finish_reason `stop`이라(기준 파일에서 확인) 어느 상한에도 걸리지 않아 비교에 영향 없다.
+  `gate.py`는 이 차이를 gate.md에 경고로 남긴다.
+- **실행 환경:** 이 Windows PC, Ollama 0.13.2, GPU GTX TITAN X 12GB(Maxwell). 세 모델 모두 GPU에 전부 올라감(`/api/ps` size_vram = size,
   실행 중 GPU 사용률 99%). 한 번에 한 건(`-j 1`), 450건에 52~65분. 비용 0.
 - **모델 다이제스트(`/api/ps` digest):** qwen2.5:7b `845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e`,
   exaone3.5:7.8b `c7c4e3d1ca22fe9225f18b35eb719f67e2ca96a42e7fd17294a45b83ba8fbf03`,
@@ -115,6 +120,11 @@ Windows ─(ssh 터널 → kubectl port-forward)→ docs 네임스페이스 (k3s
 - exaone의 문서번호 −3.0%p는 표에서 반올림한 값이고 실제 차는 3%p를 조금 넘어 탈락으로 셌다(문서번호 하나만으로도 경계).
 - **재현:** `.\eval\promptfoo\run.ps1 -Local -LocalModel <태그> -BaselineFrom ..\work\promptfoo\results_full_20261107.json`
   (후보 `local-ollama`·지시문 `current`만 부르고 기준 줄은 지난 결과에서 가져옴, OpenAI 호출 0).
+- **기준 파일:** `work/promptfoo/results_full_20261107.json` = `.\eval\promptfoo\run.ps1`(전체 행렬 1800회) 결과, promptfoo 0.125.0,
+  eval id `eval-1wQ-2026-11-06T17:35:12`(UTC, 한국 시각 11-07 02:35). 그때 코드는 main `88d6d49` 위의 커밋 전 하네스 작업본이라
+  정확히 맞는 커밋은 없다(같은 하네스가 뒤에 `b66f4f1`·`eaeafeb`로 들어감). 대신 `gate.py`가 문서마다 모델에 간 지시문(`prompt.raw`)이
+  기준과 후보에서 같은지 확인한다 — 세 후보 모두 450건 같음.
+- **측정한 코드:** 로컬 모델 실행은 main `9eba100` + 이 측정의 하네스 변경(`517a34b`로 커밋), 리뷰 반영 뒤 같은 저장 결과로 `gate.py`만 다시 돌려 숫자·판정이 같음을 확인.
 
 ### 손글씨 칸 판독 모델 비교 (1997-0002 철 10건, 칸 20개, `eval/cell_variants.py`)
 처음엔 gpt-4o-mini(low)로 시작했는데 일련번호를 빈칸("도시 58430-")으로 답하면서 확신도는 1.0에 가까웠다.

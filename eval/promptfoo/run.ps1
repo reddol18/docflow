@@ -11,7 +11,9 @@
 로컬 모델을 띄우기 전에 모델 폴더 드라이브의 디스크 여유(10GB)를 먼저 확인하고, 모자라면 멈춘다.
   .\eval\promptfoo\run.ps1 -Local -LocalModel qwen2.5:7b -BaselineFrom ..\work\promptfoo\results_full_20261107.json
                                                 로컬 모델만 돌리고 기준(gpt-4.1-mini·current)은 지난 결과에서 가져온다 — OpenAI 호출 0, 키 불필요
-                                                (https://github.com/reddol18/docflow/issues/13). 기본 후보 '^local-ollama$', 판 '^current$'
+                                                (https://github.com/reddol18/docflow/issues/13). 기본 후보 '^local-ollama$', 판 '^current$'.
+                                                -Local 필요, -Replay와 같이 못 씀. 걸러진 후보·판이 기준과 겹치면 부르기 전에 멈춘다(plan.py).
+                                                기준 파일은 work 아래 사본을 gate.py에 넘긴다
   .\eval\promptfoo\run.ps1 -Replay              LLM 호출 없이 저장 결과로 채점 연결만 확인 (eval/score.py와 같아야 함)
   .\eval\promptfoo\run.ps1 -View                마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
 
@@ -87,23 +89,6 @@ $env:DOCFLOW_LOCAL_MODEL = $LocalModel
 $prevKey = $env:OPENAI_API_KEY
 $key = $null
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
-if ($Replay) {
-    $providers = '^replay$'
-    if (-not $Prompts) { $Prompts = '^current$' }
-} else {
-    if ($BaselineFrom) {   # 기준은 지난 결과에서 → 이번엔 로컬 모델만 (기준을 거르지 않으면 gate.py가 종료 코드 2)
-        if (-not (Test-Path $BaselineFrom)) { if ($prevKey) { $env:OPENAI_API_KEY = $prevKey }; throw "기준 결과가 없다: $BaselineFrom" }
-        $BaselineFrom = (Resolve-Path $BaselineFrom).Path
-        if (-not $Providers) { $Providers = '^local-ollama$' }
-        if (-not $Prompts) { $Prompts = '^current$' }
-    }
-    $providers = if ($Providers) { $Providers } elseif ($Local) { '^(gpt-4\.1-mini|gpt-4o-mini|local-ollama)$' } else { '^(gpt-4\.1-mini|gpt-4o-mini)$' }
-    # 키는 OpenAI 후보가 걸러질 때만 (로컬 모델만이면 키를 읽지도 넣지도 않는다)
-    if (@('gpt-4.1-mini', 'gpt-4o-mini') | Where-Object { $_ -match $providers }) {
-        $key = if ($prevKey) { $prevKey } else { [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User') }
-        if (-not $key) { if ($prevKey) { $env:OPENAI_API_KEY = $prevKey }; throw 'OPENAI_API_KEY가 없다 — Windows 사용자 환경변수에 넣는다' }
-    }
-}
 
 function Test-Ollama {
     try { Invoke-WebRequest 'http://127.0.0.1:11434/api/tags' -UseBasicParsing -TimeoutSec 3 | Out-Null; $true } catch { $false }
@@ -119,7 +104,41 @@ function Test-AllInterfaces($addrs) { [bool]($addrs | Where-Object { $_ -notin @
 
 $served = $null
 $servedAt = $null
-try {
+$baseDir = $null
+try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원은 아래 finally 하나로
+    if ($Replay) {
+        if ($BaselineFrom) { throw '-BaselineFrom은 -Replay와 같이 쓰지 않는다 (Replay는 저장 결과와의 일치만 본다)' }
+        $providers = '^replay$'
+        if (-not $Prompts) { $Prompts = '^current$' }
+    } else {
+        if ($BaselineFrom) {   # 기준은 지난 결과에서 → 이번엔 로컬 모델만
+            if (-not $Local) { throw '-BaselineFrom은 -Local과 같이 쓴다 (기준 재사용은 로컬 모델 비교용)' }
+            if (-not (Test-Path $BaselineFrom -PathType Leaf)) { throw "기준 결과가 없다: $BaselineFrom" }
+            if (-not $Providers) { $Providers = '^local-ollama$' }
+            if (-not $Prompts) { $Prompts = '^current$' }
+        }
+        $providers = if ($Providers) { $Providers } elseif ($Local) { '^(gpt-4\.1-mini|gpt-4o-mini|local-ollama)$' } else { '^(gpt-4\.1-mini|gpt-4o-mini)$' }
+        # 걸러질 제공자·판을 promptfoo와 같은 규칙(id·label, 대소문자 구분)으로 미리 셈 → 키가 필요한가, 기준과 겹치는가 (plan.py)
+        $planOut = & $py -I -X utf8 (Join-Path $here 'plan.py') "--providers=$providers" "--prompts=$Prompts" "--local-model=$LocalModel"
+        if ($LASTEXITCODE -ne 0) { throw '후보 거르기 계산(plan.py) 실패' }
+        $plan = ($planOut -join "`n") | ConvertFrom-Json
+        Write-Output ("후보: {0} · 판: {1}" -f ($plan.providers -join ', '), ($plan.prompts -join ', '))
+        if (-not $plan.providers -or -not $plan.prompts) { throw '걸러진 후보나 지시문 판이 없다 — -Providers·-Prompts 정규식 확인' }
+        if ($BaselineFrom -and $plan.baseline_overlap) {   # 기준을 다시 부르면 돈을 쓰고 결과는 gate.py가 버린다 → 부르기 전에 멈춤
+            throw '-BaselineFrom인데 걸러진 후보·판이 기준(criteria.yaml baseline)과 겹친다 — -Providers·-Prompts에서 기준을 뺀다'
+        }
+        if ($plan.need_key) {   # 키는 OpenAI 후보가 걸러질 때만 (로컬 모델만이면 키를 읽지도 넣지도 않는다)
+            $key = if ($prevKey) { $prevKey } else { [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User') }
+            if (-not $key) { throw 'OPENAI_API_KEY가 없다 — Windows 사용자 환경변수에 넣는다' }
+        }
+        if ($BaselineFrom) {
+            # 기준 파일은 사본을 gate.py에 넘긴다 — 원본이 이번 실행의 results.json이든 실행 중 바뀌든 기준이 지워지거나 섞이지 않게
+            $baseDir = Join-Path $out (".baseline-{0}" -f $PID)
+            New-Item -ItemType Directory -Force $baseDir | Out-Null
+            $baseCopy = Join-Path $baseDir (Split-Path $BaselineFrom -Leaf)
+            Copy-Item -LiteralPath $BaselineFrom -Destination $baseCopy -Force
+        }
+    }
     if ($Local -and -not $Replay) {
         # 이 PC의 Ollama. 모델 폴더(OLLAMA_MODELS) 드라이브 여유를 먼저 본다 — 모델을 새로 받거나 캐시를 쓸 수 있다
         foreach ($scope in 'User', 'Machine') {   # 이 셸이 시작된 뒤 넣은 값도 읽는다
@@ -157,7 +176,6 @@ try {
         if ($LocalModel -notin $tags.models.name) { throw "Ollama에 모델 $LocalModel 이 없다 — 먼저 ollama pull (디스크 여유 확인 뒤)" }
     }
     $res = Join-Path $out 'results.json'
-    if ($BaselineFrom -and $BaselineFrom -eq [IO.Path]::GetFullPath($res)) { throw '기준 결과로 results.json을 쓰면 이번 실행이 지운다 — 다른 이름으로 복사해 넘긴다' }
     Remove-Item $res -ErrorAction SilentlyContinue   # 실패한 실행이 지난 결과로 판정되지 않게
     $args_ = @('eval', '-c', (Join-Path $here 'promptfooconfig.yaml'), '-o', $res, '--filter-providers', $providers,
                '--no-share', '--no-table', '--no-progress-bar')
@@ -177,7 +195,7 @@ try {
     if (($pcode -ne 0 -and $pcode -ne 100) -or -not (Test-Path $res)) { Write-Output "promptfoo 실패 (종료 코드 $pcode)"; exit 2 }
     $gate = @((Join-Path $here 'gate.py'), $res, '--out', $out)
     if ($Replay) { $gate += '--expect-stored' }
-    if ($BaselineFrom -and -not $Replay) { $gate += @('--baseline-results', $BaselineFrom) }
+    if ($baseDir) { $gate += @('--baseline-results', $baseCopy) }
     Push-Location $app
     & $py -I -X utf8 @gate
     $code = $LASTEXITCODE
@@ -187,6 +205,7 @@ try {
 } finally {
     # 키를 원래대로 (이 스크립트를 부른 셸에 있던 값이면 되살린다)
     if ($prevKey) { $env:OPENAI_API_KEY = $prevKey } else { Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue }
+    if ($baseDir) { Remove-Item -LiteralPath $baseDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ($served) {   # 이 스크립트가 켠 Ollama만 끈다 (serve가 띄운 모델 실행 프로세스 = 자식 프로세스도 함께)
         # serve가 죽어도 자식의 ParentProcessId는 남는다 → 남은 것이 없을 때까지 (최대 15초) 다시 찾아 끈다.
         # PID는 다시 쓰일 수 있으므로 이름(ollama*)과 시작 시각(켠 뒤)까지 맞아야 끈다.
