@@ -17,7 +17,8 @@ CHECK_OK = ("로컬 검사 `scripts/check.ps1` — 커밋 `abc1234`, 2026-11-07 
             "| gitleaks | 통과 | 1 |\n| osv | 통과 | 2 |\n| semgrep | 통과 | 12 |\n"
             "| trivy | 보고만 (출력 확인) | 9 |\n\n막는 검사 모두 통과")
 QUICK = (CHECK_OK.replace("| osv | 통과 | 2 |", "| osv | 건너뜀 | 0 |")
-         .replace("| semgrep | 통과 | 12 |", "| semgrep | 건너뜀 | 0 |").replace("| trivy | 보고만 (출력 확인) | 9 |", "| trivy | 건너뜀 | 0 |"))
+         .replace("| semgrep | 통과 | 12 |", "| semgrep | 건너뜀 | 0 |")
+         .replace("| trivy | 보고만 (출력 확인) | 9 |", "| trivy | 건너뜀 | 0 |"))
 SPEC = "## 계약 리뷰 (spec-reviewer)\n| 지적 | 반영 |\n|---|---|\n| 조건 2 근거 없음 | 본문에 추가 |"
 CODE = "## 코드 리뷰 (`/code-review high`)\n| 지적 | 반영 |\n|---|---|\n| 경계값 | 고침 |"
 SEC = "## 보안 리뷰 (security-reviewer)\n| 지적 | 반영 |\n|---|---|\n| (낮) 로그 | 그대로 |"
