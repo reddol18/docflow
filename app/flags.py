@@ -199,10 +199,6 @@ def machine(docs, schema):
     return out
 
 
-def is_machine(reason):
-    return reason.startswith(field_rules.MACHINE)
-
-
 def refresh(docs, schema):
     """사람이 값을 고친 뒤 기계 검수 표시를 다시 계산한다 (철 전체 — 철 안 중복은 다른 문서 값에 달려 있다).
     다른 표시(확신도·김해 규칙)는 그대로 둔다. 표시가 바뀐 문서만 새 dict, 나머지는 같은 객체를 돌려준다
@@ -210,12 +206,13 @@ def refresh(docs, schema):
     검토 제출(graph.review)·문서 수정·검사·단계 승인(main._edit_document)이 이것 하나를 부른다."""
     if not field_rules.ruled(schema):
         return docs
+    mine = field_rules.machine_reasons(schema)  # 이 스키마 규칙이 내는 사유만 바꿔 끼운다 (글자 머리로 고르지 않음)
     out = []
     for d, mf in zip(docs, machine(docs, schema)):
         old = d.get("flags") or {}
         fl = {}
         for k, rs in old.items():
-            keep = [x for x in rs if not is_machine(x)]
+            keep = [x for x in rs if x not in mine]
             if keep:
                 fl[k] = keep
         for k, rs in mf.items():

@@ -53,15 +53,15 @@ export function Progress({ value, max, tone = "blue" }: { value: number; max: nu
   );
 }
 
-export function FlagChips({ flags }: { flags?: string[] }) {
+export function FlagChips({ flags, machine }: { flags?: string[]; machine?: readonly string[] }) {
   if (!flags?.length) return null;
   return (
     <span className="flex flex-wrap gap-1">
       {flags.map((f) => (
-        // 기계 검수(스키마 칸 검증 규칙 위반, 서버 사유 '기계 검수 · 칸 · 규칙')는 색을 달리한다
+        // 기계 검수(칸 검증 규칙 위반)는 색을 달리한다 — 어느 사유가 기계 검수인지는 서버 /schema의 validate.reasons
         <span
           key={f}
-          className={`rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ${f.startsWith("기계 검수") ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-rose-50 text-rose-700 ring-rose-200"}`}
+          className={`rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ${machine?.includes(f) ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-rose-50 text-rose-700 ring-rose-200"}`}
         >
           {f}
         </span>

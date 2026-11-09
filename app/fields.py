@@ -121,15 +121,14 @@ def _str(f, k, where):
 
 
 def _validate(f, where, root):
-    """칸 검증 규칙 읽기 (app/field_rules.py). 화면에 보이는 건 단위 칸만 — 숨김·철 단위 칸은 검토 표시를 볼 자리가 없다"""
-    if not is_shown(f):
-        raise SchemaError(f"{where}: validate는 화면에 보이는 건 단위 칸만")
+    """칸 검증 규칙 읽기 (app/field_rules.py). 사람이 고칠 수 있는 건 단위 칸만 — 숨김·철 단위 칸은 표시를 볼 자리가 없고,
+    고정값 칸은 고칠 수 없어 풀 수 없는 표시가 생긴다 (editable과 같은 기준)"""
+    if not is_editable(f):
+        raise SchemaError(f"{where}: validate는 사람이 고칠 수 있는 건 단위 칸만 (숨김·고정값·철 단위 칸 제외)")
     try:
         f["validate"] = field_rules.compile_rules(f["validate"], root)
     except field_rules.RuleError as e:
         raise SchemaError(f"{where}: {e}") from None
-    if f["validate"].unique and f["method"] == "fixed":
-        raise SchemaError(f"{where}: 고정값 칸은 모든 건이 같은 값이라 unique를 쓸 수 없음")
 
 
 def _field(f, i, base_names, root=None):
@@ -261,8 +260,12 @@ def shown(s):
 
 def editable(s):
     """사람이 고칠 수 있는 칸 (숨김·고정값 제외)"""
-    return tuple(f["name"] for f in s["fields"]
-                 if f["method"] not in ("hidden", "fixed") and f["level"] == "document")
+    return tuple(f["name"] for f in s["fields"] if is_editable(f))
+
+
+def is_editable(f):
+    """사람이 고칠 수 있는 칸인가 (editable과 같은 기준 — 칸 검증 규칙도 이 칸에만)"""
+    return f["method"] not in ("hidden", "fixed") and f["level"] == "document"
 
 
 def labels(s):

@@ -182,18 +182,27 @@ def test_rules_schema_flags_machine_check_and_recomputes_on_edit(probe):
     assert all(s["status"] == 200 for s in r["steps"])
     # 1) 0번 문서를 맞는 값으로 → 0번 기계 검수 표시가 사라지고, 다른 표시(확신도)는 남는다
     assert _machine(s0["flags"][0]) == {} and "LLM" in s0["flags"][0]["sheet_title"]
-    assert len(s0["saved"]) == 1  # 다른 문서 표시는 그대로 → 고친 문서만 저장
+    ids = s0["ids"]
+    # 다른 문서 표시는 그대로 → 고친 문서만 저장, 응답 reflagged 비어 있음 (화면은 목록을 다시 읽지 않는다)
+    assert s0["saved"] == [ids[0]] and s0["flags_saved"] == [] and s0["reflagged"] == []
     assert s0["export_check"]["rule"] == 3 * (len(r["docs"]) - 1)
-    # 2) 1번 문서가 0번과 같은 식별자 + 코드표에 없는 코드 → 두 문서 모두 중복, 1번은 코드표 위반. 0번도 다시 저장
+    # 2) 1번 문서가 0번과 같은 식별자 + 코드표에 없는 코드 → 두 문서 모두 중복, 1번은 코드표 위반.
+    #    0번은 표시만 다시 쓴다(칸 값·검토 여부는 건드리지 않음), 응답이 0번을 알려 준다
     assert _machine(s1["flags"][0]) == {"rdid": ["기계 검수 · 도로 식별자 · 철 안 중복"]}
     assert _machine(s1["flags"][1]) == {"rdid": ["기계 검수 · 도로 식별자 · 철 안 중복"],
                                         "road_rank": ["기계 검수 · 도로 종류 코드 · 코드표에 없는 값"]}
-    assert len(s1["saved"]) == 2
+    assert s1["saved"] == [ids[1]] and s1["flags_saved"] == [ids[0]] and s1["reflagged"] == [ids[0]]
+    # 기계 검수 표시는 '검토 안 끝난 건'으로 세지 않는다 (rule 문제로만)
+    assert s1["export_check"]["not_reviewed"] == 0
+    # /schema가 칸마다 규칙과 기계 검수 사유 글자를 내려 준다 (화면이 표시 종류를 가린다)
+    v = {f["name"]: f.get("validate") for f in r["schema"]["fields"]}
+    assert v["road_rank"]["rules"] == ["required", "length", "code_table"] and v["surveyed_on"] is None
+    assert "기계 검수 · 도로 식별자 · 철 안 중복" in v["rdid"]["reasons"]
     rules1 = sorted((x["doc_id"], x["rule"]) for x in s1["export_check"]["problems"] if x["kind"] == "rule"
-                    and x["field"] in ("rdid", "road_rank") and x["doc_id"] in s1["saved"])
+                    and x["field"] in ("rdid", "road_rank") and x["doc_id"] in ids[:2])
     assert [k for _, k in rules1] == ["unique", "code_table", "unique"]
     # 3) 1번을 다른 맞는 값으로 → 0번의 중복 표시도 사라진다 (철 전체를 다시 봄)
-    assert _machine(s2["flags"][0]) == {} and _machine(s2["flags"][1]) == {}
+    assert _machine(s2["flags"][0]) == {} and _machine(s2["flags"][1]) == {} and s2["reflagged"] == [ids[0]]
     assert s2["export_check"]["rule"] == 3 * (len(r["docs"]) - 2)
 
 

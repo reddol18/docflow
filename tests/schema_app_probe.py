@@ -81,15 +81,18 @@ def edit_steps(c, steps):
     store.entered = lambda vol, uid: (False, set())
     store.stage_actors = lambda vol, uid: {}
     store.inspected_docs_by = lambda vol, uid: set()
-    saved = []
-    store.save_documents = lambda docs: saved.append(sorted(d["doc_id"] for d in docs))
+    saved, flagged = [], []
+    store.save_documents = lambda docs: saved.extend(d["doc_id"] for d in docs)
+    store.save_flags = lambda vol, items: flagged.extend(k for k, _ in items)  # 다른 문서는 표시만 쓴다
     ids = [d["doc_id"] for d in c.get(f"/volumes/{VOL}/documents").json()]
     out = []
     for s in steps:
         saved.clear()
+        flagged.clear()
         res = c.patch(f"/documents/{VOL}/{ids[s['doc']]}", json=s["fields"])
         docs = c.get(f"/volumes/{VOL}/documents").json()
-        out.append({"status": res.status_code, "saved": saved[0] if saved else [],
+        out.append({"status": res.status_code, "saved": list(saved), "flags_saved": sorted(flagged),
+                    "reflagged": res.json().get("reflagged"), "ids": ids,
                     "flags": [d["flags"] for d in docs], "fields": [d["fields"] for d in docs],
                     "export_check": c.get("/export/check", params={"vol": VOL}).json()})
     return out

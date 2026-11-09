@@ -362,9 +362,10 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
         if row and row["inspected_at"] is not None:  # 검사가 끝난 문서를 입력 경로로 바꾸면 검사 결과가 무의미해진다
             raise HTTPException(409, "검사가 끝난 문서는 고칠 수 없음")
         _entry_edit_allowed(vol, doc_id, user)
-        d, changed = _edit_document(vol, doc_id, fields, user)
+        d, changed, reflagged = _edit_document(vol, doc_id, fields, user)
         info["fields"] = changed  # 칸 이름만 (값은 edits 표)
-    return d
+    # reflagged: 기계 검수(철 안 중복)로 표시가 바뀐 다른 문서 — 화면은 이것이 있을 때만 목록을 다시 읽는다
+    return {**d, "reflagged": reflagged}
 
 
 def _edit_document(vol, doc_id, fields, user, source="edit"):
@@ -382,15 +383,19 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
                                             {k: str(v).strip() for k, v in fields.items() if k in EDITABLE})
         fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
         if not fix:
-            return docs[doc_id], []
+            return docs[doc_id], [], []
         docs[doc_id] = dict(docs[doc_id], fields=flow.rederive({**old, **fix}, fix), edited=True)
         # 기계 검수(칸 검증 규칙)를 고친 값으로 다시 본다 — 철 안 중복은 다른 문서 표시도 바꾼다 (flags.refresh는 바뀐
         # 문서만 새 객체). 규칙 없는 스키마는 이 문서 하나만 저장 — 지금과 같다
         new = {x["doc_id"]: x for x in flags.refresh(list(docs.values()), schema_fields.SCHEMA)}
         d = new[doc_id]
-        save = [d, *(x for k, x in new.items() if k != doc_id and x is not docs[k])]
-        G.update_state(cfg(vol), {"docs": save}, as_node="index")
-    store.save_documents(save)
+        others = [x for k, x in new.items() if k != doc_id and x is not docs[k]]
+        G.update_state(cfg(vol), {"docs": [d, *others]}, as_node="index")
+        # Postgres 쓰기도 철 잠금 안에서 — 잠금 밖에서 쓰면 그 사이 다른 문서를 고친 요청의 값·표시를 낡은 것으로 덮는다.
+        # 다른 문서는 표시만 쓴다 (칸 값·검토 여부는 그 문서를 고치는 요청 몫)
+        store.save_documents([d])
+        if others:
+            store.save_flags(vol, [(x["doc_id"], x["flags"]) for x in others])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
     if llm.enabled():
@@ -398,7 +403,7 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     else:  # LLM_PROVIDER=off: 예전 값으로 만든 벡터를 남기지 않는다
         store.delete_doc_vectors([doc_id])
     store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
-    return d, list(fix)
+    return d, list(fix), [x["doc_id"] for x in others]
 
 
 @app.get("/documents/{vol}/{doc_id}/edits")
@@ -617,7 +622,7 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
         if not store.claim_inspection(vol, doc_id, user.id):
             raise HTTPException(409, "이미 검사함")
         try:
-            _, changed = _edit_document(vol, doc_id, body.fields, user, source="inspect")
+            _, changed, _ = _edit_document(vol, doc_id, body.fields, user, source="inspect")
         except BaseException:
             store.release_inspection(vol, doc_id)
             raise
@@ -1093,11 +1098,17 @@ def schema_view(_: Viewer):
     화면은 칸 이름이 아니라 여기 정보로 판단한다 (https://github.com/reddol18/docflow/issues/72):
       rule  값을 만드는 코드 규칙 이름 (없으면 null) — 수신 보정 등 규칙별 안내
       hw    보여 줄 잘라낸 손글씨 칸 (/crops/{vol}/{doc_id}_{hw}.png, 문서 hw[hw]). 없으면 null
-      search_columns  검색 결과 열 (스키마 search.columns, 기본 보이는 칸 전부)"""
+      search_columns  검색 결과 열 (스키마 search.columns, 기본 보이는 칸 전부)
+      validate  칸 검증 규칙 {rules, reasons} (규칙 없는 칸은 키 없음) — reasons는 이 칸의 기계 검수 표시 사유 글자 전부"""
     s = schema_fields.SCHEMA
     return {"name": s["name"], "search_columns": list(s["search"]["columns"]), "fields": [
         {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
          "editable": f["name"] in EDITABLE, "flag_key": schema_fields.flag_key(f),
          "isad": f.get("isad") or (f["name"] if "area" in f else None),  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
-         "rule": f.get("rule"), "hw": flow.hw_cell(f)}
+         "rule": f.get("rule"), "hw": flow.hw_cell(f),
+         # 칸 검증 규칙: 규칙 이름과 이 칸에 붙을 수 있는 기계 검수 표시 사유(정확한 글자 — 화면이 표시 종류를 가린다).
+         # 규칙 없는 칸은 키 자체를 싣지 않는다 (규칙 없는 스키마의 응답은 지금과 같은 모양)
+         **({"validate": {"rules": f["validate"].names(),
+                          "reasons": sorted(field_rules.reason(f, k) for k in field_rules.possible(f))}}
+            if "validate" in f else {})}
         for f in s["fields"] if f["name"] in schema_fields.shown(s)]}

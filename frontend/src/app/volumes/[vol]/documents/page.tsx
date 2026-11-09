@@ -75,6 +75,8 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const stageLabel = (name: string | null) => wf?.stages.find((x) => x.name === name)?.label ?? name;
   const cells = (schema?.fields ?? []).filter((f) => f.level === "document");
   const titleKey = cells.find((f) => f.isad === "title")?.name ?? cells[0]?.name;
+  // 기계 검수 표시 사유 (서버가 칸마다 알려 줌) — 칩 색 구분용
+  const machine = useMemo(() => (schema?.fields ?? []).flatMap((f) => f.validate?.reasons ?? []), [schema]);
   const editor = can(useMe(), "reviewer"); // 보기 역할은 고치기·검토 버튼을 숨긴다 (서버도 403으로 막음)
 
   // 철 상태가 바뀔 때(검토 대기 → 처리 중 → 완료) 문서를 다시 읽는다
@@ -180,17 +182,31 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
     setSaving(true);
     setNote(null);
     try {
-      const updated = await api.editDocument(vol, d.doc_id, fixes[d.doc_id]);
+      const { reflagged = [], ...updated } = await api.editDocument(vol, d.doc_id, fixes[d.doc_id]);
       await timer.flush([d.doc_id], changedBy);
-      setDocs((prev) => prev?.map((x) => (x.doc_id === d.doc_id ? updated : x)) ?? null);
+      // 기계 검수의 철 안 중복으로 다른 문서 표시가 바뀌었을 때만 목록을 다시 읽는다 (https://github.com/reddol18/docflow/issues/87)
+      const list = reflagged.length
+        ? await api.documents(vol)
+        : (docs ?? []).map((x) => (x.doc_id === d.doc_id ? updated : x));
+      setDocs(list);
+      // 지금 문서 자리를 지킨다. '검토 필요만' 보기에서 빠지면(표시가 다 풀림) 그 뒤의 다음 문서로
+      const flagged = (x: Doc) => Object.keys(x.flags).length > 0;
+      const stays = !onlyFlagged || list.some((x) => x.doc_id === d.doc_id && flagged(x));
+      if (stays) setSel(d.doc_id);
+      else {
+        const pos = shown.findIndex((x) => x.doc_id === d.doc_id);
+        const ids = new Set(list.filter(flagged).map((x) => x.doc_id));
+        const next = [...shown.slice(pos + 1), ...shown.slice(0, Math.max(pos, 0))].find((x) => ids.has(x.doc_id));
+        setSel(next?.doc_id ?? null);
+      }
       setFixes((prev) => {
         const next = { ...prev };
         delete next[d.doc_id];
         return next;
       });
-      setNote(`${d.doc_id} 저장 — Postgres·Qdrant·그래프 상태 갱신`);
-      // 기계 검수의 철 안 중복은 다른 문서 표시도 바꾼다 — 문서 목록을 다시 읽는다 (https://github.com/reddol18/docflow/issues/87)
-      setStageTick((n) => n + 1);
+      setNote(
+        `${d.doc_id} 저장 — Postgres·Qdrant·그래프 상태 갱신${reflagged.length ? ` (다른 문서 ${reflagged.length}건 기계 검수 표시 바뀜)` : ""}`,
+      );
     } catch (e) {
       setNote(`실패: ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -307,7 +323,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                     <div key={k}>
                       <div className="mb-1 flex items-center gap-2 text-sm">
                         <span className="w-16 font-medium">{f.label}</span>
-                        <FlagChips flags={flags} />
+                        <FlagChips flags={flags} machine={machine} />
                       </div>
                       <input
                         value={value(cur, k)}

@@ -140,12 +140,13 @@ def _row(cols, vals, where, problems):
 
 def build(t, volumes, unconfirmed=None, schema=None):
     """volumes = [(vol, pages, docs)] → 시트 {title: [머리 행, 값 행...]}, 문제 목록.
-    문제: required_blank(필수 열 빈칸), format(형식 위반), not_reviewed(검토 표시가 있는데 사람 검토 안 됨),
+    문제: required_blank(필수 열 빈칸), format(형식 위반), not_reviewed(기계 검수 말고 검토 표시가 있는데 사람 검토 안 됨),
     unconfirmed(검토 흐름의 마지막 단계 승인 전 — unconfirmed={vol: {doc_id}}를 줄 때만, https://github.com/reddol18/docflow/issues/86),
     rule(칸 검증 규칙 위반 — schema를 주면 지금 값으로 다시 본다. 검토 표시와 같은 코드 field_rules.violations,
     https://github.com/reddol18/docflow/issues/87). rule 문제에는 칸 이름(field)·규칙 이름(rule), 양식에 그 칸 열이 있으면 열 이름"""
     vs, ds = t["sheets"]["volumes"], t["sheets"]["documents"]
     col_of = {c["source"][len("field."):]: c["name"] for c in ds["columns"] if c["source"].startswith("field.")}
+    machine = field_rules.machine_reasons(schema) if schema else set()
     vrows, drows, problems = [], [], []
     for vol, pages, docs in volumes:
         docs = ordered_docs(pages, docs)
@@ -156,7 +157,10 @@ def build(t, volumes, unconfirmed=None, schema=None):
             vals = {**vvals, "doc.seq": i, "doc.first_page": d["pages"][0], "doc.last_page": d["pages"][-1],
                     "doc.pages": len(d["pages"]), **{f"field.{k}": v for k, v in (d.get("fields") or {}).items()}}
             drows.append(_row(ds["columns"], vals, {"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"]}, problems))
-            if d.get("flags") and not d.get("reviewed"):
+            # 미검토는 사람이 봐야 하는 표시만 센다. 기계 검수 표시는 값을 고치면 풀리는 것이라 rule 문제로만 센다
+            # (사람 검토 뒤 다른 문서 수정으로 새로 붙은 중복 표시가 '미검토'로 겹쳐 세지지 않게)
+            human = [x for rs in (d.get("flags") or {}).values() for x in rs if x not in machine]
+            if human and not d.get("reviewed"):
                 problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": None,
                                  "kind": "not_reviewed"})
             if unconfirmed is not None and d["doc_id"] in unconfirmed.get(vol, ()):

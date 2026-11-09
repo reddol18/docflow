@@ -33,6 +33,8 @@ export type FieldDef = {
   isad: string | null;
   rule: string | null; // 값을 만드는 코드 규칙 (app/graph.py RULES). 칸 이름 대신 이것으로 판단한다
   hw: string | null; // 보여 줄 잘라낸 손글씨 칸 (cropImage·Doc.hw 키). 없으면 손글씨 칸 아님
+  // 칸 검증 규칙 (https://github.com/reddol18/docflow/issues/87). reasons = 이 칸에 붙을 수 있는 기계 검수 표시 사유 글자
+  validate?: { rules: string[]; reasons: string[] } | null;
 };
 export type Schema = { name: string; search_columns: string[]; fields: FieldDef[] };
 
@@ -237,7 +239,8 @@ export const api = {
       body: JSON.stringify(fixes),
     }),
   editDocument: (vol: string, docId: string, fields: Partial<Fields>) =>
-    call<Doc>(`/documents/${enc(vol)}/${enc(docId)}`, {
+    // reflagged: 기계 검수(철 안 중복)로 표시가 바뀐 다른 문서 id
+    call<Doc & { reflagged?: string[] }>(`/documents/${enc(vol)}/${enc(docId)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(fields),

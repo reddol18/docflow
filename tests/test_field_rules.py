@@ -185,9 +185,41 @@ def test_bad_rules_fail_at_load(tmp_path, rule, msg):
     assert "칸 road_rank" in str(e.value)
 
 
+SAFE = ["[A-Z0-9]{23}", "[A-Z]{2}-\\d+", "\\d{4}-\\d{2}-\\d{2}", "(\\d{2}-){3}\\d{2}", "R[0-9]+", "[가-힣]+(시|군|구)",
+        "a?b*c+", "[A-Z0-9 ]+x", "[^\\d]+-[0-9]+", "[가-힣 ]+", "[0-9]+(-[0-9]+)?", "^[A-Z]{3}[0-9]{2}$"]
+# 리뷰에서 실측한 우회 패턴 (원자 그룹 2.35초·이어진 a* 9.1초 등) — 모두 시작할 때 거부해야 한다
+BYPASS = ["(?>(a+)+b)", "a*a*a*a*a*a*a*b", "(\\w*){30}", "(a|.){60}", "\\w*\\w*\\w*\\w*\\w*\\w*\\w*\\w*",
+          "(?:ab|cd){3}", ".*x.*", "[가-힣]+\\d+", "(\\d+)?\\d+", "(?i)abc", "(?i:a)b", "(?=a)a", "(?<!a)b", "(a)(?(1)b|c)"]
+
+
 def test_safe_patterns_accepted():
-    for p in ["[A-Z0-9]{23}", "(\\d{2}-){3}\\d{2}", "R[0-9]+", "[가-힣]+(시|군|구)", "(?:ab|cd){3}", "a?b*c+"]:
+    for p in SAFE:
         field_rules.compile_pattern(p)
+
+
+@pytest.mark.parametrize("p", BYPASS)
+def test_bypass_patterns_rejected(p):
+    with pytest.raises(field_rules.RuleError, match="validate.pattern"):
+        field_rules.compile_pattern(p)
+
+
+def _worst_inputs(n=field_rules.VALUE_MAX):
+    """상한 길이의 되짚기 유발 입력: 한 글자 반복 + 끝에 안 맞는 글자, 구분자 섞인 반복"""
+    out = [c * (n - 1) + "!" for c in "aA1가 -_x."]
+    out += [("AB-" + "1" * n)[: n - 1] + "!", ("12-" * n)[: n - 1] + "!", ("가 " * n)[: n - 1] + "1", "R" + "0" * (n - 2) + "!"]
+    return out
+
+
+@pytest.mark.parametrize("p", SAFE + [f["validate"]["pattern"] for f in yaml.safe_load(
+    RULES_SCHEMA.read_text(encoding="utf-8"))["fields"] if "pattern" in (f.get("validate") or {})])
+def test_allowed_patterns_fast_on_worst_input(p):
+    """받은 패턴(시험 픽스처·흔한 식별자 모양)은 200자 최악 입력에서 0.1초 안"""
+    rx = field_rules.compile_pattern(p)
+    inputs = _worst_inputs()
+    t = time.perf_counter()
+    for s in inputs:
+        rx.fullmatch(s)
+    assert time.perf_counter() - t < 0.1
 
 
 @pytest.mark.parametrize("codes,msg", [("# 주석만\n\n", "코드 없음"), ("R101\nR101\n", "두 번"), ("\tA\n", "빈 줄")])
@@ -221,11 +253,12 @@ def test_code_table_needs_file_schema():
 
 
 @pytest.mark.parametrize("edit,msg", [
-    (lambda f: f.update(method="hidden", validate={"required": True}), "보이는 건 단위 칸만"),
-    (lambda f: f.update(level="volume", method="manual", validate={"required": True}), "보이는 건 단위 칸만"),
-    (lambda f: f.update(method="fixed", value="R101", validate={"unique": "volume"}), "unique를 쓸 수 없음"),
+    (lambda f: f.update(method="hidden", validate={"required": True}), "고칠 수 있는 건 단위 칸만"),
+    (lambda f: f.update(level="volume", method="manual", validate={"required": True}), "고칠 수 있는 건 단위 칸만"),
+    (lambda f: f.update(method="fixed", value="R101", validate={"required": True}), "고칠 수 있는 건 단위 칸만"),
 ])
-def test_rules_only_on_shown_document_fields(tmp_path, edit, msg):
+def test_rules_only_on_editable_fields(tmp_path, edit, msg):
+    """고칠 수 없는 칸(숨김·고정값·철 단위)의 규칙은 풀 수 없는 표시를 만든다 — 시작할 때 거부"""
     with pytest.raises(fields.SchemaError, match=msg):
         rules_schema(tmp_path, lambda raw: edit(field(raw, "road_rank")))
 
@@ -242,4 +275,51 @@ def test_regex_check_is_fast_on_long_values(tmp_path):
     docs = [doc(i, rdid=RID, road_rank="R101", sheet_title="A" * field_rules.VALUE_MAX) for i in range(200)]
     t = time.perf_counter()
     field_rules.violations(docs, s)
+    assert time.perf_counter() - t < 2
+
+
+def test_unique_and_code_table_ignore_surrounding_spaces(tmp_path):
+    """unique·code_table은 앞뒤 빈칸을 떼고 비교 (대소문자는 그대로). length는 값 그대로"""
+    s = rules_schema(tmp_path, lambda raw: field(raw, "rdid").update(validate={"unique": "volume"}))
+    docs = [doc(0, rdid=RID, road_rank=" R101 "), doc(1, rdid=f" {RID}", road_rank="R102"),
+            doc(2, rdid=RID.lower(), road_rank="r102")]
+    assert broken(docs, s) == [[("rdid", "unique"), ("road_rank", "length")], [("rdid", "unique")],
+                               [("road_rank", "code_table")]]
+
+
+def test_refresh_keeps_lookalike_reasons(tmp_path):
+    """기계 검수인지는 스키마 규칙이 낼 수 있는 사유 집합으로 가린다 — 머리 글자가 같아도 다른 사유는 지우지 않는다"""
+    s = rules_schema(tmp_path)
+    other = "기계 검수 · 다른 원천의 사유"
+    a = dict(doc(0, rdid=RID, road_rank="R101"), flags={"rdid": [other, "기계 검수 · 도로 식별자 · 철 안 중복"]})
+    assert flags.refresh([a], s)[0]["flags"] == {"rdid": [other]}
+    reasons = field_rules.machine_reasons(s)
+    assert "기계 검수 · 도로 식별자 · 철 안 중복" in reasons and other not in reasons
+    assert "기계 검수 · 조서명 · 30자 초과" in reasons and "기계 검수 · 조서명 · 필수 칸 빈칸" not in reasons
+
+
+def test_machine_flags_not_counted_as_not_reviewed(tmp_path, monkeypatch):
+    """기계 검수 표시만 있는 미검토 문서는 not_reviewed가 아니라 rule 문제로만 센다. 다른 표시가 있으면 지금처럼 not_reviewed"""
+    s = rules_schema(tmp_path)
+    monkeypatch.setattr(export, "FIELDS", tuple(f["name"] for f in fields.doc_fields(s)))
+    t = export.load_template(FIX / "export" / "road_ledger.yaml")
+    base = dict(rdid=RID, road_rank="R999", sheet_class="총괄")
+    m = flags.machine([doc(0, **base)], s)[0]
+    only_machine = dict(doc(0, **base), flags=m, reviewed=False)
+    with_llm = dict(doc(1, **dict(base, rdid=RID[::-1])), flags={**m, "sheet_title": ["LLM"]}, reviewed=False)
+    _, problems = export.build(t, [("v", ["d0", "d1"], [only_machine, with_llm])], schema=s)
+    sm = export.summary(problems, rules=True)
+    assert sm["not_reviewed"] == 1 and [p["doc_id"] for p in problems if p["kind"] == "not_reviewed"] == ["d1"]
+    assert sm["rule"] == 2  # 두 문서 모두 코드표 위반
+    # 스키마를 안 주면(옛 호출) 지금처럼 표시가 있으면 미검토
+    _, old = export.build(t, [("v", ["d0", "d1"], [only_machine, with_llm])])
+    assert export.summary(old)["not_reviewed"] == 2
+
+
+def test_read_codes_large_table_fast(tmp_path):
+    """코드 수만 개도 바로 읽는다 (중복 찾기가 O(n²)이 아님)"""
+    p = tmp_path / "c.txt"
+    p.write_text("\n".join(f"C{i:05d}" for i in range(50000)), encoding="utf-8")
+    t = time.perf_counter()
+    assert len(field_rules.read_codes(p)) == 50000
     assert time.perf_counter() - t < 2

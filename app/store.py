@@ -712,6 +712,15 @@ def save_documents(docs, schema=None):
                 c.execute("UPDATE documents SET edited = true WHERE doc_id = %s", (d["doc_id"],))
 
 
+def save_flags(vol, items):
+    """검토 표시만 바꾼다 [(doc_id, flags)] — 문서 수정 때 철 안 중복이 바뀐 다른 문서 (https://github.com/reddol18/docflow/issues/87).
+    칸 값·검토 여부는 건드리지 않는다 (그 문서를 동시에 고친 값을 낡은 값으로 덮지 않게). 부른 쪽이 철 잠금을 쥔다"""
+    with pool.connection() as c:
+        for doc_id, flags in items:
+            c.execute("UPDATE documents SET flags = %s, updated_at = now() WHERE vol = %s AND doc_id = %s",
+                      (json.dumps(flags, ensure_ascii=False), vol, doc_id))
+
+
 def keyword_search(words, year_from=None, year_to=None, limit=20):
     """검색 칸(스키마 search.keyword — 김해는 제목·수신·문서번호)에 든 낱말 수로 점수를 매긴다
     (형태소 분석 없는 단순 부분 일치)."""
