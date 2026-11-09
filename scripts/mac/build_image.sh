@@ -5,11 +5,11 @@ export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 cd ~/doc_platform
 # 빌드 전 디스크 여유 확인 (반드시, 따로 불러도) — scripts/mac/disk_check.sh
 sh ~/doc_platform/scripts/disk_check.sh
-# --pull: 기반 이미지를 레지스트리에서 다시 확인한다. Dockerfile FROM이 다이제스트 고정이라(issues/46) 고정한 이미지만 받고,
-# 기반 이미지 갱신은 Dockerfile의 다이제스트를 바꿀 때만 들어온다.
+# --pull 없음: Dockerfile FROM이 다이제스트 고정이라(issues/46) 다시 확인해도 같은 이미지다 — 레지스트리 장애에 빌드가 막히지 않게 뺀다.
+# 기반 이미지 갱신은 Dockerfile의 다이제스트를 바꿀 때만 들어온다 (태그와 다이제스트를 함께, scripts/mac/image_tags.sh로 확인).
 # APT_REFRESH(ISO 주): apt 갱신 층의 캐시를 주 1회 깬다 — 그대로 두면 처음 빌드한 층이 계속 재사용돼
 # 그 뒤 나온 Debian 보안 갱신이 들어오지 않는다 (https://github.com/reddol18/docflow/issues/44)
-colima nerdctl -- --namespace k8s.io build --pull --build-arg "APT_REFRESH=$(date +%G-W%V)" -t docflow:dev . \
+colima nerdctl -- --namespace k8s.io build --build-arg "APT_REFRESH=$(date +%G-W%V)" -t docflow:dev . \
     > ~/docflow_build.log 2>&1 || { tail -40 ~/docflow_build.log; exit 1; }
 tail -5 ~/docflow_build.log
 # 패키지가 requirements.lock 그대로인지 (Dockerfile이 설치 뒤 diff, https://github.com/reddol18/docflow/issues/33). 층을 캐시로 쓰면 줄이 안 나온다

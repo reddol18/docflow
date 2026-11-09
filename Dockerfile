@@ -1,5 +1,6 @@
-# 기반 이미지는 다이제스트로 고정한다 — 스캔한 이미지와 다음 빌드가 받는 이미지가 같게 (https://github.com/reddol18/docflow/issues/46).
-# 판을 올리면 다이제스트도 바꾼다 (태그 목록: scripts/mac/image_tags.sh)
+# 기반 이미지는 다이제스트로 고정한다 — 기반 층은 빌드마다 같다 (https://github.com/reddol18/docflow/issues/46).
+# 그 위 apt upgrade 층은 주마다(APT_REFRESH) 바뀌므로 이미지 전체가 같다는 뜻은 아니다.
+# 판을 올리면 태그와 다이제스트를 함께 바꾼다 (지금 다이제스트 확인: scripts/mac/image_tags.sh)
 FROM python:3.11.17-slim-bookworm@sha256:f06d01d4ba3f8ad5af45a3ec87df19c1d317d8e8961edc0fabda61811af6f7cf AS base
 # opencv(paddlex 의존)가 libGL·glib를, paddle이 OpenMP를 쓴다
 # upgrade: 기반 이미지 이후 나온 Debian 보안 갱신(openssl 등)을 받는다 (https://github.com/reddol18/docflow/issues/44)

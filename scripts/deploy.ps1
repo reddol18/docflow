@@ -30,6 +30,8 @@ try {
     if ($branch -ne "main" -and -not $NoTag) { throw "main이 아닌 브랜치($branch)입니다. 시험 배포는 -NoTag" }
 
     if (-not $NoCheck) {
+        # 배포 검사는 늘 기본 도구 폴더로 (시험용 경로 변수는 지운다, https://github.com/reddol18/docflow/issues/46)
+        Remove-Item Env:DOCFLOW_TOOLS_DIR -ErrorAction SilentlyContinue
         & (Join-Path $PSScriptRoot "check.ps1") -NoStatus  # 배포 검사는 main에서 돈다 — PR 병합 게이트 status는 올리지 않는다 (https://github.com/reddol18/docflow/issues/85)
         if ($LASTEXITCODE) { throw "로컬 검사 실패. 배포하지 않습니다." }
     }
