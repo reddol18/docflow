@@ -9,16 +9,30 @@ const VOLUME_TABS = [
 ] as const;
 
 // 철 화면의 탭 (진행 단계 · 결과·수정 · 검사 — https://github.com/reddol18/docflow/issues/66)
-export function VolumeTabs({ vol, active }: { vol: string; active: (typeof VOLUME_TABS)[number]["key"] }) {
+// reviewWaiting: 사람 검토(interrupt) 대기 중이면 표시 문서 수 — 결과·수정 탭에 '검토 N건' 배지 (null이면 없음)
+export function VolumeTabs({
+  vol,
+  active,
+  reviewWaiting = null,
+}: {
+  vol: string;
+  active: (typeof VOLUME_TABS)[number]["key"];
+  reviewWaiting?: number | null;
+}) {
   return (
     <nav className="flex gap-1 border-b border-slate-200 text-sm">
       {VOLUME_TABS.map((t) => (
         <Link
           key={t.key}
           href={`/volumes/${encodeURIComponent(vol)}${t.path}`}
-          className={`-mb-px border-b-2 px-3 py-1.5 ${t.key === active ? "border-slate-900 font-semibold text-slate-900" : "border-transparent text-slate-500 hover:text-slate-800"}`}
+          className={`-mb-px flex items-center gap-1.5 border-b-2 px-3 py-1.5 ${t.key === active ? "border-slate-900 font-semibold text-slate-900" : "border-transparent text-slate-500 hover:text-slate-800"}`}
         >
           {t.label}
+          {t.key === "documents" && reviewWaiting != null && (
+            <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[11px] font-semibold text-white">
+              검토 {reviewWaiting}건
+            </span>
+          )}
         </Link>
       ))}
     </nav>

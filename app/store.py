@@ -423,11 +423,11 @@ def finish_inspection(vol, doc_id, fixed_fields):
         c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s", (fixed_fields, vol, doc_id))
 
 
-def release_inspection(vol, doc_id):
-    """고치다 실패하면 차지를 푼다"""
+def release_inspection(vol, doc_id, user_id):
+    """검사하다 실패하면(고치기·끝내기·확정) 이 사용자의 차지를 푼다"""
     with pool.connection() as c:
         c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
-                  "WHERE vol = %s AND doc_id = %s", (vol, doc_id))
+                  "WHERE vol = %s AND doc_id = %s AND inspected_by IS NOT DISTINCT FROM %s", (vol, doc_id, user_id))
 
 
 def inspection_stats(start=None, end=None):

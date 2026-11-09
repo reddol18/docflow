@@ -119,15 +119,9 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
               끊긴 곳부터 다시
             </button>
           )}
-          <Link
-            href={`/volumes/${encodeURIComponent(vol)}/documents`}
-            className={`rounded-md px-3 py-1.5 text-sm font-medium ${waiting ? "bg-amber-500 text-white" : "bg-slate-900 text-white"}`}
-          >
-            {waiting ? `검토하기 (${s?.flagged_documents}건)` : "결과·수정"}
-          </Link>
         </div>
       </div>
-      <VolumeTabs vol={vol} active="progress" />
+      <VolumeTabs vol={vol} active="progress" reviewWaiting={waiting ? (s?.flagged_documents ?? 0) : null} />
 
       <Card title="LangGraph 진행 단계" right={<span className="text-xs text-slate-400">thread_id = {vol} · 체크포인트: Postgres</span>}>
         <div className="flex flex-wrap items-stretch gap-2">

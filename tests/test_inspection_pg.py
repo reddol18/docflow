@@ -118,6 +118,40 @@ def test_block_reason_shown_instead_of_buttons(main):
     assert blocks("a")["d01"] == (False, "inspected")
 
 
+def test_block_in_progress_and_unknown_user(main, monkeypatch):
+    """차지만 하고 끝나지 않은 검사는 '검사 중'(in_progress), 사용자를 모르면(POST가 늘 403) 'user'로 GET도 막는다"""
+    c = TestClient(main.app)
+    plan(c)
+    assert store.claim_inspection("v1", "d01", 3)  # i가 차지만 한 상태 (fixed_fields 아직 NULL)
+    view = {d["doc_id"]: d for d in c.get("/volumes/v1/inspection", headers=h("k")).json()["docs"]}
+    assert (view["d01"]["can_inspect"], view["d01"]["block"], view["d01"]["fixed_fields"]) == (False, "in_progress", None)
+
+    anon = auth.User(None, "anon", "anon", "inspector")
+    real = auth.session_user
+    monkeypatch.setattr(auth, "session_user", lambda t: anon if t == "anon" else real(t))
+    blocks = {d["doc_id"]: d["block"] for d in c.get("/volumes/v1/inspection", headers=h("anon")).json()["docs"]}
+    assert blocks["d01"] == "in_progress" and set(blocks.values()) == {"in_progress", "user"}
+    assert c.post("/inspection/v1/d02", headers=h("anon"), json={}).status_code == 403  # 서버 규칙과 같음
+
+
+def test_confirm_conflict_releases_claim(main, monkeypatch):
+    """검사와 확정 사이에 실행 세대가 바뀌어 확정이 409로 실패하면 차지를 풀어 다시 검사할 수 있다"""
+    c = TestClient(main.app)
+    plan(c)
+    finish = store.finish_inspection
+
+    def finish_then_rerun(vol, doc_id, fixed):
+        finish(vol, doc_id, fixed)
+        store.reset_stages(vol)  # 그 사이 /run이 세대를 올림 (검사 목록은 남은 채로)
+
+    monkeypatch.setattr(store, "finish_inspection", finish_then_rerun)
+    assert c.post("/inspection/v1/d01", headers=h("i"), json={}).status_code == 409
+    row = store.inspection_row("v1", "d01")
+    assert row["inspected_at"] is None and row["inspected_by"] is None and row["fixed_fields"] is None
+    monkeypatch.setattr(store, "finish_inspection", finish)
+    assert c.post("/inspection/v1/d01", headers=h("i"), json={}).status_code == 200  # 다시 검사할 수 있다
+
+
 def test_failed_fix_releases_and_still_counts(main, monkeypatch):
     """고치다 임베딩에서 실패하면 차지를 풀고, 다시 낸 제출에 차이가 없어도 앞서 저장된 수정을 고친 것으로 센다"""
     c = TestClient(main.app, raise_server_exceptions=False)

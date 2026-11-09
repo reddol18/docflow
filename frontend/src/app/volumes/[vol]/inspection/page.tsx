@@ -12,14 +12,12 @@ import {
   ROLE_LABEL,
   sampleStage,
   type EditRow,
-  type Fields,
   type InspectBlock,
   type InspectionDoc,
   type InspectionReason,
   type InspectionView,
-  type Schema,
-  type Workflow,
 } from "@/lib/api";
+import { errMsg, nextAfter, useFieldFixes, useSchemaWorkflow } from "@/lib/docEditing";
 import { useMe } from "@/lib/useMe";
 import { usePoll } from "@/lib/usePoll";
 import { Card, ErrorNote, FlagChips, Progress, StageBadge, Stat, VolumeTabs } from "@/components/ui";
@@ -30,14 +28,20 @@ const MASK = process.env.NEXT_PUBLIC_MASK_IMAGES === "1";
 const REASON_LABEL: Record<InspectionReason, string> = { flagged: "검토 표시", sample: "표본", field100: "100% 검수 칸" };
 const REASONS: InspectionReason[] = ["flagged", "sample", "field100"];
 
-const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+// 검사가 끝났나: 서버는 차지할 때 inspected_at을 먼저 쓰고 끝날 때 fixed_fields를 쓴다 — 그 사이는 '검사 중'
+const isDone = (d: InspectionDoc) => d.fixed_fields !== null;
+const inProgress = (d: InspectionDoc) => !!d.inspected_at && d.fixed_fields === null;
 
 function blockText(b: InspectBlock, d: InspectionDoc, role: string) {
   switch (b) {
     case "inspected":
       return `이미 검사함${d.inspected_by ? ` (${d.inspected_by})` : ""}`;
+    case "in_progress":
+      return `검사 중${d.inspected_by ? ` (${d.inspected_by})` : ""} — 끝나면 결과가 보입니다`;
     case "role":
       return `읽기 전용 — 검사는 ${role} 역할부터`;
+    case "user":
+      return "사용자를 알 수 없어 검사할 수 없음 (교차검사를 확인할 수 없음)";
     case "submitted":
       return "이 철의 검토를 제출한 사람은 검사할 수 없음 (교차검사)";
     case "entered":
@@ -53,36 +57,20 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
   const vol = decodeURIComponent(use(params).vol);
   const { data: s } = usePoll(() => api.volume(vol), 5000, [vol]);
   const me = useMe();
-  const [wf, setWf] = useState<Workflow | null>(null);
-  const [schema, setSchema] = useState<Schema | null>(null);
+  const { schema, wf, error: metaError } = useSchemaWorkflow();
+  const { fixes, value, setValue, drop } = useFieldFixes();
   const [view, setView] = useState<InspectionView | null>(null);
   const [missing, setMissing] = useState(false); // 검사 목록 없음 (404)
-  const [error, setError] = useState<string | null>(null);
+  const [viewError, setViewError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [sel, setSel] = useState<string | null>(null);
   const [onlyLeft, setOnlyLeft] = useState(true);
-  const [fixes, setFixes] = useState<Record<string, Partial<Fields>>>({});
-  const [edits, setEdits] = useState<EditRow[]>([]);
+  const [edits, setEdits] = useState<{ docId: string; rows: EditRow[] } | null>(null);
   const [tick, setTick] = useState(0);
   // 만들기 양식: 비율(%) — 비워 두면 서버 기본 비율, 100% 검수 칸
   const [ratePct, setRatePct] = useState<string | null>(null);
   const [fields100, setFields100] = useState<string[]>([]);
-
-  useEffect(() => {
-    let alive = true;
-    api
-      .workflow()
-      .then((x) => alive && setWf(x))
-      .catch((e) => alive && setError(msg(e)));
-    api
-      .schema()
-      .then((x) => alive && setSchema(x))
-      .catch((e) => alive && setError(msg(e)));
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   const stage = sampleStage(wf);
   const reload = useCallback(() => setTick((n) => n + 1), []);
@@ -95,14 +83,15 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
         if (!alive) return;
         setView(x);
         setMissing(false);
-        setError(null);
+        setViewError(null);
       })
       .catch((e) => {
         if (!alive) return;
         if (e instanceof ApiError && e.status === 404) {
           setView(null);
           setMissing(true);
-        } else setError(msg(e));
+          setViewError(null);
+        } else setViewError(`검사 목록: ${errMsg(e)}`);
       });
     return () => {
       alive = false;
@@ -114,23 +103,25 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
   const label = (k: string) => cells.find((f) => f.name === k)?.label ?? k;
   const stageLabel = (name: string) => wf?.stages.find((x) => x.name === name)?.label ?? name;
   const docs = useMemo(() => view?.docs ?? [], [view]);
-  const done = docs.filter((d) => d.inspected_at).length;
-  const shown = useMemo(() => docs.filter((d) => !onlyLeft || !d.inspected_at), [docs, onlyLeft]);
+  const done = docs.filter(isDone).length;
+  const working = docs.filter(inProgress).length;
+  const shown = useMemo(() => docs.filter((d) => !onlyLeft || !isDone(d)), [docs, onlyLeft]);
   const cur = shown.find((d) => d.doc_id === sel) ?? shown[0];
 
-  // 지금 문서의 수정 이력 (검사에서 고친 칸은 단계 '검사'로 남는다)
+  // 지금 문서의 수정 이력 (검사에서 고친 칸은 단계 '검사'로 남는다). 문서 id와 함께 두어 앞 문서 이력이 남아 보이지 않게
   const curId = cur?.doc_id;
   useEffect(() => {
     if (!curId) return;
     let alive = true;
     api
       .edits(vol, curId)
-      .then((x) => alive && setEdits(x))
-      .catch(() => alive && setEdits([]));
+      .then((x) => alive && setEdits({ docId: curId, rows: x }))
+      .catch(() => alive && setEdits({ docId: curId, rows: [] }));
     return () => {
       alive = false;
     };
   }, [vol, curId, tick]);
+  const curEdits = edits && edits.docId === curId ? edits.rows : [];
 
   const create = async () => {
     const pct = (ratePct ?? "").trim();
@@ -146,44 +137,29 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
       setNote(`검사 목록을 만듦 — 문서 ${r.docs}건 (표시 ${r.plan.flagged} · 표본 ${r.plan.sample})`);
       reload();
     } catch (e) {
-      setNote(`실패: ${msg(e)}`);
+      setNote(`실패: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }
   };
-
-  const value = (d: InspectionDoc, k: string) => fixes[d.doc_id]?.[k] ?? d.fields?.[k] ?? "";
-  const setValue = (d: InspectionDoc, k: string, v: string) =>
-    setFixes((prev) => {
-      const next = { ...prev, [d.doc_id]: { ...prev[d.doc_id] } };
-      if (v === (d.fields?.[k] ?? "")) delete next[d.doc_id][k];
-      else next[d.doc_id][k] = v;
-      if (!Object.keys(next[d.doc_id]).length) delete next[d.doc_id];
-      return next;
-    });
 
   const inspect = async (d: InspectionDoc, fix: boolean) => {
     setBusy(true);
     setNote(null);
     try {
       const r = await api.inspect(vol, d.doc_id, fix ? (fixes[d.doc_id] ?? {}) : {});
-      setFixes((prev) => {
-        const next = { ...prev };
-        delete next[d.doc_id];
-        return next;
-      });
+      drop(d.doc_id);
       setNote(
         r.fixed_fields.length
           ? `${d.doc_id} 고쳐서 저장 — ${r.fixed_fields.map(label).join(", ")}`
           : `${d.doc_id} 이상 없음`,
       );
-      // 다음 남은 문서로
-      const pos = shown.findIndex((x) => x.doc_id === d.doc_id);
-      const next = [...shown.slice(pos + 1), ...shown.slice(0, Math.max(pos, 0))].find((x) => !x.inspected_at);
-      setSel(onlyLeft ? (next?.doc_id ?? null) : d.doc_id);
+      // 다음 남은 문서로 — 내가 검사할 수 있는 것만 (막힌 문서로 넘어가지 않게)
+      const next = nextAfter(shown, d.doc_id, (x) => !isDone(x) && x.can_inspect);
+      setSel(next?.doc_id ?? (onlyLeft ? null : d.doc_id));
       reload();
     } catch (e) {
-      setNote(`실패: ${msg(e)}`);
+      setNote(`실패: ${errMsg(e)}`);
       reload();
     } finally {
       setBusy(false);
@@ -193,10 +169,12 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
   const dirty = cur ? Object.keys(fixes[cur.doc_id] ?? {}).length : 0;
   const checks = new Set(cur?.check_fields ?? []);
   const roleLabel = stage ? ROLE_LABEL[stage.role] : "";
+  // 흐름 설정 비율을 %로 — 부동소수 잡음(7.000000000000001) 없이
+  const defaultPct = stage?.rate != null ? String(Number((stage.rate * 100).toFixed(4))) : "";
 
   return (
     <div className="space-y-4">
-      <ErrorNote error={error} />
+      <ErrorNote error={[metaError, viewError].filter(Boolean).join(" · ") || null} />
       <div className="flex flex-wrap items-center gap-3">
         <Link href="/" className="text-sm text-slate-500 hover:text-slate-800">
           ← 대시보드
@@ -241,7 +219,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                   min={0}
                   max={100}
                   step="any"
-                  value={ratePct ?? (stage.rate != null ? String(stage.rate * 100) : "")}
+                  value={ratePct ?? defaultPct}
                   onChange={(e) => setRatePct(e.target.value)}
                   placeholder="서버 기본값"
                   className="w-32 rounded-md border border-slate-300 px-2 py-1"
@@ -283,7 +261,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
         <>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <Stat label="검사함" value={`${done} / ${docs.length}`} sub={<Progress value={done} max={docs.length} tone="emerald" />} />
-            <Stat label="남음" value={docs.length - done} />
+            <Stat label="남음" value={docs.length - done} sub={working ? `그중 검사 중 ${working}건` : undefined} />
             <Stat
               label="고친 문서"
               value={docs.filter((d) => d.fixed_fields?.length).length}
@@ -308,7 +286,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
               <tbody>
                 {REASONS.map((r) => {
                   const rows = docs.filter((d) => d.reason === r);
-                  const n = rows.filter((d) => d.inspected_at).length;
+                  const n = rows.filter(isDone).length;
                   return (
                     <tr key={r} className="border-t border-slate-50 tabular-nums">
                       <td className="py-1">{REASON_LABEL[r]}</td>
@@ -341,8 +319,10 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                         <span className="flex gap-1">
                           <span className="rounded bg-slate-200 px-1 text-slate-700">{REASON_LABEL[d.reason]}</span>
                           {fixes[d.doc_id] && <span className="rounded bg-blue-500 px-1 text-white">수정</span>}
-                          {d.inspected_at ? (
+                          {isDone(d) ? (
                             <span className="rounded bg-emerald-600 px-1 text-white">{d.fixed_fields?.length ? "고침" : "통과"}</span>
+                          ) : inProgress(d) ? (
+                            <span className="rounded bg-sky-500 px-1 text-white">검사 중</span>
                           ) : (
                             !d.can_inspect && <span className="rounded bg-slate-400 px-1 text-white">막힘</span>
                           )}
@@ -366,6 +346,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                       alt="머리부"
                       className={`w-full rounded border border-slate-200 ${MASK ? "blur-[3px]" : ""}`}
                     />
+                    {MASK && <div className="mt-1 text-[11px] text-slate-400">공개 캡처용으로 원본을 흐리게 표시 (실명·직인 보호)</div>}
                   </div>
                   <div className="space-y-4">
                     <div className="text-xs text-slate-500">확인할 칸 ({cur.check_fields.length})</div>
@@ -427,7 +408,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                       cur.block && (
                         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
                           {blockText(cur.block, cur, roleLabel)}
-                          {cur.inspected_at && cur.fixed_fields && (
+                          {isDone(cur) && cur.fixed_fields && (
                             <span className="ml-1 text-slate-500">
                               · {cur.fixed_fields.length ? `고친 칸: ${cur.fixed_fields.map(label).join(", ")}` : "이상 없음"}
                             </span>
@@ -436,12 +417,12 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                       )
                     )}
 
-                    {edits.length > 0 && (
+                    {curEdits.length > 0 && (
                       <div>
                         <div className="mb-1 text-xs text-slate-500">수정 이력</div>
                         <table className="w-full text-xs">
                           <tbody>
-                            {edits.map((e, i) => (
+                            {curEdits.map((e, i) => (
                               <tr key={i} className="border-t border-slate-50">
                                 <td className="py-0.5 pr-2 text-slate-400">
                                   {new Date(e.ts).toLocaleString("ko-KR", { hour12: false })}

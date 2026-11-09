@@ -181,7 +181,15 @@ export const hasStageActions = (wf: Workflow | null | undefined) =>
 // 표본 검사 (GET/POST /volumes/{vol}/inspection, POST /inspection/{vol}/{doc_id} — https://github.com/reddol18/docflow/issues/66)
 export type InspectionReason = "flagged" | "sample" | "field100";
 // 검사할 수 없는 까닭 (서버 main._inspect_block). null이면 검사 가능
-export type InspectBlock = "inspected" | "role" | "submitted" | "entered" | "other_stage" | "stage";
+export type InspectBlock =
+  | "inspected"
+  | "in_progress"
+  | "role"
+  | "user"
+  | "submitted"
+  | "entered"
+  | "other_stage"
+  | "stage";
 export type InspectionPlan = {
   vol: string;
   rate: number;
@@ -196,7 +204,7 @@ export type InspectionDoc = {
   reason: InspectionReason;
   inspected_at: string | null;
   inspected_by: string | null;
-  fixed_fields: string[] | null;
+  fixed_fields: string[] | null; // null이면 아직 끝나지 않음 (inspected_at만 있으면 누가 차지해 검사 중)
   fields: Fields | null;
   flags: Partial<Record<string, string[]>> | null;
   check_fields: string[];
@@ -207,7 +215,7 @@ export type InspectionView = { plan: InspectionPlan; docs: InspectionDoc[] };
 // 이 흐름의 표본 검사 단계 (없으면 검사 경로가 404)
 export const sampleStage = (wf: Workflow | null | undefined) => wf?.stages.find((s) => s.select === "sample") ?? null;
 
-const ROLE_ORDER: Role[] =["viewer", "reviewer", "inspector", "admin"];
+const ROLE_ORDER: Role[] = ["viewer", "reviewer", "inspector", "admin"];
 export const can = (me: Me | null | undefined, need: Role) => !!me && ROLE_ORDER.indexOf(me.role) >= ROLE_ORDER.indexOf(need);
 export const ROLE_LABEL: Record<Role, string> = { viewer: "보기", reviewer: "검토", inspector: "검사", admin: "관리" };
 
