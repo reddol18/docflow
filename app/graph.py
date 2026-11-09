@@ -5,7 +5,7 @@
                                                               └(없음 또는 auto)──────────────────────→ index
 문서 하위 그래프
   extract(GPT 텍스트) → locate(손글씨 칸 찾기) ─(못 찾음)→ widen(머리부 범위 넓힘) → locate …
-                                              └(찾음 또는 더 못 넓힘)→ read(GPT 비전) → merge
+                                              └(찾음 또는 더 못 넓힘)→ read(수신·제목 줄 잘라 두기 + GPT 비전) → merge
 
 PoC에서 스크립트를 차례로 돌리던 단계(run_ocr → gt_draft → 추출 → recipient_fix → crop_fields → hw_read → hw_flags)를
 노드로 옮겼다. OCR 결과는 쪽마다 파일로 남겨, 중간에 Pod가 죽어도 다시 돌리면 이미 읽은 쪽은 건너뛴다.
@@ -26,7 +26,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import errors, fields, flags, layout, llm, ocr, store
+from app import errors, fields, flags, layout, line_crops, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -51,6 +51,10 @@ HW_RULES = flags.HW_RULES  # 검토 표시 규칙도 이 rule 칸은 LLM 확신�
 if set(HW_CELLS) != HW_RULES:  # 두 목록이 어긋나면 시작할 때 멈춘다
     raise RuntimeError(f"HW_CELLS {sorted(HW_CELLS)} != flags.HW_RULES {sorted(HW_RULES)}")
 CELLS = tuple(dict.fromkeys(HW_CELLS.values()))  # 잘라낸 칸 전부 (찾는 순서)
+# 잘라 둘 인쇄 글자 줄 (스키마 crop: → 잘라낸 파일 {doc_id}_{종류}.png). 손글씨 칸과 달리 읽지 않고 보여 주기만 한다
+LINE_CROPS = line_crops.kinds(SCHEMA)
+if set(CELLS) & set(layout.LINE_KINDS):  # 잘라낸 파일 이름이 겹치면 안 된다
+    raise RuntimeError(f"CELLS {CELLS}와 layout.LINE_KINDS {layout.LINE_KINDS}가 겹침")
 # 사람이 원천 칸을 고치면 다시 계산하는 규칙 (스키마 derive_from)
 DERIVE = {"serial": layout.serial_of}  # 원천 칸(derive_from) 값 → 이 칸 값
 fields.check_rules(SCHEMA, RULES)
@@ -329,7 +333,19 @@ def widen(s: DocState):
     return {"ratio_i": s["ratio_i"] + 1}
 
 
+def crop_lines(s: DocState):
+    """수신·제목 등 인쇄 글자 줄을 잘라 둔다 (스키마 crop:, https://github.com/reddol18/docflow/issues/35).
+    OCR 상자만 쓰고 LLM은 부르지 않는다. 실패해도 문서 처리는 이어 간다 — 화면은 이미지 자리를 숨길 뿐"""
+    if not LINE_CROPS:
+        return
+    try:
+        line_crops.save(s["vol"], s["doc_id"], LINE_CROPS)
+    except Exception as e:  # noqa: BLE001 — 보여 주기용 이미지라 처리를 멈추지 않는다
+        print(f"crop_lines {s['vol']}/{s['doc_id']} 실패: {type(e).__name__}", flush=True)
+
+
 def read(s: DocState):
+    crop_lines(s)
     if not s["boxes"]:  # 손글씨 칸을 찾지 않는 스키마 — 쪽 이미지를 읽지 않는다
         return {"hw": {}}
     img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg")

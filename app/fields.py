@@ -17,6 +17,10 @@ rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 �
 코드(검토 표시·손글씨 칸·화면)는 칸 이름이 아니라 rule 이름과 이 파일의 표시 정보로 칸을 찾는다
 (https://github.com/reddol18/docflow/issues/72) — 기관 매핑은 칸 이름을 마음대로 지어도 된다.
 
+원본 줄 자르기(crop): 칸에 `crop: recipient|title`을 적으면 그 종류의 인쇄 글자 줄(app/layout.py line_box)을 OCR 상자로
+찾아 잘라 두고({doc_id}_{종류}.png), 검토 화면이 그 칸 아래에 보여 준다 (https://github.com/reddol18/docflow/issues/35).
+종류마다 칸 하나. 칸 이름과 상관없다 — 기관 매핑이 칸 이름을 바꿔도 된다.
+
 검색(search): keyword 낱말 검색 칸, embed 임베딩 머리 칸, year 연도 필터 칸, columns 검색 결과 화면 열 (기본 보이는 칸 전부).
 
 표기 규칙(normalize)은 칸 값에 차례로 적용하는 후처리다 (NORMALIZE).
@@ -30,7 +34,7 @@ from pathlib import Path
 
 import yaml
 
-from app import field_rules
+from app import field_rules, layout
 
 DIR = Path(__file__).parent / "field_schemas"
 BASE = DIR / "isad_g.yaml"  # 기본 스키마 (ISAD(G))
@@ -47,7 +51,7 @@ NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 RESERVED = {"doc_id", "vol", "pages", "flags", "reviewed", "edited", "rrf", "vector_rank", "keyword_rank", "body",
             "score", "year"}
 FIELD_KEYS = {"name", "label", "level", "method", "area", "isad", "prompt", "vocab", "value", "rule", "normalize",
-              "derive_from", "flag_key", "note", "validate"}
+              "derive_from", "flag_key", "note", "validate", "crop"}
 TOP_KEYS = {"name", "base", "fields", "extract", "search", "note"}
 
 
@@ -173,6 +177,8 @@ def _field(f, i, base_names, root=None):
         raise SchemaError(f"{where}: isad가 기본 스키마 칸 이름이 아님 ({f.get('isad')!r})")
     if "validate" in f:
         _validate(f, where, root)
+    if "crop" in f and (f["crop"] not in layout.LINE_KINDS or not is_shown(f)):
+        raise SchemaError(f"{where}: crop은 보이는 건 단위 칸에 {list(layout.LINE_KINDS)} 중 하나")
 
 
 def parse(s, base=None, root=None):
@@ -193,6 +199,9 @@ def parse(s, base=None, root=None):
     names = [f["name"] for f in fl]
     if len(set(names)) != len(names):
         raise SchemaError(f"칸 이름 중복: {sorted({n for n in names if names.count(n) > 1})}")
+    crops = [f["crop"] for f in fl if "crop" in f]
+    if len(set(crops)) != len(crops):
+        raise SchemaError(f"crop 중복: {sorted({c for c in crops if crops.count(c) > 1})}")
     by = {f["name"]: f for f in fl}
     for f in fl:
         for k in ("derive_from", "flag_key"):
@@ -286,6 +295,12 @@ def by_rule(s, rule):
     """rule 이름으로 칸 찾기 (없으면 None). 코드는 칸 이름 대신 이것으로 칸을 찾는다
     (https://github.com/reddol18/docflow/issues/72 — 기관 매핑은 칸 이름을 마음대로 짓는다). 같은 rule이 둘이면 앞 칸"""
     return next((f for f in s["fields"] if f.get("rule") == rule), None)
+
+
+def line_crops(s):
+    """{칸 이름: 잘라 둘 줄 종류} — 스키마 crop: (layout.LINE_KINDS 순서)"""
+    by = {f["crop"]: f["name"] for f in s["fields"] if "crop" in f}
+    return {by[k]: k for k in layout.LINE_KINDS if k in by}
 
 
 def is_shown(f):
