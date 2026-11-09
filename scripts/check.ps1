@@ -9,6 +9,7 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
 검사                                   막음(실패 시 종료 코드 1)
   frontend   next typegen → tsc → eslint      예
   ruff       보안 규칙(S) 포함                 예
+  lock       requirements.txt 판이 lock과 같은지·해시 있는지  예
   pytest     실제 Postgres(PGlite) 시험 포함  예
   gitleaks   커밋 이력의 비밀값                예
   osv        의존성 취약점 (osv-scanner.toml)  예
@@ -76,6 +77,9 @@ try {
 
     Step "ruff" $true { uvx --quiet "ruff@$($V.ruff)" check . --output-format concise }
 
+    # 이미지는 requirements.lock으로 설치한다 — requirements.txt만 바꾸고 lock을 안 만들면 여기서 막는다 (https://github.com/reddol18/docflow/issues/33)
+    Step "lock" $true { uv run --quiet --no-project python -I scripts/lock_hashes.py --check requirements.txt requirements.lock }
+
     Step "pytest" $true {
         $pg = $null
         if ($Skip -notcontains "pg") {
@@ -113,8 +117,8 @@ try {
 
     Step "osv" $true {
         $osv = Get-Tool osv $V.osv "osv-scanner_windows_amd64.exe" "osv-scanner_SHA256SUMS" "google/osv-scanner" "osv-scanner_windows_amd64.exe"
-        # --no-resolve: requirements.lock은 pip freeze 전체 목록이라 다시 풀지 않는다 (풀면 setuptools 거짓 경보)
-        # requirements.txt도 본다: 새로 고정한 패키지는 배포해서 잠금 파일을 받아 오기 전까지 lock에 없다 (PyJWT 2.10.1이 그렇게 지나갔다)
+        # --no-resolve: requirements.lock은 이미지에 깔리는 전체 목록(해시 포함)이라 다시 풀지 않는다 (풀면 setuptools 거짓 경보)
+        # requirements.txt도 함께 본다 (lock 단계가 둘의 판이 같은지 막지만, 예전에 PyJWT 2.10.1이 lock에 없어 지나간 적이 있다)
         & $osv scan source --no-resolve --config osv-scanner.toml --lockfile requirements.txt:requirements.lock `
             --lockfile requirements.txt:requirements.txt --lockfile requirements.txt:requirements-test.txt `
             --lockfile frontend/package-lock.json --lockfile eval/promptfoo/package-lock.json   # 평가 하네스(개발 PC 전용) 의존성

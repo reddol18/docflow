@@ -316,6 +316,8 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 ## 개발 절차
 
 - 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).
+- 파이썬 의존성: 이미지는 `requirements.lock`(전이 의존성까지 판·해시 고정)으로 `pip install --require-hashes --no-deps` 설치한다 — 같은 커밋이면 몇 번 빌드해도 같은 패키지 (https://github.com/reddol18/docflow/issues/33).
+  `requirements.txt`를 바꿨을 때만 `.\scripts\lock_refresh.ps1`로 lock을 다시 만든다(맥 컨테이너에서 linux/amd64로 풀고 `scripts/lock_hashes.py`가 PyPI 해시를 붙임, 배포 없음) → 바뀐 판을 확인하고 함께 커밋. 안 맞으면 로컬 검사 `lock` 단계가 막는다.
 - **병합은 `scripts/merge.ps1`로만** 한다 (https://github.com/reddol18/docflow/issues/83). `.\scripts\merge.ps1 <PR> -DryRun`으로 먼저 확인한다.
   PR head 커밋의 로컬 검사 요약(막는 검사 모두 통과, 건너뜀 거부)·계약 리뷰·버그 리뷰 결과 댓글(댓글·리뷰 한 글 안에 이름과
   '| 지적 | 반영 |' 표)·보안 영향 칸에 체크가 있으면 보안 리뷰 결과 댓글이 있어야, 확인한 head 그대로 squash 병합(제목 끝 `(#N)`)한다.
