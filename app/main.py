@@ -22,7 +22,7 @@
   GET   /search                        ?q=&year_from=&year_to=&k= 벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침
   GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다
   GET   /graph                         흐름 그림 (mermaid)
-  GET   /schema                        색인 칸 스키마 (보이는 칸: 이름·표시명·단위·추출 방식·고칠 수 있나·rule·손글씨 칸, 검색 열) — 화면이 칸 목록을 여기서 받는다
+  GET   /schema                        색인 칸 스키마 (보이는 칸·rule·손글씨 칸, 검색 열) — 화면이 칸 목록을 여기서 받는다
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
   GET   /report.csv                    같은 리포트 CSV
   GET   /export/check                  납품 출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건
