@@ -1,6 +1,10 @@
 # 공문서 처리 플랫폼: docs 네임스페이스 하나에 docflow(API + LangGraph + PaddleOCR), Postgres, Qdrant.
 # 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → 공인 IP 443만 (LLM_PROVIDER=openai일 때 OpenAI API용).
 # LLM_PROVIDER=local(현장 내부 서버)·off면 이 443 규칙은 쓰지 않는다 — 외부 송신 0을 막는 정책은 https://github.com/reddol18/docflow/issues/13 마지막 완료 조건.
+# 컨테이너는 최소 권한 (https://github.com/reddol18/docflow/issues/29): root 아님·권한 상승 없음·capability 전부 버림·seccomp RuntimeDefault,
+# 루트 파일시스템 읽기 전용 — 쓰는 곳만 PVC·emptyDir로 연다. 막는 검사: scripts/check.ps1의 trivy config·semgrep.
+# 데이터 소유자: postgres 70(alpine postgres), qdrant 1000, docflow 1000. k3s local-path PVC는 hostPath라 fsGroup이 듣지 않는다 —
+# 소유자가 다르면 scripts/mac/owner_migrate.sh(맥 deploy.sh가 apply 전에 check로 막는다).
 apiVersion: v1
 kind: Namespace
 metadata: {name: docs, labels: {purpose: doc-platform}}
@@ -68,6 +72,10 @@ spec:
   template:
     metadata: {labels: {app: postgres}}
     spec:
+      # 이미지의 postgres 사용자(alpine uid·gid 70)로 바로 띄운다. 진입 스크립트는 root가 아니면 chown 없이 넘어가므로
+      # PGDATA가 이미 70 소유여야 한다(지금까지 root 진입 스크립트가 70으로 바꿔 두었다). fsGroup은 주지 않는다 —
+      # 걸리는 볼륨이면 PGDATA 권한이 0770이 되어 postgres가 시작을 거부한다
+      securityContext: {runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, seccompProfile: {type: RuntimeDefault}}
       containers:
       - name: postgres
         image: postgres:17.11-alpine
@@ -79,8 +87,15 @@ spec:
         ports: [{containerPort: 5432}]
         resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
         readinessProbe: {exec: {command: [pg_isready, -U, docflow]}, periodSeconds: 5}
-        volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
-      volumes: [{name: data, persistentVolumeClaim: {claimName: pg-data}}]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/postgresql/data}
+        - {name: run, mountPath: /var/run/postgresql}  # 유닉스 소켓·잠금 파일
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: pg-data}}
+      - {name: run, emptyDir: {sizeLimit: 16Mi}}
+      - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
 ---
 apiVersion: v1
 kind: Service
@@ -102,15 +117,29 @@ spec:
   template:
     metadata: {labels: {app: qdrant}}
     spec:
+      # 같은 이미지(root 기본)를 uid 1000으로 돌린다 — qdrant 공식 helm 차트 기본값과 같은 방식(이미지 안 /qdrant는 읽기만).
+      # 예전(root로 돌 때) 만든 저장소 파일은 root 소유라 처음 한 번 scripts/mac/owner_migrate.sh qdrant로 1000에 넘긴다
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
       containers:
       - name: qdrant
         image: qdrant/qdrant:v1.20.0
-        env: [{name: QDRANT__TELEMETRY_DISABLED, value: "true"}]
+        env:
+        - {name: QDRANT__TELEMETRY_DISABLED, value: "true"}
+        - {name: QDRANT_INIT_FILE_PATH, value: /qdrant/init/.qdrant-initialized}  # 기본은 작업 폴더(/qdrant, 읽기 전용)
         ports: [{containerPort: 6333}]
         resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
         readinessProbe: {httpGet: {path: /readyz, port: 6333}, periodSeconds: 5}
-        volumeMounts: [{name: data, mountPath: /qdrant/storage}]
-      volumes: [{name: data, persistentVolumeClaim: {claimName: qdrant-data}}]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: data, mountPath: /qdrant/storage}
+        - {name: snapshots, mountPath: /qdrant/snapshots}  # 스냅숏은 만든 뒤 바로 내려받는다 (파드가 다시 뜨면 사라짐)
+        - {name: init, mountPath: /qdrant/init}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: qdrant-data}}
+      - {name: snapshots, emptyDir: {sizeLimit: 2Gi}}
+      - {name: init, emptyDir: {sizeLimit: 1Mi}}
+      - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
 ---
 apiVersion: v1
 kind: Service
@@ -132,7 +161,7 @@ spec:
   template:
     metadata: {labels: {app: docflow}}
     spec:
-      securityContext: {runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
       containers:
       - name: docflow
         image: docflow:dev
@@ -160,6 +189,7 @@ spec:
         - {name: LLM_PROVIDER, value: "openai"}
         # - {name: LLM_BASE_URL, value: "http://ollama.llm.svc.cluster.local:11434/v1"}
         - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: HOME, value: /home/app}  # 아래 emptyDir (루트 파일시스템이 읽기 전용이라 홈 아래 캐시도 여기에)
         # 인증 (app/auth.py 머리말). 설치 환경마다: local / oidc / local,oidc
         # 첫 관리자: kubectl exec -it -n docs deploy/docflow -- python -m app.users add admin --role admin
         - {name: AUTH_MODES, value: "local"}
@@ -182,12 +212,27 @@ spec:
         ports: [{containerPort: 8000}]
         resources: {requests: {cpu: 1500m, memory: 2Gi}, limits: {memory: 5Gi}}
         readinessProbe: {httpGet: {path: /healthz, port: 8000}, periodSeconds: 5}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        # 쓰는 곳: /data(쪽 이미지·잘라낸 칸·결과, app/store.py DATA_DIR), /tmp(업로드 임시 파일),
+        # /opt/paddlex/temp·locks·func_ret(paddlex 3.3 utils/cache.py가 쓰는 폴더 — 모델은 빌드 때 /opt/paddlex에 넣어 두고 읽기만),
+        # 홈(paddle·paddlex가 ~ 아래 캐시를 만들 때)
         volumeMounts:
         - {name: data, mountPath: /data}
         - {name: openai, mountPath: /etc/openai, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+        # subPath 하나로 나누지 않는다 — kubelet이 만드는 subPath 폴더는 root 0750이라 1000이 못 쓸 수 있다
+        - {name: pdx-temp, mountPath: /opt/paddlex/temp}
+        - {name: pdx-locks, mountPath: /opt/paddlex/locks}       # paddlex create_cache_dir()가 없으면 만든다
+        - {name: pdx-func, mountPath: /opt/paddlex/func_ret}
+        - {name: home, mountPath: /home/app}
       volumes:
       - {name: data, persistentVolumeClaim: {claimName: docflow-data}}
       - {name: openai, secret: {secretName: openai, optional: true}}
+      - {name: tmp, emptyDir: {sizeLimit: 2Gi}}
+      - {name: pdx-temp, emptyDir: {sizeLimit: 256Mi}}
+      - {name: pdx-locks, emptyDir: {sizeLimit: 1Mi}}
+      - {name: pdx-func, emptyDir: {sizeLimit: 64Mi}}
+      - {name: home, emptyDir: {sizeLimit: 256Mi}}
 ---
 apiVersion: v1
 kind: Service

@@ -9,7 +9,7 @@
 (공개 저장소 — 외부인이 지어낸 요약·리뷰 표는 세지 않는다, https://github.com/reddol18/docflow/issues/85).
 확인하는 흔적 (글자로 찾는다)
   로컬 검사   PR 본문(템플릿 줄 뺌)·댓글·리뷰의 `scripts/check.ps1` 요약 중, PR head 커밋에 대한 것("+ 커밋 안 된 변경" 아님)이고
-              막는 검사(CHECKS) 모두 '통과', trivy는 '보고만'/'통과'. '건너뜀'은 거부 —
+              막는 검사(CHECKS, trivy 포함 — 옛 요약의 '보고만'은 거부) 모두 '통과'. '건너뜀'은 거부 —
               단 코드 없는 PR은 osv·semgrep·trivy 건너뜀(-Quick) 허용
   계약 리뷰   댓글·리뷰 본문·줄 댓글 중 한 글 안에 "spec-review"와 '| 지적 | 반영 |' 표 (코드 없는 PR은 면제)
   버그 리뷰   같은 방식으로 "code-review" (코드 없는 PR은 면제)
@@ -45,11 +45,15 @@ _spec.loader.exec_module(wm)
 
 REPO = wm.REPO
 FIELDS = "number,title,body,comments,reviews,files,headRefOid,state,isDraft,closingIssuesReferences,url"
-CHECKS = ("frontend", "ruff", "lock", "pytest", "gitleaks", "osv", "semgrep")  # `scripts/check.ps1`의 막는 검사
+CHECKS = ("frontend", "ruff", "lock", "pytest", "gitleaks", "osv", "semgrep", "trivy")  # `scripts/check.ps1`의 막는 검사
 # 나중에 생긴 막는 검사: 생기기 전 요약에는 줄이 없으므로 없으면 통과, 있으면 '통과'여야 한다(건너뜀 거부).
 # lock: https://github.com/reddol18/docflow/issues/33 (check.ps1 lock 단계)
 ADDED_LATER = {"lock"}
-REPORT_ONLY = {"trivy": ("보고만", "통과")}  # 막지 않는 검사: 돌리기는 해야 한다
+# 막지 않는 검사 {이름: 받는 결과 머리} — 돌리기는 해야 한다. 지금은 없음.
+# trivy는 https://github.com/reddol18/docflow/issues/29 부터 막는 검사다. 그 전 요약의 'trivy | 보고만'은 받지 않는다 —
+# 옛 check.ps1(--exit-code 0)은 trivy 지적이 있어도 보고만 해서 통과인지 알 수 없다. main을 받아 다시 돌린다.
+# (lock은 줄이 없던 요약만 넘겼다 — trivy는 줄이 늘 있었으므로 그런 예외가 없다)
+REPORT_ONLY = {}
 NO_CODE_SKIP = {"osv", "semgrep", "trivy"}  # 코드 없는 PR이 건너뛰어도 되는 검사 (check.ps1 -Quick)
 # main ruleset이 요구하는 commit status (https://github.com/reddol18/docflow/issues/85, `scripts/protect_main.ps1`)
 CONTEXT_CHECK = "docflow/local-check"  # `scripts/gate_status.py`가 `scripts/check.ps1` 끝에서 올린다

@@ -90,10 +90,12 @@ def test_failed_or_skipped_or_missing_check_posts_nothing(monkeypatch, capsys, r
     assert why in capsys.readouterr().out
 
 
-def test_trivy_failing_is_report_only(monkeypatch):
+def test_trivy_failing_blocks(monkeypatch, capsys):
+    # https://github.com/reddol18/docflow/issues/29 부터 trivy도 막는 검사
     res = [(n, "fail" if n == "trivy" else s) for n, s in ALL]
     code, f = run(monkeypatch, args(res))
-    assert code == 0 and len(f.posts) == 1
+    assert code == 1 and f.gh_calls == []
+    assert "막는 검사 실패: trivy" in capsys.readouterr().out
 
 
 def test_pg_skip_option_counts_as_skip(monkeypatch, capsys):

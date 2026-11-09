@@ -9,7 +9,7 @@ docflow/local-check를 올리는 조건 (하나라도 아니면 올리지 않는
   - 검사를 시작할 때와 끝날 때 HEAD가 같고, 둘 다 커밋 안 된 변경(추적 안 된 파일 포함)이 없다.
     `git status`가 실패하면 변경이 있는 것으로 본다
   - 막는 검사(`merge_gate.CHECKS` — check.ps1이 넘기는 값이 아니라 이 목록으로 정한다)가 모두 돌았고 통과,
-    막지 않는 검사(REPORT_ONLY: trivy)도 돌았다. 같은 검사 이름이 두 번 오면 거부
+    막지 않는 검사(REPORT_ONLY — 지금은 없음, trivy는 issues/29부터 막는 검사)도 돌았다. 같은 검사 이름이 두 번 오면 거부
   - 건너뜀 없음. 단 코드 없는 PR(`git diff origin/main...HEAD` 파일이 weekly_metrics.is_no_code)은
     osv·semgrep·trivy 건너뜀(-Quick) 허용 — merge_gate의 판정과 같은 규칙. pytest 안의 `-Skip pg`도 건너뜀으로 본다
   - HEAD가 GitHub에 있다(push함). 없는 커밋이면 GitHub이 거부(422)하므로 그것으로 안다
