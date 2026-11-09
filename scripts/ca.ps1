@@ -42,7 +42,7 @@ function Invoke-Ca([string]$cmd, [string]$pass) {
 
 function Read-Pass {
     if (-not (Test-Path $passFile)) { throw "CA 암호 파일이 없음: $passFile — 먼저 .\scripts\ca.ps1 init" }
-    $sec = Get-Content $passFile -Raw | ConvertTo-SecureString  # DPAPI(지금 사용자)
+    $sec = (Get-Content $passFile -Raw).Trim() | ConvertTo-SecureString  # DPAPI(지금 사용자)
     $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
     try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
 }
@@ -52,7 +52,7 @@ switch ($Command) {
         if ((Test-Path $caCrt) -or (Test-Path (Join-Path $dir "ca.key"))) { throw "이미 CA가 있음: $dir (덮어쓰지 않는다)" }
         New-Item -ItemType Directory -Force $dir | Out-Null
         # 폴더 ACL: 상속을 끊고 지금 사용자만 (SYSTEM·Administrators 상속 제거)
-        icacls $dir /inheritance:r /grant:r "$($env:USERDOMAIN)\$($env:USERNAME):(OI)(CI)F" | Out-Null
+        icacls $dir /inheritance:r /grant:r "$($env:USERDOMAIN)\$($env:USERNAME):(OI)(CI)F" /remove:g "*S-1-5-18" "*S-1-5-32-544" | Out-Null  # SYSTEM·Administrators도 뺀다
         if ($LASTEXITCODE) { throw "폴더 권한 설정 실패: $dir" }
         $bytes = [byte[]]::new(32); [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
         $pass = [Convert]::ToBase64String($bytes)

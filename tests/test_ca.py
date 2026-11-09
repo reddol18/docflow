@@ -2,14 +2,14 @@
 발급한 서버 인증서가 CA로 확인되고, CA 이름 제약 밖의 이름·IP 인증서는 (CA 키로 서명해도) 거절되는지."""
 import datetime as dt
 import importlib.util
-import ipaddress
 import io
+import ipaddress
 import sys
 from pathlib import Path
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509 import verification
 
@@ -68,7 +68,6 @@ def _forge(made, san):
          .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
          .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
          .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False))
-    from cryptography.hazmat.primitives import hashes
     return root, b.sign(ca_key, hashes.SHA256())
 
 
