@@ -122,7 +122,8 @@ def test_concurrent_edit_not_reverted_and_no_stale_flags(main, monkeypatch):
     assert started, "B 수정이 시작되지 않음 — A의 d01 저장 지점을 못 찾았다 (시험이 아무것도 재지 않음)"
     b.join(timeout=30)
     assert not b.is_alive(), "B 수정이 30초 안에 끝나지 않음 (잠금 교착?)"
-    assert ra.status_code == 200 and b_result["res"].status_code == 200    db = rows()
+    assert ra.status_code == 200 and b_result["res"].status_code == 200
+    db = rows()
     # B의 값이 남는다 (A가 d02 칸 값을 낡은 값으로 덮지 않음)
     assert db["d02"]["fields"]["title"] == "가상 제목 B" and db["d01"]["fields"]["title"] == "가상 제목 2"
     # 늦게 끝난 쪽이 낡은 표시를 쓰지 않는다: 지금 값으로는 중복이 없다
