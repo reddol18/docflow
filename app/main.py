@@ -368,23 +368,24 @@ def release(vol, tok):
 
 
 def _upload(vol, files, replace):
-    names = []
+    names, pages = [], []  # 올린 이름(오류 문구용 — 규칙을 통과한 것만), 쪽 이름(저장은 <쪽>.jpg)
     for i, f in enumerate(files, 1):  # 1) 이름부터 모두 본다 (규칙에 안 맞는 이름은 응답에 되돌려 주지 않는다)
         name = (f.filename or "").rsplit("/", 1)[-1]
-        if not uploads.PAGE_RX.fullmatch(name):
+        page = uploads.page_of(name)
+        if page is None:
             raise HTTPException(400, f"{i}번째 파일 이름이 규칙({uploads.PAGE_RULE})에 맞지 않음")
-        if name in names:
-            raise HTTPException(400, f"같은 이름이 두 번: {name}")
+        if page in pages:
+            raise HTTPException(400, f"같은 쪽 이름이 두 번: {name}")
         names.append(name)
-    pages = [n[:-len(".jpg")] for n in names]
+        pages.append(page)
     d = store.pages_dir(vol)
     # 2) 쪽 폴더 안 임시 파일에 조각 단위로 쓰며 검사 — 같은 파일 시스템이라 옮기기는 원자적이다.
     #    /tmp(Starlette가 흘려 쓴 곳)에서 바로 옮기면 파일 시스템이 달라 복사가 되고 반쯤 쓴 *.jpg가 보일 수 있다.
     #    실패해도 쪽 폴더는 지우지 않는다 (빈 폴더는 해롭지 않고, 같은 새 철에 동시에 올리는 요청과 다투지 않게)
     tmps = []
     try:
-        for f, name in zip(files, names):
-            tmps.append(uploads.spool(f.file, d, name, name))
+        for f, name, page in zip(files, names, pages):
+            tmps.append(uploads.spool(f.file, d, f"{page}.jpg", name))
         new, same, changed = [], [], []
         for tmp, page in zip(tmps, pages):
             dest = store.page_path(vol, page)
@@ -1126,10 +1127,15 @@ def record_review(vol, flagged, fixes, user):
 
 def resume_review(vol, flagged, fixes, user):
     """이력을 먼저 남기고 흐름을 잇는다 — 이력 저장이 실패하면 고친 값도 반영되지 않는다 (누가 바꿨는지 잃지 않게)."""
-    if vol in running:
+    tok = reserve(vol, "queued")  # 이력 쓰기 전에 실행 표시를 세운다 — 쓰는 사이 업로드·/run이 끼지 못하게
+    if tok is None:
         raise HTTPException(409, f"{vol} 이미 실행 중")
-    record_review(vol, flagged, fixes, user)
-    submit(vol, Command(resume=fixes), user)
+    try:
+        record_review(vol, flagged, fixes, user)
+        submit(vol, Command(resume=fixes), user, reserved=True)
+    except BaseException:
+        release(vol, tok)
+        raise
 
 
 @app.post("/review/{vol}")

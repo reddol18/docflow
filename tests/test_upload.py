@@ -1,6 +1,7 @@
 """업로드 검증 (https://github.com/reddol18/docflow/issues/26): 진짜 JPEG만, 크기·개수·픽셀·스캔 상한, 본문 상한,
 로그인 확인 뒤 본문 읽기, 덮어쓰기 409·명시 교체, 철 단계·실행 표시 경합.
 시험 이미지는 여기서 만든 작은 JPEG (실제 기록물 이미지를 쓰지 않는다)."""
+import time
 from types import SimpleNamespace
 
 import cv2
@@ -131,10 +132,10 @@ def test_scan_bomb_rejected_before_decode(main, tmp_path, monkeypatch):
 
 def test_bad_name_not_echoed(main, tmp_path):
     c = TestClient(main.app)
-    for bad in ("<script>.jpg", "a" * 97 + ".jpg", "x.jpeg"):
+    for bad in ("<script>.jpg", "a" * 97 + ".jpg", "x.png", "x.jpg.exe"):
         res = post(c, [("ok.jpg", jpeg()), (bad, jpeg())])
         assert res.status_code == 400 and bad not in res.text and "2번째" in res.text, bad
-    assert post(c, [("가" * 96 + ".jpg", jpeg())]).status_code == 200  # 한글 이름·96자는 받는다
+    assert post(c, [("a" * 96 + ".jpg", jpeg())]).status_code == 200  # 96자는 받는다
 
 
 def test_oversize_file_413(main, tmp_path, monkeypatch):
@@ -310,6 +311,59 @@ def test_place_rolls_back_new_pages_on_error(main, tmp_path, monkeypatch):
     res = post(TestClient(main.app), [("a.jpg", jpeg(1)), ("b.jpg", jpeg(2))])
     assert res.status_code == 500 and "disk" not in res.text
     assert left(tmp_path) == [] and "v1" not in main.running
+
+
+def test_scan_end_linear_time():
+    """스캔 데이터 안의 FF가 아주 길게 이어져도 표지 걷기는 한 번 훑기 — 예전 '\\xff+' 정규식은 길이의 제곱이었다
+    (FF 4만 개에 7.5초, 20MB면 수십 시간 동안 GIL을 쥐어 /healthz까지 멈춤)"""
+    head = jpeg()[:jpeg().index(b"\xff\xda")]
+    sos = jpeg()[jpeg().index(b"\xff\xda"):]
+    sos = sos[:4 + int.from_bytes(sos[2:4], "big") - 2]
+    for n in (40_000, 2_000_000):
+        data = head + sos + b"\xff" * n + b"\x00"  # EOI 없음 → 잘린 파일
+        t = time.perf_counter()
+        assert uploads.jpeg_info(data) is None
+        assert time.perf_counter() - t < 1.0, n
+        t = time.perf_counter()
+        assert uploads.jpeg_info(data + b"\xff\xd9")["scans"] == 1  # 채움 FF 뒤의 EOI는 표지로 읽는다
+        assert time.perf_counter() - t < 1.0, n
+
+
+def test_extension_and_name_bytes(main, tmp_path):
+    """.JPG·.jpeg도 받아 <쪽>.jpg로 저장, 같은 쪽 이름 두 번은 400. 쪽 이름은 UTF-8 160바이트까지
+    (한글 96자 = 288바이트면 임시 파일 이름이 255바이트를 넘어 500이 나던 것)"""
+    c = TestClient(main.app)
+    res = post(c, [("A.JPG", jpeg(1)), ("b.jpeg", jpeg(2)), ("c.Jpg", jpeg(3))])
+    assert res.status_code == 200, res.text
+    assert left(tmp_path) == ["A.jpg", "b.jpg", "c.jpg"]
+    assert post(c, [("d.jpg", jpeg(4)), ("d.JPEG", jpeg(5))]).status_code == 400
+    assert post(c, [("가" * 53 + ".jpg", jpeg(6))]).status_code == 200  # 159바이트
+    res = post(c, [("가" * 54 + ".jpg", jpeg(7))])  # 162바이트
+    assert res.status_code == 400 and "1번째" in res.text
+
+
+def test_review_resume_reserves_first(main, monkeypatch):
+    """검토 제출은 이력을 쓰기 전에 실행 표시를 세우고, 실패하면 자기 표시를 푼다"""
+    seen, submitted = [], []
+    monkeypatch.setattr(main, "record_review", lambda vol, fl, fx, user: seen.append(main.running.get(vol)))
+    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: submitted.append(reserved))
+    main.resume_review("v1", [], {}, None)
+    assert seen == ["queued"] and submitted == [True]
+    main.running.pop("v1", None)
+
+    def boom(vol, fl, fx, user):
+        raise RuntimeError("가상 저장 실패")
+    monkeypatch.setattr(main, "record_review", boom)
+    with pytest.raises(RuntimeError):
+        main.resume_review("v1", [], {}, None)
+    assert "v1" not in main.running
+    main.running["v1"] = "running"
+    try:
+        with pytest.raises(main.HTTPException):
+            main.resume_review("v1", [], {}, None)
+        assert main.running["v1"] == "running"
+    finally:
+        main.running.pop("v1", None)
 
 
 def test_jpeg_info():

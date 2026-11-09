@@ -41,12 +41,23 @@ TMP_BUDGET = int(float(os.environ.get("UPLOAD_TMP_MB", "1536")) * MB)
 JPEG_MAGIC = b"\xff\xd8\xff"
 CHUNK = MB
 # 쪽 파일 이름 규칙 (여기 한 곳): 글자·숫자·_ . - 로 된 1~96자 + .jpg (\w는 한글도 받는다)
-PAGE_RX = re.compile(r"[\w.-]{1,96}\.jpg")
-PAGE_RULE = "글자·숫자·_ . - 1~96자 + .jpg"
+# 확장자는 .jpg·.jpeg를 대소문자 없이 받고(화면은 /\.jpe?g$/i로 고른다), 저장은 늘 <쪽 이름>.jpg —
+# OCR·목록·쪽 경로(store.page_path)가 모두 '*.jpg'로 찾으므로 저장 이름 규칙은 그대로 둔다
+PAGE_RX = re.compile(r"([\w.-]{1,96})\.(?i:jpe?g)")
+PAGE_MAX_UTF8 = 160  # 쪽 이름 바이트 상한: 임시 파일 이름(.<이름>.jpg.<8자>.part)이 파일 시스템 한도 255바이트를 넘지 않게
+PAGE_RULE = "글자·숫자·_ . - 1~96자(UTF-8 160바이트 안) + .jpg/.jpeg"
+
+
+def page_of(filename):
+    """올린 파일 이름 → 쪽 이름(확장자 뺀 것). 규칙에 안 맞으면 None"""
+    m = PAGE_RX.fullmatch(filename)
+    return m.group(1) if m and len(m.group(1).encode("utf-8")) <= PAGE_MAX_UTF8 else None
 # 프레임 시작(SOF) 표지 — 크기가 여기 있다. C4(허프만 표)·C8(예약)·CC(산술 조건)는 SOF가 아니다
 SOF = set(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 # 스캔의 압축 데이터 다음 표지: FF(+채움 FF) 뒤 00(바이트 채움)·D0~D7(RST, 스캔 안)이 아닌 것
-SCAN_END = re.compile(rb"\xff+[^\x00\xd0-\xd7\xff]")
+# FF 하나만 본다 — '\xff+'는 FF가 길게 이어진 입력에서 자리마다 되짚어 길이의 제곱이 된다(FF 4만 개에 7.5초).
+# 채움 FF가 앞에 더 있어도 마지막 FF에서 맞고, 걷기(jpeg_info)는 거기서 채움을 건너뛰며 표지를 읽는다
+SCAN_END = re.compile(rb"\xff[^\x00\xd0-\xd7\xff]")
 
 
 class BodyCap:
