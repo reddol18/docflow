@@ -3,7 +3,8 @@
 양식은 YAML 매핑(`app/export_templates/*.yaml`): 양식 열 ↔ 원천(철·건·색인 칸·고정값) ↔ 형식 변환.
 철 목록 시트와 건 색인 시트를 따로 내고, 건은 철 안 쪽 순서(원질서)대로 둔다.
 출력 전 검증은 필수 열 빈칸·형식 위반·검토 안 끝난 건을 센다. 검토 흐름 설정이 count_unconfirmed면
-마지막 단계 승인 전 건도 '미확정'으로 센다."""
+마지막 단계 승인 전 건도 '미확정'으로 센다. 스키마에 칸 검증 규칙(validate)이 있으면 그 위반도 센다 —
+검토 표시와 같은 코드(app/field_rules.violations)로 지금 값을 다시 본다."""
 import datetime as dt
 import io
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from app import fields
+from app import field_rules, fields
 
 DEFAULT_TEMPLATE = Path(__file__).parent / "export_templates" / "aihub88.yaml"
 FIELDS = tuple(f["name"] for f in fields.doc_fields(fields.SCHEMA))  # 색인 스키마의 문서별 칸 (https://github.com/reddol18/docflow/issues/9)
@@ -137,34 +138,47 @@ def _row(cols, vals, where, problems):
     return out
 
 
-def build(t, volumes, unconfirmed=None):
+def build(t, volumes, unconfirmed=None, schema=None):
     """volumes = [(vol, pages, docs)] → 시트 {title: [머리 행, 값 행...]}, 문제 목록.
-    문제: required_blank(필수 열 빈칸), format(형식 위반), not_reviewed(검토 표시가 있는데 사람 검토 안 됨),
-    unconfirmed(검토 흐름의 마지막 단계 승인 전 — unconfirmed={vol: {doc_id}}를 줄 때만, https://github.com/reddol18/docflow/issues/86)"""
+    문제: required_blank(필수 열 빈칸), format(형식 위반), not_reviewed(기계 검수 말고 검토 표시가 있는데 사람 검토 안 됨),
+    unconfirmed(검토 흐름의 마지막 단계 승인 전 — unconfirmed={vol: {doc_id}}를 줄 때만, https://github.com/reddol18/docflow/issues/86),
+    rule(칸 검증 규칙 위반 — schema를 주면 지금 값으로 다시 본다. 검토 표시와 같은 코드 field_rules.violations,
+    https://github.com/reddol18/docflow/issues/87). rule 문제에는 칸 이름(field)·규칙 이름(rule), 양식에 그 칸 열이 있으면 열 이름"""
     vs, ds = t["sheets"]["volumes"], t["sheets"]["documents"]
+    col_of = {c["source"][len("field."):]: c["name"] for c in ds["columns"] if c["source"].startswith("field.")}
     vrows, drows, problems = [], [], []
     for vol, pages, docs in volumes:
         docs = ordered_docs(pages, docs)
         vvals = _vol_values(t, vol, pages, docs)
         vrows.append(_row(vs["columns"], vvals, {"sheet": vs["title"], "vol": vol, "doc_id": None}, problems))
+        broken = field_rules.violations(docs, schema) if schema else [[] for _ in docs]
         for i, d in enumerate(docs, 1):
             vals = {**vvals, "doc.seq": i, "doc.first_page": d["pages"][0], "doc.last_page": d["pages"][-1],
                     "doc.pages": len(d["pages"]), **{f"field.{k}": v for k, v in (d.get("fields") or {}).items()}}
             drows.append(_row(ds["columns"], vals, {"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"]}, problems))
-            if d.get("flags") and not d.get("reviewed"):
+            # 미검토는 사람이 봐야 하는 표시만 센다. 기계 검수 표시는 값을 고치면 풀리는 것이라 rule 문제로만 센다
+            # (사람 검토 뒤 다른 문서 수정으로 새로 붙은 중복 표시가 '미검토'로 겹쳐 세지지 않게)
+            human = [x for rs in (d.get("flags") or {}).values() for x in rs if not field_rules.is_machine(x)]
+            if human and not d.get("reviewed"):
                 problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": None,
                                  "kind": "not_reviewed"})
             if unconfirmed is not None and d["doc_id"] in unconfirmed.get(vol, ()):
                 problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": None,
                                  "kind": "unconfirmed"})
+            for f, k in broken[i - 1]:
+                problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": col_of.get(f["name"]),
+                                 "kind": "rule", "field": f["name"], "rule": field_rules.rule_key(k),
+                                 "reason": field_rules.reason(f, k)})
     sheets = {vs["title"]: [[c["name"] for c in vs["columns"]], *vrows],
               ds["title"]: [[c["name"] for c in ds["columns"]], *drows]}
     return sheets, problems
 
 
-def summary(problems, unconfirmed=False):
-    """건수 요약. unconfirmed: 미확정 건수 칸을 더한다 (흐름 설정 count_unconfirmed — 기본 흐름은 지금처럼 없음)"""
-    kinds = ("required_blank", "format", "not_reviewed") + (("unconfirmed",) if unconfirmed else ())
+def summary(problems, unconfirmed=False, rules=False):
+    """건수 요약. unconfirmed: 미확정 건수 칸을 더한다 (흐름 설정 count_unconfirmed — 기본 흐름은 지금처럼 없음).
+    rules: 칸 검증 규칙 위반 건수 칸(rule)을 더한다 (스키마에 validate가 있을 때 — 없는 스키마는 지금과 같은 모양)"""
+    kinds = (("required_blank", "format", "not_reviewed") + (("unconfirmed",) if unconfirmed else ())
+             + (("rule",) if rules else ()))
     count = {k: sum(p["kind"] == k for p in problems) for k in kinds}
     return {**count, "problems": problems[:PROBLEMS_MAX], "problems_total": len(problems)}
 

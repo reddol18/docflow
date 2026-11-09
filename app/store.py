@@ -698,18 +698,34 @@ def save_documents(docs, schema=None):
     schema = schema or fields.SCHEMA
     with pool.connection() as c:
         for d in docs:
-            f = d["fields"]
-            c.execute(
-                """INSERT INTO documents (doc_id, vol, pages, fields, search_text, year, flags, reviewed, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
-                   ON CONFLICT (doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
-                     search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
-                     reviewed=EXCLUDED.reviewed, updated_at=now()""",
-                (d["doc_id"], d["vol"], d["pages"], json.dumps(f, ensure_ascii=False),
-                 fields.search_text(schema, f), fields.year_of(schema, f),
-                 json.dumps(d["flags"], ensure_ascii=False), d.get("reviewed", False)))
-            if d.get("edited"):
-                c.execute("UPDATE documents SET edited = true WHERE doc_id = %s", (d["doc_id"],))
+            _upsert_doc(c, d, schema)
+
+
+def _upsert_doc(c, d, schema):
+    f = d["fields"]
+    c.execute(
+        """INSERT INTO documents (doc_id, vol, pages, fields, search_text, year, flags, reviewed, updated_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+           ON CONFLICT (doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
+             search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
+             reviewed=EXCLUDED.reviewed, updated_at=now()""",
+        (d["doc_id"], d["vol"], d["pages"], json.dumps(f, ensure_ascii=False),
+         fields.search_text(schema, f), fields.year_of(schema, f),
+         json.dumps(d["flags"], ensure_ascii=False), d.get("reviewed", False)))
+    if d.get("edited"):
+        c.execute("UPDATE documents SET edited = true WHERE doc_id = %s", (d["doc_id"],))
+
+
+def save_edit(vol, d, flag_items, schema=None):
+    """문서 수정 저장 — 고친 문서 d는 통째로, 철 안 중복이 바뀐 다른 문서는 검토 표시만 [(doc_id, flags)], 한 트랜잭션으로
+    (https://github.com/reddol18/docflow/issues/87). 다른 문서의 칸 값·검토 여부는 건드리지 않는다 (그 문서를 동시에 고친 값을
+    낡은 값으로 덮지 않게). 부른 쪽(main._edit_document)이 철 잠금을 쥔다"""
+    schema = schema or fields.SCHEMA
+    with pool.connection() as c, c.transaction():
+        _upsert_doc(c, d, schema)
+        for doc_id, flags in flag_items:
+            c.execute("UPDATE documents SET flags = %s, updated_at = now() WHERE vol = %s AND doc_id = %s",
+                      (json.dumps(flags, ensure_ascii=False), vol, doc_id))
 
 
 def keyword_search(words, year_from=None, year_to=None, limit=20):

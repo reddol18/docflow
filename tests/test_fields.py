@@ -190,7 +190,7 @@ def test_schema_endpoint():
     assert body["search_columns"] == ["date", "docno", "title", "recipient"]  # 예전 고정 검색 화면과 같은 열·순서
     assert "prompt" not in json.dumps(body)
     # 내보내는 키를 정확히 — 지시문·고정값·주기가 새지 않게
-    assert set(body) == {"name", "fields", "search_columns"}
+    assert set(body) == {"name", "fields", "search_columns", "machine_flag_prefix"}  # 머리: 기계 검수 표시 구분 (#87)
     assert all(set(f) == {"name", "label", "level", "method", "editable", "flag_key", "isad", "rule", "hw"}
                for f in body["fields"])
 

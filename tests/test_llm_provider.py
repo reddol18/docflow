@@ -278,7 +278,7 @@ def test_off_edit_drops_vector(monkeypatch, fake_openai):
     monkeypatch.setattr(store, "event", lambda *a, **k: None)
     monkeypatch.setattr(store, "upsert_vectors", lambda *a: pytest.fail("off면 벡터를 넣지 않는다"))
     monkeypatch.setattr(store, "delete_doc_vectors", lambda ids: rec.dropped.append(list(ids)))
-    d, changed = main._edit_document("v1", "v1-0001", {"title": "가상 제목"}, SimpleNamespace(id=1, username="가상"))
+    d, changed, _ = main._edit_document("v1", "v1-0001", {"title": "가상 제목"}, SimpleNamespace(id=1, username="가상"))
     assert changed == ["title"] and d["fields"]["title"] == "가상 제목" and rec.saved == [d]
     assert rec.edits == [("v1-0001", "title", "", "가상 제목")] and rec.dropped == [["v1-0001"]]
     assert fake_openai.made == []

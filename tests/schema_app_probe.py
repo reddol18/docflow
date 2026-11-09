@@ -2,7 +2,7 @@
 tests/test_schema_customers.py가 FIELD_SCHEMA·EXPORT_TEMPLATE을 준 새 프로세스로 부른다 — 앱은 불러올 때 스키마를 읽고
 (칸 목록·규칙·양식 확인) 시작하므로, 다른 스키마는 새 프로세스에서만 '앱이 시작한다'를 그대로 잴 수 있다.
 
-  python -I tests/schema_app_probe.py <작업 폴더> <결과 JSON>
+  python -I tests/schema_app_probe.py <작업 폴더> <결과 JSON> [수정 단계 JSON]
 
 LLM·OCR·DB는 부르지 않는다 (가짜로 바꿔 끼움). 값은 모두 지어낸 것.
 흐름: 철 실행(human) → 검토 대기 → GET /schema · /review/{vol} → POST /review/{vol}/json(고친 칸 하나) → 색인 끝
@@ -72,7 +72,34 @@ def setup(tmp):
     auth.session_user = lambda t: auth.User(1, "probe", "가상 관리자", "admin")
 
 
-def run(tmp, out):
+def edit_steps(c, steps):
+    """색인이 끝난 철에 문서 수정(PATCH)을 차례로 하고, 매번 문서별 표시·출력 전 검증을 남긴다 (칸 검증 규칙 시험,
+    https://github.com/reddol18/docflow/issues/87). steps = [{"doc": 문서 순번, "fields": {칸: 값}}]"""
+    import contextlib
+    store.doc_lock = store.vol_lock = lambda *a: contextlib.nullcontext()
+    store.inspection_row = lambda vol, doc_id: None
+    store.entered = lambda vol, uid: (False, set())
+    store.stage_actors = lambda vol, uid: {}
+    store.inspected_docs_by = lambda vol, uid: set()
+    saved, flagged = [], []
+    store.save_documents = lambda docs: saved.extend(d["doc_id"] for d in docs)
+    # 다른 문서 표시가 바뀌면 고친 문서 + 다른 문서 표시만을 한 번에 (store.save_edit)
+    store.save_edit = lambda vol, d, items: (saved.append(d["doc_id"]), flagged.extend(k for k, _ in items))
+    ids = [d["doc_id"] for d in c.get(f"/volumes/{VOL}/documents").json()]
+    out = []
+    for s in steps:
+        saved.clear()
+        flagged.clear()
+        res = c.patch(f"/documents/{VOL}/{ids[s['doc']]}", json=s["fields"])
+        docs = c.get(f"/volumes/{VOL}/documents").json()
+        out.append({"status": res.status_code, "saved": list(saved), "flags_saved": sorted(flagged),
+                    "reflagged": res.json().get("reflagged"), "ids": ids,
+                    "flags": [d["flags"] for d in docs], "fields": [d["fields"] for d in docs],
+                    "export_check": c.get("/export/check", params={"vol": VOL}).json()})
+    return out
+
+
+def run(tmp, out, steps=None):
     setup(tmp)
     main.G = graph.build(MemorySaver())
     main.G.invoke({"vol": VOL, "review_mode": "human"}, main.cfg(VOL))
@@ -105,8 +132,11 @@ def run(tmp, out):
     if x.status_code == 200:
         wb = load_workbook(io.BytesIO(x.content))
         r["xlsx"] = {ws.title: [list(row) for row in ws.iter_rows(values_only=True)] for ws in wb.worksheets}
+    if steps:
+        r["steps"] = edit_steps(c, steps)
     out.write_text(json.dumps(r, ensure_ascii=False, default=str), encoding="utf-8")
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1]), Path(sys.argv[2]))
+    run(Path(sys.argv[1]), Path(sys.argv[2]),
+        json.loads(Path(sys.argv[3]).read_text(encoding="utf-8")) if len(sys.argv) > 3 else None)

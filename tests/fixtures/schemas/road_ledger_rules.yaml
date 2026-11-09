@@ -1,0 +1,38 @@
+# 시험용 칸 검증 규칙 스키마 — 도로대장식 조서 + 기계 검수 규칙 (https://github.com/reddol18/docflow/issues/87).
+# 이름·값·코드는 모두 지어낸 것. road_ledger.yaml과 칸은 같고 validate만 더했다 (그 스키마는 규칙 없이 지금처럼 시험한다).
+# 고정 길이 식별자 23자리(영문 대문자·숫자, 철 안 중복 금지) + 도로 종류 코드 4자리(코드표 codes/road_rank.txt).
+name: 가상 도로대장 조서 — 칸 검증 규칙 (시험)
+base: isad_g.yaml
+extract:
+  preamble: 입력은 가상 도로대장 조서 한 장을 OCR로 줄 단위로 옮긴 텍스트다.
+  rules: 칸마다 confidence(0~1)를 붙인다. 텍스트에 없는 것을 지어내지 않는다.
+fields:
+  - name: sheet_class
+    label: 조서 분류
+    level: document
+    method: vocab
+    isad: scope_content
+    prompt: 조서 분류
+    vocab: [총괄, 주요시설물제원, 기하구조, 토공·배수, 안전시설, 부대시설, 기타]
+  - name: rdid
+    label: 도로 식별자
+    level: document
+    method: llm_extract
+    isad: reference_code
+    prompt: 도로 식별자 (영문 대문자·숫자 23자리)
+    normalize: [strip]
+    validate: {required: true, length: 23, pattern: "[A-Z0-9]{23}", unique: volume}
+  - name: road_rank
+    label: 도로 종류 코드
+    level: document
+    method: manual
+    isad: notes
+    validate: {required: true, length: 4, code_table: codes/road_rank.txt}
+  - {name: sheet_title, label: 조서명, level: document, method: llm_extract, isad: title, prompt: 조서 제목,
+     validate: {max_length: 30}}
+  - {name: surveyed_on, label: 조사일자, level: document, method: llm_extract, isad: dates, prompt: 조사일자를 YYYY-MM-DD로}
+  - {name: sheets, label: 쪽수, level: document, method: rule, rule: pages, isad: extent}
+search:
+  keyword: [sheet_title, rdid, sheet_class]
+  embed: [sheet_title, sheet_class, rdid]
+  year: surveyed_on

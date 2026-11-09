@@ -20,6 +20,8 @@ rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 �
 검색(search): keyword 낱말 검색 칸, embed 임베딩 머리 칸, year 연도 필터 칸, columns 검색 결과 화면 열 (기본 보이는 칸 전부).
 
 표기 규칙(normalize)은 칸 값에 차례로 적용하는 후처리다 (NORMALIZE).
+칸 검증 규칙(validate: 필수·길이·정규식·코드표·철 안 중복)은 app/field_rules.py — 읽을 때 검사·컴파일한다
+(https://github.com/reddol18/docflow/issues/87).
 """
 import json
 import os
@@ -27,6 +29,8 @@ import re
 from pathlib import Path
 
 import yaml
+
+from app import field_rules
 
 DIR = Path(__file__).parent / "field_schemas"
 BASE = DIR / "isad_g.yaml"  # 기본 스키마 (ISAD(G))
@@ -43,7 +47,7 @@ NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 RESERVED = {"doc_id", "vol", "pages", "flags", "reviewed", "edited", "rrf", "vector_rank", "keyword_rank", "body",
             "score", "year"}
 FIELD_KEYS = {"name", "label", "level", "method", "area", "isad", "prompt", "vocab", "value", "rule", "normalize",
-              "derive_from", "flag_key", "note"}
+              "derive_from", "flag_key", "note", "validate"}
 TOP_KEYS = {"name", "base", "fields", "extract", "search", "note"}
 
 
@@ -116,7 +120,18 @@ def _str(f, k, where):
         raise SchemaError(f"{where}: {k} 없음")
 
 
-def _field(f, i, base_names):
+def _validate(f, where, root):
+    """칸 검증 규칙 읽기 (app/field_rules.py). 사람이 고칠 수 있는 건 단위 칸만 — 숨김·철 단위 칸은 표시를 볼 자리가 없고,
+    고정값 칸은 고칠 수 없어 풀 수 없는 표시가 생긴다 (editable과 같은 기준)"""
+    if not is_editable(f):
+        raise SchemaError(f"{where}: validate는 사람이 고칠 수 있는 건 단위 칸만 (숨김·고정값·철 단위 칸 제외)")
+    try:
+        f["validate"] = field_rules.compile_rules(f["validate"], root)
+    except field_rules.RuleError as e:
+        raise SchemaError(f"{where}: {e}") from None
+
+
+def _field(f, i, base_names, root=None):
     where = f"fields[{i}]"
     if not isinstance(f, dict):
         raise SchemaError(f"{where}: 항목이 아님")
@@ -156,10 +171,13 @@ def _field(f, i, base_names):
             raise SchemaError(f"{where}: 기본 스키마 칸에는 ISAD(G) 영역(area: {list(AREAS)})이 있어야 함")
     elif f.get("isad") not in base_names:
         raise SchemaError(f"{where}: isad가 기본 스키마 칸 이름이 아님 ({f.get('isad')!r})")
+    if "validate" in f:
+        _validate(f, where, root)
 
 
-def parse(s, base=None):
-    """스키마 dict 검사. base(기본 스키마 dict)를 주면 기관 매핑으로 본다. 빠진 항목·모르는 방식은 SchemaError"""
+def parse(s, base=None, root=None):
+    """스키마 dict 검사. base(기본 스키마 dict)를 주면 기관 매핑으로 본다. 빠진 항목·모르는 방식은 SchemaError.
+    root = 스키마 파일 폴더 (validate.code_table 경로의 기준 — 파일에서 읽을 때 load가 준다)"""
     if not isinstance(s, dict):
         raise SchemaError("스키마가 객체가 아님")
     extra = set(s) - TOP_KEYS
@@ -171,7 +189,7 @@ def parse(s, base=None):
         raise SchemaError("fields 없음")
     base_names = {f["name"] for f in base["fields"]} if base else None
     for i, f in enumerate(fl):
-        _field(f, i, base_names)
+        _field(f, i, base_names, root)
     names = [f["name"] for f in fl]
     if len(set(names)) != len(names):
         raise SchemaError(f"칸 이름 중복: {sorted({n for n in names if names.count(n) > 1})}")
@@ -220,8 +238,8 @@ def load(path=None):
         bp = path.parent / s["base"]
         if bp.parent != path.parent or not bp.is_file():
             raise SchemaError(f"base 파일 없음: {s['base']!r} (같은 폴더의 파일 이름)")
-        base = parse(_read(bp))
-    return parse(s, base)
+        base = parse(_read(bp), root=bp.parent)
+    return parse(s, base, root=path.parent)
 
 
 # ---------- 쓰기 ----------
@@ -242,8 +260,12 @@ def shown(s):
 
 def editable(s):
     """사람이 고칠 수 있는 칸 (숨김·고정값 제외)"""
-    return tuple(f["name"] for f in s["fields"]
-                 if f["method"] not in ("hidden", "fixed") and f["level"] == "document")
+    return tuple(f["name"] for f in s["fields"] if is_editable(f))
+
+
+def is_editable(f):
+    """사람이 고칠 수 있는 칸인가 (editable과 같은 기준 — 칸 검증 규칙도 이 칸에만)"""
+    return f["method"] not in ("hidden", "fixed") and f["level"] == "document"
 
 
 def labels(s):
