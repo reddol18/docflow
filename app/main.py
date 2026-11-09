@@ -32,6 +32,7 @@
   GET   /report.csv                    같은 리포트 CSV
   GET   /export/check                  출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건·칸 규칙 위반
   GET   /export.xlsx                   납품 양식 엑셀 (철 목록·건 색인 시트, 쪽 순서 유지) — 관리자
+  GET   /export/errors.xlsx            검수 오류목록 엑셀 (?vol=…, 문서·칸·오류 내용·수정 전후 값·담당자·조치일·재검수 판정) — 관리자
   DELETE /volumes/{vol}                납품 뒤 사업 데이터 일괄 삭제 (?confirm=철 이름, 내보낸 철만) — 관리자
   /auth/*                              로그인·로그아웃·OIDC (app/auth.py)
 머리말 목록은 시험(`tests/test_input.py`)이 실제 라우트와 비교한다 (https://github.com/reddol18/docflow/issues/49).
@@ -48,6 +49,7 @@ import re
 import secrets
 import shutil
 import sys
+import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
@@ -60,7 +62,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
+from app import auth, error_list, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
@@ -1003,8 +1005,53 @@ def export_xlsx(user: Admin, vol: VolList):
         store.add_export(v, sum(p["vol"] == v for p in problems), user.id)
         audit_safe(user, "export", v, None, "ok", docs=len(docs))
     name = f"docflow_export_{dt.datetime.now(store.KST):%Y%m%d_%H%M}.xlsx"
-    return Response(body, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    return Response(body, media_type=XLSX_TYPE, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# ---------- 검수 오류목록 (https://github.com/reddol18/docflow/issues/88) ----------
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+ERROR_TEMPLATE = error_list.load_template()  # 틀리면 시작할 때 멈춘다 (ERROR_LIST_TEMPLATE=경로, 기본 예시 양식)
+ERROR_ROWS_MAX = 50_000  # 한 파일의 오류 행 상한 — 넘으면 철을 나눠 받는다 (메모리·응답 크기, 측정은 README)
+_error_list_busy = threading.Lock()  # 오류목록 만들기는 한 번에 하나 (프로세스 안 — 무거운 요청이 겹쳐 메모리를 넘지 않게)
+
+
+@app.get("/export/errors.xlsx")
+def export_errors(user: Admin, vol: VolList):
+    """검수 오류목록 엑셀 — 철마다 오류(문서·칸·오류 내용)와 수정 전후 값·담당자·조치일·재검수 판정. 새로 저장하지 않고
+    표시·수정 이력·단계 기록(지금 세대)에서 만든다 (app/error_list.py). 관리자만: 철 전체의 값과 사람(담당자)·반려 사유가
+    담긴 반출 파일이라 납품 엑셀(/export.xlsx)과 같은 권한. 철 목록 상한(철을 안 고를 때도)·행 상한·동시 1건(바쁘면 409),
+    감사 로그(요청 + 철마다)"""
+    with audited(user, "error_list_request", None, vols=len(vol), actor=ERROR_TEMPLATE["actor"]) as info:
+        if not _error_list_busy.acquire(blocking=False):
+            raise HTTPException(409, "다른 오류목록을 만드는 중 — 잠시 뒤 다시")
+        try:
+            body, per_vol = _error_list(vol, info)
+        finally:
+            _error_list_busy.release()
+    for v, n in per_vol.items():
+        audit_safe(user, "error_list", v, None, "ok", rows=n)
+    name = f"docflow_errors_{dt.datetime.now(store.KST):%Y%m%d_%H%M}.xlsx"
+    return Response(body, media_type=XLSX_TYPE, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+def _error_list(vol, info):
+    if not vol and len(volume_names()) > EXPORT_VOLS_MAX:
+        raise HTTPException(400, f"철이 {EXPORT_VOLS_MAX}개를 넘음 — vol로 철을 지정한다")
+    volumes, _ = _export_volumes(vol, need_done=True)
+    rows, per_vol = [], {}
+    for v, pages, docs in volumes:
+        docs = export.ordered_docs(pages, docs)
+        status = {d: p["status"] for d, p in positions(v, [d["doc_id"] for d in docs]).items()}
+        found = error_list.collect(v, docs, store.gen_edits(v), store.gen_stage_log(v), schema_fields.SCHEMA,
+                                   WORKFLOW, status)
+        per_vol[v] = len(found)
+        rows += found
+        if len(rows) > ERROR_ROWS_MAX:
+            raise HTTPException(400, f"오류 행이 {ERROR_ROWS_MAX}개를 넘음 — 철을 나눠 받는다")
+    key = secrets.token_bytes(32)  # 가린 ID 키: 이 응답에만 쓰고 버린다 (저장·기록하지 않음)
+    body = export.to_xlsx(error_list.build(ERROR_TEMPLATE, rows, key))
+    info.update(volumes=len(volumes), rows=len(rows))
+    return body, per_vol
 
 
 @app.delete("/volumes/{vol}")

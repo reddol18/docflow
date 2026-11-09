@@ -163,7 +163,8 @@ def test_csrf():
 # ---------- 경로 보호: 앱의 모든 경로를 돌며 확인 → 새 경로에서 보호를 빠뜨리면 실패 ----------
 
 ADMIN_ROUTES = {("POST", "/volumes/{vol}/pages"), ("POST", "/volumes/{vol}/run"), ("POST", "/volumes/{vol}/resume"),
-                ("GET", "/export.xlsx"), ("DELETE", "/volumes/{vol}")}  # 납품 출력·일괄 삭제 (https://github.com/reddol18/docflow/issues/12)
+                ("GET", "/export.xlsx"), ("DELETE", "/volumes/{vol}"),  # 납품 출력·일괄 삭제 (https://github.com/reddol18/docflow/issues/12)
+                ("GET", "/export/errors.xlsx")}  # 검수 오류목록 (https://github.com/reddol18/docflow/issues/88)
 
 
 def _roles(dependant):

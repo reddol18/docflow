@@ -60,33 +60,38 @@ def parse_template(t):
     groups = set(rx.groupindex) if rx else set()
     sheets = {}
     for sheet in SHEETS:
-        s = t["sheets"].get(sheet)
-        if not isinstance(s, dict) or not s.get("title") or not isinstance(s.get("columns"), list) or not s["columns"]:
-            raise TemplateError(f"{sheet}: title·columns 필요")
-        if len(str(s["title"])) > 31 or SHEET_BAD.search(str(s["title"])):
-            raise TemplateError(f"{sheet}: 시트 이름은 31자까지, []:*?/\\ 못 씀")
-        cols = []
-        for c in s["columns"]:
-            if not isinstance(c, dict) or not c.get("name") or not c.get("source"):
-                raise TemplateError(f"{sheet}: 열마다 name·source 필요 ({c!r})")
-            _check_source(c["source"], sheet, groups)
-            fmt = c.get("format", "text")
-            if fmt not in FORMATS:
-                raise TemplateError(f"{sheet}.{c['name']}: 모르는 format {fmt!r}")
-            if fmt == "date" and c.get("out", "YYYY-MM-DD") not in DATE_OUT:
-                raise TemplateError(f"{sheet}.{c['name']}: 모르는 날짜 out {c.get('out')!r}")
-            if c["source"] == "const" and not isinstance(c.get("value", ""), str):
-                raise TemplateError(f"{sheet}.{c['name']}: const value는 문자열")
-            cols.append({"name": str(c["name"]), "source": c["source"], "format": fmt,
-                         "out": c.get("out", "YYYY-MM-DD"), "required": bool(c.get("required")),
-                         "value": c.get("value", "")})
-        names = [c["name"] for c in cols]
-        if len(set(names)) != len(names):
-            raise TemplateError(f"{sheet}: 열 이름 중복")
-        sheets[sheet] = {"title": str(s["title"]), "columns": cols}
+        sheets[sheet] = parse_sheet(sheet, t["sheets"].get(sheet), lambda src, sheet=sheet: _check_source(src, sheet, groups))
     if sheets["volumes"]["title"].casefold() == sheets["documents"]["title"].casefold():  # 엑셀은 대소문자를 안 가린다
         raise TemplateError("두 시트 이름이 같음")
     return {"name": t.get("name", ""), "volume_id": rx, "sheets": sheets}
+
+
+def parse_sheet(sheet, s, check_source):
+    """시트 하나의 양식 (title·columns)을 읽고 검사한다. check_source(원천)는 모르는 원천이면 TemplateError.
+    납품 양식과 검수 오류목록 양식(app/error_list.py)이 같이 쓴다"""
+    if not isinstance(s, dict) or not s.get("title") or not isinstance(s.get("columns"), list) or not s["columns"]:
+        raise TemplateError(f"{sheet}: title·columns 필요")
+    if len(str(s["title"])) > 31 or SHEET_BAD.search(str(s["title"])):
+        raise TemplateError(f"{sheet}: 시트 이름은 31자까지, []:*?/\\ 못 씀")
+    cols = []
+    for c in s["columns"]:
+        if not isinstance(c, dict) or not c.get("name") or not c.get("source"):
+            raise TemplateError(f"{sheet}: 열마다 name·source 필요 ({c!r})")
+        check_source(c["source"])
+        fmt = c.get("format", "text")
+        if fmt not in FORMATS:
+            raise TemplateError(f"{sheet}.{c['name']}: 모르는 format {fmt!r}")
+        if fmt == "date" and c.get("out", "YYYY-MM-DD") not in DATE_OUT:
+            raise TemplateError(f"{sheet}.{c['name']}: 모르는 날짜 out {c.get('out')!r}")
+        if c["source"] == "const" and not isinstance(c.get("value", ""), str):
+            raise TemplateError(f"{sheet}.{c['name']}: const value는 문자열")
+        cols.append({"name": str(c["name"]), "source": c["source"], "format": fmt,
+                     "out": c.get("out", "YYYY-MM-DD"), "required": bool(c.get("required")),
+                     "value": c.get("value", "")})
+    names = [c["name"] for c in cols]
+    if len(set(names)) != len(names):
+        raise TemplateError(f"{sheet}: 열 이름 중복")
+    return {"title": str(s["title"]), "columns": cols}
 
 
 def convert(value, col):
@@ -183,20 +188,30 @@ def summary(problems, unconfirmed=False, rules=False):
     return {**count, "problems": problems[:PROBLEMS_MAX], "problems_total": len(problems)}
 
 
+FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")  # 엑셀이 수식(또는 DDE)으로 읽을 수 있는 첫 글자
+
+
 def to_xlsx(sheets):
     """모든 글자 칸을 문자열 형식으로 쓴다 — '='·'+'·'-'·'@'로 시작하는 값이 엑셀에서 수식으로 실행되지 않게
-    (openpyxl은 '='로 시작하는 문자열을 수식으로 저장한다). 숫자 열(int)만 숫자로"""
+    (openpyxl은 '='로 시작하는 문자열을 수식으로 저장한다). 숫자 열(int)만 숫자로.
+    그런 글자로 시작하는 칸은 따옴표 접두(quotePrefix)도 켠다 — 받은 사람이 칸을 열어 고치고 Enter를 쳐도 수식이 되지 않게
+    (값은 그대로, https://github.com/reddol18/docflow/issues/88). 쓰기 전용(write_only) 통으로 행을 흘려 쓴다 —
+    큰 오류목록에서 칸 객체를 모두 메모리에 들고 있지 않게"""
     from openpyxl import Workbook
-    wb = Workbook()
-    wb.remove(wb.active)
+    from openpyxl.cell import WriteOnlyCell
+    wb = Workbook(write_only=True)
     for title, rows in sheets.items():
         ws = wb.create_sheet(title)
-        for r, row in enumerate(rows, 1):
-            for c, v in enumerate(row, 1):
-                cell = ws.cell(row=r, column=c)
-                cell.value = v
+        for row in rows:
+            out = []
+            for v in row:
+                cell = WriteOnlyCell(ws, value=v)
                 if isinstance(v, str):
                     cell.data_type = "s"
+                    if v.startswith(FORMULA_LEAD):
+                        cell.quotePrefix = True
+                out.append(cell)
+            ws.append(out)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

@@ -390,17 +390,30 @@ def inspection_stats(start=None, end=None):
     return rows
 
 
+def stage_of_source(source):
+    """수정 이력 source → 단계: 입력(검토 제출·색인 뒤 수정) 'entry' / 표본 검사 'inspect'
+    (https://github.com/reddol18/docflow/issues/10) / 설정 흐름의 검수 단계 'stage:<단계 이름>' → 그 단계 이름
+    (https://github.com/reddol18/docflow/issues/86). 수정 이력 화면과 검수 오류목록이 이것 하나를 쓴다"""
+    if source == "inspect":
+        return "inspect"
+    if source.startswith("stage:"):
+        return source[len("stage:"):]
+    return "entry"
+
+
+# 사람 칸: sso — SSO 사용자는 이름을 제공자가 정하므로 local 계정과 이름이 같을 수 있다 → 구별해서 보여 준다.
+# 수정 이력 화면과 검수 오류목록(표시 이름 모드)이 같은 칸을 쓴다
+_USER_COLS = "u.username, u.name, u.issuer IS NOT NULL AS sso"
+
+
 def edit_history(vol, doc_id):
     with pool.connection() as c:
-        # sso: SSO 사용자는 이름을 제공자가 정하므로 local 계정과 이름이 같을 수 있다 → 구별해서 보여 준다
-        # stage: 입력(검토 제출·색인 뒤 수정) / 검사 (https://github.com/reddol18/docflow/issues/10)
-        # 설정 흐름의 검수 단계에서 고친 칸은 source 'stage:<단계 이름>' (https://github.com/reddol18/docflow/issues/86)
-        return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, "
-                         "CASE WHEN e.source = 'inspect' THEN 'inspect' WHEN e.source LIKE 'stage:%%' "
-                         "THEN substr(e.source, 7) ELSE 'entry' END AS stage, "
-                         "u.username, u.name, u.issuer IS NOT NULL AS sso FROM edits e "
+        rows = c.execute(f"SELECT e.ts, e.field, e.old, e.new, e.source, {_USER_COLS} FROM edits e "  # noqa: S608 — 상수
                          "LEFT JOIN users u ON u.id = e.user_id WHERE e.vol = %s AND e.doc_id = %s ORDER BY e.id",
                          (vol, doc_id)).fetchall()
+    for r in rows:
+        r["stage"] = stage_of_source(r["source"])
+    return rows
 
 
 def add_export(vol, problems, user_id):
@@ -657,6 +670,24 @@ def stage_history(vol, doc_id):
                          "u.username, u.name FROM stage_log s LEFT JOIN users u ON u.id = s.user_id "
                          f"WHERE s.vol = %(v)s AND s.doc_id = %(d)s AND s.gen = {_GEN} ORDER BY s.id",
                          {"v": vol, "d": doc_id}).fetchall()
+
+
+def gen_edits(vol):
+    """철의 지금 세대 수정 이력 (stage_gen.since 뒤, id 순) — 검수 오류목록용 (https://github.com/reddol18/docflow/issues/88).
+    user_id는 가린 ID를 만드는 데만 쓰고 파일에 싣지 않는다. 사람 칸(_USER_COLS)은 수정 이력 화면과 같다"""
+    with pool.connection() as c:
+        return c.execute("SELECT e.id, e.ts, e.doc_id, e.field, e.old, e.new, e.source, e.user_id, "  # noqa: S608
+                         f"{_USER_COLS} FROM edits e LEFT JOIN users u ON u.id = e.user_id "
+                         f"WHERE e.vol = %(v)s AND e.ts >= {_SINCE} ORDER BY e.id", {"v": vol}).fetchall()
+
+
+def gen_stage_log(vol):
+    """철의 지금 세대 단계 승인·반려 기록 (id 순) — 검수 오류목록용. 예전 세대(다시 돌리기 전) 기록은 빼고 본다"""
+    with pool.connection() as c:
+        return c.execute("SELECT s.id, s.ts, s.doc_id, s.stage, s.round, s.action, s.to_stage, s.reason, "  # noqa: S608
+                         f"s.fixed_fields, s.user_id, {_USER_COLS} FROM stage_log s "
+                         f"LEFT JOIN users u ON u.id = s.user_id WHERE s.vol = %(v)s AND s.gen = {_GEN} ORDER BY s.id",
+                         {"v": vol}).fetchall()
 
 
 def reset_stages(vol):

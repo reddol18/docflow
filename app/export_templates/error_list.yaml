@@ -1,0 +1,39 @@
+# 예시 검수 오류목록 양식 — 철 단위 오류목록 엑셀의 열 매핑 (https://github.com/reddol18/docflow/issues/88)
+# 납품 양식(aihub88.yaml)과 같은 형식: 열 이름 ↔ 원천 ↔ 형식. 기관 양식은 이 파일을 복사해 열 이름·순서·형식만 바꾼다
+# (ERROR_LIST_TEMPLATE=경로). 행 하나 = 실제 오류 하나 (문서·칸·오류 내용 — README '검수 오류목록').
+#
+# actor   담당자 칸을 무엇으로 쓸까: masked(기본) 가린 ID — 내보낼 때마다 새로 만든 비밀 키로 사용자 id를 HMAC 해
+#         앞 8자리 ('담당자-1a2b3c4d'). 한 파일 안에서는 같은 사람이 같은 값, 파일이 다르면 달라 되돌리거나 잇지 못한다
+#         name     표시 이름 (SSO 사용자는 ' (SSO)'. 표시 이름이 없으면 로그인 이름 대신 가린 ID)
+#
+# source  vol                철 이름
+#         doc.seq            철 안 건 순번(1부터, 쪽 순서)       doc.id  문서 id
+#         doc.first_page / doc.last_page                       건의 시작 쪽·끝 쪽 이름
+#         field.name / field.label                             칸 이름·표시명 (문서 전체 반려는 '(문서)')
+#         error.reason       오류 내용 (검토 표시 사유·칸 규칙 위반·반려 사유·검수 수정 — ' / '로 이음)
+#         error.kind         오류 구분 (표시·규칙·반려·검수 수정 — '·'로 이음)
+#         value.before       수정 전 값 (첫 수정의 이전 값, 수정이 없으면 지금 값)
+#         value.after        수정 후 값 (마지막 수정의 새 값, 수정이 없으면 빈칸)
+#         action             조치 (수정 / 재제출 / 미조치)
+#         actor              담당자 (위 actor 설정)
+#         action.date        조치일 (마지막 수정·재제출 시각의 날짜, 한국 시간)
+#         verdict            재검수 판정 — 검수 단계마다 마지막 판정 ('품질관리자: 합격 (2차) · 감독관: 불합격(반려)')
+#         const              value에 적은 고정값
+# format  text(기본) | int | year(YYYY) | date (out: YYYY-MM-DD | YYYYMMDD | YYYY.MM.DD)
+name: 예시 검수 오류목록
+actor: masked
+sheet:
+  title: 오류목록
+  columns:
+    - {name: 철번호, source: vol}
+    - {name: 건순번, source: doc.seq, format: int}
+    - {name: 문서, source: doc.id}
+    - {name: 칸, source: field.label}
+    - {name: 오류 구분, source: error.kind}
+    - {name: 오류 내용, source: error.reason}
+    - {name: 수정 전 값, source: value.before}
+    - {name: 수정 후 값, source: value.after}
+    - {name: 조치, source: action}
+    - {name: 담당자, source: actor}
+    - {name: 조치일, source: action.date, format: date, out: YYYY-MM-DD}
+    - {name: 재검수 판정, source: verdict}
