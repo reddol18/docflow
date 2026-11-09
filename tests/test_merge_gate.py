@@ -15,10 +15,10 @@ HEAD = "abc1234def5678900000000000000000000000000"
 CHECK_OK = ("로컬 검사 `scripts/check.ps1` — 커밋 `abc1234`, 2026-11-07 12:00\n"
             "| 검사 | 결과 | 초 |\n|---|---|---|\n| frontend | 통과 | 10 |\n| ruff | 통과 | 0 |\n| pytest | 통과 | 18 |\n"
             "| gitleaks | 통과 | 1 |\n| osv | 통과 | 2 |\n| semgrep | 통과 | 12 |\n"
-            "| trivy | 보고만 (출력 확인) | 9 |\n\n막는 검사 모두 통과")
+            "| trivy | 통과 | 9 |\n\n막는 검사 모두 통과")
 QUICK = (CHECK_OK.replace("| osv | 통과 | 2 |", "| osv | 건너뜀 | 0 |")
          .replace("| semgrep | 통과 | 12 |", "| semgrep | 건너뜀 | 0 |")
-         .replace("| trivy | 보고만 (출력 확인) | 9 |", "| trivy | 건너뜀 | 0 |"))
+         .replace("| trivy | 통과 | 9 |", "| trivy | 건너뜀 | 0 |"))
 SPEC = "## 계약 리뷰 (spec-reviewer)\n| 지적 | 반영 |\n|---|---|\n| 조건 2 근거 없음 | 본문에 추가 |"
 CODE = "## 코드 리뷰 (`/code-review high`)\n| 지적 | 반영 |\n|---|---|\n| 경계값 | 고침 |"
 SEC = "## 보안 리뷰 (security-reviewer)\n| 지적 | 반영 |\n|---|---|\n| (낮) 로그 | 그대로 |"
@@ -132,6 +132,10 @@ def test_subject_keeps_existing_suffix():
     (CHECK_OK.replace("| semgrep | 통과 | 12 |\n", ""), "semgrep 없음"),  # 막는 검사 행이 빠짐
     (CHECK_OK.replace("| pytest | 통과 | 18 |", "| pytest | 건너뜀 | 0 |"), "pytest 건너뜀"),
     (QUICK, "osv 건너뜀"),  # 코드 PR의 -Quick
+    (CHECK_OK.replace("| trivy | 통과 | 9 |", "| trivy | **실패** | 9 |").replace("막는 검사 모두 통과", "실패: trivy"), "trivy"),
+    # https://github.com/reddol18/docflow/issues/29 전 요약: trivy는 보고만이라 통과인지 알 수 없다 → 거부
+    (CHECK_OK.replace("| trivy | 통과 | 9 |", "| trivy | 보고만 (출력 확인) | 9 |"), "trivy 보고만"),
+    (CHECK_OK.replace("| trivy | 통과 | 9 |\n", ""), "trivy 없음"),
 ])
 def test_local_check_rejected(monkeypatch, capsys, body, why):
     code, fake = run(monkeypatch, make_pr(body=body), PLAIN, "--merge")

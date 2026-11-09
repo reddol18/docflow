@@ -14,7 +14,7 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
   gitleaks   커밋 이력의 비밀값                예
   osv        의존성 취약점 (osv-scanner.toml)  예
   semgrep    정적 분석 (OWASP·Python·TS)       예
-  trivy      k8s·Dockerfile 설정               아니오 (issues/29 고치기 전까지 보고만)
+  trivy      k8s·Dockerfile 설정 (HIGH 이상)   예 (issues/29부터)
 
 필요한 것: node(npx), uv(uvx). gitleaks·osv-scanner·trivy는 처음에 받아 %LOCALAPPDATA%\docflow-tools에 두고 체크섬을 확인한다.
 끝에 PR 본문 '테스트' 칸에 붙일 요약을 출력한다.
@@ -135,22 +135,23 @@ try {
 
     Step "semgrep" $true {
         $env:SEMGREP_SEND_METRICS = "off"
-        # k8s 매니페스트는 trivy가 맡는다
+        # k8s 매니페스트도 본다 (권한 상승·root 실행 규칙, https://github.com/reddol18/docflow/issues/29)
         uvx --quiet "semgrep@$($V.semgrep)" scan --metrics=off --error --quiet --config p/python --config p/typescript `
-            --config p/owasp-top-ten --exclude k8s --exclude sim --severity ERROR --severity WARNING
+            --config p/owasp-top-ten --exclude sim --severity ERROR --severity WARNING
     }
 
-    Step "trivy" $false {
+    Step "trivy" $true {
         $tv = Get-Tool trivy $V.trivy "trivy_$($V.trivy)_windows-64bit.zip" "trivy_$($V.trivy)_checksums.txt" "aquasecurity/trivy" "trivy.exe"
         # 빌드 산출물은 건너뛴다 (next dev가 .next 안 파일을 잠가 두면 스캔이 멈춘다)
-        & $tv config --quiet --severity HIGH,CRITICAL --exit-code 0 --skip-dirs frontend/node_modules --skip-dirs frontend/.next .
+        & $tv config --quiet --severity HIGH,CRITICAL --exit-code 1 --skip-dirs frontend/node_modules --skip-dirs frontend/.next .
     }
 } finally {
     Pop-Location
 }
 
 $failed = @($results | Where-Object { $_.blocking -and $_.ok -eq $false })
-$mark = { param($r) if ($null -eq $r.ok) { "건너뜀" } elseif (-not $r.blocking) { "보고만 (출력 확인)" } elseif ($r.ok) { "통과" } else { "**실패**" } }
+# 막지 않는 Step은 없다(trivy는 issues/29부터 막음) — 생기면 merge_gate.py 판정에도 그 결과를 받는 규칙을 함께 넣는다
+$mark = { param($r) if ($null -eq $r.ok) { "건너뜀" } elseif ($r.ok) { "통과" } else { "**실패**" } }
 Write-Host "`n---- PR '테스트' 칸에 붙일 요약 ----"
 $at = "{0:yyyy-MM-dd HH:mm}" -f (Get-Date)
 Write-Host ("로컬 검사 ``scripts/check.ps1`` — 커밋 ``{0}``{1}, {2}" -f $sha, $(if ($dirty) { " + 커밋 안 된 변경" } else { "" }), $at)
