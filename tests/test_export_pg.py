@@ -70,6 +70,9 @@ def env(pg_store, monkeypatch, tmp_path):
         store.add_review_submitter(vol, 1)
         plan = {"rate": 0.5, "fields100": [], "seed": 1, "flagged": 0, "unflagged": 2, "sample": 1}
         store.create_inspection(vol, plan, {pages[0]: "sample"}, 1)
+        # 검토 단계 위치·기록 (https://github.com/reddol18/docflow/issues/86) — 반려 사유가 들어 있으므로 일괄 삭제 대상
+        store.ensure_stage(vol, pages[0], "entry")
+        store.add_stage_log(vol, pages[0], "qc", 1, "reject", "entry", 1, reason="가상 사유")
         q.upsert(store.COLLECTION, [PointStruct(id=i * 10 + j, vector=[1.0, float(j)], payload={"vol": vol, "doc_id": d})
                                     for j, d in enumerate((pages[0], pages[2]))])
         graph.invoke({"x": 0}, {"configurable": {"thread_id": vol}})

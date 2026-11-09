@@ -14,6 +14,11 @@
   POST  /volumes/{vol}/inspection      검사 목록 만들기 (표시 문서 전부 + 표본 + 100% 검수 칸) — 검사자
   GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부)
   POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
+  GET   /workflow                      검토 흐름 설정 (단계·맡는 역할·전수/표본·반려 규칙 — app/workflows/*.yaml)
+  GET   /volumes/{vol}/workflow        문서마다 지금 단계·차례(재검수)·반려 사유·내가 승인/반려할 수 있나
+  POST  /workflow/{vol}/{doc_id}/approve  단계 승인 (고친 칸 함께). 마지막 단계면 확정
+  POST  /workflow/{vol}/{doc_id}/reject   단계 반려 (사유 필수) → 정해진 앞 단계로, 다시 올라오면 재검수
+  GET   /documents/{vol}/{doc_id}/stages  단계 승인·반려 기록 (단계·차례·사람·사유·고친 칸)
   GET   /crops/{vol}/{name}            손글씨 칸을 잘라 둔 이미지
   GET   /head/{vol}/{page}             쪽 위 45% 줄인 이미지 (검토용)
   GET   /review/{vol}                  사람 검토 화면 → 아래 POST로 고친 값을 넣으면 흐름이 이어진다
@@ -33,6 +38,8 @@
 
 인증: /healthz와 로그인 경로를 빼고 모두 로그인 필요 (앱 전체 의존성 auth.guard, 기본 거부).
 역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정(입력) reviewer, 검사 inspector, 업로드·실행 admin.
+검토 단계(입력 뒤 검수 단계들)와 단계마다 맡는 역할은 흐름 설정 WORKFLOW가 정한다 (app/workflow.py,
+https://github.com/reddol18/docflow/issues/86). 설정이 없으면 위의 입력 → 표본 검사 2단계 그대로.
 """
 import datetime as dt
 import html
@@ -52,10 +59,10 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, errors, export, inspection, llm, ocr, report, store
+from app import auth, errors, export, inspection, llm, ocr, report, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
-from app.auth import Admin, Inspector, Reviewer, Viewer
+from app.auth import Admin, Reviewer, Viewer
 from app.review_input import EDITABLE, changes, clean_fixes
 
 # 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부. fullmatch + \Z — '$'는 끝 줄바꿈 앞에서도 맞아 'v1\n'이 지나간다
@@ -244,6 +251,8 @@ def run(vol: str, user: Admin, review: str = "human"):
             raise HTTPException(404, "올린 쪽이 없음")
         if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
             store.event(vol, "inspection", "reset", None, user=user.username)
+        if moved := store.reset_stages(vol):  # 검토 단계 위치도 처음으로 (승인·반려 기록 stage_log는 남음)
+            store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
         submit(vol, {"vol": vol, "review_mode": review}, user)
     return {"vol": vol, "started": True}
 
@@ -327,6 +336,7 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
         row = store.inspection_row(vol, doc_id)
         if row and row["inspected_at"] is not None:  # 검사가 끝난 문서를 입력 경로로 바꾸면 검사 결과가 무의미해진다
             raise HTTPException(409, "검사가 끝난 문서는 고칠 수 없음")
+        _entry_edit_allowed(vol, doc_id, user)
         d, changed = _edit_document(vol, doc_id, fields, user)
         info["fields"] = changed  # 칸 이름만 (값은 edits 표)
     return d
@@ -375,7 +385,85 @@ def _inspect_rate():
     return rate
 
 
+# ---------- 검토 흐름 설정 (https://github.com/reddol18/docflow/issues/86) ----------
+WORKFLOW = workflow.load()  # 틀리면 시작할 때 멈춘다 (WORKFLOW=경로, 기본 app/workflows/default.yaml — 지금의 2단계)
+ENTRY = workflow.entry(WORKFLOW)
+SAMPLE = workflow.sample_stage(WORKFLOW)  # 표본 검사 단계 (/inspection 경로). 없는 흐름도 있다
+CONFIRMED = workflow.CONFIRMED
+REASON_MAX = 500
+# 단계 경로의 역할 하한: 흐름에서 가장 좁은 역할. 문서마다 그 단계의 역할은 경로 안에서 다시 본다
+StageUser = Annotated[auth.User, auth.require(min((s["role"] for s in WORKFLOW["stages"]), key=auth.ROLES.index))]
+# 표본 검사 경로의 역할: 그 단계에 설정한 역할 (기본 inspector — 지금과 같다)
+SampleUser = Annotated[auth.User, auth.require(SAMPLE["role"] if SAMPLE else "inspector")]
+
+
+def positions(vol, doc_ids, raw=False):
+    """문서마다 지금 위치 {doc_id: {stage, round, last_reason, rejected_from, busy_at}}.
+    doc_stage 행이 없으면 흐름의 처음 단계 (예전 철·기본 흐름). raw가 아니면 표본 단계에 있는 문서 중
+    검사 목록 밖이거나 검사가 끝난 문서는 확정(CONFIRMED)으로 본다"""
+    rows = store.stage_rows(vol)
+    init = workflow.initial(WORKFLOW)
+    sampled = None
+    if SAMPLE and not raw and store.inspection_plan(vol):
+        sampled = {r["doc_id"]: r["inspected_at"] for r in store.inspection_rows(vol)}
+    out = {}
+    for d in doc_ids:
+        p = dict(rows.get(d) or {"stage": init, "round": 1, "last_reason": None, "rejected_from": None, "busy_at": None})
+        if sampled is not None and p["stage"] == SAMPLE["name"] and (d not in sampled or sampled[d] is not None):
+            p["stage"] = CONFIRMED
+        out[d] = p
+    return out
+
+
+def acted_stages(vol, user):
+    """이 사용자가 맡았던 단계: (철 전체 입력 여부, {doc_id: {단계 이름}}) — 작업자 ≠ 검수자 확인용.
+    입력: 철 검토 제출·입력 경로 수정(edits review/edit), 검수: 단계 승인·반려 기록, 표본 검사: 검사 차지·검사 수정"""
+    whole, mine = store.entered(vol, user.id)
+    acts = store.stage_actors(vol, user.id)
+    for d in mine:
+        acts.setdefault(d, set()).add(ENTRY["name"])
+    if SAMPLE:
+        for d in store.inspected_docs_by(vol, user.id):
+            acts.setdefault(d, set()).add(SAMPLE["name"])
+    return whole, acts
+
+
+def other_stages(whole, acts, doc_id, stage_name):
+    """같은 문서에서 이 단계 말고 맡았던 단계 (비어 있으면 맡아도 된다)"""
+    s = set(acts.get(doc_id, ()))
+    if whole:
+        s.add(ENTRY["name"])
+    return s - {stage_name}
+
+
+def _distinct_check(vol, doc_id, user, stage_name):
+    """설정 distinct_actors: 같은 사람이 같은 문서의 두 단계를 맡지 못한다. 사용자를 모르면(인증 끈 개발 모드) 막는다"""
+    if not WORKFLOW["distinct_actors"]:
+        return
+    if user.id is None:
+        raise HTTPException(403, "사용자를 알 수 없어 작업자 ≠ 검수자를 확인할 수 없음")
+    other = other_stages(*acted_stages(vol, user), doc_id, stage_name)
+    if other:
+        raise HTTPException(403, f"같은 문서의 다른 단계({', '.join(sorted(other))})를 맡은 사람은 이 단계를 맡을 수 없음")
+
+
+def _entry_edit_allowed(vol, doc_id, user):
+    """입력 경로(PATCH)로 고칠 수 있는 문서인가: 확정됐거나 검수 단계로 넘어간 문서는 409 (반려되어 돌아오면 고친다).
+    기본 흐름(입력 on_index → 표본 검사)은 검사 전 문서를 지금처럼 고칠 수 있다"""
+    stage = positions(vol, [doc_id], raw=True)[doc_id]["stage"]
+    if stage == CONFIRMED:
+        raise HTTPException(409, "확정된 문서는 고칠 수 없음")
+    if stage not in workflow.editable_positions(WORKFLOW):
+        raise HTTPException(409, "검수 단계로 넘어간 문서는 입력 경로로 고칠 수 없음 (반려되면 고친다)")
+    if WORKFLOW["distinct_actors"] and user.id is not None:
+        other = other_stages(*acted_stages(vol, user), doc_id, ENTRY["name"])
+        if other:
+            raise HTTPException(403, f"같은 문서의 검수 단계({', '.join(sorted(other))})를 맡은 사람은 입력을 고칠 수 없음")
+
+
 INSPECT_RATE = _inspect_rate()  # 표시 없는 문서 표본 비율 — 기본값이자 하한 (관리자만 낮출 수 있다)
+if SAMPLE and SAMPLE["rate"] is not None:
+    INSPECT_RATE = SAMPLE["rate"]  # 흐름 설정에 적은 비율이 환경변수보다 먼저
 FIELD = Literal[EDITABLE]
 
 
@@ -404,15 +492,21 @@ def _check_fields(doc, reason, fields100):
     return sorted((flagged | set(fields100)) & set(EDITABLE))
 
 
+def _need_sample():
+    if not SAMPLE:
+        raise HTTPException(404, "이 검토 흐름에는 표본 검사 단계가 없음")
+
+
 @app.post("/volumes/{vol}/inspection")
-def inspection_create(vol: str, body: InspectionPlanIn, user: Inspector):
+def inspection_create(vol: str, body: InspectionPlanIn, user: SampleUser):
     """검사 목록을 만든다. 표본이 치우치지 않게 시드는 서버가 정하고(관리자만 지정), 비율은 INSPECT_RATE 아래로 못 내린다
     (관리자 빼고). 이 철의 검토를 제출한 사람은 만들 수 없다."""
     with audited(user, "inspection_plan", vol, rate=body.rate, fields100=body.fields100) as info:
+        _need_sample()
         admin = auth.role_at_least(user.role, "admin")
         if not admin and (body.seed is not None or body.rate < INSPECT_RATE):
             raise HTTPException(403, f"시드 지정과 {INSPECT_RATE} 미만 비율은 관리자만")
-        if user.id is not None and store.entered(vol, user.id)[0]:
+        if WORKFLOW["distinct_actors"] and user.id is not None and store.entered(vol, user.id)[0]:
             raise HTTPException(403, "이 철의 검토를 제출한 사람은 검사 목록을 만들 수 없음 (교차검사)")
         docs = _done_docs(vol)
         seed = body.seed if body.seed is not None else secrets.randbelow(2**31)
@@ -425,32 +519,46 @@ def inspection_create(vol: str, body: InspectionPlanIn, user: Inspector):
 
 @app.get("/volumes/{vol}/inspection")
 def inspection_view(vol: str, user: Viewer):
-    plan = store.inspection_plan(vol)
+    plan = store.inspection_plan(vol) if SAMPLE else None
     if not plan:
         raise HTTPException(404, "검사 목록 없음")
     docs = {d["doc_id"]: d for d in (G.get_state(cfg(vol)).values or {}).get("docs", [])}
-    inspector = auth.role_at_least(user.role, "inspector")
-    whole, mine = store.entered(vol, user.id) if inspector and user.id is not None else (False, set())
+    inspector = bool(SAMPLE) and auth.role_at_least(user.role, SAMPLE["role"])
+    whole, acts = acted_stages(vol, user) if inspector and user.id is not None else (False, {})
+    rows = store.inspection_rows(vol)
+    pos = positions(vol, [r["doc_id"] for r in rows], raw=True)
     out = []
-    for r in store.inspection_rows(vol):
+    for r in rows:
         d = docs.get(r["doc_id"], {})
+        mine = WORKFLOW["distinct_actors"] and other_stages(whole, acts, r["doc_id"], SAMPLE["name"])
         out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
                     "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
-                    "can_inspect": inspector and r["inspected_at"] is None and not whole and r["doc_id"] not in mine})
+                    "can_inspect": inspector and r["inspected_at"] is None and not mine
+                    and pos[r["doc_id"]]["stage"] == SAMPLE["name"]})
     return {"plan": plan, "docs": out}
 
 
 @app.post("/inspection/{vol}/{doc_id}")
-def inspect_document(vol: str, doc_id: str, body: InspectIn, user: Inspector):
+def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
     """검사 결과. 문서를 먼저 차지하고(동시 제출 막기) 고친 칸은 문서 수정과 같은 길(그래프 상태·Postgres·Qdrant)로
     반영한다. 이력 단계는 inspect. 고치다 실패하면 차지를 풀어 다시 검사할 수 있게 한다.
-    교차검사: 이 문서를 입력 단계에서 고쳤거나 이 철의 검토를 제출한 사람은 검사할 수 없다."""
+    교차검사: 이 문서를 입력 단계에서 고쳤거나 이 철의 검토를 제출한 사람은 검사할 수 없다.
+    흐름 설정의 표본 단계(기본 흐름은 inspect)에 와 있는 문서만 — 앞 단계를 건너뛰고 검사하지 못한다."""
     with audited(user, "inspect", vol, doc_id) as info:
+        _need_sample()
         _done_docs(vol)
         if not store.inspection_row(vol, doc_id):
             raise HTTPException(404, "검사 목록에 없는 문서")
-        if user.id is None or store.is_entrant(vol, doc_id, user.id):
+        if user.id is None:
             raise HTTPException(403, "자기가 입력·수정한 문서는 검사할 수 없음 (교차검사)")
+        if WORKFLOW["distinct_actors"]:
+            other = other_stages(*acted_stages(vol, user), doc_id, SAMPLE["name"])
+            if other:
+                raise HTTPException(403, "자기가 입력·수정한 문서는 검사할 수 없음 (교차검사)" if ENTRY["name"] in other
+                                    else f"같은 문서의 다른 단계({', '.join(sorted(other))})를 맡은 사람은 검사할 수 없음")
+        pos = positions(vol, [doc_id], raw=True)[doc_id]
+        if pos["stage"] != SAMPLE["name"]:
+            raise HTTPException(409, "아직 검사 단계에 오지 않은 문서")
         if not store.claim_inspection(vol, doc_id, user.id):
             raise HTTPException(409, "이미 검사함")
         try:
@@ -461,8 +569,119 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: Inspector):
         # 고친 칸은 이력에서 센다 — 앞선 시도가 저장 뒤(임베딩 등)에서 실패해 이번 제출에 차이가 없어도 빠지지 않게
         fixed = store.inspected_fields(vol, doc_id)
         store.finish_inspection(vol, doc_id, fixed)
-        info["fields"] = fixed
+        # 단계 기록: 표본 단계는 마지막 단계라 검사가 끝나면 확정 (오류목록 내보내기가 다른 단계와 같은 표에서 읽는다)
+        store.add_stage_log(vol, doc_id, SAMPLE["name"], pos["round"], "approve", CONFIRMED, user.id, fixed=fixed)
+        info.update(fields=fixed, stage=SAMPLE["name"], to=CONFIRMED)
     return {"doc_id": doc_id, "fixed_fields": fixed}
+
+
+# ---------- 설정 흐름의 단계 승인·반려 (https://github.com/reddol18/docflow/issues/86) ----------
+class StageApproveIn(BaseModel):
+    stage: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")  # 승인하려는 단계 — 그 사이 문서가 움직였으면 409
+    fields: dict[str, CellValue] = Field(default_factory=dict, max_length=10)  # 승인하며 고친 칸
+
+
+class StageRejectIn(BaseModel):
+    stage: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    reason: str = Field(min_length=1, max_length=REASON_MAX)  # 반려 사유 (필수)
+
+
+def _stage_action(vol, doc_id, name, user):
+    """단계 승인·반려 전에 서버가 보는 것: 색인 끝난 철의 문서인가, 설정에 있는 /workflow 단계인가, 그 단계의 역할인가,
+    문서가 지금 그 단계에 있나(건너뛰기·확정 문서 막기), 같은 문서의 다른 단계를 맡지 않았나"""
+    if doc_id not in {d["doc_id"] for d in _done_docs(vol)}:
+        raise HTTPException(404, "문서 없음")
+    st = workflow.stage(WORKFLOW, name)
+    if st is None:
+        raise HTTPException(404, "흐름에 없는 단계")
+    if st["select"] == "sample":
+        raise HTTPException(409, "표본 검사 단계는 /inspection 경로로")
+    if not auth.role_at_least(user.role, st["role"]):
+        raise HTTPException(403, f"{st['role']} 역할 필요")
+    pos = positions(vol, [doc_id])[doc_id]
+    if pos["stage"] == CONFIRMED:
+        raise HTTPException(409, "이미 확정된 문서")
+    if pos["stage"] != name:
+        raise HTTPException(409, "문서가 지금 이 단계에 있지 않음")
+    _distinct_check(vol, doc_id, user, name)
+    return st, pos
+
+
+@app.get("/workflow")
+def workflow_config(_: Viewer):
+    return workflow.public(WORKFLOW)
+
+
+@app.get("/volumes/{vol}/workflow")
+def workflow_view(vol: str, user: Viewer):
+    """철의 문서마다 지금 단계. 색인이 끝나기 전에는 문서 없이 ready=false"""
+    snap = G.get_state(cfg(vol))
+    ready = _stage(vol, snap) == "done"
+    ids = [d["doc_id"] for d in (snap.values or {}).get("docs", [])] if ready else []
+    pos = positions(vol, ids)
+    whole, acts = acted_stages(vol, user) if ids and user.id is not None else (False, {})
+    out, counts = [], {}
+    for d in ids:
+        p = pos[d]
+        st = workflow.stage(WORKFLOW, p["stage"])
+        counts[p["stage"]] = counts.get(p["stage"], 0) + 1
+        can = (st is not None and st["select"] != "sample" and auth.role_at_least(user.role, st["role"])
+               and not (WORKFLOW["distinct_actors"] and (user.id is None or other_stages(whole, acts, d, st["name"]))))
+        out.append({"doc_id": d, "stage": p["stage"], "label": st["label"] if st else ("확정" if p["stage"] == CONFIRMED else None),
+                    "round": p["round"], "recheck": p["round"] > 1, "confirmed": p["stage"] == CONFIRMED,
+                    "last_reason": p["last_reason"], "rejected_from": p["rejected_from"],
+                    "can_approve": can, "can_reject": can and st["reject"]})
+    return {"workflow": workflow.public(WORKFLOW), "ready": ready, "counts": counts, "docs": out}
+
+
+@app.post("/workflow/{vol}/{doc_id}/approve")
+def stage_approve(vol: str, doc_id: str, body: StageApproveIn, user: StageUser):
+    """단계 승인. 고친 칸은 문서 수정과 같은 길로 반영(이력 source: 입력은 edit, 검수는 stage:<단계>)하고 다음 단계로.
+    마지막 단계면 확정. 승인하는 동안 문서를 차지해 같은 차례를 두 번 넘기지 않는다"""
+    with audited(user, "stage_approve", vol, doc_id, stage=body.stage) as info:
+        st, pos = _stage_action(vol, doc_id, body.stage, user)
+        row = store.ensure_stage(vol, doc_id, pos["stage"])
+        rnd = row["round"]
+        if row["stage"] != st["name"] or not store.claim_stage(vol, doc_id, st["name"], rnd, user.id):
+            raise HTTPException(409, "다른 사람이 처리 중이거나 문서의 단계가 바뀜")
+        to = workflow.next_stage(WORKFLOW, st["name"])
+        try:
+            changed = []
+            if body.fields:
+                source = "edit" if st["kind"] == "entry" else f"stage:{st['name']}"
+                _, changed = _edit_document(vol, doc_id, body.fields, user, source=source)
+            if not store.move_stage(vol, doc_id, st["name"], rnd, "approve", to, rnd, user.id, fixed=changed, claimed=True):
+                raise HTTPException(409, "문서의 단계가 바뀜")
+        except BaseException:
+            store.release_stage(vol, doc_id)
+            raise
+        info.update(to=to, round=rnd, recheck=rnd > 1, fields=changed)
+    return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd, "fixed_fields": changed}
+
+
+@app.post("/workflow/{vol}/{doc_id}/reject")
+def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
+    """단계 반려 (사유 필수): 문서만 정해진 앞 단계(reject_to)로 돌아가고 차례(round)가 하나 는다 → 다시 올라오면 재검수.
+    사유는 단계 기록(stage_log)에, 감사 로그에는 단계·차례·사유 길이만"""
+    with audited(user, "stage_reject", vol, doc_id, stage=body.stage) as info:
+        reason = export.CONTROL.sub("", body.reason).strip()
+        if not reason:
+            raise HTTPException(422, "반려 사유를 적어야 함")
+        st, pos = _stage_action(vol, doc_id, body.stage, user)
+        if not st["reject"]:
+            raise HTTPException(409, "이 단계는 반려할 수 없음")
+        row = store.ensure_stage(vol, doc_id, pos["stage"])
+        rnd, to = row["round"], st["reject_to"]
+        if row["stage"] != st["name"] or not store.move_stage(vol, doc_id, st["name"], rnd, "reject", to, rnd + 1,
+                                                              user.id, reason=reason):
+            raise HTTPException(409, "다른 사람이 처리 중이거나 문서의 단계가 바뀜")
+        info.update(to=to, round=rnd + 1, reason_chars=len(reason))
+    return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd + 1}
+
+
+@app.get("/documents/{vol}/{doc_id}/stages")
+def document_stages(vol: str, doc_id: str, _: Viewer):
+    return store.stage_history(vol, doc_id)
 
 @app.get("/volumes/{vol}/documents")
 def documents(vol: str, _: Viewer):
@@ -667,22 +886,38 @@ def _export_volumes(vols, need_done):
     return out, stages
 
 
+def _unconfirmed(volumes, stages):
+    """{vol: 마지막 단계 승인 전 doc_id 집합}. 흐름 설정이 세지 않으면(기본 흐름) None.
+    색인이 끝나지 않은 철의 문서는 모두 미확정"""
+    if not WORKFLOW["count_unconfirmed"]:
+        return None
+    out = {}
+    for v, _, docs in volumes:
+        ids = [d["doc_id"] for d in docs]
+        if stages[v] != "done":
+            out[v] = set(ids)
+        else:
+            pos = positions(v, ids)
+            out[v] = {d for d in ids if pos[d]["stage"] != CONFIRMED}
+    return out
+
+
 @app.get("/export/check")
 def export_check(_: Viewer, vol: VolList):
-    """출력 전 검증: 필수 열 빈칸·형식 위반·검토 안 끝난 건 수와 어느 문서·열인지"""
+    """출력 전 검증: 필수 열 빈칸·형식 위반·검토 안 끝난 건(·흐름 설정에 따라 미확정 건) 수와 어느 문서·열인지"""
     volumes, stages = _export_volumes(vol, need_done=False)
-    _, problems = export.build(EXPORT_TEMPLATE, volumes)
+    _, problems = export.build(EXPORT_TEMPLATE, volumes, _unconfirmed(volumes, stages))
     return {"template": EXPORT_TEMPLATE["name"], "volumes": [{"vol": v, "stage": stages[v], "docs": len(d)}
                                                              for v, _, d in volumes],
-            **export.summary(problems)}
+            **export.summary(problems, WORKFLOW["count_unconfirmed"])}
 
 
 @app.get("/export.xlsx")
 def export_xlsx(user: Admin, vol: VolList):
     """납품 양식 엑셀. 검증 문제가 있어도 낸다 (빈칸은 빈칸으로) — 먼저 /export/check로 확인한다"""
     with audited(user, "export_request", None, vols=len(vol)) as info:
-        volumes, _ = _export_volumes(vol, need_done=True)
-        sheets, problems = export.build(EXPORT_TEMPLATE, volumes)
+        volumes, stages = _export_volumes(vol, need_done=True)
+        sheets, problems = export.build(EXPORT_TEMPLATE, volumes, _unconfirmed(volumes, stages))
         body = export.to_xlsx(sheets)
         info.update(volumes=len(volumes), problems=len(problems))
     for v, _, docs in volumes:  # 철마다 출력 기록 — 일괄 삭제는 지금 내용을 문제 없이 내보낸 철만 받는다
@@ -704,7 +939,7 @@ def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False
             raise HTTPException(400, "confirm에 철 이름을 그대로 넣어야 함")
         if vol in running:
             raise HTTPException(409, "실행 중인 철")
-        last = store.last_export(vol)
+        last = store.last_export(vol, stage_moves=WORKFLOW["count_unconfirmed"])
         if not last:
             raise HTTPException(409, "납품 형식으로 내보낸 적 없는 철 (/export.xlsx 먼저)")
         if not last["current"]:

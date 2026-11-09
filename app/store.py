@@ -123,8 +123,19 @@ CREATE TABLE IF NOT EXISTS inspection (
 CREATE TABLE IF NOT EXISTS review_submitters (
   vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id));
 CREATE TABLE IF NOT EXISTS exports (
-  id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), vol text NOT NULL, problems int NOT NULL, user_id bigint)
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), vol text NOT NULL, problems int NOT NULL, user_id bigint);
+CREATE TABLE IF NOT EXISTS doc_stage (
+  vol text NOT NULL, doc_id text NOT NULL, stage text NOT NULL, round int NOT NULL DEFAULT 1,
+  busy_by bigint, busy_at timestamptz, last_reason text, rejected_from text, updated_at timestamptz DEFAULT now(),
+  PRIMARY KEY (vol, doc_id));
+CREATE TABLE IF NOT EXISTS stage_log (
+  id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), vol text NOT NULL, doc_id text NOT NULL,
+  stage text NOT NULL, round int NOT NULL, action text NOT NULL, to_stage text NOT NULL, user_id bigint,
+  reason text, fixed_fields text[]);
+CREATE INDEX IF NOT EXISTS stage_log_doc ON stage_log (vol, doc_id)
 """
+# ↑ doc_stage·stage_log (https://github.com/reddol18/docflow/issues/86): 새 표만 더한다. 행이 없는 문서(예전 철)는
+#   흐름 설정의 처음 단계에 있는 것으로 본다 → 옛 철은 옮길 것 없이 그대로 열린다
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
 
 
@@ -373,8 +384,10 @@ def edit_history(vol, doc_id):
     with pool.connection() as c:
         # sso: SSO 사용자는 이름을 제공자가 정하므로 local 계정과 이름이 같을 수 있다 → 구별해서 보여 준다
         # stage: 입력(검토 제출·색인 뒤 수정) / 검사 (https://github.com/reddol18/docflow/issues/10)
+        # 설정 흐름의 검수 단계에서 고친 칸은 source 'stage:<단계 이름>' (https://github.com/reddol18/docflow/issues/86)
         return c.execute("SELECT e.ts, e.field, e.old, e.new, e.source, "
-                         "CASE WHEN e.source = 'inspect' THEN 'inspect' ELSE 'entry' END AS stage, "
+                         "CASE WHEN e.source = 'inspect' THEN 'inspect' WHEN e.source LIKE 'stage:%%' "
+                         "THEN substr(e.source, 7) ELSE 'entry' END AS stage, "
                          "u.username, u.name, u.issuer IS NOT NULL AS sso FROM edits e "
                          "LEFT JOIN users u ON u.id = e.user_id WHERE e.vol = %s AND e.doc_id = %s ORDER BY e.id",
                          (vol, doc_id)).fetchall()
@@ -386,24 +399,128 @@ def add_export(vol, problems, user_id):
         c.execute("INSERT INTO exports (vol, problems, user_id) VALUES (%s,%s,%s)", (vol, problems, user_id))
 
 
-def last_export(vol):
+def last_export(vol, stage_moves=False):
     """마지막 출력이 철의 지금 내용과 같은가. None(내보낸 적 없음) 또는 {ts, problems, current}.
     current: 출력 뒤에 색인이 바뀌지 않았고(documents.updated_at — 실행·검토·수정·검사가 모두 여기를 바꾼다)
-    쪽을 다시 올리거나 다시 돌리지 않았음(감사 로그 upload·run·resume)"""
+    쪽을 다시 올리거나 다시 돌리지 않았음(감사 로그 upload·run·resume).
+    stage_moves: 검토 단계 이동도 내용 변화로 본다 — 출력 전 검증이 미확정 문서를 셀 때 (흐름 설정 count_unconfirmed)"""
+    moves = ", (SELECT max(ts) FROM stage_log WHERE vol = %(v)s)" if stage_moves else ""
     with pool.connection() as c:
         e = c.execute("SELECT ts, problems FROM exports WHERE vol = %s ORDER BY id DESC LIMIT 1", (vol,)).fetchone()
         if not e:
             return None
         changed = c.execute(
-            "SELECT greatest((SELECT max(updated_at) FROM documents WHERE vol = %(v)s), "
-            "(SELECT max(ts) FROM audit WHERE vol = %(v)s AND action IN ('upload','run','resume') AND result = 'ok')) AS t",
-            {"v": vol}).fetchone()["t"]
+            "SELECT greatest((SELECT max(updated_at) FROM documents WHERE vol = %(v)s), "  # noqa: S608 — 상수 조각만 끼움
+            "(SELECT max(ts) FROM audit WHERE vol = %(v)s AND action IN ('upload','run','resume') AND result = 'ok')"
+            f"{moves}) AS t", {"v": vol}).fetchone()["t"]
     return {**e, "current": changed is None or changed < e["ts"]}
+
+
+# ---------- 검토 단계 (https://github.com/reddol18/docflow/issues/86) ----------
+# doc_stage: 문서가 지금 어느 단계·몇 번째 차례(round)에 있나. 행이 없으면 흐름의 처음 단계 (app/workflow.py initial)
+# stage_log: 단계 승인·반려 기록 (누가·언제·어느 단계·차례·어디로·사유·고친 칸) — 오류목록 내보내기의 원천
+BUSY_SEC = 600  # 승인 중(칸 반영·재색인) 차지가 이보다 오래면 죽은 요청으로 본다
+
+
+def stage_rows(vol):
+    with pool.connection() as c:
+        return {r["doc_id"]: r for r in c.execute(
+            "SELECT doc_id, stage, round, last_reason, rejected_from, busy_at FROM doc_stage WHERE vol = %s",
+            (vol,)).fetchall()}
+
+
+def ensure_stage(vol, doc_id, stage):
+    """처음 손댈 때 행을 만든다 (이미 있으면 그대로). 지금 행을 돌려준다"""
+    with pool.connection() as c:
+        c.execute("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING", (vol, doc_id, stage))
+        return c.execute("SELECT * FROM doc_stage WHERE vol = %s AND doc_id = %s", (vol, doc_id)).fetchone()
+
+
+_FREE = "(busy_at IS NULL OR busy_at < now() - make_interval(secs => %(busy)s))"
+
+
+def claim_stage(vol, doc_id, stage, rnd, user_id):
+    """승인하는 동안 문서를 차지한다 (같은 차례를 두 사람이 동시에 넘기지 않게). 단계·차례가 그대로이고 비어 있어야 True"""
+    with pool.connection() as c:
+        return c.execute("UPDATE doc_stage SET busy_by = %(u)s, busy_at = now() "  # noqa: S608 — 상수 조각만 끼움
+                         f"WHERE vol = %(v)s AND doc_id = %(d)s AND stage = %(s)s AND round = %(r)s AND {_FREE}",
+                         {"u": user_id, "v": vol, "d": doc_id, "s": stage, "r": rnd, "busy": BUSY_SEC}).rowcount == 1
+
+
+def release_stage(vol, doc_id):
+    with pool.connection() as c:
+        c.execute("UPDATE doc_stage SET busy_by = NULL, busy_at = NULL WHERE vol = %s AND doc_id = %s", (vol, doc_id))
+
+
+def move_stage(vol, doc_id, stage, rnd, action, to_stage, to_round, user_id, reason=None, fixed=None, claimed=False):
+    """단계 이동과 기록을 한 트랜잭션으로. 단계·차례가 그대로일 때만 (claimed면 이 사용자의 차지, 아니면 비어 있어야).
+    반려면 사유와 반려한 단계를 문서에 남긴다. 옮겼으면 True"""
+    cond = "busy_at IS NOT NULL AND busy_by IS NOT DISTINCT FROM %(u)s" if claimed else _FREE
+    reject = action == "reject"
+    with pool.connection() as c, c.transaction():
+        n = c.execute("UPDATE doc_stage SET stage = %(to)s, round = %(tr)s, busy_by = NULL, busy_at = NULL, "  # noqa: S608
+                      "last_reason = CASE WHEN %(rej)s THEN %(why)s ELSE last_reason END, "
+                      "rejected_from = CASE WHEN %(rej)s THEN %(s)s ELSE rejected_from END, updated_at = now() "
+                      f"WHERE vol = %(v)s AND doc_id = %(d)s AND stage = %(s)s AND round = %(r)s AND {cond}",
+                      {"to": to_stage, "tr": to_round, "rej": reject, "why": reason, "v": vol, "d": doc_id, "s": stage,
+                       "r": rnd, "u": user_id, "busy": BUSY_SEC}).rowcount
+        if n != 1:
+            return False
+        add_stage_log(vol, doc_id, stage, rnd, action, to_stage, user_id, reason, fixed, conn=c)
+    return True
+
+
+def add_stage_log(vol, doc_id, stage, rnd, action, to_stage, user_id, reason=None, fixed=None, conn=None):
+    sql = ("INSERT INTO stage_log (vol, doc_id, stage, round, action, to_stage, user_id, reason, fixed_fields) "
+           "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+    args = (vol, doc_id, stage, rnd, action, to_stage, user_id, reason, fixed)
+    if conn is not None:
+        conn.execute(sql, args)
+        return
+    with pool.connection() as c:
+        c.execute(sql, args)
+
+
+def stage_actors(vol, user_id):
+    """이 사용자가 승인·반려한 단계 {doc_id: {단계 이름}} — 작업자 ≠ 검수자 확인용. 검사(inspect)·입력 이력도 더한다"""
+    out = {}
+    with pool.connection() as c:
+        for r in c.execute("SELECT DISTINCT doc_id, stage FROM stage_log WHERE vol = %s AND user_id = %s",
+                           (vol, user_id)).fetchall():
+            out.setdefault(r["doc_id"], set()).add(r["stage"])
+        for r in c.execute("SELECT DISTINCT doc_id, substr(source, 7) AS stage FROM edits "
+                           "WHERE vol = %s AND user_id = %s AND source LIKE 'stage:%%'", (vol, user_id)).fetchall():
+            out.setdefault(r["doc_id"], set()).add(r["stage"])
+    return out
+
+
+def inspected_docs_by(vol, user_id):
+    """검사(표본 단계)를 맡은 문서 — 차지했거나 검사로 칸을 고친 문서"""
+    with pool.connection() as c:
+        return {r["doc_id"] for r in c.execute(
+            "SELECT doc_id FROM inspection WHERE vol = %(v)s AND inspected_by = %(u)s "
+            "UNION SELECT doc_id FROM edits WHERE vol = %(v)s AND user_id = %(u)s AND source = 'inspect'",
+            {"v": vol, "u": user_id}).fetchall()}
+
+
+def stage_history(vol, doc_id):
+    """문서의 단계 기록 — 화면과 오류목록 내보내기용 (사유·고친 칸 포함, 사용자 id는 이름으로)"""
+    with pool.connection() as c:
+        return c.execute("SELECT s.ts, s.stage, s.round, s.action, s.to_stage, s.reason, s.fixed_fields, "
+                         "u.username, u.name FROM stage_log s LEFT JOIN users u ON u.id = s.user_id "
+                         "WHERE s.vol = %s AND s.doc_id = %s ORDER BY s.id", (vol, doc_id)).fetchall()
+
+
+def reset_stages(vol):
+    """철을 처음부터 다시 돌릴 때 단계 위치를 지운다 (기록 stage_log는 남긴다). 지운 행 수"""
+    with pool.connection() as c:
+        return c.execute("DELETE FROM doc_stage WHERE vol = %s", (vol,)).rowcount
 
 
 # 납품 뒤 지우는 사업 데이터 (https://github.com/reddol18/docflow/issues/12): 값·원문이 든 표.
 # 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간)·exports(출력 기록) — 개수·시각만 있고 값은 없다
-PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters")
+PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters",
+                "doc_stage", "stage_log")  # 단계 기록에는 반려 사유(사람이 쓴 글)가 있다
 
 
 def purge_volume(vol, delete_thread):

@@ -1,0 +1,22 @@
+# 예시: 3단계 자체검수 → 최종검수 (작업자 → 품질관리자 → 감독관)
+# 작업자가 문서마다 넘기고, 품질관리자·감독관이 전수로 승인하거나 사유를 적어 반려한다.
+# 반려된 문서는 그 문서만 정해진 앞 단계로 돌아가고, 다시 올라오면 재검수(round 2…)가 된다.
+# 감독관 역할은 지금 역할 체계(auth.ROLES)에서 admin이 맡는다.
+name: 3단계 검수 (작업자 → 품질관리자 → 감독관)
+distinct_actors: true
+count_unconfirmed: true
+stages:
+  - name: entry
+    label: 작업자
+    role: reviewer
+    submit: manual
+  - name: qc
+    label: 품질관리자
+    role: inspector
+    reject: true
+    reject_to: entry
+  - name: supervisor
+    label: 감독관
+    role: admin
+    reject: true
+    reject_to: entry

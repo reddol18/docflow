@@ -1,0 +1,23 @@
+# 예시: 가등록 → 승인(반려 가능) → 자료정리 → 등록
+# 승인에서 반려되면 가등록으로, 등록 단계에서 반려되면 자료정리로 돌아간다.
+name: 가등록 → 승인 → 자료정리 → 등록
+distinct_actors: true
+count_unconfirmed: true
+stages:
+  - name: draft
+    label: 가등록
+    role: reviewer
+    submit: manual
+  - name: approve
+    label: 승인
+    role: inspector
+    reject: true
+    reject_to: draft
+  - name: arrange
+    label: 자료정리
+    role: reviewer
+  - name: register
+    label: 등록
+    role: admin
+    reject: true
+    reject_to: arrange

@@ -1,0 +1,16 @@
+# 기본 검토 흐름 — 지금까지 코드에 고정돼 있던 2단계 (https://github.com/reddol18/docflow/issues/86)
+#   입력(reviewer): 철 흐름의 사람 검토(/review/{vol})와 색인 뒤 수정(PATCH /documents) — 색인이 끝나면 넘어간 것으로 본다
+#   검사(inspector): 표시 문서 전부 + 표시 없는 문서 표본(/volumes/{vol}/inspection, https://github.com/reddol18/docflow/issues/10)
+# 표본 비율은 rate를 비워 두면 환경변수 INSPECT_RATE(기본 0.05). 다른 흐름은 WORKFLOW=파일 경로로 고른다.
+name: 기본 2단계 (입력 → 표본 검사)
+distinct_actors: true      # 교차검사: 입력한 사람은 그 문서를 검사하지 못한다
+count_unconfirmed: false   # 지금 동작: 표본 검사는 납품 출력 전 검증에 넣지 않는다
+stages:
+  - name: entry
+    label: 입력
+    role: reviewer
+    submit: on_index
+  - name: inspect
+    label: 검사
+    role: inspector
+    select: sample
