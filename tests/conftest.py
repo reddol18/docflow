@@ -32,4 +32,5 @@ def pg_store():
     store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True})()
     store.init()
     yield store
+    store.lock_pool.close()
     store.pool.close()

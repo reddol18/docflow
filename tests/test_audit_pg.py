@@ -21,7 +21,7 @@ JPG = b"\xff\xd8\xff\xe0" + b"0" * 64
 def main(pg_store, monkeypatch, tmp_path):
     from app import main
     with pg_store.pool.connection() as c:
-        for t in ("audit", "events", "edits", "sessions", "review_time", "users"):
+        for t in ("audit", "events", "edits", "sessions", "review_time", "doc_stage", "stage_log", "stage_gen", "users"):
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
         c.execute("INSERT INTO users (id, username, role) VALUES (1, 'a', 'admin')")
     monkeypatch.setattr(auth, "MODES", frozenset({"local"}))

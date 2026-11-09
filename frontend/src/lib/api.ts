@@ -130,9 +130,50 @@ export type Role = "viewer" | "reviewer" | "inspector" | "admin";
 export type Me = { username: string; name: string; role: Role };
 export type AuthConfig = { modes: ("local" | "oidc")[]; off: boolean; oidc_label: string | null };
 export type EditRow = {
-  ts: string; field: string; old: string | null; new: string; source: "review" | "edit" | "inspect"; stage: "entry" | "inspect";
+  // source·stage: 설정 흐름의 검수 단계에서 고친 칸은 source "stage:<단계>", stage "<단계>"
+  ts: string; field: string; old: string | null; new: string; source: string; stage: string;
   username: string | null; name: string | null;
 };
+
+// 검토 흐름 설정 (GET /workflow, app/workflows/*.yaml — https://github.com/reddol18/docflow/issues/86)
+export type WorkflowStage = {
+  name: string;
+  label: string;
+  role: Role;
+  kind: "entry" | "review";
+  select: "all" | "sample";
+  rate: number | null;
+  reject: boolean;
+  reject_to: string | null;
+  submit: "manual" | "on_index" | null;
+  actions: boolean; // /workflow 경로로 승인·반려하는 단계 (표본 검사 단계는 /inspection)
+};
+export type Workflow = {
+  name: string;
+  distinct_actors: boolean;
+  count_unconfirmed: boolean;
+  initial: string;
+  stages: WorkflowStage[];
+};
+export type DocStage = {
+  doc_id: string;
+  stage: string; // 저장된 위치: 단계 이름, 확정이면 "_confirmed"
+  // confirmed 확정 / excluded 표본 단계의 검사 목록 밖 — 검사 없이 넘어감(입력 경로로 고칠 수 있음) / pending 차례 기다림
+  status: "pending" | "excluded" | "confirmed";
+  label: string | null;
+  editable: boolean; // 입력 경로(PATCH /documents)로 고칠 수 있는 위치
+  round: number;
+  recheck: boolean;
+  confirmed: boolean;
+  last_reason: string | null;
+  rejected_from: string | null;
+  can_approve: boolean;
+  can_reject: boolean;
+};
+export type VolumeWorkflow = { workflow: Workflow; ready: boolean; counts: Record<string, number>; docs: DocStage[] };
+// 단계 승인·반려를 이 화면에서 하는 흐름인가 (기본 흐름 — 입력은 색인으로 끝나고 검사는 표본 — 이면 화면은 지금 그대로)
+export const hasStageActions = (wf: Workflow | null | undefined) =>
+  !!wf && (wf.stages.some((s) => s.kind === "review" && s.actions) || wf.stages[0]?.submit === "manual");
 
 const ROLE_ORDER: Role[] = ["viewer", "reviewer", "inspector", "admin"];
 export const can = (me: Me | null | undefined, need: Role) => !!me && ROLE_ORDER.indexOf(me.role) >= ROLE_ORDER.indexOf(need);
@@ -216,6 +257,20 @@ export const api = {
     }),
   report: (dayFrom?: string, dayTo?: string) => call<Report>(`/report?${reportQuery(dayFrom, dayTo)}`),
   edits: (vol: string, docId: string) => call<EditRow[]>(`/documents/${enc(vol)}/${enc(docId)}/edits`),
+  workflow: () => call<Workflow>("/workflow"),
+  volumeWorkflow: (vol: string) => call<VolumeWorkflow>(`/volumes/${enc(vol)}/workflow`),
+  approveStage: (vol: string, docId: string, stage: string, fields: Partial<Fields>) =>
+    call<{ to: string; round: number; fixed_fields: string[] }>(`/workflow/${enc(vol)}/${enc(docId)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage, fields }),
+    }),
+  rejectStage: (vol: string, docId: string, stage: string, reason: string) =>
+    call<{ to: string; round: number }>(`/workflow/${enc(vol)}/${enc(docId)}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage, reason }),
+    }),
   authConfig: () => call<AuthConfig>("/auth/config", { noRedirect: true }),
   me: () => call<{ user: Me }>("/auth/me", { noRedirect: true }),
   login: (username: string, password: string) =>

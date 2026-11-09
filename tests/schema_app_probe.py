@@ -62,6 +62,10 @@ def setup(tmp):
     for name in ("event", "save_documents", "upsert_vectors", "delete_doc_vectors", "add_review_submitter", "add_edits",
                  "audit", "add_export"):
         setattr(store, name, lambda *a, **k: None)
+    # 검토 단계(https://github.com/reddol18/docflow/issues/86): 단계 행·검사 목록 없음 → 출력 전 검증이 미확정을 센다
+    store.stage_rows = lambda vol: {}
+    store.inspection_plan = lambda vol: None
+    store.inspection_rows = lambda vol: []
     store.spent_today = lambda: 0.0
     store.usage_summary = lambda vol=None: []
     auth.MODES = frozenset({"local"})

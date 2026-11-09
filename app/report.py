@@ -81,7 +81,9 @@ def daily(day_from: dt.date, day_to: dt.date):
         put(_rows(f"SELECT {_day('ts')} AS day, sum(({expr})::int)::int AS n FROM events "  # noqa: S608
                   "WHERE node='review' AND phase='submit' AND ts >= %s AND ts < %s GROUP BY 1", rng), key)
     put(_rows(f"SELECT {_day('ts')} AS day, sum(jsonb_array_length(info->'fields'))::int AS n FROM events "  # noqa: S608
-              "WHERE node='edit' AND phase='end' AND ts >= %s AND ts < %s GROUP BY 1", rng), "cells_edited")
+              # 설정 흐름의 검수 단계에서 승인하며 고친 칸(node 'stage:<단계>')도 수정으로 센다 (https://github.com/reddol18/docflow/issues/86)
+              "WHERE (node='edit' OR node LIKE 'stage:%%') AND phase='end' AND ts >= %s AND ts < %s GROUP BY 1", rng),
+        "cells_edited")
     put(_rows(f"SELECT {_day('ts')} AS day, sum(usd)::float AS n FROM usage "  # noqa: S608
               "WHERE ts >= %s AND ts < %s GROUP BY 1", rng), "usd")
     times = {}

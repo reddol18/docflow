@@ -2,7 +2,8 @@
 
 양식은 YAML 매핑(`app/export_templates/*.yaml`): 양식 열 ↔ 원천(철·건·색인 칸·고정값) ↔ 형식 변환.
 철 목록 시트와 건 색인 시트를 따로 내고, 건은 철 안 쪽 순서(원질서)대로 둔다.
-출력 전 검증은 필수 열 빈칸·형식 위반·검토 안 끝난 건을 센다."""
+출력 전 검증은 필수 열 빈칸·형식 위반·검토 안 끝난 건을 센다. 검토 흐름 설정이 count_unconfirmed면
+마지막 단계 승인 전 건도 '미확정'으로 센다."""
 import datetime as dt
 import io
 import os
@@ -136,9 +137,10 @@ def _row(cols, vals, where, problems):
     return out
 
 
-def build(t, volumes):
+def build(t, volumes, unconfirmed=None):
     """volumes = [(vol, pages, docs)] → 시트 {title: [머리 행, 값 행...]}, 문제 목록.
-    문제: required_blank(필수 열 빈칸), format(형식 위반), not_reviewed(검토 표시가 있는데 사람 검토 안 됨)"""
+    문제: required_blank(필수 열 빈칸), format(형식 위반), not_reviewed(검토 표시가 있는데 사람 검토 안 됨),
+    unconfirmed(검토 흐름의 마지막 단계 승인 전 — unconfirmed={vol: {doc_id}}를 줄 때만, https://github.com/reddol18/docflow/issues/86)"""
     vs, ds = t["sheets"]["volumes"], t["sheets"]["documents"]
     vrows, drows, problems = [], [], []
     for vol, pages, docs in volumes:
@@ -152,13 +154,18 @@ def build(t, volumes):
             if d.get("flags") and not d.get("reviewed"):
                 problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": None,
                                  "kind": "not_reviewed"})
+            if unconfirmed is not None and d["doc_id"] in unconfirmed.get(vol, ()):
+                problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": None,
+                                 "kind": "unconfirmed"})
     sheets = {vs["title"]: [[c["name"] for c in vs["columns"]], *vrows],
               ds["title"]: [[c["name"] for c in ds["columns"]], *drows]}
     return sheets, problems
 
 
-def summary(problems):
-    count = {k: sum(p["kind"] == k for p in problems) for k in ("required_blank", "format", "not_reviewed")}
+def summary(problems, unconfirmed=False):
+    """건수 요약. unconfirmed: 미확정 건수 칸을 더한다 (흐름 설정 count_unconfirmed — 기본 흐름은 지금처럼 없음)"""
+    kinds = ("required_blank", "format", "not_reviewed") + (("unconfirmed",) if unconfirmed else ())
+    count = {k: sum(p["kind"] == k for p in problems) for k in kinds}
     return {**count, "problems": problems[:PROBLEMS_MAX], "problems_total": len(problems)}
 
 

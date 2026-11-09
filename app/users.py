@@ -84,6 +84,7 @@ def main(argv=None):
         run(args)
     finally:
         if opened_here:
+            store.lock_pool.close()
             store.pool.close()
 
 

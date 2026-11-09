@@ -72,7 +72,7 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 
 1. `GET /export/check?vol=…` — 출력 전 검증. 필수 열 빈칸·형식 위반(예: 일부만 읽은 날짜)·검토 안 끝난 건(검토 표시가 있는데 사람 검토 전) 수와 어느 문서·열인지. 철을 안 고르면 끝난 철 전부.
 2. `GET /export.xlsx?vol=…` (관리자) — 철 목록 시트 + 건 색인 시트. 건은 철 안 쪽 순서(원질서)대로, 철마다 순번 1부터. 글자 칸은 모두 문자열로 써서 `=`로 시작하는 값이 수식이 되지 않는다.
-3. `DELETE /volumes/{vol}?confirm={vol}` (관리자) — 내보낸 철만. 쪽 이미지·OCR·잘라낸 칸(`DATA_DIR`), `documents`·`edits`·`events`·검사 표·LangGraph 체크포인트, Qdrant 벡터를 지운다. `usage`(비용)·`audit`·`review_time`은 값이 없어 남긴다. 지운 개수는 감사 로그(`purge`)에.
+3. `DELETE /volumes/{vol}?confirm={vol}` (관리자) — 내보낸 철만. 쪽 이미지·OCR·잘라낸 칸(`DATA_DIR`), `documents`·`edits`·`events`·검사 표·검토 단계 표(`doc_stage`·`stage_log`)·LangGraph 체크포인트, Qdrant 벡터를 지운다. `usage`(비용)·`audit`·`review_time`은 값이 없어 남긴다. 지운 개수는 감사 로그(`purge`)에.
 
 양식 열 매핑은 YAML (`app/export_templates/aihub88.yaml`, 바꾸려면 `EXPORT_TEMPLATE=경로`): 열 이름 ↔ 원천(철 이름 조각·쪽 수, 건 순번·쪽, 색인 칸, 고정값) ↔ 형식(`text`·`int`·`year`·`date`+출력 모양). 기본은 AI Hub 88 공개 라벨 기준 예시(철번호·생산기관코드·생산연도 / 문서번호·생산일자 `YYYYMMDD`·수신·제목·시작쪽·끝쪽). 매핑이 틀리면 앱이 시작하지 않는다.
 
@@ -93,6 +93,21 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
   - 검색 화면 열은 스키마 `search.columns`(없으면 보이는 칸 전부, `/schema`의 `search_columns`). `/search`·`/ask` 결과의 칸 값은 `fields` 아래에 있다.
   - 칸 이름을 바꾼 김해 매핑으로 칸 값·표시가 같은지: `eval/rename_replay.py <저장된 철 JSON…>`. 다른 고객 시험 스키마(지어낸 값)는 `tests/fixtures/schemas/`.
 - 철 단위 칸은 고정값·사람 입력만 된다 (철 단위 추출 없음).
+
+### 검토 단계 설정 (https://github.com/reddol18/docflow/issues/86)
+
+검토 흐름(단계 수·이름·맡는 역할·전수/표본·반려 규칙)도 YAML(`app/workflows/`)이 정한다. 쓰는 파일은 `WORKFLOW=경로`, 없으면 `default.yaml` — 지금까지의 입력(reviewer, 철 검토·색인 뒤 수정) → 표본 검사(inspector, `/volumes/{vol}/inspection`) 2단계와 동작·API·화면이 같다. 틀리면 앱이 시작하지 않는다. 항목은 `app/workflow.py` 머리말.
+
+- 예시: `three_stage.yaml`(작업자 → 품질관리자 → 감독관, 감독관은 지금 역할 체계에서 admin), `register_approve.yaml`(가등록 → 승인 → 자료정리 → 등록).
+- 단계 승인 `POST /workflow/{vol}/{doc_id}/approve`(고친 칸 함께, 마지막 단계면 확정), 반려 `POST /workflow/{vol}/{doc_id}/reject`(사유 필수) → 그 문서만 `reject_to` 단계로 돌아가고 차례(`round`)가 늘어 다시 올라오면 재검수. 서버가 단계 역할·문서의 지금 단계(건너뛰기·확정 문서)·작업자 ≠ 검수자(`distinct_actors`)를 확인한다. 확인과 쓰기는 문서 잠금(`store.doc_lock`: 프로세스 안 잠금 + Postgres advisory lock) 안에서 한다 — 입력 수정·검사·승인·반려 모두.
+- 입력 경로(`PATCH /documents`)로 고칠 수 있는 것은 입력 단계에 있는 문서뿐이다. 예외는 입력 `on_index` 바로 다음이 표본 단계인 흐름(기본 흐름): 검사 전·검사 목록 밖 문서를 지금처럼 고친다. 전수 검수 단계에 있는 문서는 검수자가 승인하며 고치거나 반려로 입력에 돌아와야 고친다. 화면은 `/volumes/{vol}/workflow`의 `editable`로 같은 규칙을 쓴다.
+- 문서 상태(`status`): `confirmed` 확정, `excluded` 표본 단계의 검사 목록 밖(검사 제외 — 출력 전 검증에서는 미확정이 아니고 입력 경로로 고칠 수 있다), `pending` 차례 기다림.
+- 위치는 `doc_stage`, 승인·반려 기록(사람·단계·차례·사유·고친 칸)은 `stage_log`(`GET /documents/{vol}/{doc_id}/stages`), 감사 로그에는 `stage_approve`·`stage_reject`(단계·이동·차례·재검수 여부, 사유는 길이만). 반려 사유의 제어·방향 제어·폭 0 문자는 지운다. 두 표는 일괄 삭제 대상.
+- 철을 처음부터 다시 돌리면(`/run`) 단계 위치를 지우고 실행 세대(`stage_gen`)를 올린다. 작업자 ≠ 검수자와 단계 기록 화면은 지금 세대만 본다(예전 세대 기록은 표에 남는다). 감사 로그 `run`에 지운 위치 수(`stage_reset`).
+- `count_unconfirmed: true`면 출력 전 검증(`/export/check`)이 마지막 단계 승인 전 건을 `unconfirmed`로 센다(다른 문제 칸과 같이 경고만 — 출력을 막지 않고, 일괄 삭제는 `allow_problems` 규칙 그대로). 기본 흐름도 센다(사용자 결정 2026-11-09): 확정은 표본 검사를 마친 문서와, 검사 목록이 만들어지고 그 철의 검사가 모두 끝난 뒤의 검사 제외 문서. 검사 목록이 없거나 검사가 남아 있으면 나머지는 미확정.
+- 문서 잠금은 `DOC_LOCK_WAIT_SEC`(기본 10초)까지 기다리고, 넘기면 409 "다른 사람이 처리 중". 그래프 상태 읽기→쓰기는 철 잠금 안에서(잠금 순서 문서 → 철).
+- 작업자 ≠ 검수자의 입력 판단(철 검토 제출·입력 경로 수정, `store.entered`)은 실행 세대로 거르지 않는다(의도 — 다시 돌리기 전 입력자도 계속 입력자로 보아 넓게 막는다). 단계 승인·반려·검수 수정 기록만 세대로 거른다.
+- 예전 판에서 끝나지 않은 검사 차지(`inspection.inspected_at`만 있고 `fixed_fields`가 비어 있음 — 요청이 죽은 경우)는 그대로 두면 그 문서를 검사할 수 없다. 관리자가 확인한 뒤 DB에서 푼다: `UPDATE inspection SET inspected_by = NULL, inspected_at = NULL WHERE vol = '<철>' AND doc_id = '<문서>' AND fixed_fields IS NULL;` (지금 판은 검사를 문서 잠금 안에서 하고 실패하면 차지를 풀어 새로 생기지 않는다)
 
 ## 측정 결과
 

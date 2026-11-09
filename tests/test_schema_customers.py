@@ -88,6 +88,8 @@ def _common(r):
     assert all(set(h) == {"doc_id", "rrf", "vector_rank", "keyword_rank", "vol", "fields"} and h["vol"] == r["docs"][0]["vol"]
                for h in r["hits"])
     assert r["export_status"] == 200 and r["export_check"]["not_reviewed"] == 0
+    # 기본 흐름도 미확정을 센다 (사용자 결정 2026-11-09): 검사 목록이 없으니 모든 건이 미확정 — 출력은 막지 않는다
+    assert r["export_check"]["unconfirmed"] == len(r["docs"])
     assert all(len(rows) == 1 + (len(r["docs"]) if i else 1) for i, rows in enumerate(r["xlsx"].values()))
     return names
 
