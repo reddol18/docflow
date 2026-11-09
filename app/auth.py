@@ -353,6 +353,8 @@ def _audited(e):
 # ---------- 시도 제한 (인증 전 경로) ----------
 # 계정 이름별 창(대입)과 IP별 창(TRUST_PROXY일 때만). 전체 창은 두지 않는다: 누구나 채워 모든 사람의 로그인을 막을 수 있다.
 # Next 프록시는 X-Forwarded-For를 덮어쓰지 않고 클라이언트가 보낸 값을 그대로 넘긴다 → Next 뒤에서는 TRUST_PROXY를 켜지 않는다.
+# request.client는 늘 소켓 상대다: 이미지가 uvicorn을 --no-proxy-headers로 띄운다(Dockerfile CMD) — uvicorn 기본은 127.0.0.1에서 온
+# X-Forwarded-For를 믿어 client를 바꾸므로, port-forward 경로에서 보낸 XFF가 아래 루프백 쿠키 판단을 흔들 수 있었다 (issues/48).
 # 남는 위험(IP를 못 믿을 때 이름을 바꿔 가며 뿌리기)은 https://github.com/reddol18/docflow/issues/40
 
 _hits: dict[str, collections.deque] = {}
@@ -432,7 +434,8 @@ def drop_user_sessions(user_id):
 
 
 def _loopback(request):
-    """요청이 파드 안 루프백에서 왔나 — kubectl port-forward 경로 (uvicorn은 127.0.0.1의 X-Forwarded-For만 믿는다)"""
+    """요청이 파드 안 루프백에서 왔나 — kubectl port-forward 경로. request.client = 소켓 상대여야 한다
+    (uvicorn --no-proxy-headers, Dockerfile CMD — 헤더로 꾸밀 수 없음. tests/test_auth.py test_uvicorn_ignores_proxy_headers)"""
     host = request.client.host if request.client else ""
     try:
         a = ipaddress.ip_address(host)
@@ -632,6 +635,8 @@ def check_discovery(d, issuer, allow_http=False):
     docflow가 따라가는 주소(DISCOVERY_URLS)의 scheme·호스트·포트가 issuer와 같아야 한다 — 문서가 바뀌거나 가로채여도
     키·토큰 교환·로그인 화면을 다른 서버(메타데이터·내부 주소 포함)로 보내지 않게. 발급자와 다른 호스트에 JWKS를 두는
     제공자(예: 구글)는 받지 않는다 (남은 한계)."""
+    if not isinstance(d, dict):  # JSON이지만 객체가 아님 (목록·문자열·null)
+        raise RuntimeError("discovery 문서가 JSON 객체가 아님")
     if d.get("issuer") != issuer:
         raise RuntimeError("discovery 문서의 issuer가 설정과 다름")
     want = _origin(issuer)

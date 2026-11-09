@@ -129,6 +129,9 @@ def test_check_discovery_hosts():
             auth.check_discovery({k2: v for k2, v in good.items() if k2 != k}, ISS)  # 빠짐
     with pytest.raises(RuntimeError):
         auth.check_discovery({**good, "issuer": "https://evil.test/realms/x"}, ISS)
+    for not_obj in ([good], "x", None, 1):  # JSON이지만 객체가 아님 → AttributeError가 아니라 설정 오류(502·로그인 화면)
+        with pytest.raises(RuntimeError):
+            auth.check_discovery(not_obj, ISS)
     h = "http://keycloak:8080/realms/x"  # 클러스터 안 시험 제공자 (OIDC_ALLOW_HTTP=1)
     local = {"issuer": h, **{k: h + "/" + k for k in auth.DISCOVERY_URLS}}
     with pytest.raises(RuntimeError):
@@ -136,6 +139,26 @@ def test_check_discovery_hosts():
     assert auth.check_discovery(local, h, allow_http=True) is local
     with pytest.raises(RuntimeError):
         auth.check_discovery({**local, "jwks_uri": "http://keycloak:8081/certs"}, h, allow_http=True)
+
+
+def test_uvicorn_ignores_proxy_headers():
+    """루프백 쿠키 판단(auth._loopback)은 request.client = 소켓 상대여야 맞다 → 이미지의 uvicorn은 --no-proxy-headers.
+    빠지면 uvicorn 기본(127.0.0.1의 X-Forwarded-For를 믿음)으로 port-forward 경로의 XFF가 client를 바꾼다 (https://github.com/reddol18/docflow/issues/48)"""
+    from pathlib import Path
+    cmd = [line for line in (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8").splitlines() if line.startswith("CMD")]
+    assert len(cmd) == 1
+    args = json.loads(cmd[0][3:])
+    assert args[0] == "uvicorn" and "--no-proxy-headers" in args and "--proxy-headers" not in args
+    assert not any(a.startswith("--forwarded-allow-ips") for a in args)
+    k8s = (Path(__file__).parents[1] / "k8s" / "docs.yaml").read_text(encoding="utf-8")
+    assert "FORWARDED_ALLOW_IPS" not in k8s and "uvicorn" not in k8s  # 매니페스트가 명령·설정을 덮지 않는다
+
+
+def test_loopback_uses_socket_peer_only():
+    def req(host, xff=None):
+        return type("R", (), {"client": type("C", (), {"host": host})(), "headers": {"x-forwarded-for": xff} if xff else {}})()
+    assert auth.cookie_mode(req("127.0.0.1", xff="192.168.0.5"))[2] is False  # 헤더는 보지 않는다 — 소켓 상대만
+    assert auth.cookie_mode(req("10.42.0.9", xff="127.0.0.1"))[2] is True  # web 파드에서 XFF로 루프백을 꾸며도 __Host-
 
 
 def test_rate_limit(monkeypatch):

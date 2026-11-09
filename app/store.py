@@ -22,6 +22,33 @@ PG_URL = os.environ.get("PG_URL", "postgresql://docflow@postgres:5432/docflow")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
 COLLECTION = "documents"
 KST = dt.timezone(dt.timedelta(hours=9))
+PG_TLS_MODES = ("require", "verify-ca", "verify-full")
+
+
+def check_transport(env=os.environ):
+    """배포 표시 DOCFLOW_REQUIRE_TLS=1(k8s/docs.yaml)이면 안쪽 통신이 평문·무키일 때 시작을 멈춘다 (https://github.com/reddol18/docflow/issues/48).
+    PG_URL(또는 PGSSLMODE)의 sslmode가 require 이상, QDRANT_URL이 https, QDRANT_API_KEY_FILE이 있어야 한다.
+    표시가 없으면(이 PC 시험 PGlite·개발) 아무것도 보지 않는다 — 기본값은 개발용 평문 그대로."""
+    if env.get("DOCFLOW_REQUIRE_TLS") != "1":
+        return
+    from psycopg import Error as PgError
+    from psycopg.conninfo import conninfo_to_dict
+    try:
+        mode = conninfo_to_dict(env.get("PG_URL", PG_URL)).get("sslmode") or env.get("PGSSLMODE")
+    except (ValueError, PgError):  # 형식 오류도 멈춤 (값은 비밀번호가 있을 수 있어 싣지 않음)
+        raise RuntimeError("DOCFLOW_REQUIRE_TLS: PG_URL을 읽지 못함") from None
+    bad = []
+    if mode not in PG_TLS_MODES:
+        bad.append("PG_URL sslmode가 require·verify-ca·verify-full이 아님")
+    if not env.get("QDRANT_URL", QDRANT_URL).startswith("https://"):
+        bad.append("QDRANT_URL이 https가 아님")
+    if not env.get("QDRANT_API_KEY_FILE"):
+        bad.append("QDRANT_API_KEY_FILE 없음")
+    if bad:
+        raise RuntimeError("DOCFLOW_REQUIRE_TLS=1인데 " + ", ".join(bad))
+
+
+check_transport()
 
 pool = ConnectionPool(PG_URL, open=False, min_size=1, max_size=8,
                       kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row})

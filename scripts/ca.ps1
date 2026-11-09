@@ -2,7 +2,7 @@
 내부 데모 CA (https://github.com/reddol18/docflow/issues/48). 이 PC에서만 돈다. 키·인증서 내용은 출력하지 않는다 (경로·지문·만료만).
 
   .\scripts\ca.ps1 init            CA 만들기 (한 번). 이미 있으면 멈춤
-  .\scripts\ca.ps1 issue           서버 인증서 발급·갱신: web(docflow.localhost)·postgres·qdrant(클러스터 안 이름) — 397일
+  .\scripts\ca.ps1 issue           서버 인증서 발급·갱신: web(docflow.localhost)·postgres·qdrant(클러스터 안 전체 이름) — 397일
   .\scripts\ca.ps1 show            지문·만료 보기
   .\scripts\ca.ps1 trust-command   브라우저가 CA를 믿게 하는 명령과 지우는 명령을 출력만 한다 (실행하지 않음)
 
@@ -12,7 +12,8 @@
   ca.key   CA 키 — 암호화(PKCS8). 암호는 ca.pass에 DPAPI(이 Windows 사용자에게 묶임)로 보관 → 다른 계정·PC에서는 열 수 없다
   ca.crt   CA 인증서 (공개 값 — k8s ConfigMap docflow-ca, Windows 신뢰 루트)
   issued\<web|postgres|qdrant>\tls.crt·tls.key   서버 인증서·키 (키는 k8s Secret으로만 보낸다)
-CA 인증서에는 이름 제약이 있다 (scripts/ca.py PERMITTED): docflow.localhost와 클러스터 안 postgres·qdrant 이름만, IP는 막힘.
+CA 인증서에는 이름 제약이 있다 (scripts/ca.py PERMITTED): docflow.localhost, postgres.docs.svc.cluster.local, qdrant.docs.svc.cluster.local만.
+IP는 막고 메일·URI는 쓸 수 없는 이름(.invalid)만. CA의 확장 키 용도는 serverAuth만.
 CA를 새로 만들려면: 신뢰 루트에서 지우고(trust-command의 제거 명령) 폴더를 지운 뒤 init → issue → tls_secrets.
 #>
 param(
@@ -26,6 +27,8 @@ $caCrt = Join-Path $dir "ca.crt"
 
 function Invoke-Ca([string]$cmd, [string]$pass) {
     Push-Location $root
+    $lock = Join-Path $root "uv.lock"
+    $hadLock = Test-Path $lock  # 실행 전에 없던 uv.lock만 지운다 (uv run이 만들었을 때)
     $prevEnc = [Console]::OutputEncoding
     [Console]::OutputEncoding = [Text.Encoding]::UTF8  # ca.py 출력(한글)
     try {
@@ -36,7 +39,7 @@ function Invoke-Ca([string]$cmd, [string]$pass) {
     } finally {
         [Console]::OutputEncoding = $prevEnc
         Pop-Location
-        if (Test-Path (Join-Path $root "uv.lock")) { Remove-Item (Join-Path $root "uv.lock") }
+        if (-not $hadLock -and (Test-Path $lock)) { Remove-Item $lock }
     }
 }
 

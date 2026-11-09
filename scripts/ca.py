@@ -6,7 +6,8 @@
   ca.py issue <폴더>    서비스마다 서버 키(EC P-256)·인증서(397일)를 <폴더>/issued/<이름>/tls.{crt,key}에 (있으면 새로 바꿈)
   ca.py show  <폴더>    CA·발급한 인증서의 지문·만료
 
-CA 인증서에는 이름 제약(Name Constraints, critical)을 건다: 아래 SERVICES의 이름만 발급할 수 있고 IP 주소는 막는다.
+CA 인증서에는 이름 제약(Name Constraints, critical)을 건다: 아래 SERVICES의 이름만 발급할 수 있고 IP·메일·URI는 막는다.
+CA에도 확장 키 용도 serverAuth만 둔다.
 이 CA를 Windows 신뢰 루트에 넣어도, 키가 새면 다른 사이트(예: 은행)를 흉내 내는 인증서를 브라우저가 받지 않게.
 """
 import datetime as dt
@@ -22,15 +23,17 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 NS = "docs"
-# 서비스 → 인증서 이름(SAN). 첫 이름이 CN. 바꾸면 PERMITTED도 맞춘다
+# 서비스 → 인증서 이름(SAN) 하나씩 — 클라이언트가 실제로 부르는 이름만 (k8s/docs.yaml PG_URL·QDRANT_URL은 이 전체 이름을 쓴다.
+# 짧은 이름 postgres·qdrant는 넣지 않는다: 어느 네임스페이스·검색 도메인에서든 풀릴 수 있는 이름이라 제약이 넓어진다)
 SERVICES = {
     "web": ["docflow.localhost"],  # 브라우저 주소 https://docflow.localhost:<포트> (*.localhost는 루프백으로 풀린다)
-    "postgres": ["postgres", f"postgres.{NS}", f"postgres.{NS}.svc", f"postgres.{NS}.svc.cluster.local"],
-    "qdrant": ["qdrant", f"qdrant.{NS}", f"qdrant.{NS}.svc", f"qdrant.{NS}.svc.cluster.local"],
+    "postgres": [f"postgres.{NS}.svc.cluster.local"],
+    "qdrant": [f"qdrant.{NS}.svc.cluster.local"],
 }
-# 이름 제약: dNSName은 그 이름과 하위 이름을 허용한다 (RFC 5280 4.2.1.10)
-PERMITTED = ["docflow.localhost", "postgres", "qdrant", f"postgres.{NS}", f"qdrant.{NS}", f"postgres.{NS}.svc",
-             f"qdrant.{NS}.svc", f"{NS}.svc.cluster.local"]
+# 이름 제약: 위 이름 셋만 (dNSName 제약은 그 이름의 하위 이름도 허용한다 — RFC 5280 4.2.1.10, 피할 수 없음).
+# IP는 전부 막고, 메일(rfc822Name)·URI는 쓸 수 없는 이름(.invalid, RFC 6761)만 허용해 사실상 막는다
+PERMITTED = [n for names in SERVICES.values() for n in names]
+BLOCKED_DOMAIN = "docflow.invalid"
 CA_DAYS, LEAF_DAYS = 5 * 365 + 1, 397  # 397일: 브라우저의 서버 인증서 최대 유효 기간 정책에 맞춘다
 CA_NAME = x509.Name([x509.NameAttribute(NameOID.ORGANIZATION_NAME, "docflow demo"),
                      x509.NameAttribute(NameOID.COMMON_NAME, "docflow internal demo CA")])
@@ -75,9 +78,12 @@ def ca_cert_for(key, now):
                                          key_encipherment=False, data_encipherment=False, key_agreement=False,
                                          encipher_only=False, decipher_only=False), critical=True)
             .add_extension(x509.NameConstraints(
-                permitted_subtrees=[x509.DNSName(n) for n in PERMITTED],
+                permitted_subtrees=[x509.DNSName(n) for n in PERMITTED]
+                + [x509.RFC822Name(BLOCKED_DOMAIN), x509.UniformResourceIdentifier(BLOCKED_DOMAIN)],
                 excluded_subtrees=[x509.IPAddress(ipaddress.ip_network("0.0.0.0/0")), x509.IPAddress(ipaddress.ip_network("::/0"))]),
                 critical=True)
+            # 이 CA로 확인되는 인증서는 서버 인증서뿐 (코드 서명·메일·클라이언트 인증에 쓰지 못하게 — 이를 따르는 검증기 기준)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(pub), critical=False)
             .sign(key, hashes.SHA384()))
 

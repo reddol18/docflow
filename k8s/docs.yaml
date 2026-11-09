@@ -50,7 +50,9 @@ spec:
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
-        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, 100.64.0.0/10]
+        # 사설 + 링크 로컬·루프백·CGNAT + "이 네트워크"(0/8)·IETF 예약(192.0.0/24)·벤치마크(198.18/15)·멀티캐스트(224/4)·예약(240/4)
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, 100.64.0.0/10,
+                 0.0.0.0/8, 192.0.0.0/24, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4]
     ports: [{protocol: TCP, port: 443}]
 ---
 # docflow API(8000)는 web 파드(Next)에서만. 이 PC 개발 서버는 kubectl port-forward라 NetworkPolicy를 거치지 않는다
@@ -240,10 +242,14 @@ spec:
         image: docflow:dev
         imagePullPolicy: Never
         env:
-        # TLS 필수 + 서버 인증서·이름 확인(verify-full: 내부 CA, 이름 postgres) — require보다 강하다 (가로채기 막음, issues/48)
-        - {name: PG_URL, value: "postgresql://docflow@postgres:5432/docflow?sslmode=verify-full&sslrootcert=/etc/docflow-ca/ca.crt"}
+        # 배포 표시 (issues/48): 이 값이 있으면 PG_URL에 sslmode(require 이상)·QDRANT_URL https·Qdrant 키 파일이 없을 때 시작을 멈춘다
+        # (app/store.py check_transport). 이 PC 시험(PGlite)·개발은 표시가 없어 그대로
+        - {name: DOCFLOW_REQUIRE_TLS, value: "1"}
+        # TLS 필수 + 서버 인증서·이름 확인(verify-full: 내부 CA) — require보다 강하다 (가로채기 막음). 호스트는 인증서 이름(SAN)과 같은
+        # 전체 이름 — 짧은 이름 postgres·qdrant는 인증서에 없다 (scripts/ca.py SERVICES)
+        - {name: PG_URL, value: "postgresql://docflow@postgres.docs.svc.cluster.local:5432/docflow?sslmode=verify-full&sslrootcert=/etc/docflow-ca/ca.crt"}
         - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
-        - {name: QDRANT_URL, value: "https://qdrant:6333"}
+        - {name: QDRANT_URL, value: "https://qdrant.docs.svc.cluster.local:6333"}
         - {name: QDRANT_CA_FILE, value: /etc/docflow-ca/ca.crt}
         - {name: QDRANT_API_KEY_FILE, value: /etc/qdrant/api-key}  # app/store.py qdrant_args — 없거나 비면 시작할 때 멈춤
         - {name: OCR_THREADS, value: "4"}
@@ -345,12 +351,8 @@ spec:
       - name: next
         image: docflow-web:dev
         imagePullPolicy: Never
-        command: [node_modules/.bin/next, start, -H, 127.0.0.1, -p, "3000"]  # 운영 서버 (next build는 이미지 빌드 때)
-        env:
-        - {name: NODE_ENV, value: production}
-        - {name: DOCFLOW_URL, value: "http://docflow:8000"}  # 흐림 route(src/lib/masked.ts)가 실행 때 읽는다. /api rewrite는 빌드 때 같은 값
-        - {name: NEXT_TELEMETRY_DISABLED, value: "1"}
-        - {name: HOME, value: /tmp}
+        # 명령·환경(next start -H 127.0.0.1 -p 3000, NODE_ENV=production, DOCFLOW_URL 등)은 frontend/Dockerfile 한 곳에 둔다.
+        # /api → docflow 주소는 next build 때 박힌다 (바꾸려면 이미지를 다시 빌드)
         resources: {requests: {cpu: 100m, memory: 192Mi}, limits: {memory: 512Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
@@ -359,14 +361,12 @@ spec:
       - name: tls
         image: docflow-web:dev
         imagePullPolicy: Never
-        command: [node, tls-proxy.mjs]
-        env:
-        - {name: TLS_CERT, value: /tls/tls.crt}
-        - {name: TLS_KEY, value: /tls/tls.key}
+        command: [node, tls-proxy.mjs]  # 인증서 경로·받는 이름(docflow.localhost:8443)·시간 제한은 그 파일 머리 상수
         ports: [{containerPort: 8443}]
         resources: {requests: {cpu: 20m, memory: 48Mi}, limits: {memory: 128Mi}}
         # /login까지 통과해야 준비 — next가 죽어 있으면 502라 준비 안 됨 (kubelet은 인증서를 확인하지 않는다)
-        readinessProbe: {httpGet: {path: /login, port: 8443, scheme: HTTPS}, periodSeconds: 10}
+        # Host는 받는 이름과 같아야 한다 (다른 Host는 421)
+        readinessProbe: {httpGet: {path: /login, port: 8443, scheme: HTTPS, httpHeaders: [{name: Host, value: "docflow.localhost:8443"}]}, periodSeconds: 10}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
         - {name: tls, mountPath: /tls, readOnly: true}

@@ -64,7 +64,7 @@ def _forge(made, san):
     b = (x509.CertificateBuilder().subject_name(x509.Name([])).issuer_name(root.subject).public_key(leaf_key.public_key())
          .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(minutes=1))
          .not_valid_after(now + dt.timedelta(days=30))
-         .add_extension(x509.SubjectAlternativeName([san]), critical=True)
+         .add_extension(x509.SubjectAlternativeName(san if isinstance(san, list) else [san]), critical=True)
          .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
          .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
          .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False))
@@ -74,6 +74,8 @@ def _forge(made, san):
 @pytest.mark.parametrize("san,name", [
     (x509.DNSName("bank.example.com"), x509.DNSName("bank.example.com")),
     (x509.DNSName("localhost"), x509.DNSName("localhost")),  # 개발 서버 이름도 밖
+    (x509.DNSName("postgres"), x509.DNSName("postgres")),  # 짧은 이름도 밖 (클라이언트는 전체 이름을 쓴다)
+    (x509.DNSName("evil.docs.svc.cluster.local"), x509.DNSName("evil.docs.svc.cluster.local")),  # 같은 네임스페이스 다른 서비스
     (x509.IPAddress(ipaddress.ip_address("127.0.0.1")), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))),
 ])
 def test_name_constraints_block_other_names(made, san, name):
@@ -91,3 +93,24 @@ def test_init_does_not_overwrite_and_wrong_pass(made, monkeypatch):
         run(monkeypatch, "issue", str(made), stdin="y" * 44)  # 틀린 암호
     with pytest.raises(SystemExit):
         run(monkeypatch, "issue", str(made), stdin="")  # 암호 없음
+
+
+@pytest.mark.parametrize("san", [x509.RFC822Name("a@bank.example.com"), x509.UniformResourceIdentifier("https://bank.example.com/")])
+def test_name_constraints_block_mail_and_uri(made, san):
+    """메일·URI 이름은 쓸 수 없는 도메인(.invalid)만 허용 — CA 키로 서명해도 이름 확인 전에 제약에서 거절"""
+    ok = x509.DNSName("docflow.localhost")
+    root, leaf = _forge(made, [ok])
+    verifier(root, ok).verify(leaf, [])  # 대조군: 허용 이름만이면 통과
+    root, leaf = _forge(made, [ok, san])  # 허용 이름 + 메일·URI → 제약 위반
+    with pytest.raises(verification.VerificationError):
+        verifier(root, ok).verify(leaf, [])
+
+
+def test_ca_extensions(made):
+    root = load(made / "ca.crt")
+    eku = root.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    assert list(eku) == [x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]
+    nc = root.extensions.get_extension_for_class(x509.NameConstraints)
+    assert nc.critical
+    dns = [n.value for n in nc.value.permitted_subtrees if isinstance(n, x509.DNSName)]
+    assert dns == ["docflow.localhost", "postgres.docs.svc.cluster.local", "qdrant.docs.svc.cluster.local"]
