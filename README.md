@@ -58,9 +58,9 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 
 | 남는 곳 | 내용 | 원문 값 |
 |---|---|---|
-| `audit` 표 | 로그인·로그아웃·잠금, 처리 함수 앞에서 거절된 변경 요청, 업로드·실행·이어 가기·검토 저장·문서 수정·작업 시간 보내기마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름. 뒤에서 돈 실행의 끝(`run_done`: `ok` / `review_waiting` / `error`)도 시작한 사람으로 | 없음 |
+| `audit` 표 | 로그인·로그아웃·잠금, 처리 함수 앞에서 거절된 변경 요청, 업로드·실행·이어 가기·검토 저장·문서 수정·작업 시간 보내기마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름. 뒤에서 돈 실행의 끝(`run_done`: `ok` / `review_waiting` / `budget_stop`(비용 한도 멈춤, https://github.com/reddol18/docflow/issues/7) / `error`)도 시작한 사람으로 | 없음 |
 | `edits` 표 | 고친 칸의 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/10) | 있음 |
-| `events` 표 (진행 화면) | 노드 시작·끝·오류. 오류는 분류 코드(`budget`·`llm`·`db`·`vector`·`network`·`storage`·`internal`)와 짧은 문구만 | 일부 있음 — 손글씨 판독 값(문서번호·일자), 사용자 이름 |
+| `events` 표 (진행 화면) | 노드 시작·끝·오류·한도 멈춤(`budget` — 오류가 아님, 철 단계 `budget`). 오류는 분류 코드(`budget`·`llm`·`db`·`vector`·`network`·`storage`·`internal`)와 짧은 문구만 | 일부 있음 — 손글씨 판독 값(문서번호·일자), 사용자 이름 |
 | 서버 로그 (표준 오류) | 오류 traceback. 키·Bearer/Basic·JWT, 이름이 key·secret·token·password로 끝나는 값, 주소 속 비밀번호는 `***`로 가림 (`app/errors.py`) | 예외 문구에 실명 등이 들어 있으면 남음 |
 
 - **인증 사건** (https://github.com/reddol18/docflow/issues/63): 로그인 성공(`login`/`ok`, 방식 `local`·`oidc`), 실패(`login`/`failed` + 사유 분류), 로그아웃(`logout`/`ok`), 잠금(`lockout`/`locked` — 잠그게 된 실패는 실패 행 대신 이 한 행). 실패 사유: `bad_password`·`unknown_user`·`locked`·`disabled`·`no_password`·`busy`(동시 시도 중)·`csrf`·`rate_limited`, OIDC는 `oidc_error`·`oidc_state`·`oidc_expired`·`oidc_verify`·`oidc_role`. 응답은 지금처럼 늘 같은 문구라 사유는 감사 로그에만 있다.

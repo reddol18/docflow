@@ -17,6 +17,10 @@ export default function Dashboard() {
   const spent = list[0]?.spent_today_usd ?? 0;
   const cost = list.reduce((s, v) => s + v.usage.reduce((a, u) => a + u.usd, 0), 0);
   const waiting = list.filter((v) => v.stage === "review");
+  const budgetStopped = list.filter((v) => v.stage === "budget");
+  const budget = list[0]?.budget; // 오늘 예산은 철과 상관없이 같다 (색인·수정 / 검색·질문 따로)
+  const budgetLine = (label: string, b?: { used: number; held: number; limit: number }) =>
+    b ? `${label} ${usd(b.used + b.held)} / ${usd(b.limit)}` : null;
   const admin = can(useMe(), "admin"); // 올리기·실행은 관리 역할만 (서버도 403으로 막음)
 
   return (
@@ -31,8 +35,27 @@ export default function Dashboard() {
           value={flagged}
           sub={docs ? `${Math.round((flagged / docs) * 100)}% · 나머지는 자동 통과` : undefined}
         />
-        <Stat label="GPT 비용 (누적)" value={usd(cost)} sub={`오늘 ${usd(spent)} / 한도 $3`} />
+        <Stat
+          label="GPT 비용 (누적)"
+          value={usd(cost)}
+          sub={
+            budget
+              ? [budgetLine("오늘 색인", budget.index), budgetLine("검색", budget.query)].filter(Boolean).join(" · ")
+              : `오늘 ${usd(spent)}`
+          }
+        />
       </div>
+
+      {budgetStopped.length > 0 && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          오늘 비용 한도에 닿아 멈춘 철 (오류 아님 — 한도가 풀리면 진행 화면에서 이어 갑니다):{" "}
+          {budgetStopped.map((v) => (
+            <Link key={v.vol} href={`/volumes/${encodeURIComponent(v.vol)}`} className="mr-3 font-medium underline">
+              {v.vol}
+            </Link>
+          ))}
+        </div>
+      )}
 
       {waiting.length > 0 && (
         <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">

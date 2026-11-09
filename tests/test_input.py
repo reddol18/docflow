@@ -76,8 +76,9 @@ def test_review_form_value_limit(main, monkeypatch):
 
 
 def test_search_ask_limits(main, monkeypatch):
-    monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k: [])
-    monkeypatch.setattr(main.llm, "answer", lambda q, hits: "답")
+    monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k, user=None: [])
+    monkeypatch.setattr(main.llm, "answer", lambda q, hits, user_id=None: "답")
+    monkeypatch.setattr(main.store, "take_quota", lambda *a: None)  # 호출 제한은 test_budget_pg에서
     c = TestClient(main.app)
     ok = "가" * main.Q_MAX
     assert c.get("/search", params={"q": ok}, headers=ADMIN).status_code == 200
@@ -87,6 +88,25 @@ def test_search_ask_limits(main, monkeypatch):
         assert c.get("/search", params={"q": "농지", "k": k}, headers=ADMIN).status_code == want, k
     assert c.get("/ask", params={"q": ok}, headers=ADMIN).status_code == 200
     assert c.get("/ask", params={"q": ok + "가"}, headers=ADMIN).status_code == 422
+
+
+def test_search_ask_rate_and_budget_responses(main, monkeypatch):
+    """두 경로 모두 호출 제한을 거치고(넘으면 429 + Retry-After), 검색·질문 예산이 차면 503 + 공개 문구
+    (https://github.com/reddol18/docflow/issues/7). 실제 셈은 test_budget_pg"""
+    seen = []
+    monkeypatch.setattr(main.store, "take_quota", lambda key, route, wins: seen.append((route, [w[0] for w in wins])) or "min")
+    c = TestClient(main.app)
+    for path in ("/search", "/ask"):
+        r = c.get(path, params={"q": "가상"}, headers=ADMIN)
+        assert r.status_code == 429 and r.headers["retry-after"] == "60"
+    assert seen == [("search", ["min", "day"]), ("ask", ["min", "day"])]
+    monkeypatch.setattr(main.store, "take_quota", lambda *a: None)
+
+    def over(*a, **k):
+        raise main.llm.BudgetExceeded("query 예산 한도 (가상)")
+    monkeypatch.setattr(main, "hybrid", over)
+    r = c.get("/ask", params={"q": "가상"}, headers=ADMIN)
+    assert r.status_code == 503 and r.json()["code"] == "budget" and "가상" not in r.text and int(r.headers["retry-after"]) > 0
 
 
 def test_upload_requires_jpeg(main, tmp_path, monkeypatch):

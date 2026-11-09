@@ -24,8 +24,8 @@
   GET   /review/{vol}                  사람 검토 화면 → 아래 POST로 고친 값을 넣으면 흐름이 이어진다
   POST  /review/{vol}                  검토 화면 폼 제출
   POST  /review/{vol}/json             검토 값을 JSON으로 제출 (스크립트·Next 검토 화면)
-  GET   /search                        ?q=&year_from=&year_to=&k= 벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침
-  GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다
+  GET   /search                        ?q=&year_from=&year_to=&k= 벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침 (사용자별 호출 제한)
+  GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다 (사용자별 호출 제한)
   GET   /graph                         흐름 그림 (mermaid)
   GET   /schema                        색인 칸 스키마 (보이는 칸·rule·손글씨 칸, 검색 열) — 화면이 칸 목록을 여기서 받는다
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
@@ -133,6 +133,19 @@ async def llm_off(request: Request, exc: llm.LLMOff):
     """LLM을 쓰지 않는 설치(LLM_PROVIDER=off)에서 LLM이 필요한 요청 — 화면엔 errors 공개 문구만, 설정 이름은 서버 로그에"""
     print(f"[llm_off] {request.method} {request.url.path}: {exc}", file=sys.stderr, flush=True)
     return JSONResponse(errors.public(exc), status_code=503)
+
+
+@app.exception_handler(llm.BudgetExceeded)
+async def budget_exceeded(request: Request, exc: llm.BudgetExceeded):
+    """요청 안에서 부른 LLM이 그날 예산에 걸림 (검색·질문은 query 예산, 문서 수정 임베딩은 index 예산) — 오류가 아니라
+    한도라 503 + Retry-After(다음 날 0시 KST까지). 화면엔 errors 공개 문구만"""
+    print(f"[budget] {request.method} {request.url.path}: {exc}", file=sys.stderr, flush=True)
+    return JSONResponse(errors.public(exc), status_code=503, headers={"Retry-After": str(_until_tomorrow())})
+
+
+def _until_tomorrow():
+    _, start = store.kst_day()
+    return max(1, int((start + dt.timedelta(days=1) - dt.datetime.now(store.KST)).total_seconds()))
 
 
 @app.exception_handler(store.LockBusy)
@@ -295,6 +308,12 @@ def submit(vol, arg, user=None, reserved=False):
             else:
                 store.event(vol, "run", "end", None)
                 audit_safe(user, "run_done", vol, None, "ok")
+        except llm.BudgetExceeded as e:
+            # 오류가 아니라 한도 멈춤 (https://github.com/reddol18/docflow/issues/7): 체크포인트까지 한 일은 남고, 철 단계는
+            # 'budget'으로 보인다 (_stage). 한도가 풀리면(다음 날·한도 올림) /resume으로 이어 간다
+            print(f"run {vol} budget stop: {e}", file=sys.stderr, flush=True)
+            store.event(vol, "run", "budget", None, **errors.public(e))
+            audit_safe(user, "run_done", vol, None, "budget_stop")
         except Exception as e:
             errors.log_exception(f"run {vol}")  # 상세는 서버 로그에만 (키 꼴 문자열은 가림)
             store.event(vol, "run", "error", None, **errors.public(e))  # 화면엔 분류 코드만
@@ -491,7 +510,10 @@ def _stage(vol, snap):
         return "review"
     if vol in running:
         return "running"
-    return _flow_stage(snap)
+    stage = _flow_stage(snap)
+    if stage == "stopped" and store.last_run_phase(vol) == "budget":
+        return "budget"  # 비용 한도로 멈춤 — 끊긴 철(stopped)과 같이 /resume으로 이어 간다
+    return stage
 
 
 def _flow_stage(snap):
@@ -525,6 +547,7 @@ def summary(vol):
         "indexed": v.get("indexed"),
         "usage": store.usage_summary(vol),
         "spent_today_usd": round(store.spent_today(), 6),
+        "budget": store.budget_today(llm.LIMITS),  # 오늘 예산 {index·query: {used, held, limit}}
     }
 
 
@@ -1248,7 +1271,7 @@ def _export_volumes(vols, need_done):
         if stage != "done":
             if need_done and vols:
                 raise HTTPException(409, f"색인이 끝나지 않은 철: {v} ({stage})")
-            if not vols or stage not in ("review", "stopped"):
+            if not vols or stage not in ("review", "stopped", "budget"):
                 continue  # 고르지 않았으면 끝난 철만, 골랐으면 문서가 있는 단계만 (검토 대기 건을 세려고)
         vals = snap.values or {}
         out.append((v, vals.get("pages", []), vals.get("docs", [])))
@@ -1406,9 +1429,10 @@ def ranked(q, vec, year_from=None, year_to=None):
     return v, kw, score, sorted(score, key=score.get, reverse=True)
 
 
-def hybrid(q, year_from=None, year_to=None, k=10):
-    # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다
-    vec = llm.embed("-", [q])[0]
+def hybrid(q, year_from=None, year_to=None, k=10, user=None):
+    # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다.
+    # 질의 임베딩은 검색·질문 예산(query) — 다 쓰면 BudgetExceeded → 503 (budget_exceeded 처리기)
+    vec = llm.embed("-", [q], scope="query", user_id=getattr(user, "id", None))[0]
     v, kw, score, order = ranked(q, vec, year_from, year_to)
     top = order[:k]
     rows = store.get_documents(top)
@@ -1421,19 +1445,57 @@ def hybrid(q, year_from=None, year_to=None, k=10):
             for k in top if k in rows]
 
 
+# ---------- /search·/ask 사용자별 호출 제한 (https://github.com/reddol18/docflow/issues/7, API6) ----------
+# 분당·하루 상한 (통제자 결정 2026-11-10, 환경변수로 바꿈). 넘으면 그 사용자만 429 + Retry-After — 다른 사용자는 그대로.
+# 셈은 Postgres(api_quota)에: 하루 쿼터는 재시작·배포 뒤에도 이어져야 하고, 분당 제한도 같은 문장으로 함께 세면
+# Pod가 여러 개가 되어도(https://github.com/reddol18/docflow/issues/16) 그대로 맞는다. 요청마다 짧은 문장 2개.
+# 사용자 키는 users.id (인증을 끈 개발 모드는 사용자 이름). 상한 0 = 그 창은 막지 않음
+RATE = {route: {"min": int(os.environ.get(f"{route.upper()}_PER_MIN", per_min)),
+                "day": int(os.environ.get(f"{route.upper()}_PER_DAY", per_day))}
+        for route, per_min, per_day in (("ask", 10, 200), ("search", 30, 1000))}
+
+
+def _quota_windows(route, now=None):
+    now = now or dt.datetime.now(store.KST)
+    _, day = store.kst_day(now)
+    lim = RATE[route]
+    wins = [("min", now.replace(second=0, microsecond=0), lim["min"]), ("day", day, lim["day"])]
+    return [w for w in wins if w[2] > 0]
+
+
+def rate_limit(route):
+    def dep(user: Viewer):
+        key = str(user.id) if user.id is not None else f"name:{user.username}"
+        full = store.take_quota(key, route, _quota_windows(route))
+        if full:  # 누가 얼마나 막혔나는 서버 로그로 (질의 글자는 남기지 않는다)
+            print(f"[rate] {route} {full} 상한 — user {key}", file=sys.stderr, flush=True)
+        if full == "min":
+            raise HTTPException(429, f"{route} 호출이 많습니다 — 분당 {RATE[route]['min']}회", headers={"Retry-After": "60"})
+        if full == "day":
+            raise HTTPException(429, f"{route} 오늘 호출 한도 {RATE[route]['day']}회를 다 썼습니다",
+                                headers={"Retry-After": str(_until_tomorrow())})
+        return user
+    return dep
+
+
+SearchUser = Annotated[auth.User, Depends(rate_limit("search"))]  # viewer 이상 + 호출 제한
+AskUser = Annotated[auth.User, Depends(rate_limit("ask"))]
+
+
 @app.get("/search")
-def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], _: Viewer, year_from: int | None = None,
+def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: SearchUser, year_from: int | None = None,
            year_to: int | None = None, k: Annotated[int, Query(ge=1, le=50)] = 10):
-    return hybrid(q, year_from, year_to, k)
+    return hybrid(q, year_from, year_to, k, user)
 
 
 @app.get("/ask")
-def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], _: Viewer, year_from: int | None = None,
+def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: AskUser, year_from: int | None = None,
         year_to: int | None = None):
-    hits = hybrid(q, year_from, year_to, 5)
+    hits = hybrid(q, year_from, year_to, 5, user)
     for h in hits:
         h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
-    return {"answer": llm.answer(q, hits), "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
+    return {"answer": llm.answer(q, hits, user_id=getattr(user, "id", None)),
+            "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
 
 
 @app.get("/graph", response_class=PlainTextResponse)

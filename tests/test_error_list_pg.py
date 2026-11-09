@@ -50,7 +50,7 @@ def main(pg_store, monkeypatch, tmp_path):
 
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snap, update_state=update_state,
                                                     invoke=lambda arg, cfg: None))
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     monkeypatch.setattr(main.store, "upsert_vectors", lambda docs, vecs: None)
     monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "x")
     wf = workflow.load(workflow.DIR / "three_stage.yaml")

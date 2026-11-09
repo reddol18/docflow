@@ -57,7 +57,7 @@ def env(pg_store, monkeypatch, tmp_path):
         s["docs"] = [new.get(d["doc_id"], d) for d in s["docs"]]
 
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=get_state, update_state=update_state))
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[1.0, 0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[1.0, 0.0]] * len(texts))
     monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "x")
     yield SimpleNamespace(main=main, q=q, states=states, nexts=nexts)
     with store.pool.connection() as c:

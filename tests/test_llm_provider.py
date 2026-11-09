@@ -143,7 +143,7 @@ def test_client_per_provider(monkeypatch, tmp_path, fake_openai):
 def test_local_calls_use_local_models_without_budget(monkeypatch, fake_openai):
     from app import store
     use(monkeypatch, LOCAL)
-    monkeypatch.setattr(store, "spent_today", lambda: pytest.fail("로컬 제공자는 한도(OpenAI 사용액)를 보지 않는다"))
+    monkeypatch.setattr(store, "reserve_budget", lambda *a: pytest.fail("로컬 제공자는 한도(OpenAI 비용)를 예약하지 않는다"))
     logged = []
     monkeypatch.setattr(store, "add_usage", lambda *a: logged.append(a))
     out = llm.extract("v", ["가상 줄"])
@@ -153,26 +153,96 @@ def test_local_calls_use_local_models_without_budget(monkeypatch, fake_openai):
     assert [(a[2], a[5]) for a in logged] == [("가상-추출", 0.0), ("가상-임베딩", 0.0)]  # usage 없는 응답도 0원으로 남김
 
 
-def test_openai_budget_and_max_tokens(monkeypatch, fake_openai):
-    """openai는 한도를 보고, 추출·답변에 출력 상한을 건다"""
+def fake_budget(monkeypatch, ok=True):
+    """예약·정산을 기록만 하는 가짜 (실제 Postgres 예약은 test_budget_pg). 기록: [("reserve", scope, est) | ("settle", …)]"""
     from app import store
-    monkeypatch.setattr(store, "add_usage", lambda *a: None)
+    rec = []
+    monkeypatch.setattr(store, "reserve_budget", lambda scope, day, start, est, limit: rec.append(("reserve", scope, est))
+                        or (len(rec) if ok else None))
+    monkeypatch.setattr(store, "settle_budget", lambda hold, scope, day, usd, row: rec.append(("settle", scope, usd, row)))
+    monkeypatch.setattr(store, "release_budget", lambda hold: rec.append(("release", hold)))
+    return rec
+
+
+def test_openai_budget_and_max_tokens(monkeypatch, fake_openai):
+    """openai는 부르기 전에 예약하고, 추출·답변에 출력 상한을 건다 (https://github.com/reddol18/docflow/issues/7)"""
     monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
-    seen = []
-    monkeypatch.setattr(store, "spent_today", lambda: seen.append(1) or 0.0)
+    rec = fake_budget(monkeypatch)
     llm.extract("v", ["가상 줄"])
-    llm.answer("가상 질문", [{"vol": "v1", "doc_id": "v1-0001", "body": "가상 본문"}])
-    assert len(seen) == 2
+    llm.answer("가상 질문", [{"vol": "v1", "doc_id": "v1-0001", "body": "가상 본문"}], user_id=7)
+    assert [(r[0], r[1]) for r in rec] == [("reserve", "index"), ("settle", "index"), ("reserve", "query"), ("settle", "query")]
     (_, ex), (_, an) = fake_openai.calls
-    assert ex["max_tokens"] == 512 == llm.EXTRACT_MAX_TOKENS and an["max_tokens"] == 1024 == llm.ANSWER_MAX_TOKENS
+    assert ex["max_tokens"] == 256 == llm.EXTRACT_MAX_TOKENS and an["max_tokens"] == 800 == llm.ANSWER_MAX_TOKENS
+    # 응답에 usage가 없으면 예약한 금액 그대로 정산 (모자라게 세지 않게). 답변 사용량 행에는 부른 사람
+    assert rec[1][2] == rec[0][2] > 0 and rec[3][2] == rec[2][2]
+    assert rec[3][3] == ("-", "answer", "gpt-4o-mini", 0, 0, 7)
+    # 예약 상한: 출력 상한 × 출력 단가가 들어 있다
+    assert rec[2][2] >= llm.ANSWER_MAX_TOKENS * llm.PRICE["gpt-4o-mini"][1] / 1e6
+
+
+def test_extract_truncated_goes_to_review(monkeypatch, fake_openai, capsys):
+    """추출 응답이 max_tokens에서 잘리면(JSON이 깨짐) 실행을 멈추지 않고 빈 값·확신도 0 → 검토 표시"""
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    fake_budget(monkeypatch)
+    trunc = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10, completion_tokens=256), choices=[SimpleNamespace(
+        finish_reason="length", message=SimpleNamespace(content='{"title": {"value": "가상'))])
+    monkeypatch.setattr(llm, "client", lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **a: trunc))))
+    out = llm.extract("v", ["가상 줄"])
+    assert out and all(c == {"value": "", "confidence": 0.0} for c in out.values())
+    assert "잘림" in capsys.readouterr().err
+
+
+def test_settles_actual_cost_and_releases_on_failure(monkeypatch, fake_openai):
+    """정산은 실제 토큰 비용 (예약보다 작다), 호출이 실패하면 예약만 지운다"""
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    rec = fake_budget(monkeypatch)
+    used = SimpleNamespace(prompt_tokens=7, completion_tokens=0)
+    monkeypatch.setattr(llm, "client", lambda: SimpleNamespace(embeddings=SimpleNamespace(
+        create=lambda **a: SimpleNamespace(usage=used, data=[SimpleNamespace(embedding=[0.0])]))))
+    llm.embed("v", ["가상"])
+    (_, _, est), (_, _, usd, row) = rec
+    assert usd == 7 * 0.02 / 1e6 < est and row == ("v", "embed", "text-embedding-3-small", 7, 0, None)
+
+    def boom(**a):
+        raise TimeoutError("가상 시간 초과")
+    monkeypatch.setattr(llm, "client", lambda: SimpleNamespace(embeddings=SimpleNamespace(create=boom)))
+    rec.clear()
+    with pytest.raises(TimeoutError):
+        llm.embed("v", ["가상"])
+    assert [r[0] for r in rec] == ["reserve", "release"]
+
+
+def test_budget_refused_before_call(monkeypatch, fake_openai):
+    """예약이 안 되면(한도) OpenAI 클라이언트를 만들지도 부르지도 않는다"""
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    fake_budget(monkeypatch, ok=False)
+    for call in (lambda: llm.extract("v", ["가상 줄"]), lambda: llm.embed("v", ["가"]), lambda: llm.answer("가상", []),
+                 lambda: llm.read_cell("v", "date", b"\x89PNG")):
+        with pytest.raises(llm.BudgetExceeded):
+            call()
+    assert fake_openai.made == [] and fake_openai.calls == []
+
+
+def test_unpriced_model_refused(monkeypatch, fake_openai):
+    """PRICE에 없는 모델: 시작할 때(설정 읽기) 멈추고, 그래도 부르면 OpenAI 호출 전에 거부 (https://github.com/reddol18/docflow/issues/7)"""
+    with pytest.raises(llm.UnpricedModel, match="EXTRACT_MODEL=gpt-가상-9"):
+        llm.load_provider({"LLM_PROVIDER": "openai", "EXTRACT_MODEL": "gpt-가상-9"})
+    with pytest.raises(llm.UnpricedModel, match="CHAT_MODEL"):
+        llm.load_provider({"CHAT_MODEL": "gpt-4.1"})  # 실제 있는 모델이어도 가격표에 없으면
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    rec = fake_budget(monkeypatch)
+    monkeypatch.setattr(llm, "PROVIDER", llm.Provider("openai", models={**llm.OPENAI_MODELS, "extract": "gpt-가상-9"}))
+    with pytest.raises(llm.UnpricedModel):
+        llm.extract("v", ["가상 줄"])
+    assert fake_openai.made == [] and fake_openai.calls == [] and rec == []  # 예약도 하지 않음
 
 
 def test_answer_cites_volume_and_doc(monkeypatch, fake_openai):
     """/ask 근거 표시는 [철/doc_id] — 두 철에 같은 쪽 이름이 있어도 어느 철 문서인지 가린다
     (https://github.com/reddol18/docflow/issues/50). 지시문·목록 표시·답변 읽기가 같은 꼴 (모델 호출 없음)"""
     from app import store
-    monkeypatch.setattr(store, "add_usage", lambda *a: None)
-    monkeypatch.setattr(store, "spent_today", lambda: 0.0)
+    fake_budget(monkeypatch)
     monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
     llm.answer("가상 질문", [{"vol": "va", "doc_id": "p-0001", "body": "가상 갑"},
                          {"vol": "vb", "doc_id": "p-0001", "body": "가상 을"}])
@@ -181,7 +251,7 @@ def test_answer_cites_volume_and_doc(monkeypatch, fake_openai):
     assert "[철/문서]" in llm.ANSWER_PROMPT
     assert llm.citations("가상 답 [vb/p-0001], [va/p-0001] 그리고 [vb/p-0001] [p-0002]") == [("vb", "p-0001"),
                                                                                          ("va", "p-0001")]
-    monkeypatch.setattr(store, "spent_today", lambda: llm.BUDGET)
+    monkeypatch.setattr(store, "reserve_budget", lambda *a: None)
     with pytest.raises(llm.BudgetExceeded):
         llm.extract("v", ["가상 줄"])
 
@@ -202,7 +272,7 @@ def test_llm_off_error_code():
 def _fake_volume(tmp_path, monkeypatch):
     from app import layout, ocr, store
     monkeypatch.setattr(store, "DATA", tmp_path)
-    monkeypatch.setattr(store, "spent_today", lambda: pytest.fail("off면 사용액도 보지 않는다"))
+    monkeypatch.setattr(store, "reserve_budget", lambda *a: pytest.fail("off면 예약도 하지 않는다"))
     monkeypatch.setattr(store, "add_usage", lambda *a: pytest.fail("off면 사용량을 남길 호출이 없다"))
     (tmp_path / "pages" / "v1").mkdir(parents=True)
     for p in ["v1-0001", "v1-0002", "v1-0003"]:
@@ -253,6 +323,36 @@ def test_off_runs_whole_flow_without_openai(tmp_path, monkeypatch, fake_openai, 
     for node in ("extract", "read"):  # 진행 화면(events)에 건너뜀이 드러난다
         assert sum(n == node and s == "end" and k.get("skipped") == "llm_off" for n, s, k in rec.events) == 2
     assert any(n == "index" and k.get("embedded") == 0 and k.get("indexed") == 2 for n, _, k in rec.events)
+
+
+def test_budget_stop_is_not_error(tmp_path, monkeypatch, fake_openai):
+    """실행 중 BudgetExceeded → 철이 오류가 아니라 한도 멈춤(budget)으로 (https://github.com/reddol18/docflow/issues/7).
+    진행 화면 이벤트도 error가 아니라 budget, 감사 결과 budget_stop. 체크포인트가 남아 /resume으로 이어 갈 수 있다"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app import graph, main, store
+    rec = _fake_volume(tmp_path, monkeypatch)
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    monkeypatch.setattr(store, "reserve_budget", lambda *a: None)  # 그날 색인 예산이 다 참
+    monkeypatch.setattr(main, "G", graph.build(MemorySaver()))
+    audits = []
+    monkeypatch.setattr(main, "audit_safe", lambda user, action, vol=None, doc_id=None, result="ok", **i:
+                        audits.append((action, result)))
+    main.submit("v1", {"vol": "v1", "review_mode": "auto"})
+    main.runner.submit(lambda: None).result()  # 일꾼이 하나라 앞선 실행이 끝날 때까지 기다린다
+
+    runs = [(s, k) for n, s, k in rec.events if n == "run"]
+    assert [s for s, _ in runs] == ["start", "budget"] and runs[-1][1]["code"] == "budget"
+    assert sum(n == "extract" and s == "budget" for n, s, _ in rec.events) >= 1
+    assert not [e for e in rec.events if e[1] == "error"]  # 오류 이벤트 없음
+    assert audits == [("run_done", "budget_stop")]
+    assert fake_openai.made == [] and fake_openai.calls == []  # 예약이 안 되어 부르지 않음
+    snap = main.G.get_state(main.cfg("v1"))
+    assert snap.next  # 멈춘 곳이 남는다 → /resume
+    monkeypatch.setattr(store, "last_run_phase", lambda vol: runs[-1][0])
+    assert main._stage("v1", snap) == "budget" and main._flow_stage(snap) == "stopped"
+    monkeypatch.setattr(store, "last_run_phase", lambda vol: "error")  # 다른 까닭으로 끊긴 철은 그대로 stopped
+    assert main._stage("v1", snap) == "stopped"
 
 
 def test_off_flags_other_schema(monkeypatch):

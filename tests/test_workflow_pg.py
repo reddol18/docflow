@@ -58,7 +58,7 @@ def main(pg_store, monkeypatch, tmp_path):
 
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snap, update_state=update_state,
                                                     invoke=lambda arg, cfg: None))
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     monkeypatch.setattr(main.store, "upsert_vectors", lambda docs, vecs: None)
     monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "x")
     return main
@@ -246,10 +246,10 @@ def test_failed_fix_does_not_move(main, monkeypatch):
     use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
     c = TestClient(main.app, raise_server_exceptions=False)
     assert approve(c, "w", "d03", "entry").status_code == 200
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: (_ for _ in ()).throw(TimeoutError("embed")))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: (_ for _ in ()).throw(TimeoutError("embed")))
     assert approve(c, "q", "d03", "qc", title="가상").status_code == 500
     assert where(c)["d03"]["stage"] == "qc"
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     r = approve(c, "q", "d03", "qc", title="가상").json()
     # 앞선 시도에서 칸은 이미 반영됐다 → 이번 차이는 없지만 고친 칸은 이력에서 세어 기록에 남는다
     assert (r["to"], r["fixed_fields"]) == ("supervisor", ["title"])
