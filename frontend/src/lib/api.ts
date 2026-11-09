@@ -33,6 +33,8 @@ export type FieldDef = {
   isad: string | null;
   rule: string | null; // 값을 만드는 코드 규칙 (app/graph.py RULES). 칸 이름 대신 이것으로 판단한다
   hw: string | null; // 보여 줄 잘라낸 손글씨 칸 (cropImage·Doc.hw 키). 없으면 손글씨 칸 아님
+  // 보여 줄 잘라 둔 원본 줄 (cropImage 종류 — 수신·제목, https://github.com/reddol18/docflow/issues/35). 못 찾은 문서는 404
+  crop?: string | null;
   // 칸 검증 규칙 (https://github.com/reddol18/docflow/issues/87). reasons = 이 칸에 붙을 수 있는 기계 검수 표시 사유 글자
   validate?: { rules: string[]; reasons: string[] } | null;
 };

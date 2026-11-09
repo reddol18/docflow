@@ -19,7 +19,7 @@
   POST  /workflow/{vol}/{doc_id}/approve  단계 승인 (고친 칸 함께). 마지막 단계면 확정
   POST  /workflow/{vol}/{doc_id}/reject   단계 반려 (사유 필수) → 정해진 앞 단계로, 다시 올라오면 재검수
   GET   /documents/{vol}/{doc_id}/stages  단계 승인·반려 기록 (단계·차례·사람·사유·고친 칸)
-  GET   /crops/{vol}/{name}            손글씨 칸을 잘라 둔 이미지
+  GET   /crops/{vol}/{name}            손글씨 칸·수신·제목 줄을 잘라 둔 이미지
   GET   /head/{vol}/{page}             쪽 위 45% 줄인 이미지 (검토용)
   GET   /review/{vol}                  사람 검토 화면 → 아래 POST로 고친 값을 넣으면 흐름이 이어진다
   POST  /review/{vol}                  검토 화면 폼 제출
@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, error_list, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
+from app import auth, error_list, errors, export, field_rules, flags, inspection, layout, llm, ocr, report, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app import upload as uploads  # 경로 함수 이름 upload와 겹치지 않게
@@ -432,7 +432,7 @@ def _place(vol, new, changed):
         for tmp, dest in changed:
             page = dest.stem
             store.ocr_path(vol, page).unlink(missing_ok=True)
-            for cell in flow.CELLS:
+            for cell in CROP_KINDS:
                 store.crop_path(vol, page, cell).unlink(missing_ok=True)
             os.replace(tmp, dest)
     except BaseException as e:
@@ -1044,8 +1044,10 @@ def documents(vol: str, _: Viewer):
     return (G.get_state(cfg(vol)).values or {}).get("docs", [])
 
 
-# 잘라낸 칸 이름 = 손글씨 규칙이 쓰는 칸 (app/graph.py CELLS — 스키마 칸 이름과 상관없다)
-CROP_RX = re.compile(r"[\w.-]+_(" + "|".join(map(re.escape, flow.CELLS)) + r")\.png")
+# 잘라낸 칸 이름 = 손글씨 규칙이 쓰는 칸 (app/graph.py CELLS) + 잘라 둔 인쇄 글자 줄 (app/layout.py LINE_KINDS: 수신·제목,
+# https://github.com/reddol18/docflow/issues/35) — 스키마 칸 이름과 상관없다. 다른 이름은 400
+CROP_KINDS = (*flow.CELLS, *layout.LINE_KINDS)
+CROP_RX = re.compile(r"[\w.-]+_(" + "|".join(map(re.escape, CROP_KINDS)) + r")\.png")
 
 
 @app.get("/crops/{vol}/{name}")
@@ -1076,6 +1078,7 @@ LABEL = schema_fields.labels(schema_fields.SCHEMA)
 FLAG_FIELD = schema_fields.flag_keys(schema_fields.SCHEMA)  # 김해: 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
 FLAG_OF = {v: k for k, v in FLAG_FIELD.items()}
 HW_OF = {f["name"]: c for f in schema_fields.SCHEMA["fields"] if (c := flow.hw_cell(f))}  # 칸 → 잘라낸 손글씨 칸 (rule로)
+LINE_OF = schema_fields.line_crops(schema_fields.SCHEMA)  # 칸 → 잘라 둔 인쇄 글자 줄 (스키마 crop:)
 
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
@@ -1103,6 +1106,9 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
             val = html.escape(d["fields"].get(k) or "")
             out.append(f"<div class=f><label>{html.escape(LABEL[k])}</label><input name='{did}__{k}' value=\"{val}\" "
                        f"maxlength={CELL_MAX}{ro}> <span class=flag>{html.escape(fl)}</span></div>")
+            line = LINE_OF.get(k)  # 잘라 둔 원본 줄 (수신·제목) — 있을 때만 (https://github.com/reddol18/docflow/issues/35)
+            if line and store.crop_path(vol, did, line).exists():
+                out.append(f"<img class=crop src='/crops/{html.escape(vol)}/{html.escape(did)}_{line}.png'>")
             cell = HW_OF.get(k)  # 칸 이름이 아니라 rule이 정한 잘라낸 칸 (https://github.com/reddol18/docflow/issues/72)
             if cell and (d.get("hw") or {}).get(cell, {}).get("text") is not None:
                 # 인라인 onerror 대신 파일이 있을 때만 그린다 (CSP가 인라인 스크립트를 막는다)
@@ -1441,6 +1447,7 @@ def schema_view(_: Viewer):
     화면은 칸 이름이 아니라 여기 정보로 판단한다 (https://github.com/reddol18/docflow/issues/72):
       rule  값을 만드는 코드 규칙 이름 (없으면 null) — 수신 보정 등 규칙별 안내
       hw    보여 줄 잘라낸 손글씨 칸 (/crops/{vol}/{doc_id}_{hw}.png, 문서 hw[hw]). 없으면 null
+      crop  보여 줄 잘라 둔 원본 줄 (/crops/{vol}/{doc_id}_{crop}.png — 수신·제목, 못 찾은 문서는 파일 없음 404). 없으면 null
       search_columns  검색 결과 열 (스키마 search.columns, 기본 보이는 칸 전부)
       validate  칸 검증 규칙 {rules, reasons} (규칙 없는 칸은 키 없음) — reasons는 이 칸의 기계 검수 표시 사유 글자 전부
       machine_flag_prefix  기계 검수 표시 사유의 머리 — 화면은 이것으로 표시 종류를 가린다 (규칙을 바꾼 뒤 남은 사유 포함)"""
@@ -1451,7 +1458,7 @@ def schema_view(_: Viewer):
         {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
          "editable": f["name"] in EDITABLE, "flag_key": schema_fields.flag_key(f),
          "isad": f.get("isad") or (f["name"] if "area" in f else None),  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
-         "rule": f.get("rule"), "hw": flow.hw_cell(f),
+         "rule": f.get("rule"), "hw": flow.hw_cell(f), "crop": f.get("crop"),
          # 칸 검증 규칙: 규칙 이름과 이 칸에 붙을 수 있는 기계 검수 표시 사유(정확한 글자 — 화면이 표시 종류를 가린다).
          # 규칙 없는 칸은 키 자체를 싣지 않는다 (규칙 없는 스키마의 응답은 지금과 같은 모양)
          **({"validate": {"rules": f["validate"].names(),

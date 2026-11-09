@@ -22,6 +22,63 @@ const MASK = process.env.NEXT_PUBLIC_MASK_IMAGES === "1";
 
 const conf = (n: number | undefined) => (n == null ? "" : n.toFixed(2));
 
+type Zoom = { src: string; alt: string };
+
+const CROP_RETRY_MS = 20000; // 아직 없는 이미지(보충·처리 중)를 다시 불러 보는 간격
+const CROP_RETRIES = 3;
+
+// 잘라 둔 원본 줄 (수신·제목, https://github.com/reddol18/docflow/issues/35). 못 찾은 문서는 파일이 없어(404) 자리째 숨긴다.
+// 처리·보충 스크립트가 나중에 만들 수 있으니 숨긴 뒤 몇 번 다시 불러 본다. 철 상태가 바뀌어도(부모 key) 처음부터 다시.
+// 문서를 바꾸면 key로 새로 그려 숨김 상태가 다음 문서에 남지 않게 한다
+function LineCrop({ src: base, alt, onOpen }: { src: string; alt: string; onOpen: (z: Zoom) => void }) {
+  const [failed, setFailed] = useState(false);
+  const [tries, setTries] = useState(0);
+  useEffect(() => {
+    if (!failed || tries >= CROP_RETRIES) return;
+    const t = setTimeout(() => {
+      setTries((n) => n + 1);
+      setFailed(false);
+    }, CROP_RETRY_MS);
+    return () => clearTimeout(t);
+  }, [failed, tries]);
+  if (failed) return null;
+  const src = tries ? `${base}?retry=${tries}` : base;
+  return (
+    <button type="button" onClick={() => onOpen({ src, alt })} title="클릭하면 크게 봅니다" className="block max-w-full cursor-zoom-in">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt={alt}
+        onError={() => setFailed(true)}
+        className={`my-1 max-h-16 max-w-full rounded border border-slate-200 bg-white ${MASK ? "blur-[3px]" : ""}`}
+      />
+    </button>
+  );
+}
+
+function ZoomView({ zoom, onClose }: { zoom: Zoom; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div
+      role="dialog"
+      aria-label={zoom.alt}
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/60 p-4"
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={zoom.src}
+        alt={zoom.alt}
+        className={`max-h-[90vh] max-w-[95vw] rounded bg-white shadow-xl ${MASK ? "blur-md" : ""}`}
+      />
+    </div>
+  );
+}
+
 export default function DocumentsPage({ params }: { params: Promise<{ vol: string }> }) {
   const vol = decodeURIComponent(use(params).vol);
   const { data: s } = usePoll(() => api.volume(vol), 3000, [vol]);
@@ -32,6 +89,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const { fixes, value, setValue, drop: dropFixes, clear: clearFixes } = useFieldFixes();
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [zoom, setZoom] = useState<Zoom | null>(null); // 크게 보는 잘라 둔 줄
   // 칸 목록·표시명은 서버의 색인 스키마에서 (https://github.com/reddol18/docflow/issues/9)
   // 검토 단계는 서버의 흐름 설정에서 (https://github.com/reddol18/docflow/issues/86)
   const { schema, wf, error: metaError } = useSchemaWorkflow();
@@ -174,6 +232,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
 
   return (
     <div className="space-y-4">
+      {zoom && <ZoomView zoom={zoom} onClose={() => setZoom(null)} />}
       <ErrorNote error={error ?? metaError} />
       <div className="flex flex-wrap items-center gap-3">
         <Link href="/" className="text-sm text-slate-500 hover:text-slate-800">
@@ -291,6 +350,14 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                         className={`w-full rounded-md border px-3 py-1.5 text-sm ${dirty ? "border-blue-500 bg-blue-50" : flags?.length ? "border-rose-300" : "border-slate-300"}`}
                       />
                       <div className="mt-1 space-y-1 text-xs text-slate-500">
+                        {f.crop && (
+                          <LineCrop
+                            key={`${cur.doc_id}_${f.crop}_${s?.stage ?? ""}`}
+                            src={cropImage(vol, cur.doc_id, f.crop)}
+                            alt={`${f.label} 원본 줄`}
+                            onOpen={setZoom}
+                          />
+                        )}
                         {cur.b[k] && (
                           <div>
                             GPT 텍스트 추출: <span className="font-mono">{cur.b[k]?.value || "–"}</span> (확신도 {conf(cur.b[k]?.confidence)})

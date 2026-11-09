@@ -37,7 +37,8 @@ fields:
     isad: scope_content
     note: ISAD(G)에 수신 요소가 없어 범위와 내용(3.3.1)에 잇는다
     prompt: '수신 (기관·사람·주소). "내부결재", "수신처 참조"도 그대로 값이다'
-  - {name: title, label: 제목, level: document, method: llm_extract, isad: title, prompt: 제목}
+    crop: recipient  # 검토 화면에 원본 수신 줄(수신처 참조면 쪽 아래 수신처 목록 줄)을 잘라 보여 준다
+  - {name: title, label: 제목, level: document, method: llm_extract, isad: title, prompt: 제목, crop: title}
 search:
   keyword: [title, recipient, docno]
   embed: [title, recipient, docno, date]
