@@ -188,7 +188,7 @@ def flags(docs, cfg=None, t=LEGACY_TARGETS):
 
 
 def machine(docs, schema):
-    """칸 검증 규칙(스키마 validate — app/field_rules.py) 위반 → 문서마다 {표시 키: ['기계 검수 · 칸 · 규칙']}.
+    """칸 검증 규칙(스키마 validate — app/field_rules.py) 위반 → 문서마다 {표시 키: [field_rules.reason 사유]}.
     표시 키는 칸의 flag_key. 규칙이 없는 스키마는 모두 빈 dict (https://github.com/reddol18/docflow/issues/87)"""
     out = []
     for vs in field_rules.violations(docs, schema):
@@ -202,23 +202,24 @@ def machine(docs, schema):
 def refresh(docs, schema):
     """사람이 값을 고친 뒤 기계 검수 표시를 다시 계산한다 (철 전체 — 철 안 중복은 다른 문서 값에 달려 있다).
     다른 표시(확신도·김해 규칙)는 그대로 둔다. 표시가 바뀐 문서만 새 dict, 나머지는 같은 객체를 돌려준다
-    (부른 쪽이 바뀐 문서만 저장한다). 규칙이 없는 스키마는 docs 그대로 — 지금과 같다.
+    (부른 쪽이 바뀐 문서만 저장한다). 바뀐 문서가 없으면 docs 그대로 — 규칙 없는 스키마는 지금과 같다.
     검토 제출(graph.review)·문서 수정·검사·단계 승인(main._edit_document)이 이것 하나를 부른다."""
-    if not field_rules.ruled(schema):
-        return docs
-    mine = field_rules.machine_reasons(schema)  # 이 스키마 규칙이 내는 사유만 바꿔 끼운다 (글자 머리로 고르지 않음)
-    out = []
+    # 기계 검수 사유는 서버 상수 머리(field_rules.PREFIX)로 가린다 — 스키마 규칙을 빼거나 바꾼 뒤 남은 예전 사유도 지운다.
+    # 바뀐 문서가 없으면 같은 목록 그대로 (규칙 없는 김해·ISAD(G)는 기계 검수 사유가 없어 늘 그대로)
+    out, changed = [], False
     for d, mf in zip(docs, machine(docs, schema)):
         old = d.get("flags") or {}
         fl = {}
         for k, rs in old.items():
-            keep = [x for x in rs if x not in mine]
+            keep = [x for x in rs if not field_rules.is_machine(x)]
             if keep:
                 fl[k] = keep
         for k, rs in mf.items():
             fl.setdefault(k, []).extend(rs)
-        out.append(d if fl == old else dict(d, flags=fl))
-    return out
+        same = fl == old
+        changed = changed or not same
+        out.append(d if same else dict(d, flags=fl))
+    return out if changed else docs
 
 
 def _order_conflict(d, day, docs, v, slack_days=3):

@@ -75,8 +75,8 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const stageLabel = (name: string | null) => wf?.stages.find((x) => x.name === name)?.label ?? name;
   const cells = (schema?.fields ?? []).filter((f) => f.level === "document");
   const titleKey = cells.find((f) => f.isad === "title")?.name ?? cells[0]?.name;
-  // 기계 검수 표시 사유 (서버가 칸마다 알려 줌) — 칩 색 구분용
-  const machine = useMemo(() => (schema?.fields ?? []).flatMap((f) => f.validate?.reasons ?? []), [schema]);
+  // 기계 검수 표시 사유의 머리 (서버 상수 /schema machine_flag_prefix) — 칩 색 구분용
+  const machinePrefix = schema?.machine_flag_prefix;
   const editor = can(useMe(), "reviewer"); // 보기 역할은 고치기·검토 버튼을 숨긴다 (서버도 403으로 막음)
 
   // 철 상태가 바뀔 때(검토 대기 → 처리 중 → 완료) 문서를 다시 읽는다
@@ -323,7 +323,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                     <div key={k}>
                       <div className="mb-1 flex items-center gap-2 text-sm">
                         <span className="w-16 font-medium">{f.label}</span>
-                        <FlagChips flags={flags} machine={machine} />
+                        <FlagChips flags={flags} machinePrefix={machinePrefix} />
                       </div>
                       <input
                         value={value(cur, k)}

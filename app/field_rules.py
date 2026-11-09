@@ -22,14 +22,18 @@
   1. 시작할 때 거부 (compile_pattern → _seq): 패턴 길이 PATTERN_MAX 초과, 그리고 되짚기가 길이에 따라 폭증하는 모양
      - 길이가 바뀌는 반복(*, +, {m,n}) 안에 다시 길이가 바뀌는 반복이나 선택(|)        예 (a+)+, (a|ab)*, (?>(a+)+b)
      - 고정 횟수 반복 {n>1} 안에 길이가 바뀌는 반복이나 선택                        예 (\\w*){30}, (a|.){60}
-     - 글자 집합이 겹치는 가변 반복 둘이, 앞 반복의 집합에 들지 않는 고정 글자 없이 이어짐 예 a*a*b, \\w+\\w+, .*x.*
+     - 글자 집합이 겹치는 가변 요소 둘이, 앞 요소의 집합에 들지 않는 고정 글자 없이 이어짐 예 a*a*b, \\w+\\w+, .*x.*, (a|)(a|)
        (선택적 부분(?, {0,1})은 건너뛸 수 있다고 보고 앞뒤를 이어 본다)
+     - 선택(|)은 기본이 가변 요소다. (가) 모든 갈래가 같은 고정 폭이고 빈 갈래가 없으며 (나) 어느 자리에서도 갈래끼리
+       글자 집합이 겹치지 않을 때만 고정 글자처럼 본다 — (시|군|구)는 고정, (a|), (a|aa), (a|[^-]|\\w)는 가변
+     - 안전띠: 패턴 전체의 가변 요소(가변 반복 + 가변 선택)는 VAR_MAX(6)개까지, 가변 선택들의 갈래 수 곱은 WAYS_MAX(64)까지
+       — 겹치지 않게 구분자로 떼어도 갈래 고르기는 곱으로 늘어난다 (예 (a|[^-]|\\w)- 를 16번)
      - 역참조·조건 그룹·앞뒤 보기(lookaround)·인라인 플래그((?i) 등)·이 판정이 모르는 구문은 모두 거부
      겹침 판정에서 \\d·\\w·\\s(와 부정)는 ASCII 밖 글자 전체를 포함한다고 넉넉히 본다 → [가-힣]+\\d+는 거부된다. [0-9]로 쓴다.
      받는 예: [A-Z0-9]{23}, [A-Z]{2}-[0-9]+, \\d{4}-\\d{2}-\\d{2}, (\\d{2}-){3}\\d{2}, [가-힣]+(시|군|구), a?b*c+
   2. 검사할 때: 값이 VALUE_MAX자를 넘으면 정규식을 돌리지 않고 위반('형식 검사 길이 초과')으로 본다.
-     1을 통과한 패턴은 한 자리를 두고 다툴 수 있는 가변 반복이 하나뿐이라 되짚기가 대략 값 길이에 비례한다 — 엄밀한 증명은
-     아니고, 허용 패턴의 상한 길이 최악 입력 시간을 시험(tests/test_field_rules.py)으로 잰다.
+     1을 통과한 패턴은 한 자리를 두고 다툴 수 있는 가변 요소가 이어지지 않고 가변 요소 수·갈래 곱도 묶여 있다 — 엄밀한
+     증명은 아니고, 허용 패턴의 상한 길이 최악 입력 시간을 시험(tests/test_field_rules.py)으로 잰다. 애매하면 거부한다.
 
 스키마 검사(시작할 때 멈춤): 모르는 규칙 키, 잘못된 값 형식, 깨진 정규식·위험한 정규식, length > max_length,
 코드표 파일 없음·경로 이탈·코드가 길이·정규식과 안 맞음, 사람이 고칠 수 없는 칸(숨김·고정값·철 단위)의 규칙.
@@ -51,7 +55,11 @@ LEN_MAX = 10000  # 길이 규칙 값의 상한 (칸 입력 상한보다 넉넉�
 PATTERN_MAX = 200  # 정규식 패턴 길이 상한
 VALUE_MAX = 200  # 정규식을 돌리는 값 길이 상한 (넘으면 위반)
 CODE_FILE_MAX = 1_000_000  # 코드표 파일 크기 상한 (바이트)
-MACHINE = "기계 검수"  # 검토 표시 사유 머리 (사람이 읽는 글). 기계 검수 사유인지는 머리가 아니라 machine_reasons로 가린다
+MACHINE = "기계 검수"
+# 기계 검수 사유의 머리 (서버 상수). 이 머리로 시작하는 사유는 이 모듈(reason)만 만든다 — 시험으로 고정
+# (tests/test_field_rules.py::test_machine_prefix_only_from_field_rules). 다시 계산할 때 지우기·미검토에서 빼기·화면 색 구분이
+# 이 머리로 가린다 → 스키마 규칙을 빼거나 바꿔도 예전 기계 검수 사유가 남지 않는다
+PREFIX = MACHINE + " · "
 
 # 규칙 → 위반 설명 (검토 화면에 보이는 글. 값은 싣지 않는다)
 TEXT = {"required": "필수 칸 빈칸", "length": "길이 {n}자 아님", "max_length": "{n}자 초과", "pattern": "형식(정규식) 불일치",
@@ -158,7 +166,7 @@ def _reject(why):
 
 
 def _has_var(items):
-    """가변 반복이나 선택이 들어 있나"""
+    """가변 반복이나 선택이 들어 있나 (선택은 고정 폭이어도 가변으로 본다 — 막는 쪽)"""
     for op, av in items:
         if op in _REPEATS:
             if av[0] != av[1] or _has_var(av[2]):
@@ -192,16 +200,76 @@ def _all_chars(items):
     return _norm(iv)
 
 
-def _open(pending, s, what):
+def _positions(items):
+    """고정 폭이면 자리마다 글자 집합 목록, 가변이거나 모르는 구문이면 None"""
+    out = []
+    for op, av in items:
+        if op in _CHAR_OPS:
+            out.append(_chars(op, av))
+        elif op == _sre.AT:
+            continue
+        elif op in _REPEATS:
+            lo, hi, sub = av
+            p = _positions(list(sub)) if lo == hi else None
+            if p is None:
+                return None
+            out.extend(p * lo)
+        elif op == _sre.SUBPATTERN:
+            p = _positions(list(av[-1]))
+            if p is None:
+                return None
+            out.extend(p)
+        elif op == _sre.ATOMIC_GROUP:
+            p = _positions(list(av))
+            if p is None:
+                return None
+            out.extend(p)
+        elif op == _sre.BRANCH:
+            p = _fixed_branch(av[1])
+            if p is None:
+                return None
+            out.extend(p)
+        else:
+            return None
+    return out
+
+
+def _fixed_branch(branches):
+    """선택을 고정(되짚기 없음)으로 볼 수 있으면 자리마다 글자 집합, 아니면 None.
+    (가) 모든 갈래가 같은 고정 폭이고 빈 갈래가 없으며 (나) 어느 자리에서도 갈래끼리 글자 집합이 겹치지 않을 때만 —
+    그러면 글자마다 갈 갈래가 하나뿐이다. 애매하면 None(가변)"""
+    ps = [_positions(list(b)) for b in branches]
+    if any(not p for p in ps) or len({len(p) for p in ps}) != 1:
+        return None
+    for i in range(len(ps[0])):
+        for x in range(len(ps)):
+            for y in range(x + 1, len(ps)):
+                if _overlap(ps[x][i], ps[y][i]):
+                    return None
+    return [_norm([iv for p in ps for iv in p[i]]) for i in range(len(ps[0]))]
+
+
+VAR_MAX = 6  # 패턴 전체의 가변 요소(가변 반복 + 고정이 아닌 선택) 상한 — 겹치지 않아도 갈래 고르기가 곱해지는 것을 묶는 안전띠
+WAYS_MAX = 64  # 고정이 아닌 선택들의 갈래 수 곱 상한
+
+
+def _open(pending, s, what, ctx, ways=1):
+    ctx["var"] += 1
+    ctx["ways"] *= ways
+    if ctx["var"] > VAR_MAX:
+        _reject(f"가변 요소(가변 반복·선택)가 {VAR_MAX}개를 넘음")
+    if ctx["ways"] > WAYS_MAX:
+        _reject(f"고정이 아닌 선택의 갈래 수 곱이 {WAYS_MAX}을 넘음")
     if any(_overlap(s, p) for p in pending):
-        _reject(f"글자 집합이 겹치는 가변 반복이 이어짐 ({what})")
+        _reject(f"글자 집합이 겹치는 가변 요소가 이어짐 ({what})")
     pending.append(s)
 
 
-def _seq(items, pending):
-    """차례로 이어지는 부분 패턴 검사. pending = 아직 끝나지 않은(뒤 글자와 다툴 수 있는) 가변 반복의 글자 집합 목록 — 고친다"""
+def _seq(items, pending, ctx):
+    """차례로 이어지는 부분 패턴 검사. pending = 아직 끝나지 않은(뒤 글자와 다툴 수 있는) 가변 요소의 글자 집합 목록 — 고친다.
+    ctx = 패턴 전체의 가변 요소 수·선택 갈래 곱"""
     for op, av in items:
-        if op in _CHAR_OPS:  # 고정 글자 하나: 이 글자를 먹을 수 없는 가변 반복은 여기서 끝난다
+        if op in _CHAR_OPS:  # 고정 글자 하나: 이 글자를 먹을 수 없는 가변 요소는 여기서 끝난다
             c = _chars(op, av)
             pending[:] = [p for p in pending if _overlap(c, p)]
         elif op == _sre.AT:
@@ -214,33 +282,31 @@ def _seq(items, pending):
                 if hi > 1 and inner_var:
                     _reject("가변 반복 안에 다시 가변 반복·선택")
                 if hi > 1 or not inner_var:
-                    _seq(sub, [])  # 안쪽 구문 확인 (안쪽에 가변 부분 없음)
-                    _open(pending, _all_chars(sub), "반복")
+                    _seq(sub, [], ctx)  # 안쪽 구문 확인 (안쪽에 가변 부분 없음)
+                    _open(pending, _all_chars(sub), "반복", ctx)
                 else:  # 선택적 부분(?, {0,1}) 안에 가변 부분 — 거치는 길과 건너뛰는 길을 함께 본다
                     taken = list(pending)
-                    _seq(sub, taken)
+                    _seq(sub, taken, ctx)
                     pending.extend(p for p in taken if p not in pending)
             elif lo > 1 and inner_var:
                 _reject(f"고정 횟수 반복 {{{lo}}} 안에 가변 반복·선택")
             elif lo >= 1:
-                _seq(sub, pending)  # 고정 횟수 — 한 번 이어 본 것과 같다
+                _seq(sub, pending, ctx)  # 고정 횟수 — 한 번 이어 본 것과 같다
         elif op == _sre.SUBPATTERN:
             if av[1] or av[2]:
                 raise RuleError("validate.pattern: 인라인 플래그((?i) 등)는 쓰지 않는다")
-            _seq(list(av[-1]), pending)
+            _seq(list(av[-1]), pending, ctx)
         elif op == _sre.ATOMIC_GROUP:
-            _seq(list(av), pending)
+            _seq(list(av), pending, ctx)
         elif op == _sre.BRANCH:
-            branches = [list(b) for b in av[1]]
-            var = False
-            for b in branches:
-                _seq(b, [])  # 갈래마다 따로 확인
-                var = var or _has_var(b)
-            s = _all_chars([(op, av)])
-            if var:
-                _open(pending, s, "선택")
-            else:
-                pending[:] = [p for p in pending if _overlap(s, p)]
+            for b in av[1]:
+                _seq(list(b), [], ctx)  # 갈래마다 안쪽 구문 확인
+            fixed = _fixed_branch(av[1])
+            if fixed is not None:  # 고정 폭·자리마다 서로 다른 글자 — 고정 글자들처럼 본다
+                for c in fixed:
+                    pending[:] = [p for p in pending if _overlap(c, p)]
+            else:  # 그 밖의 선택은 가변 요소 (빈 갈래·폭이 다른 갈래·겹치는 갈래)
+                _open(pending, _all_chars([(op, av)]), "선택", ctx, ways=len(av[1]))
         elif op in (_sre.GROUPREF, _sre.GROUPREF_EXISTS):
             raise RuleError("validate.pattern: 역참조·조건 그룹은 쓰지 않는다")
         elif op in (_sre.ASSERT, _sre.ASSERT_NOT):
@@ -262,7 +328,7 @@ def compile_pattern(p):
         raise RuleError(f"validate.pattern 정규식 오류: {e}") from None
     if tree.state.flags & ~re.UNICODE:
         raise RuleError("validate.pattern: 인라인 플래그((?i) 등)는 쓰지 않는다")
-    _seq(list(tree), [])
+    _seq(list(tree), [], {"var": 0, "ways": 1})
     return rx
 
 
@@ -390,7 +456,12 @@ def reason(f, k):
     """검토 표시 사유: '기계 검수 · 칸 표시명 · 위반 설명' — 값은 싣지 않는다"""
     r = f["validate"]
     n = r.length if k == "length" else r.max_length if k == "max_length" else None
-    return f"{MACHINE} · {f['label']} · {TEXT[k].format(n=n)}"
+    return f"{PREFIX}{f['label']} · {TEXT[k].format(n=n)}"
+
+
+def is_machine(r):
+    """기계 검수 표시 사유인가 (서버 상수 머리 PREFIX — 이 모듈만 만든다)"""
+    return isinstance(r, str) and r.startswith(PREFIX)
 
 
 def possible(f):
@@ -402,7 +473,6 @@ def possible(f):
 
 
 def machine_reasons(schema):
-    """이 스키마의 칸 규칙이 낼 수 있는 검토 표시 사유 전부 (정확한 글자). 기계 검수 표시인지는 이 집합으로 가린다 —
-    다시 계산(flags.refresh)·미검토 판정(export)·화면(/schema checks)이 같이 쓴다. 글자 머리로 고르지 않으므로 다른 사유를
-    잘못 지우지 않는다. 규칙 없는 스키마는 빈 집합"""
+    """이 스키마의 칸 규칙이 낼 수 있는 검토 표시 사유 전부 (정확한 글자) — /schema의 칸별 안내용. 표시를 지우거나 셀 때는
+    is_machine(머리)을 쓴다 (규칙을 바꾼 뒤 남은 예전 사유도 가리도록). 규칙 없는 스키마는 빈 집합"""
     return {reason(f, k) for f in ruled(schema) for k in possible(f)}

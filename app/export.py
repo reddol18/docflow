@@ -146,7 +146,6 @@ def build(t, volumes, unconfirmed=None, schema=None):
     https://github.com/reddol18/docflow/issues/87). rule 문제에는 칸 이름(field)·규칙 이름(rule), 양식에 그 칸 열이 있으면 열 이름"""
     vs, ds = t["sheets"]["volumes"], t["sheets"]["documents"]
     col_of = {c["source"][len("field."):]: c["name"] for c in ds["columns"] if c["source"].startswith("field.")}
-    machine = field_rules.machine_reasons(schema) if schema else set()
     vrows, drows, problems = [], [], []
     for vol, pages, docs in volumes:
         docs = ordered_docs(pages, docs)
@@ -159,7 +158,7 @@ def build(t, volumes, unconfirmed=None, schema=None):
             drows.append(_row(ds["columns"], vals, {"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"]}, problems))
             # 미검토는 사람이 봐야 하는 표시만 센다. 기계 검수 표시는 값을 고치면 풀리는 것이라 rule 문제로만 센다
             # (사람 검토 뒤 다른 문서 수정으로 새로 붙은 중복 표시가 '미검토'로 겹쳐 세지지 않게)
-            human = [x for rs in (d.get("flags") or {}).values() for x in rs if x not in machine]
+            human = [x for rs in (d.get("flags") or {}).values() for x in rs if not field_rules.is_machine(x)]
             if human and not d.get("reviewed"):
                 problems.append({"sheet": ds["title"], "vol": vol, "doc_id": d["doc_id"], "column": None,
                                  "kind": "not_reviewed"})

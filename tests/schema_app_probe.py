@@ -83,7 +83,8 @@ def edit_steps(c, steps):
     store.inspected_docs_by = lambda vol, uid: set()
     saved, flagged = [], []
     store.save_documents = lambda docs: saved.extend(d["doc_id"] for d in docs)
-    store.save_flags = lambda vol, items: flagged.extend(k for k, _ in items)  # 다른 문서는 표시만 쓴다
+    # 다른 문서 표시가 바뀌면 고친 문서 + 다른 문서 표시만을 한 번에 (store.save_edit)
+    store.save_edit = lambda vol, d, items: (saved.append(d["doc_id"]), flagged.extend(k for k, _ in items))
     ids = [d["doc_id"] for d in c.get(f"/volumes/{VOL}/documents").json()]
     out = []
     for s in steps:

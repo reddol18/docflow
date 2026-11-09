@@ -392,10 +392,12 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
         others = [x for k, x in new.items() if k != doc_id and x is not docs[k]]
         G.update_state(cfg(vol), {"docs": [d, *others]}, as_node="index")
         # Postgres 쓰기도 철 잠금 안에서 — 잠금 밖에서 쓰면 그 사이 다른 문서를 고친 요청의 값·표시를 낡은 것으로 덮는다.
-        # 다른 문서는 표시만 쓴다 (칸 값·검토 여부는 그 문서를 고치는 요청 몫)
-        store.save_documents([d])
+        # 다른 문서는 표시만 쓴다 (칸 값·검토 여부는 그 문서를 고치는 요청 몫). 둘은 한 트랜잭션(store.save_edit).
+        # 다른 문서 표시가 그대로면(규칙 없는 스키마는 늘) 지금처럼 이 문서만 저장
         if others:
-            store.save_flags(vol, [(x["doc_id"], x["flags"]) for x in others])
+            store.save_edit(vol, d, [(x["doc_id"], x["flags"]) for x in others])
+        else:
+            store.save_documents([d])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
     if llm.enabled():
@@ -1099,9 +1101,12 @@ def schema_view(_: Viewer):
       rule  값을 만드는 코드 규칙 이름 (없으면 null) — 수신 보정 등 규칙별 안내
       hw    보여 줄 잘라낸 손글씨 칸 (/crops/{vol}/{doc_id}_{hw}.png, 문서 hw[hw]). 없으면 null
       search_columns  검색 결과 열 (스키마 search.columns, 기본 보이는 칸 전부)
-      validate  칸 검증 규칙 {rules, reasons} (규칙 없는 칸은 키 없음) — reasons는 이 칸의 기계 검수 표시 사유 글자 전부"""
+      validate  칸 검증 규칙 {rules, reasons} (규칙 없는 칸은 키 없음) — reasons는 이 칸의 기계 검수 표시 사유 글자 전부
+      machine_flag_prefix  기계 검수 표시 사유의 머리 — 화면은 이것으로 표시 종류를 가린다 (규칙을 바꾼 뒤 남은 사유 포함)"""
     s = schema_fields.SCHEMA
-    return {"name": s["name"], "search_columns": list(s["search"]["columns"]), "fields": [
+    return {"name": s["name"], "search_columns": list(s["search"]["columns"]),
+            "machine_flag_prefix": field_rules.PREFIX,  # 기계 검수 표시 사유의 머리 (서버 상수) — 화면이 표시 종류를 가린다
+            "fields": [
         {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
          "editable": f["name"] in EDITABLE, "flag_key": schema_fields.flag_key(f),
          "isad": f.get("isad") or (f["name"] if "area" in f else None),  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸

@@ -90,25 +90,39 @@ def test_concurrent_edit_not_reverted_and_no_stale_flags(main, monkeypatch):
     """A(d01 → d02와 같은 제목)가 저장하는 중에 B가 d02 제목을 고친다. A의 저장 지점에서 B를 시작하고 잠깐 멈춘다 —
     쓰기가 철 잠금 밖이었으면 B가 그 사이 끝나고 A가 낡은 d02(값·표시)로 덮었다"""
     c = TestClient(main.app)
-    real = store.save_documents
-    b_result = {}
+    real_docs, real_edit = store.save_documents, getattr(store, "save_edit", None)
+    b_result, started = {}, []
 
     def run_b():
         b_result["res"] = c.patch("/documents/v1/d02", headers=h("w2"), json={"title": "가상 제목 B"})
 
     b = threading.Thread(target=run_b)
 
-    def slow_save(docs, schema=None):
-        if [d["doc_id"] for d in docs] == ["d01"] and not b.is_alive() and "res" not in b_result:
+    def interleave(first_id):
+        # A가 d01을 저장하는 순간 B를 시작하고 멈춘다. 저장 방식(통째·표시만·한 트랜잭션)과 상관없이 첫 문서로 고른다 —
+        # 쓰기가 철 잠금 밖이던 반영 전 코드(save_documents([d01, d02]))에서도 같은 지점에서 끼어들어 lost update로 실패한다
+        if first_id == "d01" and not started:
+            started.append(1)
             b.start()
             time.sleep(0.5)  # B가 끼어들 틈
-        return real(docs, schema)
 
-    monkeypatch.setattr(store, "save_documents", slow_save)
+    def slow_docs(docs, schema=None):
+        if docs:
+            interleave(docs[0]["doc_id"])
+        return real_docs(docs, schema)
+
+    def slow_edit(vol, d, items, schema=None):
+        interleave(d["doc_id"])
+        return real_edit(vol, d, items, schema)
+
+    monkeypatch.setattr(store, "save_documents", slow_docs)
+    if real_edit is not None:
+        monkeypatch.setattr(store, "save_edit", slow_edit)
     ra = c.patch("/documents/v1/d01", headers=h("w"), json={"title": "가상 제목 2"})
+    assert started, "B 수정이 시작되지 않음 — A의 d01 저장 지점을 못 찾았다 (시험이 아무것도 재지 않음)"
     b.join(timeout=30)
-    assert ra.status_code == 200 and b_result["res"].status_code == 200
-    db = rows()
+    assert not b.is_alive(), "B 수정이 30초 안에 끝나지 않음 (잠금 교착?)"
+    assert ra.status_code == 200 and b_result["res"].status_code == 200    db = rows()
     # B의 값이 남는다 (A가 d02 칸 값을 낡은 값으로 덮지 않음)
     assert db["d02"]["fields"]["title"] == "가상 제목 B" and db["d01"]["fields"]["title"] == "가상 제목 2"
     # 늦게 끝난 쪽이 낡은 표시를 쓰지 않는다: 지금 값으로는 중복이 없다

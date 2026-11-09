@@ -36,7 +36,8 @@ export type FieldDef = {
   // 칸 검증 규칙 (https://github.com/reddol18/docflow/issues/87). reasons = 이 칸에 붙을 수 있는 기계 검수 표시 사유 글자
   validate?: { rules: string[]; reasons: string[] } | null;
 };
-export type Schema = { name: string; search_columns: string[]; fields: FieldDef[] };
+// machine_flag_prefix: 기계 검수 표시 사유의 머리 (서버 상수, https://github.com/reddol18/docflow/issues/87)
+export type Schema = { name: string; search_columns: string[]; machine_flag_prefix?: string; fields: FieldDef[] };
 
 export type Doc = {
   doc_id: string;

@@ -128,9 +128,9 @@ def test_schemas_without_rules_unchanged(path, monkeypatch):
     monkeypatch.setattr(export, "FIELDS", tuple(f["name"] for f in fields.doc_fields(s)))  # 양식 확인은 이 스키마 칸으로
     assert field_rules.ruled(s) == []
     docs = [{"doc_id": "d0", "pages": ["d0"], "fields": {f["name"]: "" for f in s["fields"]},
-             "flags": {"x": ["기계 검수 · 예전 값"]}}]
+             "flags": {"x": ["LLM", "형식"]}}]
     assert flags.machine(docs, s) == [{}]
-    assert flags.refresh(docs, s) is docs  # 규칙이 없으면 아무것도 건드리지 않는다
+    assert flags.refresh(docs, s) is docs  # 규칙이 없으면(기계 검수 사유도 없으면) 아무것도 건드리지 않는다
     t = export.load_template(FIX / "export" / "isad_g.yaml") if path == fields.BASE else export.load_template()
     with_schema = export.build(t, [("v", ["d0"], docs)], schema=s)
     assert with_schema == export.build(t, [("v", ["d0"], docs)])
@@ -189,7 +189,11 @@ SAFE = ["[A-Z0-9]{23}", "[A-Z]{2}-\\d+", "\\d{4}-\\d{2}-\\d{2}", "(\\d{2}-){3}\\
         "a?b*c+", "[A-Z0-9 ]+x", "[^\\d]+-[0-9]+", "[가-힣 ]+", "[0-9]+(-[0-9]+)?", "^[A-Z]{3}[0-9]{2}$"]
 # 리뷰에서 실측한 우회 패턴 (원자 그룹 2.35초·이어진 a* 9.1초 등) — 모두 시작할 때 거부해야 한다
 BYPASS = ["(?>(a+)+b)", "a*a*a*a*a*a*a*b", "(\\w*){30}", "(a|.){60}", "\\w*\\w*\\w*\\w*\\w*\\w*\\w*\\w*",
-          "(?:ab|cd){3}", ".*x.*", "[가-힣]+\\d+", "(\\d+)?\\d+", "(?i)abc", "(?i:a)b", "(?=a)a", "(?<!a)b", "(a)(?(1)b|c)"]
+          "(?:ab|cd){3}", ".*x.*", "[가-힣]+\\d+", "(\\d+)?\\d+", "(?i)abc", "(?i:a)b", "(?=a)a", "(?<!a)b", "(a)(?(1)b|c)",
+          # 재리뷰 실측 (선택을 고정으로 잘못 봄): 20초 넘음·1.45초·1.89초
+          "(a|)" * 40 + "a" * 40, "(a|)" * 50, "(?:a|)" * 33, "(a|aa)" * 33, "(a|[^-]|\\w)-" * 16, "(a|)" * 25 + "a" * 25,
+          # 가변 요소 수·갈래 곱 상한 (겹치지 않게 떼어 놓아도)
+          "[0-9]+-" * 7, "(a|ab)-" * 7, "(a|b|c|d|e|f|g|h|aa)-" * 2]
 
 
 def test_safe_patterns_accepted():
@@ -199,8 +203,10 @@ def test_safe_patterns_accepted():
 
 @pytest.mark.parametrize("p", BYPASS)
 def test_bypass_patterns_rejected(p):
-    with pytest.raises(field_rules.RuleError, match="validate.pattern"):
+    assert len(p) <= field_rules.PATTERN_MAX  # 길이 상한이 아니라 모양 판정으로 거부되어야 한다
+    with pytest.raises(field_rules.RuleError, match="validate.pattern") as e:
         field_rules.compile_pattern(p)
+    assert "자까지" not in str(e.value)
 
 
 def _worst_inputs(n=field_rules.VALUE_MAX):
@@ -288,11 +294,13 @@ def test_unique_and_code_table_ignore_surrounding_spaces(tmp_path):
 
 
 def test_refresh_keeps_lookalike_reasons(tmp_path):
-    """기계 검수인지는 스키마 규칙이 낼 수 있는 사유 집합으로 가린다 — 머리 글자가 같아도 다른 사유는 지우지 않는다"""
+    """기계 검수인지는 서버 상수 머리(PREFIX '기계 검수 · ')로 가린다 — 비슷한 글자의 다른 사유는 지우지 않는다"""
     s = rules_schema(tmp_path)
-    other = "기계 검수 · 다른 원천의 사유"
-    a = dict(doc(0, rdid=RID, road_rank="R101"), flags={"rdid": [other, "기계 검수 · 도로 식별자 · 철 안 중복"]})
-    assert flags.refresh([a], s)[0]["flags"] == {"rdid": [other]}
+    other = "기계 검수 대기"  # 머리(구분자 포함)가 다르다
+    a = dict(doc(0, rdid=RID, road_rank="R101"), flags={"rdid": [other, "LLM", "기계 검수 · 도로 식별자 · 철 안 중복"]})
+    assert flags.refresh([a], s)[0]["flags"] == {"rdid": [other, "LLM"]}
+    assert not field_rules.is_machine(other) and field_rules.is_machine("기계 검수 · 아무 칸 · 아무 규칙")
+    # machine_reasons는 /schema 칸별 안내용 (지금 규칙이 낼 수 있는 사유)
     reasons = field_rules.machine_reasons(s)
     assert "기계 검수 · 도로 식별자 · 철 안 중복" in reasons and other not in reasons
     assert "기계 검수 · 조서명 · 30자 초과" in reasons and "기계 검수 · 조서명 · 필수 칸 빈칸" not in reasons
@@ -311,9 +319,53 @@ def test_machine_flags_not_counted_as_not_reviewed(tmp_path, monkeypatch):
     sm = export.summary(problems, rules=True)
     assert sm["not_reviewed"] == 1 and [p["doc_id"] for p in problems if p["kind"] == "not_reviewed"] == ["d1"]
     assert sm["rule"] == 2  # 두 문서 모두 코드표 위반
-    # 스키마를 안 주면(옛 호출) 지금처럼 표시가 있으면 미검토
+    # 스키마를 안 줘도(rule 문제는 안 셈) 기계 검수 표시는 미검토로 세지 않는다 — 머리는 서버 상수
     _, old = export.build(t, [("v", ["d0", "d1"], [only_machine, with_llm])])
-    assert export.summary(old)["not_reviewed"] == 2
+    assert export.summary(old)["not_reviewed"] == 1
+
+
+@pytest.mark.parametrize("edit", [
+    lambda raw: field(raw, "rdid").pop("validate"),  # 규칙을 뺌
+    lambda raw: field(raw, "rdid")["validate"].update(length=22, pattern="[A-Z0-9]{22}"),  # 길이를 바꿈
+    lambda raw: [f.pop("validate", None) for f in raw["fields"]],  # 스키마에서 규칙을 모두 뺌
+])
+def test_old_machine_reasons_removed_after_schema_change(tmp_path, edit):
+    """스키마 규칙을 빼거나 바꾼 뒤에도 예전 기계 검수 사유가 남지 않는다 (다시 계산·미검토 판정 모두 머리로 가린다)"""
+    old_s = rules_schema(tmp_path)
+    d = doc(0, rdid=RID[:-1], road_rank="R101")
+    fl = flags.machine([d], old_s)[0]
+    assert fl == {"rdid": ["기계 검수 · 도로 식별자 · 길이 23자 아님", "기계 검수 · 도로 식별자 · 형식(정규식) 불일치"]}
+    d = dict(d, flags={"rdid": ["LLM", *fl["rdid"]]}, reviewed=False)
+    new_s = rules_schema(tmp_path, edit)
+    # 바뀐 규칙으로는 22자 식별자가 위반이 아니다 → 예전 사유는 모두 지워지고 다른 표시(LLM)만 남는다
+    assert flags.refresh([d], new_s)[0]["flags"] == {"rdid": ["LLM"]}
+    # 다시 계산하기 전이라도 출력 전 검증은 예전 기계 검수 사유를 미검토로 세지 않는다 (LLM 표시 때문에 1건)
+    only_old = dict(d, flags={"rdid": fl["rdid"]})
+    _, problems = export.build(export.parse_template({"sheets": {
+        "volumes": {"title": "a", "columns": [{"name": "철", "source": "vol"}]},
+        "documents": {"title": "b", "columns": [{"name": "순번", "source": "doc.seq"}]}}}),
+        [("v", ["d0", "d1"], [only_old, dict(d, doc_id="d1", pages=["d1"])])], schema=new_s)
+    assert [p["doc_id"] for p in problems if p["kind"] == "not_reviewed"] == ["d1"]
+
+
+def test_machine_prefix_only_from_field_rules():
+    """기계 검수 머리(PREFIX)로 시작하는 사유는 field_rules만 만든다 — 다른 표시를 만드는 코드가 그 머리를 쓰면 다시 계산 때
+    지워지고 미검토에서 빠지므로, app 코드의 글자 상수와 이름 참조로 막아 둔다"""
+    import ast
+    root = Path(__file__).resolve().parent.parent / "app"
+    for p in sorted(root.glob("*.py")):
+        if p.name == "field_rules.py":
+            continue
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert field_rules.PREFIX not in node.value and not node.value.startswith(field_rules.MACHINE), p.name
+            if isinstance(node, ast.Attribute) and node.attr in ("PREFIX", "MACHINE"):
+                # 머리를 쓰는 곳은 화면에 알려 주는 /schema 하나뿐 (사유를 만들지 않는다)
+                assert p.name == "main.py" and node.attr == "PREFIX", p.name
+    from app import graph
+    assert not field_rules.is_machine(graph.OFF_FLAG)
+    assert not any(field_rules.is_machine(v) for v in flags.RULES.values())
 
 
 def test_read_codes_large_table_fast(tmp_path):
