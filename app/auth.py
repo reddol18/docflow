@@ -27,15 +27,20 @@ OIDC 설정 (oidc를 켤 때)
   TRUST_PROXY            X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 → IP별 창(LOGIN_RATE_MAX, 기본 20)도 쓴다.
                          Next rewrites는 덮어쓰지 않으므로 지금 구성에서는 0
   OIDC_LABEL             로그인 버튼 글자 (기본 "SSO")
+  AUDIT_ANON_MAX         계정에 묶이지 않는 감사 행(로그인 안 한 요청의 거절 등)을 60초에 몇 행까지 (기본 30, README)
 """
+import atexit
 import base64
 import collections
 import dataclasses
+import datetime as dt
 import functools
 import hashlib
 import json
 import os
+import queue
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -49,7 +54,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from app import store
+from app import errors, store
 
 ROLES = ("viewer", "reviewer", "inspector", "admin")  # 뒤로 갈수록 넓다. reviewer=입력자, inspector=검사자 (https://github.com/reddol18/docflow/issues/10)
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -123,8 +128,13 @@ def _verify(h, pw):
         return False
 
 
-def login_local(username, password):
-    """맞으면 User, 틀리거나 잠겼거나 없는 계정이면 None. 없는 계정에도 해시 검증을 한 번 돌려 시간 차를 줄인다."""
+def login_local(username, password, outcome=None):
+    """맞으면 User, 틀리거나 잠겼거나 없는 계정이면 None. 없는 계정에도 해시 검증을 한 번 돌려 시간 차를 줄인다.
+    outcome(dict)을 주면 실패 사유 분류(reason)와 해당 계정(account: 있는 local 계정일 때만)을 채운다 — 감사 로그용.
+    사유는 응답에 나가지 않는다 (응답은 늘 FAIL_MSG — 계정이 있는지·잠겼는지 드러내지 않는다)"""
+    out = outcome if outcome is not None else {}
+    # 실패 경로의 동기 DB 왕복은 계정이 있든 없든 같다 (아래 UPDATE 한 번 — 틀린 비밀번호만 원래대로 하나 더).
+    # 까닭 분류(_why_refused)와 감사 쓰기는 응답 뒤 감사 쓰기 스레드가 한다 (https://github.com/reddol18/docflow/issues/63)
     with store.pool.connection() as c:
         # 검증 전에 시도 한 번을 원자적으로 잡는다 → 동시에 여러 요청을 보내도 잠금 전 MAX_FAILS번까지만 검증한다.
         # 자리를 잡은 뒤 요청이 죽으면(풀 오류·프로세스 종료) failed가 MAX_FAILS에 남는다 → 마지막 시도가 CLAIM_SEC보다
@@ -137,18 +147,198 @@ def login_local(username, password):
                       (MAX_FAILS, username, MAX_FAILS, CLAIM_SEC)).fetchone()
     if not u:  # 없음·꺼짐·잠김·이미 MAX_FAILS번 시도 중
         _verify(_dummy_hash(), password)
+        out["refused"] = True  # 까닭은 응답 시간에 넣지 않는다 — 감사 쓰기 스레드가 _why_refused로
         return None
     ok = _verify(u["password_hash"], password)
     with store.pool.connection() as c:
         if not ok:
+            out["account"] = User(u["id"], u["username"], u["name"] or u["username"], u["role"])
+            out["reason"] = "bad_password"
             if u["failed"] >= MAX_FAILS:  # MAX_FAILS번째 실패 → 잠그고 횟수를 되돌린다 (풀린 뒤 다시 MAX_FAILS번)
                 c.execute("UPDATE users SET failed = 0, locked_until = now() + make_interval(mins => %s) WHERE id = %s",
                           (LOCK_MIN, u["id"]))
+                out["reason"] = "lockout"  # 이 실패로 잠겼다 — 감사 로그에 'lockout' 행
             return None
         c.execute("UPDATE users SET failed = 0, locked_until = NULL, last_login = now() WHERE id = %s", (u["id"],))
         if ph.check_needs_rehash(u["password_hash"]):
             c.execute("UPDATE users SET password_hash = %s WHERE id = %s", (ph.hash(password), u["id"]))
     return User(u["id"], u["username"], u["name"] or u["username"], u["role"])
+
+
+def _why_refused(username):
+    """검증 자리를 못 잡은 까닭 (reason, account) — 감사 쓰기 스레드에서만 부른다 (응답 시간 밖).
+    없는 계정은 account가 None — 아이디를 남기지 않는다 (아이디 칸에 비밀번호를 잘못 넣은 것일 수 있다)"""
+    with store.pool.connection() as c:
+        r = c.execute("SELECT id, username, name, role, disabled, password_hash IS NULL AS no_pw, "
+                      "coalesce(locked_until > now(), false) AS locked FROM users WHERE username = %s AND issuer IS NULL",
+                      (username,)).fetchone()
+    if not r:
+        return "unknown_user", None
+    reason = ("disabled" if r["disabled"] else "no_password" if r["no_pw"] else "locked" if r["locked"]
+              else "busy")  # busy: 다른 요청들이 이미 MAX_FAILS번 검증 중
+    return reason, User(r["id"], r["username"], r["name"] or r["username"], r["role"])
+
+
+def _login_refused(username):
+    reason, account = _why_refused(username)
+    login_failed(reason, "local", account)
+
+
+# ---------- 인증 사건 감사 로그 (https://github.com/reddol18/docflow/issues/63) ----------
+# 남기는 것: 행위(login·lockout·logout·거절된 요청)·결과·사유 분류·방식(local/oidc)·계정(있는 계정일 때만).
+# 남기지 않는 것: 비밀번호, 세션 토큰·쿠키·헤더, 요청 본문, 없는 계정으로 시도한 아이디(비밀번호를 잘못 넣은 것일 수 있다).
+# 계정에 묶이지 않는 행(로그인 안 한 요청의 거절·없는 계정 시도)과 CSRF 거절(공격 사이트가 일으킨다 — 쿠키 주인 이름으로
+# 남지만 그 사람이 한 일이 아니다)은 누구나 무한히 만들 수 있다 → 프로세스 전체에서 AUDIT_ANON_MAX행/60초까지만 쓰고,
+# 넘친 개수는 다음에 쓸 수 있을 때 'audit_suppressed' 한 행으로 남긴다.
+# 계정에 묶인 로그인 행은 계정별 시도 제한(USER_RATE)·잠금(MAX_FAILS)이 이미 묶는다.
+# 로그인·로그아웃 행은 응답 뒤 감사 쓰기 스레드 하나(audit_later)가 쓴다 → 실패 응답 시간이 계정 유무·상한과 무관하다.
+
+ANON_AUDIT = (int(os.environ.get("AUDIT_ANON_MAX", "30")), 60)
+_anon: collections.deque = collections.deque()
+_anon_state = {"dropped": 0, "overflow": 0}  # dropped: 상한 창에서 버림, overflow: 감사 쓰기 대기열이 차서 버림
+_anon_lock = threading.Lock()
+AUDIT_QUEUE_MAX = 10000  # 감사 쓰기 스레드 대기열 — 넘치면 버리고 개수만 audit_suppressed/queue_full로
+FLUSH_SEC = 5.0  # 종료 때 남은 감사 행을 기다리는 마감 (DB가 느려도 종료가 막히지 않게)
+_audit_q: queue.Queue = queue.Queue(maxsize=AUDIT_QUEUE_MAX)
+_worker: list = []
+_worker_lock = threading.Lock()
+_tls = threading.local()  # 감사 쓰기 스레드가 지금 쓰는 행의 시각 (audit_later를 부른 때)
+
+
+def _say(msg):
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except BaseException:  # noqa: S110 — 알림 출력이 실패해도 감사 스레드는 살아야 한다
+        pass
+
+
+def _work(q):
+    """감사 쓰기 스레드. 어떤 예외(로거 실패 포함)에도 죽지 않는다 — 죽으면 이후 행이 모두 쌓이기만 한다"""
+    while True:
+        try:
+            fn, a, kw, ts = q.get()
+        except BaseException:  # noqa: S112 — 대기열 읽기 실패는 다시 시도
+            continue
+        try:
+            _tls.ts = ts
+            fn(*a, **kw)
+        except BaseException:
+            try:
+                errors.log_exception("audit worker")
+            except BaseException:
+                _say("감사 로그: 감사 쓰기 스레드 오류 (로그 출력도 실패)")
+        finally:
+            _tls.ts = None
+            try:
+                q.task_done()
+            except BaseException:  # noqa: S110 — task_done 짝이 어긋나도 루프는 이어 간다
+                pass
+
+
+def audit_later(fn, *a, **kw):
+    """감사 쓰기를 응답 뒤로 미룬다 (차례는 지킨다 — 스레드 하나). 행의 시각은 지금(부른 때).
+    스레드가 없거나 죽었으면 새로 띄운다. 대기열이 차면 버리고 개수만 남긴다"""
+    with _worker_lock:
+        if not _worker or not _worker[-1].is_alive():
+            t = threading.Thread(target=_work, args=(_audit_q,), name="audit-writer", daemon=True)
+            t.start()
+            _worker[:] = [t]
+    try:
+        _audit_q.put_nowait((fn, a, kw, dt.datetime.now(dt.timezone.utc)))
+    except queue.Full:
+        with _anon_lock:
+            if not _anon_state["overflow"]:
+                _say("감사 로그: 감사 쓰기 대기열이 차서 버림 (AUDIT_QUEUE_MAX)")
+            _anon_state["overflow"] += 1
+
+
+def audit_flush(timeout=None):
+    """미뤄 둔 감사 쓰기를 끝낸다 — 앱 종료(lifespan·atexit)와 시험. 마감(기본 FLUSH_SEC)이 지나면 남은 개수를
+    서버 로그에 남기고 그만 기다린다. 다 썼으면 True"""
+    if not _worker:
+        return True
+    wait = FLUSH_SEC if timeout is None else timeout
+    end = time.monotonic() + wait
+    q = _audit_q
+    with q.all_tasks_done:
+        while q.unfinished_tasks:
+            left = end - time.monotonic()
+            if left <= 0:
+                _say(f"감사 로그: {wait}초 안에 못 쓴 감사 행 {q.unfinished_tasks}개 (종료 마감)")
+                return False
+            q.all_tasks_done.wait(left)
+    return True
+
+
+atexit.register(audit_flush)
+
+
+def _anon_slot():
+    """(쓸 수 있나, 그동안 버린 개수). 버린 개수는 쓸 수 있게 된 첫 행이 가져가 요약 행으로 남긴다"""
+    n, win = ANON_AUDIT
+    now = time.monotonic()
+    with _anon_lock:
+        while _anon and _anon[0] < now - win:
+            _anon.popleft()
+        if len(_anon) >= n:
+            if not _anon_state["dropped"]:
+                _say("감사 로그: 계정 없는 거절 기록이 많아 줄여 남김 (AUDIT_ANON_MAX)")
+            _anon_state["dropped"] += 1
+            return False, 0
+        _anon.append(now)
+        dropped, _anon_state["dropped"] = _anon_state["dropped"], 0
+        return True, dropped
+
+
+def _summary(key, result, n):
+    """버린 개수 요약 행. 못 쓰면 개수를 되돌려 다음 요약에 넣는다"""
+    try:
+        store.audit(None, "audit_suppressed", None, None, result, count=n)
+    except Exception:
+        errors.log_exception("audit audit_suppressed")
+        with _anon_lock:
+            _anon_state[key] += n
+
+
+def audit_event(user, action, result, vol=None, doc_id=None, *, limited=False, **info):
+    """감사 로그 한 행 — 앱의 모든 감사 쓰기가 여기로 온다 (main.audit_safe·audited도).
+    limited면 상한 창(ANON_AUDIT)에 넣는다. 기록 실패는 요청 결과를 바꾸지 않는다 (서버 로그로). 썼으면 True.
+    요약 행: dropped(상한 창에서 버림), queue_full(감사 쓰기 대기열이 차서 버림)"""
+    with _anon_lock:
+        overflow, _anon_state["overflow"] = _anon_state["overflow"], 0
+    if overflow:
+        _summary("overflow", "queue_full", overflow)
+    if limited:
+        ok, dropped = _anon_slot()
+        if not ok:
+            return False
+        if dropped:
+            _summary("dropped", "dropped", dropped)
+    try:
+        store.audit(user, action, vol, doc_id, result, ts=getattr(_tls, "ts", None), **info)
+        return True
+    except Exception:
+        errors.log_exception(f"audit {action} {result}")
+        return False
+
+
+def audit_as(action):
+    """경로 함수에 감사 행위 이름을 붙인다. GET이 아닌 경로는 모두 이것이 있어야 한다 (시험이 app.routes를 돈다).
+    처리 함수 앞(로그인·역할·CSRF·본문 검증)에서 거절된 요청은 main의 예외 처리기가 이 이름으로 rejected_<상태> 행을 남긴다"""
+    def deco(fn):
+        fn.audit_action = action
+        return fn
+    return deco
+
+
+def _reason(e, reason):
+    e.reason = reason  # 감사 로그 사유 분류 (응답에는 나가지 않는다)
+    return e
+
+
+def _audited(e):
+    e.audited = True  # 이미 감사 로그에 남겼다 — 예외 처리기가 다시 남기지 않는다
+    return e
 
 
 # ---------- 시도 제한 (인증 전 경로) ----------
@@ -188,7 +378,7 @@ def rate_limit(request, username=None):
             while q and q[0] < now - win:
                 q.popleft()
             if len(q) >= n:
-                raise HTTPException(429, "시도가 너무 많습니다. 잠시 뒤 다시 하세요")
+                raise _reason(HTTPException(429, "시도가 너무 많습니다. 잠시 뒤 다시 하세요"), "rate_limited")
             qs.append(q)
         for q in qs:
             q.append(now)
@@ -220,8 +410,11 @@ def session_user(token):
 
 
 def drop_session(token):
+    """세션을 지운다. 지운 세션의 사용자(User), 없던 토큰이면 None"""
     with store.pool.connection() as c:
-        c.execute("DELETE FROM sessions WHERE token_hash = %s", (_h(token),))
+        r = c.execute("DELETE FROM sessions s USING users u WHERE s.token_hash = %s AND u.id = s.user_id "
+                      "RETURNING u.id, u.username, u.name, u.role", (_h(token),)).fetchone()
+    return User(r["id"], r["username"], r["name"] or r["username"], r["role"]) if r else None
 
 
 def drop_user_sessions(user_id):
@@ -251,7 +444,7 @@ def check_csrf(request):
         return
     if request.headers.get("sec-fetch-site") in ("same-origin", "none"):
         return
-    raise HTTPException(403, "다른 사이트에서 온 요청은 받지 않음")
+    raise _reason(HTTPException(403, "다른 사이트에서 온 요청은 받지 않음"), "csrf")
 
 
 def resolve(request: Request):
@@ -263,10 +456,14 @@ def resolve(request: Request):
         return DEV_USER
     token, via_cookie = _token(request)
     u = session_user(token) if token else None
-    if not u:
-        raise HTTPException(401, "로그인 필요")
+    if not u:  # 사유: 토큰 없음 / 맞지 않거나 끝난 토큰 (토큰 자체는 어디에도 남기지 않는다)
+        raise _reason(HTTPException(401, "로그인 필요"), "bad_session" if token else "no_session")
     if via_cookie and request.method not in SAFE_METHODS:
-        check_csrf(request)
+        try:
+            check_csrf(request)
+        except HTTPException as e:
+            e.user = u  # 세션 쿠키가 실린 다른 사이트 요청 — 감사 로그에 그 쿠키의 사용자로 (CSRF 시도 흔적)
+            raise
     request.state.user = u
     return u
 
@@ -285,7 +482,7 @@ def require(role):
     def dep(request: Request):
         u = resolve(request)
         if not role_at_least(u.role, role):
-            raise HTTPException(403, f"{role} 역할 필요")
+            raise _reason(HTTPException(403, f"{role} 역할 필요"), "role")
         return u
 
     dep.role = role  # 경로 보호 시험이 읽는다
@@ -488,18 +685,37 @@ class LoginBody(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+def login_failed(reason, via, account=None):
+    """로그인 실패 한 행: 사유 분류만. 있는 계정이면 그 계정(id·이름), 없으면 계정 칸을 비운다 (상한 걸림).
+    감사 쓰기 스레드에서 부른다 (audit_later)"""
+    audit_event(account, "login", "failed", limited=account is None, via=via, reason=reason)
+
+
 @router.post("/login")
+@audit_as("login")
 def login(body: LoginBody, request: Request):
     if "local" not in MODES:
         raise HTTPException(404)
-    check_csrf(request)  # 로그인 CSRF(남의 계정으로 로그인시키기) 방지
-    rate_limit(request, body.username)
-    u = login_local(body.username, body.password)
-    if not u:
-        raise HTTPException(401, FAIL_MSG)
+    try:
+        check_csrf(request)  # 로그인 CSRF(남의 계정으로 로그인시키기) 방지
+        rate_limit(request, body.username)
+    except HTTPException as e:
+        audit_later(login_failed, getattr(e, "reason", f"rejected_{e.status_code}"), "local")
+        raise _audited(e) from None
+    out = {}
+    u = login_local(body.username, body.password, out)
+    if not u:  # 감사 쓰기는 모두 응답 뒤로 — 실패 응답 시간이 계정 유무·감사 상한과 무관
+        if out.get("refused"):  # 없음·꺼짐·잠김·동시 시도: 까닭 분류도 응답 뒤에
+            audit_later(_login_refused, body.username)
+        elif out["reason"] == "lockout":  # 이 실패로 계정이 잠겼다 — 실패 행 대신 잠금 행 하나
+            audit_later(audit_event, out["account"], "lockout", "locked", via="local", minutes=LOCK_MIN, fails=MAX_FAILS)
+        else:
+            audit_later(login_failed, out["reason"], "local", out["account"])
+        raise _audited(HTTPException(401, FAIL_MSG))
     _drop_previous(request)
     resp = JSONResponse({"user": u.public()})
     set_session_cookie(resp, new_session(u.id, "local"))
+    audit_later(audit_event, u, "login", "ok", via="local")  # 세션을 만든 뒤에 — 만들다 실패하면 ok가 남지 않게
     return resp
 
 
@@ -511,12 +727,19 @@ def _drop_previous(request):
 
 
 @router.post("/logout")
+@audit_as("logout")
 def logout(request: Request):
     token, via_cookie = _token(request)
     if via_cookie:
-        check_csrf(request)
-    if token:
-        drop_session(token)
+        try:
+            check_csrf(request)
+        except HTTPException as e:  # 다른 경로처럼 쿠키 세션의 사용자로 (main 예외 처리기가 csrf 사유·상한 창으로 남긴다)
+            e.user = session_user(token) if token else None
+            raise
+    # 실제로 지운 세션이 있을 때만 남긴다 — 세션 없는 로그아웃은 아무 일도 안 하므로 누구나 행을 만들지 못하게
+    u = drop_session(token) if token else None
+    if u:
+        audit_later(audit_event, u, "logout", "ok", via="bearer" if not via_cookie else "cookie")
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE, path="/")
     return resp
@@ -550,20 +773,24 @@ def oidc_login(request: Request, next: str = "/"):
 
 
 @router.get("/oidc/callback")
+@audit_as("login")
 def oidc_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
     if "oidc" not in MODES:
         raise HTTPException(404)
-    if error:
+    if error:  # 제공자가 거절·취소 (error 값은 제공자가 정한 글이라 남기지 않는다)
+        audit_later(login_failed, "oidc_error", "oidc")
         resp = RedirectResponse("/login?error=oidc", status_code=303)
         resp.delete_cookie(STATE_COOKIE, path="/")
         return resp
     mine = request.cookies.get(STATE_COOKIE)
     if not (code and state and mine and secrets.compare_digest(state, mine)):
+        audit_later(login_failed, "oidc_state", "oidc")
         raise HTTPException(400, "로그인 요청이 맞지 않음 — 다시 시도")
     with store.pool.connection() as c:
         p = c.execute("DELETE FROM oidc_pending WHERE state = %s AND created_at > now() - make_interval(secs => %s) "
                       "RETURNING nonce, verifier, next", (state, PENDING_SEC)).fetchone()
     if not p:
+        audit_later(login_failed, "oidc_expired", "oidc")
         raise HTTPException(400, "로그인 요청이 만료됨 — 다시 시도")
     try:
         d = discovery()
@@ -576,14 +803,17 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     except (httpx.HTTPError, HTTPException, RuntimeError, ValueError, KeyError, TypeError) as e:
         # 제공자 연결 실패·응답 오류·토큰 검증 실패 → 오류 화면 대신 로그인 화면으로 (원인은 서버 로그에만, 토큰은 남기지 않음)
         print(f"OIDC 콜백 실패: {type(e).__name__}", flush=True)
+        audit_later(login_failed, "oidc_verify", "oidc")
         resp = RedirectResponse("/login?error=oidc", status_code=303)
         resp.delete_cookie(STATE_COOKIE, path="/")
         return resp
-    if u is None:
+    if u is None:  # 역할을 못 정함·꺼진 계정 — 제공자 로그인은 됐지만 docflow가 거절
+        audit_later(login_failed, "oidc_role", "oidc")
         resp = RedirectResponse("/login?error=role", status_code=303)
     else:
         _drop_previous(request)
         resp = RedirectResponse(p["next"] or "/", status_code=303)
         set_session_cookie(resp, new_session(u.id, "oidc"))
+        audit_later(audit_event, u, "login", "ok", via="oidc")  # 세션을 만든 뒤에
     resp.delete_cookie(STATE_COOKIE, path="/")
     return resp

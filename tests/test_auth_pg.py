@@ -1,10 +1,13 @@
 """인증을 실제 Postgres에 돌린다: local 로그인·잠금·세션·로그아웃, OIDC 전체 흐름(가짜 제공자), 수정 이력.
 TEST_PG_URL이 없으면 건너뛴다. 표를 지우므로 운영 DB에 대고 돌리지 말 것."""
 import base64
+import collections
 import hashlib
 import io
 import json
 import os
+import queue
+import threading
 import time
 import urllib.parse
 
@@ -24,8 +27,9 @@ ISS, CID = "https://idp.test/realms/x", "docflow"
 
 @pytest.fixture
 def db(pg_store):
+    auth.audit_flush()  # 앞 시험이 미뤄 둔 감사 행이 이 시험의 표에 끼지 않게
     with pg_store.pool.connection() as c:
-        for t in ("sessions", "oidc_pending", "edits", "review_time", "users"):
+        for t in ("sessions", "oidc_pending", "edits", "review_time", "audit", "users"):
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
     return pg_store
 
@@ -35,6 +39,8 @@ def client(db, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"local", "oidc"}))
     monkeypatch.setattr(auth, "COOKIE_SECURE", False)  # 시험 클라이언트는 http → Secure 쿠키를 다시 보내지 않는다
     monkeypatch.setattr(auth, "_hits", {})  # 시험마다 IP 제한 창을 비운다
+    monkeypatch.setattr(auth, "_anon", collections.deque())  # 감사 로그 계정 없는 행 상한 창도
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
     app = FastAPI(dependencies=[Depends(auth.guard)])
     app.include_router(auth.router)
 
@@ -84,6 +90,196 @@ def test_local_login_session_logout(client, db, monkeypatch):
     client.post("/auth/logout", headers=CSRF)
     assert client.get("/p").status_code == 401
     assert client.get("/p", headers={"authorization": f"Bearer {token}"}).status_code == 401  # 로그아웃한 토큰 재사용
+
+
+def audit_rows(db):
+    auth.audit_flush()  # 로그인·로그아웃 행은 감사 쓰기 스레드가 응답 뒤에 쓴다
+    with db.pool.connection() as c:
+        return c.execute("SELECT * FROM audit ORDER BY id").fetchall()
+
+
+def test_auth_events_audited(client, db, monkeypatch):
+    """로그인 성공·실패·로그아웃·잠금 각 1회 → 감사 행 4개, 비밀번호·세션 토큰 문자열 0건
+    (https://github.com/reddol18/docflow/issues/63)"""
+    monkeypatch.setattr(auth, "MAX_FAILS", 2)  # 두 번째 실패에서 잠금 → 실패 1회 + 잠금 1회
+    add_user(monkeypatch, "alice", "reviewer")
+    add_user(monkeypatch, "bob", "viewer")
+    assert login(client, "alice").status_code == 200
+    token = client.cookies.get(auth.COOKIE)
+    assert client.post("/auth/logout", headers=CSRF).status_code == 200
+    assert login(client, "bob", "wrong-password-1").status_code == 401
+    r = login(client, "bob", "wrong-password-2")
+    assert r.status_code == 401 and r.json()["detail"] == auth.FAIL_MSG  # 응답은 잠겼는지 드러내지 않는다
+
+    rows = audit_rows(db)
+    assert [(r["action"], r["result"], r["username"], r["info"]) for r in rows] == [
+        ("login", "ok", "alice", {"via": "local"}),
+        ("logout", "ok", "alice", {"via": "cookie"}),
+        ("login", "failed", "bob", {"via": "local", "reason": "bad_password"}),
+        ("lockout", "locked", "bob", {"via": "local", "minutes": auth.LOCK_MIN, "fails": 2})]
+    assert all(r["user_id"] and r["ts"] for r in rows)
+    text = json.dumps(rows, ensure_ascii=False, default=str)
+    for bad in (PW, "wrong-password-1", "wrong-password-2", token, hashlib.sha256(token.encode()).hexdigest()):
+        assert bad not in text
+
+
+def test_failed_login_reasons(client, db, monkeypatch):
+    """실패 사유 분류. 없는 계정으로 시도한 아이디는 남기지 않는다 (아이디 칸에 비밀번호를 넣은 것일 수 있다)"""
+    add_user(monkeypatch, "carol", "viewer")
+    typo = "correct-horse-battery-typed-as-id"
+    assert login(client, typo).status_code == 401
+    assert login(client, "carol", headers={}).status_code == 403  # CSRF 표시 없음
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET locked_until = now() + interval '5 minutes' WHERE username = 'carol'")
+    assert login(client, "carol").status_code == 401  # 잠긴 동안 (맞는 비밀번호여도)
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET locked_until = NULL, disabled = true WHERE username = 'carol'")
+    assert login(client, "carol").status_code == 401
+    monkeypatch.setattr(auth, "USER_RATE", (0, 300))
+    assert login(client, "carol").status_code == 429
+    rows = audit_rows(db)
+    assert [(r["action"], r["result"], r["username"], r["info"]["reason"]) for r in rows] == [
+        ("login", "failed", None, "unknown_user"), ("login", "failed", None, "csrf"),
+        ("login", "failed", "carol", "locked"), ("login", "failed", "carol", "disabled"),
+        ("login", "failed", None, "rate_limited")]
+    assert typo not in json.dumps(rows, ensure_ascii=False, default=str)
+
+
+def test_failed_login_time_independent_of_account(client, db, monkeypatch):
+    """실패 응답이 계정 유무·감사 상한에 따라 달라지지 않는다 (https://github.com/reddol18/docflow/issues/63 리뷰):
+    요청 스레드의 DB 왕복 수가 없는 계정·잠긴 계정·꺼진 계정·상한이 찬 때 모두 같고, 감사 쓰기를 기다리지 않는다"""
+    add_user(monkeypatch, "dave", "viewer")
+    add_user(monkeypatch, "erin", "viewer")
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET locked_until = now() + interval '5 minutes' WHERE username = 'dave'")
+        c.execute("UPDATE users SET disabled = true WHERE username = 'erin'")
+    real = db.pool.connection
+    trips = []
+
+    def counting(*a, **k):
+        if threading.current_thread().name != "audit-writer":
+            trips.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(db.pool, "connection", counting)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 10)  # 감사 쓰기 스레드를 붙잡아 둔다 — 응답은 그래도 바로 와야 한다
+    counts = {}
+    for name in ("nobody-x", "dave", "erin"):
+        trips.clear()
+        assert login(client, name).status_code == 401
+        counts[name] = len(trips)
+    assert not hold.is_set() and auth._audit_q.unfinished_tasks == 4  # 세 응답 모두 감사 쓰기 전에 왔다
+    hold.set()
+    auth.audit_flush()
+    monkeypatch.setattr(auth, "ANON_AUDIT", (0, 60))  # 상한이 찬 때
+    trips.clear()
+    assert login(client, "nobody-y").status_code == 401
+    counts["capped"] = len(trips)
+    assert set(counts.values()) == {1}, counts  # 자리잡기 UPDATE 한 번
+    monkeypatch.setattr(db.pool, "connection", real)
+    rows = audit_rows(db)
+    assert [(r["username"], r["info"]["reason"]) for r in rows] == [
+        (None, "unknown_user"), ("dave", "locked"), ("erin", "disabled")]  # 상한이 찬 넷째는 버림
+
+
+def test_login_ok_only_after_session(client, db, monkeypatch):
+    """세션을 만들다 실패하면 login/ok가 남지 않는다"""
+    add_user(monkeypatch, "fay", "viewer")
+
+    def boom(*a):
+        raise RuntimeError("세션 표 쓰기 실패 (가상)")
+
+    monkeypatch.setattr(auth, "new_session", boom)
+    with pytest.raises(RuntimeError):
+        login(client, "fay")
+    assert audit_rows(db) == []
+
+
+def fresh_writer(monkeypatch, size=100):
+    """이 시험만의 감사 쓰기 대기열·스레드 (전역 스레드의 차례를 건드리지 않게)"""
+    monkeypatch.setattr(auth, "_audit_q", queue.Queue(maxsize=size))
+    monkeypatch.setattr(auth, "_worker", [])
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
+
+
+def actions(db):
+    return [(r["action"], r["result"], r["info"]) for r in audit_rows(db)]
+
+
+def test_writer_survives_errors_and_respawns(db, monkeypatch):
+    """감사 쓰기 스레드는 일·로거가 터져도 죽지 않고, 죽어 있으면 다음 audit_later가 새로 띄운다"""
+    fresh_writer(monkeypatch)
+
+    def bad():
+        raise RuntimeError("일 실패 (가상)")
+
+    def bad_log(*a):
+        raise RuntimeError("로거 실패 (가상)")
+
+    monkeypatch.setattr(auth.errors, "log_exception", bad_log)
+    auth.audit_later(bad)
+    auth.audit_later(auth.audit_event, None, "after_error", "ok")
+    assert auth.audit_flush(5) and auth._worker[-1].is_alive()
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    monkeypatch.setattr(auth, "_audit_q", queue.Queue(maxsize=100))
+    auth._worker[:] = [dead]
+    auth.audit_later(auth.audit_event, None, "after_respawn", "ok")
+    assert auth.audit_flush(5) and auth._worker[-1] is not dead
+    assert [a for a, _, _ in actions(db)] == ["after_error", "after_respawn"]
+
+
+def test_flush_has_deadline(db, monkeypatch, capsys):
+    """DB가 느려도 종료가 막히지 않는다: 마감이 지나면 남은 개수를 서버 로그에 남기고 그만 기다린다"""
+    fresh_writer(monkeypatch)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 5)
+    auth.audit_later(auth.audit_event, None, "late", "ok")
+    t0 = time.monotonic()
+    assert auth.audit_flush(0.2) is False
+    assert time.monotonic() - t0 < 2
+    assert "못 쓴 감사 행" in capsys.readouterr().err
+    hold.set()
+    assert auth.audit_flush(5)
+
+
+def test_queue_overflow_counted_apart(db, monkeypatch, capsys):
+    """대기열이 차서 버린 것은 상한 창에서 버린 것과 따로 세고 요약 행도 따로 (queue_full)"""
+    fresh_writer(monkeypatch, size=1)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 5)
+    for _ in range(100):  # 감사 스레드가 붙잡는 일을 꺼내 갈 때까지
+        if auth._audit_q.qsize() == 0:
+            break
+        time.sleep(0.02)
+    auth.audit_later(auth.audit_event, None, "t1", "ok")
+    auth.audit_later(auth.audit_event, None, "t2", "ok")  # 넘침
+    assert auth._anon_state == {"dropped": 0, "overflow": 1}
+    assert "대기열이 차서" in capsys.readouterr().err
+    hold.set()
+    assert actions(db) == [("audit_suppressed", "queue_full", {"count": 1}), ("t1", "ok", None)]
+
+
+def test_deferred_row_keeps_request_time(db, monkeypatch):
+    """응답 뒤에 쓰는 행의 시각은 요청 때 — 나중에 바로 쓴 행보다 뒤로 가지 않는다"""
+    fresh_writer(monkeypatch)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 5)
+    auth.audit_later(auth.audit_event, None, "deferred", "ok")
+    time.sleep(0.05)
+    db.audit(None, "direct", result="ok")
+    hold.set()
+    rows = {r["action"]: r for r in audit_rows(db)}
+    assert rows["deferred"]["id"] > rows["direct"]["id"] and rows["deferred"]["ts"] < rows["direct"]["ts"]
+
+
+def test_logout_without_session_not_audited(client, db):
+    """세션 없는 로그아웃은 아무 일도 안 한다 — 누구나 감사 행을 만들지 못하게 남기지 않는다"""
+    assert client.post("/auth/logout", headers=CSRF).status_code == 200
+    assert client.post("/auth/logout", headers={"authorization": "Bearer not-a-session"}).status_code == 200
+    assert audit_rows(db) == []
 
 
 def test_bearer_and_expiry(client, db, monkeypatch):
@@ -274,6 +470,29 @@ def test_oidc_flow(client, db, idp):
     assert (u["issuer"], u["subject"], u["password_hash"]) == (ISS, "sso-1", None)
     # 같은 state 다시 쓰기 → 거절
     assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 400
+
+
+def test_oidc_login_audited(client, db, idp):
+    seen, claims = idp
+    state = start(client, seen)
+    assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 303
+    assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 400  # 다시 쓰기 (state 쿠키 없음)
+    client.cookies.set(auth.STATE_COOKIE, state)
+    assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 400  # 쓴 state
+    assert client.get("/auth/oidc/callback", params={"error": "access_denied"}).status_code == 303
+    claims["groups"] = []
+    auth.OIDC.default_role = None  # 역할을 못 정하면 거절
+    state = start(client, seen)
+    assert client.get("/auth/oidc/callback", params={"code": "c2", "state": state}).headers["location"] == "/login?error=role"
+    rows = audit_rows(db)
+    assert [(r["action"], r["result"], r["username"], r["info"]) for r in rows] == [
+        ("login", "ok", "kim", {"via": "oidc"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_state"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_expired"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_error"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_role"})]
+    text = json.dumps(rows, default=str)
+    assert "access_denied" not in text and seen["data"]["code_verifier"] not in text  # 제공자 오류 글·PKCE 값 없음
 
 
 def test_oidc_state_must_match_browser(client, db, idp):

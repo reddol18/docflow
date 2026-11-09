@@ -1,5 +1,6 @@
 """감사 로그·오류 노출·로그 가림 (https://github.com/reddol18/docflow/issues/28). 실제 Postgres(PGlite)에 돌린다.
 TEST_PG_URL이 없으면 건너뛴다. 표를 지우므로 운영 DB에 대고 돌리지 말 것. 이름·키는 모두 가상의 값."""
+import collections
 import json
 import os
 import time
@@ -20,14 +21,22 @@ JPG = b"\xff\xd8\xff\xe0" + b"0" * 64
 @pytest.fixture
 def main(pg_store, monkeypatch, tmp_path):
     from app import main
+    auth.audit_flush()  # 앞 시험이 미뤄 둔 감사 행이 이 시험의 표에 끼지 않게
     with pg_store.pool.connection() as c:
         for t in ("audit", "events", "edits", "sessions", "review_time", "doc_stage", "stage_log", "stage_gen", "users"):
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
         c.execute("INSERT INTO users (id, username, role) VALUES (1, 'a', 'admin')")
     monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
-    monkeypatch.setattr(auth, "session_user", lambda t: auth.User(1, "a", "a", "admin") if t == "a" else None)
+    monkeypatch.setattr(auth, "session_user", lambda t: SESSIONS.get(t))
     monkeypatch.setattr(store, "DATA", tmp_path)
+    monkeypatch.setattr(auth, "_anon", collections.deque())  # 계정 없는 행 상한 창을 시험마다 비운다
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
     return main
+
+
+SESSIONS = {"a": auth.User(1, "a", "a", "admin"), "v": auth.User(2, "v", "v", "viewer"),
+            "i": auth.User(3, "i", "i", "inspector")}
+SESSION_TOKEN = "SeSsIoN-TOKEN-fake-0000000000000000"  # 쿠키로 보내는 맞지 않는 토큰 — 어디에도 남으면 안 된다
 
 
 def wait_idle(main, vol):
@@ -134,6 +143,139 @@ def test_run_outcome_audited(main, monkeypatch):
     rows = {(r["action"], r["result"]): r for r in store.audit_log()}
     assert rows[("run", "rejected_400")]["info"]["review"] == "invalid"  # 사용자가 넣은 문자열은 남기지 않음
     assert rows[("run_done", "error")]["info"] == {"code": "internal"} and rows[("run_done", "error")]["username"] == "a"
+
+
+def test_rejected_before_handler_audited(main, monkeypatch):
+    """처리 함수 앞에서 막힌 요청(로그인·역할·CSRF·본문 검증)도 경로의 행위 이름으로 한 행 (https://github.com/reddol18/docflow/issues/63)"""
+    monkeypatch.setattr(main, "G", fake_graph())
+    c = TestClient(main.app)
+    viewer = {"authorization": "Bearer v", "x-docflow-csrf": "1"}
+    # 권한 없는 사용자로 업로드
+    assert c.post("/volumes/v1/pages", headers=viewer, files=[("files", ("p1.jpg", JPG, "image/jpeg"))]).status_code == 403
+    assert c.post("/volumes/v1/run").status_code == 401  # 로그인 안 함
+    assert c.post("/volumes/v1/run", headers={"cookie": f"{auth.COOKIE}={SESSION_TOKEN}"}).status_code == 401  # 맞지 않는 세션
+    assert c.post("/volumes/v1/run", headers={"cookie": f"{auth.COOKIE}=a"}).status_code == 403  # 쿠키 세션 + CSRF 표시 없음
+    # 본문 검증 실패 (422) — 입력 값은 남기지 않고 오류 개수만
+    r = c.post("/workflow/v1/d1/reject", headers=ADMIN, json={"stage": "BAD STAGE!", "reason": FAKE_NAME, "x": FAKE_KEY})
+    assert r.status_code == 422
+    # 처리 함수 안(audited)에서 난 403은 한 번만
+    assert c.post("/volumes/v1/inspection", headers={"authorization": "Bearer i", "x-docflow-csrf": "1"},
+                  json={"seed": 1}).status_code == 403
+    # 감사 표시가 붙은 GET(납품 엑셀)도 남는다. 표시 없는 GET의 401은 남기지 않는다
+    assert c.get("/export.xlsx", headers=viewer).status_code == 403
+    assert c.get("/volumes").status_code == 401
+
+    rows = store.audit_log()
+    got = sorted((r["action"], r["result"], (r["info"] or {}).get("reason") or "", r["username"] or "") for r in rows)
+    assert got == sorted([
+        ("upload", "rejected_403", "role", "v"), ("run", "rejected_401", "no_session", ""),
+        ("run", "rejected_401", "bad_session", ""), ("run", "rejected_403", "csrf", "a"),
+        ("stage_reject", "rejected_422", "", "a"), ("inspection_plan", "rejected_403", "", "i"),
+        ("export_request", "rejected_403", "role", "v")])
+    up = next(r for r in rows if r["action"] == "upload")
+    assert up["vol"] == "v1" and up["user_id"] == 2 and up["info"] == {"method": "POST", "reason": "role"}
+    rej = next(r for r in rows if r["action"] == "stage_reject")
+    assert rej["vol"] == "v1" and rej["doc_id"] == "d1" and rej["info"]["errors"] >= 1
+    text = json.dumps(rows, ensure_ascii=False, default=str)
+    for bad in (SESSION_TOKEN, FAKE_NAME, FAKE_KEY, "BAD STAGE"):
+        assert bad not in text
+
+
+def test_every_mutating_route_logs_rejection(main, monkeypatch):
+    """GET이 아닌 경로 전부: 로그인 없이 부르면 그 경로의 행위 이름으로 rejected_401 한 행씩"""
+    monkeypatch.setattr(auth, "ANON_AUDIT", (1000, 60))
+    c = TestClient(main.app)
+    want = []
+    for path, r in main.api_routes(main.app.routes):
+        methods = set(r.methods) - set(auth.SAFE_METHODS)
+        if not methods or path.startswith("/auth"):  # 로그인·로그아웃은 로그인 없이 부르는 경로 (test_auth_pg)
+            continue
+        for m in methods:
+            assert c.request(m, path.replace("{vol}", "v1").replace("{doc_id}", "d1")).status_code == 401, path
+            want.append((r.endpoint.audit_action, "rejected_401"))
+    assert len(want) >= 12
+    assert sorted((r["action"], r["result"]) for r in store.audit_log()) == sorted(want)
+
+
+def test_anonymous_rejections_capped(main, monkeypatch):
+    """로그인 안 한 요청의 거절은 누구나 무한히 만들 수 있다 → 계정 없는 행은 상한, 넘친 개수는 요약 한 행"""
+    monkeypatch.setattr(auth, "ANON_AUDIT", (3, 60))
+    c = TestClient(main.app)
+    for _ in range(8):
+        assert c.post("/volumes/v1/run").status_code == 401
+    assert [r["action"] for r in store.audit_log()] == ["run"] * 3
+    for _ in range(4):  # 사용자가 있는 거절은 상한 밖 (누구인지 남는다)
+        assert c.post("/volumes/v1/run", headers={"authorization": "Bearer v"}).status_code == 403
+    assert len(store.audit_log()) == 7
+    auth._anon.clear()  # 창이 지나감
+    assert c.post("/volumes/v1/run").status_code == 401
+    rows = store.audit_log()
+    assert [(r["action"], r["result"]) for r in rows[:2]] == [("run", "rejected_401"), ("audit_suppressed", "dropped")]
+    assert rows[1]["info"] == {"count": 5} and rows[1]["user_id"] is None
+
+
+def test_csrf_rejections_capped_and_logout(main, monkeypatch):
+    """CSRF 거절은 쿠키 주인 이름으로 남지만 공격 사이트가 일으킨다 → 상한 창에 넣고 사유는 csrf. 로그아웃도 같다"""
+    monkeypatch.setattr(auth, "ANON_AUDIT", (3, 60))
+    c = TestClient(main.app)
+    cookie = {"cookie": f"{auth.COOKIE}=a"}
+    for _ in range(4):
+        assert c.post("/volumes/v1/run", headers=cookie).status_code == 403
+    assert c.post("/auth/logout", headers=cookie).status_code == 403
+    rows = store.audit_log()
+    assert [(r["action"], r["result"], r["username"], r["info"]["reason"]) for r in rows] == [
+        ("run", "rejected_403", "a", "csrf")] * 3
+    auth._anon.clear()
+    assert c.post("/auth/logout", headers=cookie).status_code == 403
+    rows = store.audit_log()
+    assert (rows[0]["action"], rows[0]["username"], rows[0]["info"]["reason"]) == ("logout", "a", "csrf")
+    assert (rows[1]["action"], rows[1]["info"]) == ("audit_suppressed", {"count": 2})
+
+
+def test_broken_json_422_keeps_user(main):
+    """깨진 JSON은 로그인 확인보다 먼저 422 — 세션 토큰으로 사용자를 찾아 붙인다"""
+    c = TestClient(main.app)
+    r = c.post("/workflow/v1/d1/reject", headers={**ADMIN, "content-type": "application/json"}, content=b'{"stage": ')
+    assert r.status_code == 422
+    row = store.audit_log()[0]
+    assert (row["action"], row["result"], row["username"]) == ("stage_reject", "rejected_422", "a")
+
+
+def test_audit_failure_keeps_rejection_status(main, monkeypatch):
+    """감사 쓰기·분류가 터져도 원래 401·403·422 그대로 (500이 아니라)"""
+    def boom(*a, **k):
+        raise RuntimeError("audit down (가상)")
+
+    monkeypatch.setattr(auth, "audit_event", boom)
+    c = TestClient(main.app)
+    assert c.post("/volumes/v1/run").status_code == 401
+    assert c.post("/volumes/v1/run", headers={"authorization": "Bearer v"}).status_code == 403
+    assert c.post("/workflow/v1/d1/reject", headers=ADMIN, json={"stage": "BAD STAGE!"}).status_code == 422
+
+
+def test_suppressed_summary_failure_keeps_count(main, monkeypatch):
+    """요약 행을 못 쓰면 버린 개수를 되돌려 다음 요약에 넣고, 본래 행은 따로 쓴다"""
+    monkeypatch.setattr(auth, "ANON_AUDIT", (1, 60))
+    c = TestClient(main.app)
+    for _ in range(3):
+        c.post("/volumes/v1/run")  # 1행 + 버림 2
+    real = store.audit
+
+    def no_summary(user, action, *a, **k):
+        if action == "audit_suppressed":
+            raise RuntimeError("summary write failed (가상)")
+        return real(user, action, *a, **k)
+
+    monkeypatch.setattr(store, "audit", no_summary)
+    auth._anon.clear()
+    c.post("/volumes/v1/run")
+    assert [r["action"] for r in store.audit_log()] == ["run", "run"]  # 본래 행은 썼다
+    assert auth._anon_state["dropped"] == 2
+    monkeypatch.setattr(store, "audit", real)
+    auth._anon.clear()
+    c.post("/volumes/v1/run")
+    rows = store.audit_log()
+    assert (rows[1]["action"], rows[1]["info"]) == ("audit_suppressed", {"count": 2})
 
 
 def test_error_codes_and_mask():

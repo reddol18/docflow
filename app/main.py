@@ -57,15 +57,19 @@ from typing import Annotated, Literal
 
 import cv2
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import auth, error_list, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
-from app.auth import Admin, Reviewer, Viewer
+from app.auth import Admin, Reviewer, Viewer, audit_as
 from app.review_input import EDITABLE, changes, clean_fixes
 
 # 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부. fullmatch + \Z — '$'는 끝 줄바꿈 앞에서도 맞아 'v1\n'이 지나간다
@@ -88,6 +92,7 @@ async def lifespan(_):
     G = flow.build(saver)
     startup_migrate()
     yield
+    auth.audit_flush()  # 미뤄 둔 로그인·로그아웃 감사 행을 쓰고 닫는다
     store.lock_pool.close()
     store.pool.close()
 
@@ -165,6 +170,7 @@ def audited(user, action, vol=None, doc_id=None, **info):
         yield info
     except HTTPException as e:
         audit_safe(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
+        e.audited = True  # 예외 처리기(rejected_http)가 같은 거절을 다시 남기지 않게
         raise
     except store.LockBusy:  # 다른 요청이 같은 문서·철을 처리 중 → 409 (lock_busy 처리기)
         audit_safe(user, action, vol, doc_id, "rejected_409", **info)
@@ -175,12 +181,91 @@ def audited(user, action, vol=None, doc_id=None, **info):
     audit_safe(user, action, vol, doc_id, "ok", **info)
 
 
-def audit_safe(*args, **kw):
-    """감사 기록이 실패해도 이미 끝난 처리를 500으로 바꾸거나 원래 거절(409 등)을 가리지 않는다 — 실패는 서버 로그로"""
+def audit_safe(user, action, vol=None, doc_id=None, result="ok", **info):
+    """감사 기록이 실패해도 이미 끝난 처리를 500으로 바꾸거나 원래 거절(409 등)을 가리지 않는다 — 실패는 서버 로그로.
+    쓰기는 auth.audit_event 한 곳 (처리 함수 안의 행은 바로 쓴다 — 교차검사가 audit의 review 행을 읽는다)"""
+    auth.audit_event(user, action, result, vol, doc_id, **info)
+
+
+# ---------- 처리 함수 앞에서 거절된 요청 (https://github.com/reddol18/docflow/issues/63) ----------
+# 로그인(401)·역할·CSRF(403)·본문 검증(422)은 의존성·FastAPI가 처리 함수 앞에서 막아 audited()까지 오지 않는다.
+# 예외 처리기에서 경로의 감사 행위 이름(auth.audit_as)으로 rejected_<상태> 한 행을 남긴다:
+#   대상  GET이 아닌 경로 전부 + audit_as가 붙은 GET 경로(엑셀 반출·OIDC 콜백)
+#   남김  행위·결과·메서드·사유 분류(no_session/bad_session/csrf/role)·422 오류 개수, 규칙에 맞는 철·문서 id
+#   안 남김  헤더·쿠키·토큰·본문·검증 오류 내용(입력 값이 들어 있다)·규칙에 안 맞는 경로 값
+#   중복  audited() 안에서 난 거절은 이미 남겼으므로(e.audited) 건너뛴다
+#   상한  사용자를 모르는 행(401 등)과 CSRF 거절(공격 사이트가 일으킨다)은 auth.audit_event의 상한 창(AUDIT_ANON_MAX/60초)
+#   실패  감사 쓰기·분류가 실패해도 원래 401·403·422 응답은 그대로 (서버 로그로)
+REJECT_AUDIT = {401, 403, 422}
+ID_RX = re.compile(r"[\w.-]{1,120}")
+
+
+def _session_owner(request):
+    """본문을 못 읽은 422(깨진 JSON 등)는 로그인 확인(guard)보다 먼저 난다 → 세션 토큰으로 사용자만 가볍게 찾는다.
+    guard가 같은 요청에 하는 조회와 같다. CSRF 확인은 하지 않는다 (누구 요청인지만 — 권한을 주지 않는다)"""
+    if not auth.MODES:
+        return auth.DEV_USER
+    token, _ = auth._token(request)
+    return auth.session_user(token) if token else None
+
+
+def _wants_audit(request, status, exc):
+    if status not in REJECT_AUDIT or getattr(exc, "audited", False):
+        return False
+    route = request.scope.get("route")
+    # 감사 대상이 아닌 읽기 경로는 건너뛴다
+    return request.method not in auth.SAFE_METHODS or bool(getattr(getattr(route, "endpoint", None), "audit_action", None))
+
+
+def _audit_rejected(request, status, exc):
     try:
-        store.audit(*args, **kw)
+        action = getattr(getattr(request.scope.get("route"), "endpoint", None), "audit_action", None)
+        user = getattr(exc, "user", None) or getattr(request.state, "user", None)
+        info = {"method": request.method}
+        if status == 422:
+            info["errors"] = len(exc.errors()) if hasattr(exc, "errors") else 0
+            if user is None:
+                user = _session_owner(request)
+        reason = getattr(exc, "reason", None)
+        if reason:
+            info["reason"] = reason
+        pp = request.path_params
+        vol = pp.get("vol") if VOL_RX.fullmatch(pp.get("vol") or "") else None
+        doc_id = pp.get("doc_id") if ID_RX.fullmatch(pp.get("doc_id") or "") else None
+        auth.audit_event(user, action or "unaudited_route", f"rejected_{status}", vol, doc_id,
+                         limited=user is None or reason == "csrf", **info)
     except Exception:
-        errors.log_exception(f"audit {args[1]} {args[2]}")
+        errors.log_exception(f"audit rejected {status}")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def rejected_http(request: Request, exc: StarletteHTTPException):
+    if _wants_audit(request, exc.status_code, exc):
+        await run_in_threadpool(_audit_rejected, request, exc.status_code, exc)
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def rejected_validation(request: Request, exc: RequestValidationError):
+    if _wants_audit(request, 422, exc):
+        await run_in_threadpool(_audit_rejected, request, 422, exc)
+    return await request_validation_exception_handler(request, exc)
+
+
+def api_routes(routes, prefix=""):
+    """(경로, 라우트) 전부 — include_router로 넣은 라우터 안까지 (FastAPI 0.16x는 넣은 라우터를 묶음 하나로 둔다)"""
+    for r in routes:
+        if hasattr(r, "original_router"):
+            ctx = getattr(r, "include_context", None)
+            yield from api_routes(r.original_router.routes, prefix + (getattr(ctx, "prefix", "") or ""))
+        elif getattr(r, "methods", None):  # APIRoute, 그리고 /docs 같은 Starlette Route
+            yield prefix + r.path, r
+
+
+def unaudited_routes(application):
+    """GET이 아닌데 감사 행위 이름(auth.audit_as)이 없는 경로 [(메서드, 경로)] — 시험이 비어 있음을 확인한다"""
+    return [(",".join(sorted(r.methods)), path) for path, r in api_routes(application.routes)
+            if set(r.methods) - set(auth.SAFE_METHODS) and not getattr(r.endpoint, "audit_action", None)]
 
 
 def submit(vol, arg, user=None, reserved=False):
@@ -220,6 +305,7 @@ def healthz():
 
 
 @app.post("/volumes/{vol}/pages")
+@audit_as("upload")
 async def upload(vol: str, user: Admin, files: list[UploadFile] = File(...)):
     with audited(user, "upload", vol, files=len(files)) as info:
         out = await _upload(vol, files)
@@ -258,6 +344,7 @@ async def _upload(vol, files):
 
 
 @app.post("/volumes/{vol}/run")
+@audit_as("run")
 def run(vol: str, user: Admin, review: str = "human"):
     ok_mode = review in ("human", "auto")
     # 사용자가 넣은 임의 문자열은 남기지 않는다
@@ -285,6 +372,7 @@ def run(vol: str, user: Admin, review: str = "human"):
 
 
 @app.post("/volumes/{vol}/resume")
+@audit_as("resume")
 def resume(vol: str, user: Admin):
     with audited(user, "resume", vol):
         snap = G.get_state(cfg(vol))
@@ -356,6 +444,7 @@ def volume_events(vol: str, _: Viewer, after: int = 0):
 
 
 @app.patch("/documents/{vol}/{doc_id}")
+@audit_as("edit")
 def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Reviewer):
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
@@ -617,6 +706,7 @@ def _need_sample():
 
 
 @app.post("/volumes/{vol}/inspection")
+@audit_as("inspection_plan")
 def inspection_create(vol: str, body: InspectionPlanIn, user: SampleUser):
     """검사 목록을 만든다. 표본이 치우치지 않게 시드는 서버가 정하고(관리자만 지정), 비율은 INSPECT_RATE 아래로 못 내린다
     (관리자 빼고). 이 철의 검토를 제출한 사람은 만들 수 없다."""
@@ -678,6 +768,7 @@ def _inspect_block(row, inspector, user, whole, mine, stage):
 
 
 @app.post("/inspection/{vol}/{doc_id}")
+@audit_as("inspect")
 def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
     """검사 결과. 문서를 먼저 차지하고(동시 제출 막기) 고친 칸은 문서 수정과 같은 길(그래프 상태·Postgres·Qdrant)로
     반영한다. 이력 단계는 inspect. 고치다 실패하면 차지를 풀어 다시 검사할 수 있게 한다.
@@ -794,6 +885,7 @@ def workflow_view(vol: str, user: Viewer):
 
 
 @app.post("/workflow/{vol}/{doc_id}/approve")
+@audit_as("stage_approve")
 def stage_approve(vol: str, doc_id: str, body: StageApproveIn, user: StageUser):
     """단계 승인. 고친 칸은 문서 수정과 같은 길로 반영(이력 source: 입력은 edit, 검수는 stage:<단계>)하고 다음 단계로.
     마지막 단계면 확정. 확인·칸 반영·이동을 문서 잠금(doc_lock) 안에서 차례로 한다 — 같은 차례를 두 번 넘기거나,
@@ -816,6 +908,7 @@ def stage_approve(vol: str, doc_id: str, body: StageApproveIn, user: StageUser):
 
 
 @app.post("/workflow/{vol}/{doc_id}/reject")
+@audit_as("stage_reject")
 def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
     """단계 반려 (사유 필수): 문서만 정해진 앞 단계(reject_to)로 돌아가고 차례(round)가 하나 는다 → 다시 올라오면 재검수.
     사유는 단계 기록(stage_log)에, 감사 로그에는 단계·차례·사유 길이만"""
@@ -934,6 +1027,7 @@ def resume_review(vol, flagged, fixes, user):
 
 
 @app.post("/review/{vol}")
+@audit_as("review")
 async def review_submit(vol: str, request: Request, user: Reviewer):
     with audited(user, "review", vol, via="form") as info:
         snap = G.get_state(cfg(vol))
@@ -951,6 +1045,7 @@ async def review_submit(vol: str, request: Request, user: Reviewer):
 
 
 @app.post("/review/{vol}/json")
+@audit_as("review")
 def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field(max_length=1000)], user: Reviewer):
     """스크립트·검토 화면용: {doc_id: {칸: 값}} 으로 이어 가기. 검토 대기 문서의 바뀐 칸만 반영한다."""
     with audited(user, "review", vol, via="json") as info:
@@ -973,6 +1068,7 @@ class Timing(BaseModel):
 
 
 @app.post("/volumes/{vol}/timings")
+@audit_as("timings")
 def timings(vol: str, rows: Annotated[list[Timing], Field(max_length=1000)], user: Reviewer):
     """검토 화면이 확정(검토 제출·문서 저장) 때 보내는 문서별 작업 시간 (자리 비움 제외).
     이 철에 없는 문서와 1초 미만(넘겨 보기만 한 것)은 버린다."""
@@ -1073,6 +1169,7 @@ def export_check(_: Viewer, vol: VolList):
 
 
 @app.get("/export.xlsx")
+@audit_as("export_request")
 def export_xlsx(user: Admin, vol: VolList):
     """납품 양식 엑셀. 검증 문제가 있어도 낸다 (빈칸은 빈칸으로) — 먼저 /export/check로 확인한다"""
     with audited(user, "export_request", None, vols=len(vol)) as info:
@@ -1095,6 +1192,7 @@ _error_list_busy = threading.Lock()  # 오류목록 만들기는 한 번에 하�
 
 
 @app.get("/export/errors.xlsx")
+@audit_as("error_list_request")
 def export_errors(user: Admin, vol: VolList):
     """검수 오류목록 엑셀 — 철마다 오류(문서·칸·오류 내용)와 수정 전후 값·담당자·조치일·재검수 판정. 새로 저장하지 않고
     표시·수정 이력·단계 기록(지금 세대)에서 만든다 (app/error_list.py). 관리자만: 철 전체의 값과 사람(담당자)·반려 사유가
@@ -1134,6 +1232,7 @@ def _error_list(vol, info):
 
 
 @app.delete("/volumes/{vol}")
+@audit_as("purge")
 def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False):
     """납품 뒤 사업 데이터 일괄 삭제: 쪽 이미지·OCR·잘라낸 칸, 문서·이력·이벤트·검사 행, LangGraph 체크포인트, Qdrant 벡터.
     비용 장부·감사 로그·작업 시간·출력 기록은 남긴다 (값 없음). 실수를 막으려고 confirm에 철 이름을 다시 받는다.

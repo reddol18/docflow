@@ -146,12 +146,14 @@ def test_error_list_matches_history(main, monkeypatch):
         logs = cn.execute("SELECT action, vol, result, info, username FROM audit WHERE action LIKE 'error_list%%' "
                           "ORDER BY id").fetchall()
     assert [(x["action"], x["result"]) for x in logs] == [
+        ("error_list_request", "rejected_403"),  # 관리자 아닌 사람의 반출 시도 (https://github.com/reddol18/docflow/issues/63)
         ("error_list_request", "rejected_400"), ("error_list_request", "ok"), ("error_list", "ok"),
         ("error_list_request", "ok"), ("error_list", "ok"), ("error_list_request", "ok"), ("error_list", "ok"),
         ("error_list_request", "rejected_400")]
-    assert logs[1]["info"] == {"vols": 1, "actor": "masked", "volumes": 1, "rows": 4} and logs[1]["username"] == "s"
-    assert logs[2]["vol"] == "v1" and logs[2]["info"] == {"rows": 4}
-    assert logs[5]["info"]["actor"] == "name"
+    assert logs[0]["username"] == "q" and logs[0]["vol"] is None and logs[0]["info"]["reason"] == "role"
+    assert logs[2]["info"] == {"vols": 1, "actor": "masked", "volumes": 1, "rows": 4} and logs[2]["username"] == "s"
+    assert logs[3]["vol"] == "v1" and logs[3]["info"] == {"rows": 4}
+    assert logs[6]["info"]["actor"] == "name"
     assert "가상" not in str([x["info"] for x in logs])
     assert not store.last_export("v1")  # 납품 출력 기록(일괄 삭제 근거)은 남기지 않는다
 
