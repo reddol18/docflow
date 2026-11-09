@@ -332,6 +332,23 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
   `docs/`·README·잠금 파일만 바꾼 PR은(`requirements*.txt`·`requirements.lock`은 이미지 입력이라 코드로 봄) 리뷰 흔적을 요구하지 않고 osv·semgrep·trivy 건너뜀(`-Quick`)을 허용한다.
   실제 병합은 사용자 승인 뒤에만. 판정은 `scripts/merge_gate.py`가 하고, 흔적 찾기·코드 없음·보안 영향 함수는 주간 지표
   `scripts/weekly_metrics.py`와 공유한다. 주간 지표는 흔적이 있는지만 세고, 병합 검사가 더 엄격하다(head 기준, 표 필요, 건너뜀 거부, 리뷰는 PR 본문 제외).
+- **GitHub 쪽 강제 — commit status + main ruleset** (https://github.com/reddol18/docflow/issues/85, 클라우드 CI 없음).
+  main ruleset("Protect Main")이 PR head 커밋에 아래 두 status가 모두 success여야 병합을 허락한다 — 웹 화면·`gh pr merge`도 같다.
+
+  | status | 올리는 것 | 올리는 조건 |
+  |---|---|---|
+  | `docflow/local-check` | `scripts/check.ps1` 끝 (`scripts/gate_status.py`) | 막는 검사(`merge_gate.CHECKS`) 모두 통과, 건너뜀 없음(코드 없는 PR만 osv·semgrep·trivy 허용, `-Skip pg`도 건너뜀), 시작·끝 모두 커밋 안 된 변경 없음(`git status` 실패도 변경으로 봄), 검사 중 HEAD 그대로, HEAD가 push돼 있음. 아니면 아무것도 올리지 않는다 |
+  | `docflow/review-gate` | `scripts/merge.ps1`의 실제 병합 호출(묻고 y 또는 `-Yes`, 즉 사용자 승인 뒤) | 위 병합 판정 통과 + 열린 PR일 때 병합 직전에 success. `-DryRun`·처음 판정·취소에서는 올리지 않는다. 판정이 거부인데 전의 success가 있으면 failure로 덮는다 |
+
+  병합 판정은 저장소 주인·멤버·협업자(authorAssociation)의 글만 흔적으로 세고(공개 저장소), head의 `docflow/local-check` success도 확인한다.
+  그래서 순서는: 커밋 → **push** → `.\scripts\check.ps1`(끝에 'commit status: 올림/올리지 않음/올리기 실패'를 보인다, 요약을 PR에 붙임) → 리뷰 댓글 → `.\scripts\merge.ps1 <PR>`.
+  status는 커밋에 붙으므로 push로 head가 바뀌면 둘 다 다시 받아야 한다. push 전에 돌린 검사는 status를 못 올리니 push 뒤 다시 돌린다. 배포(`scripts/deploy.ps1`)의 검사는 `-NoStatus`.
+  확인: `gh api repos/reddol18/docflow/commits/<sha>/status --jq '.statuses[] | [.context,.state,.description] | @tsv'`.
+  규칙 설정은 `scripts/protect_main.ps1`(→ `scripts/gate_ruleset.py`; 먼저 `-DryRun`, 저장소 설정을 바꾸므로 사용자 승인 뒤에만): classic branch protection이 아니라
+  기존 ruleset에 required_status_checks 규칙(위 둘, strict 끔 — 켜면 main이 바뀔 때마다 다시 올리고 로컬 검사를 다시 돌려야 함, `-Strict`)을 더한다. 다른 규칙(PR 필수·삭제·force push 금지)은 그대로.
+  ruleset에 우회 주체가 없으므로 저장소 주인도 우회 못 한다(classic의 enforce_admins와 같음).
+  비상 해제(status 올리기가 고장 나 다 막힘): `.\scripts\protect_main.ps1 -AllowAdminBypass`(관리자만 우회) 또는 `-RemoveStatusRule`(status 규칙만 뺌). 고친 뒤 인자 없이 다시 돌린다.
+  남은 한계: 쓰기 권한 토큰이면 누구나 status를 올릴 수 있다(올린 앱을 고정하지 않음 — 고정하려면 GitHub App 필요). strict를 끄므로 오래된 base 위에서 통과한 PR도 병합될 수 있다.
 
 ## 폴더
 

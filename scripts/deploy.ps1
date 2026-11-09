@@ -30,7 +30,7 @@ try {
     if ($branch -ne "main" -and -not $NoTag) { throw "main이 아닌 브랜치($branch)입니다. 시험 배포는 -NoTag" }
 
     if (-not $NoCheck) {
-        & (Join-Path $PSScriptRoot "check.ps1")
+        & (Join-Path $PSScriptRoot "check.ps1") -NoStatus  # 배포 검사는 main에서 돈다 — PR 병합 게이트 status는 올리지 않는다 (https://github.com/reddol18/docflow/issues/85)
         if ($LASTEXITCODE) { throw "로컬 검사 실패. 배포하지 않습니다." }
     }
 
