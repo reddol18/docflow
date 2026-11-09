@@ -148,7 +148,7 @@ def test_post_failure_is_reported_not_raised(monkeypatch, capsys):
 def test_rules_follow_merge_gate():
     """check.ps1 막는 검사 목록·코드 없는 PR 건너뜀은 merge_gate와 한 곳에서 온다"""
     assert gs.mg.NO_CODE_SKIP == {"osv", "semgrep", "trivy"}
-    assert set(gs.mg.CHECKS) | set(gs.mg.REPORT_ONLY) == {n for n, _ in ALL}
+    assert set(gs.mg.CHECKS) == {n for n, _ in ALL}
 
 
 def test_git_status_failure_counts_as_dirty(monkeypatch, capsys):

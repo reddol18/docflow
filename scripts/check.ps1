@@ -150,7 +150,8 @@ try {
 }
 
 $failed = @($results | Where-Object { $_.blocking -and $_.ok -eq $false })
-$mark = { param($r) if ($null -eq $r.ok) { "건너뜀" } elseif (-not $r.blocking) { "보고만 (출력 확인)" } elseif ($r.ok) { "통과" } else { "**실패**" } }
+# 막지 않는 Step은 없다(trivy는 issues/29부터 막음) — 생기면 merge_gate.py 판정에도 그 결과를 받는 규칙을 함께 넣는다
+$mark = { param($r) if ($null -eq $r.ok) { "건너뜀" } elseif ($r.ok) { "통과" } else { "**실패**" } }
 Write-Host "`n---- PR '테스트' 칸에 붙일 요약 ----"
 $at = "{0:yyyy-MM-dd HH:mm}" -f (Get-Date)
 Write-Host ("로컬 검사 ``scripts/check.ps1`` — 커밋 ``{0}``{1}, {2}" -f $sha, $(if ($dirty) { " + 커밋 안 된 변경" } else { "" }), $at)

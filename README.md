@@ -321,6 +321,10 @@ kubectl port-forward -n docs svc/docflow 8000:8000
 cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFLOW_URL 기본 http://127.0.0.1:8000)
 ```
 
+컨테이너 최소 권한 (https://github.com/reddol18/docflow/issues/29): 세 컨테이너 모두 root 아님(postgres 70, qdrant·docflow 1000)·읽기 전용 루트 파일시스템·capability 전부 버림·SA 토큰 없음. 쓰는 곳만 PVC·emptyDir(`k8s/docs.yaml` 주석).
+- k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
+- emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi. 업로드 크기·개수 상한이 아직 없어(https://github.com/reddol18/docflow/issues/26) 한 번에 2Gi를 넘게 올리면 kubelet이 docflow 파드를 내쫓는다.
+
 ## 개발 절차
 
 - 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).

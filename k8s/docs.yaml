@@ -1,7 +1,7 @@
 # 공문서 처리 플랫폼: docs 네임스페이스 하나에 docflow(API + LangGraph + PaddleOCR), Postgres, Qdrant.
 # 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → 공인 IP 443만 (LLM_PROVIDER=openai일 때 OpenAI API용).
 # LLM_PROVIDER=local(현장 내부 서버)·off면 이 443 규칙은 쓰지 않는다 — 외부 송신 0을 막는 정책은 https://github.com/reddol18/docflow/issues/13 마지막 완료 조건.
-# 컨테이너는 최소 권한 (https://github.com/reddol18/docflow/issues/29): root 아님·권한 상승 없음·capability 전부 버림·seccomp RuntimeDefault,
+# 컨테이너는 최소 권한 (https://github.com/reddol18/docflow/issues/29): root 아님·권한 상승 없음·capability 전부 버림·seccomp RuntimeDefault·SA 토큰 없음,
 # 루트 파일시스템 읽기 전용 — 쓰는 곳만 PVC·emptyDir로 연다. 막는 검사: scripts/check.ps1의 trivy config·semgrep.
 # 데이터 소유자: postgres 70(alpine postgres), qdrant 1000, docflow 1000. k3s local-path PVC는 hostPath라 fsGroup이 듣지 않는다 —
 # 소유자가 다르면 scripts/mac/owner_migrate.sh(맥 deploy.sh가 apply 전에 check로 막는다).
@@ -76,6 +76,7 @@ spec:
       # PGDATA가 이미 70 소유여야 한다(지금까지 root 진입 스크립트가 70으로 바꿔 두었다). fsGroup은 주지 않는다 —
       # 걸리는 볼륨이면 PGDATA 권한이 0770이 되어 postgres가 시작을 거부한다
       securityContext: {runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       containers:
       - name: postgres
         image: postgres:17.11-alpine
@@ -120,6 +121,7 @@ spec:
       # 같은 이미지(root 기본)를 uid 1000으로 돌린다 — qdrant 공식 helm 차트 기본값과 같은 방식(이미지 안 /qdrant는 읽기만).
       # 예전(root로 돌 때) 만든 저장소 파일은 root 소유라 처음 한 번 scripts/mac/owner_migrate.sh qdrant로 1000에 넘긴다
       securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       containers:
       - name: qdrant
         image: qdrant/qdrant:v1.20.0
@@ -137,7 +139,7 @@ spec:
         - {name: tmp, mountPath: /tmp}
       volumes:
       - {name: data, persistentVolumeClaim: {claimName: qdrant-data}}
-      - {name: snapshots, emptyDir: {sizeLimit: 2Gi}}
+      - {name: snapshots, emptyDir: {sizeLimit: 2Gi}}  # 저장소 PVC(2Gi)보다 작지 않게. PVC를 늘리면 함께 늘린다 (넘으면 kubelet이 파드를 내쫓는다)
       - {name: init, emptyDir: {sizeLimit: 1Mi}}
       - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
 ---
@@ -162,6 +164,7 @@ spec:
     metadata: {labels: {app: docflow}}
     spec:
       securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       containers:
       - name: docflow
         image: docflow:dev
@@ -228,6 +231,8 @@ spec:
       volumes:
       - {name: data, persistentVolumeClaim: {claimName: docflow-data}}
       - {name: openai, secret: {secretName: openai, optional: true}}
+      # 업로드 임시 파일(python-multipart가 /tmp에 흘려 씀). 업로드 크기·개수 상한이 아직 없어(https://github.com/reddol18/docflow/issues/26)
+      # 한 번에 2Gi를 넘게 올리면 kubelet이 docflow 파드를 내쫓는다 — 상한은 그 이슈에서
       - {name: tmp, emptyDir: {sizeLimit: 2Gi}}
       - {name: pdx-temp, emptyDir: {sizeLimit: 256Mi}}
       - {name: pdx-locks, emptyDir: {sizeLimit: 1Mi}}
