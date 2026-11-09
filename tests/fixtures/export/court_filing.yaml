@@ -1,0 +1,19 @@
+# 시험용 납품 양식 — tests/fixtures/schemas/court_filing.yaml 칸 이름으로 (지어낸 양식)
+name: 가상 소송기록 문건 양식 (시험)
+sheets:
+  volumes:
+    title: 기록목록
+    columns:
+      - {name: 기록, source: vol, required: true}
+      - {name: 문건수, source: vol.docs, format: int}
+  documents:
+    title: 문건목록
+    columns:
+      - {name: 사건번호, source: field.case_no, required: true}
+      - {name: 사건종류, source: field.case_kind, required: true}
+      - {name: 문건명, source: field.doc_name}
+      - {name: 제출일자, source: field.filed_on, format: date}
+      - {name: 분류, source: field.doc_class}
+      - {name: 서증번호, source: field.exhibit_no}
+      - {name: 면수, source: field.page_count, format: int}
+      - {name: 예외처리사유, source: field.exception_reason}

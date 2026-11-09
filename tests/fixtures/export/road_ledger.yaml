@@ -1,0 +1,17 @@
+# 시험용 납품 양식 — tests/fixtures/schemas/road_ledger.yaml 칸 이름으로 (지어낸 양식)
+name: 가상 도로대장 조서 양식 (시험)
+sheets:
+  volumes:
+    title: 조서철
+    columns:
+      - {name: 철, source: vol, required: true}
+      - {name: 조서수, source: vol.docs, format: int}
+  documents:
+    title: 조서
+    columns:
+      - {name: RDID, source: field.rdid, required: true}
+      - {name: ROAD_RANK, source: field.road_rank}
+      - {name: 조서분류, source: field.sheet_class, required: true}
+      - {name: 조서명, source: field.sheet_title}
+      - {name: 조사일자, source: field.surveyed_on, format: date, out: YYYYMMDD}
+      - {name: 쪽수, source: field.sheets, format: int}

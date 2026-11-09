@@ -1,0 +1,28 @@
+# 시험용 세 번째 고객 스키마 — 법원 소송기록 스캔식 문건 색인. 칸 구조만 본뜨고 이름·값은 모두 지어낸 것
+# (https://github.com/reddol18/docflow/issues/72). 김해 칸 이름(docno·serial·date·recipient·title)을 쓰지 않는다.
+# 추출 지시문 품질은 시험 범위 밖 — 앱 시작·검토 화면·검색·내보내기가 이 칸 이름으로 도는지만 본다.
+name: 가상 소송기록 스캔 (시험)
+base: isad_g.yaml
+extract:
+  preamble: 입력은 가상 소송기록 문건 한 건의 첫 쪽을 OCR로 줄 단위로 옮긴 텍스트다.
+  rules: 칸마다 confidence(0~1)를 붙인다. 텍스트에 없는 것을 지어내지 않는다.
+fields:
+  - {name: case_no, label: 사건번호, level: document, method: llm_extract, isad: reference_code, prompt: 사건번호}
+  - name: case_kind
+    label: 사건종류
+    level: document
+    method: vocab
+    isad: scope_content
+    prompt: 사건종류
+    vocab: [민사, 가사, 행정, 신청, 도산, 집행, 비송, 독촉, 형사]
+  - {name: doc_name, label: 문건명, level: document, method: llm_extract, isad: title, prompt: 문건명}
+  - {name: filed_on, label: 제출일자, level: document, method: llm_extract, isad: dates, prompt: 제출일자를 YYYY-MM-DD로}
+  - {name: doc_class, label: 분류, level: document, method: vocab, isad: scope_content, prompt: 문건 분류, vocab: [주장, 첨부, 서증]}
+  - {name: exhibit_no, label: 서증번호, level: document, method: llm_extract, isad: reference_code, prompt: 서증번호 (서증일 때만)}
+  - {name: page_count, label: 면수, level: document, method: rule, rule: pages, isad: extent}
+  - {name: exception_reason, label: 예외처리 사유, level: document, method: manual, isad: notes}
+search:
+  keyword: [doc_name, case_no, exhibit_no]
+  embed: [doc_name, case_kind, doc_class, filed_on]
+  year: filed_on
+  columns: [filed_on, case_no, case_kind, doc_name, doc_class]

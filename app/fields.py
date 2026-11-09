@@ -14,6 +14,10 @@
   manual       사람이 입력 (처음엔 빈칸)
   hidden       화면·검색 결과에 안 보이는 칸 (`rule:`로 값을 만들 수 있다)
 rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 재료로 쓸 때 (김해 문서번호·일자·수신).
+코드(검토 표시·손글씨 칸·화면)는 칸 이름이 아니라 rule 이름과 이 파일의 표시 정보로 칸을 찾는다
+(https://github.com/reddol18/docflow/issues/72) — 기관 매핑은 칸 이름을 마음대로 지어도 된다.
+
+검색(search): keyword 낱말 검색 칸, embed 임베딩 머리 칸, year 연도 필터 칸, columns 검색 결과 화면 열 (기본 보이는 칸 전부).
 
 표기 규칙(normalize)은 칸 값에 차례로 적용하는 후처리다 (NORMALIZE).
 """
@@ -186,10 +190,10 @@ def parse(s, base=None):
             _str(ex, k, "extract")
     shown = [f["name"] for f in fl if f["method"] != "hidden" and f["level"] == "document"]
     se = s.get("search") or {}
-    if not isinstance(se, dict) or set(se) - {"keyword", "embed", "year"}:
-        raise SchemaError("search는 keyword·embed·year만")
-    for k in ("keyword", "embed"):
-        v = se.setdefault(k, shown)
+    if not isinstance(se, dict) or set(se) - {"keyword", "embed", "year", "columns"}:
+        raise SchemaError("search는 keyword·embed·year·columns만")
+    for k in ("keyword", "embed", "columns"):  # columns = 검색 결과 화면의 열 (순서대로)
+        v = se.setdefault(k, list(shown))
         # 숨김·철 단위 칸은 넣지 않는다 — 검색 순위로 숨긴 값이 드러나지 않게
         if not isinstance(v, list) or not v or any(n not in shown for n in v):
             raise SchemaError(f"search.{k}: 보이는 건 단위 칸 이름 목록이어야 함")

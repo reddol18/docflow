@@ -182,11 +182,17 @@ def test_schema_endpoint():
     body = main.schema_view(None)  # 권한(보기)은 tests/test_auth.py가 경로 목록으로 본다
     assert [f["name"] for f in body["fields"]] == ["docno", "date", "recipient", "title"]
     assert body["fields"][0] == {"name": "docno", "label": "문서번호", "level": "document", "method": "rule",
-                                 "editable": True, "flag_key": "serial", "isad": "reference_code"}
+                                 "editable": True, "flag_key": "serial", "isad": "reference_code",
+                                 "rule": "docno", "hw": "docno"}
+    # 손글씨 칸·규칙은 rule로 (https://github.com/reddol18/docflow/issues/72)
+    assert {f["name"]: (f["rule"], f["hw"]) for f in body["fields"]} == {
+        "docno": ("docno", "docno"), "date": ("date", "date"), "recipient": ("recipient", None), "title": (None, None)}
+    assert body["search_columns"] == ["date", "docno", "title", "recipient"]  # 예전 고정 검색 화면과 같은 열·순서
     assert "prompt" not in json.dumps(body)
     # 내보내는 키를 정확히 — 지시문·고정값·주기가 새지 않게
-    assert set(body) == {"name", "fields"}
-    assert all(set(f) == {"name", "label", "level", "method", "editable", "flag_key", "isad"} for f in body["fields"])
+    assert set(body) == {"name", "fields", "search_columns"}
+    assert all(set(f) == {"name", "label", "level", "method", "editable", "flag_key", "isad", "rule", "hw"}
+               for f in body["fields"])
 
 
 # ---------- 표기 규칙 ----------

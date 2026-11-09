@@ -42,3 +42,4 @@ search:
   keyword: [title, recipient, docno]
   embed: [title, recipient, docno, date]
   year: date
+  columns: [date, docno, title, recipient]  # 검색 결과 화면 열 (예전 고정 화면과 같은 순서)

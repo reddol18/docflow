@@ -20,9 +20,11 @@ def replay(graph, docs, b_of=None, recipient_of=None):
                         없으면 저장된 수신·보정 사유 — b를 바꿀 때는 꼭 넘긴다 (수신 보정은 b의 수신 값에서 나온다)
     """
     merged = []
+    # 저장된 수신은 rule: recipient 칸에서 (기관 매핑이 칸 이름을 바꿔도 — https://github.com/reddol18/docflow/issues/72)
+    rec_name = next((f["name"] for f in graph.SCHEMA["fields"] if f.get("rule") == "recipient"), None)
     for d in docs:
         b = b_of(d) if b_of else d["b"]
-        rec, why = recipient_of(d, b) if recipient_of else (d["fields"]["recipient"], d["info"]["recipient_fix"])
+        rec, why = recipient_of(d, b) if recipient_of else (d["fields"].get(rec_name, ""), d["info"]["recipient_fix"])
         s = {"vol": d["vol"], "doc_id": d["doc_id"], "pages": d["pages"], "b": b, "hw": d["hw"],
              "recipient": rec, "recipient_fix": why,
              "ratio_i": graph.HEAD_RATIOS.index(d["info"]["head_ratio"]), "box_fail": d["info"]["box_fail"]}

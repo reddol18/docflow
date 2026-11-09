@@ -31,8 +31,10 @@ export type FieldDef = {
   editable: boolean;
   flag_key: string; // 이 칸의 검토 표시가 붙는 키 (김해 문서번호 → serial)
   isad: string | null;
+  rule: string | null; // 값을 만드는 코드 규칙 (app/graph.py RULES). 칸 이름 대신 이것으로 판단한다
+  hw: string | null; // 보여 줄 잘라낸 손글씨 칸 (cropImage·Doc.hw 키). 없으면 손글씨 칸 아님
 };
-export type Schema = { name: string; fields: FieldDef[] };
+export type Schema = { name: string; search_columns: string[]; fields: FieldDef[] };
 
 export type Doc = {
   doc_id: string;
@@ -66,16 +68,14 @@ export type GraphEvent = {
   info: Record<string, unknown> | null;
 };
 
+// 검색 결과: 순위 정보 + 스키마의 보이는 칸 값 (칸 이름은 스키마마다 다르다 — 열은 Schema.search_columns)
 export type SearchHit = {
   doc_id: string;
   rrf: number;
   vector_rank: number | null;
   keyword_rank: number | null;
   vol: string;
-  docno: string;
-  date: string;
-  recipient: string;
-  title: string;
+  [field: string]: string | number | null;
 };
 
 export type Timing = {
@@ -239,8 +239,9 @@ const reportQuery = (dayFrom?: string, dayTo?: string) => {
 export const reportCsv = (dayFrom?: string, dayTo?: string) => `/api/report.csv?${reportQuery(dayFrom, dayTo)}`;
 
 export const headImage = (vol: string, page: string) => `/api/head/${enc(vol)}/${enc(page)}`;
-export const cropImage = (vol: string, docId: string, field: string) =>
-  `/api/crops/${enc(vol)}/${enc(docId)}_${field}.png`;
+// cell = FieldDef.hw (잘라낸 손글씨 칸 — 칸 이름이 아니다)
+export const cropImage = (vol: string, docId: string, cell: string) =>
+  `/api/crops/${enc(vol)}/${enc(docId)}_${cell}.png`;
 
 export const STAGE_LABEL: Record<Stage, string> = {
   new: "대기",
@@ -250,6 +251,3 @@ export const STAGE_LABEL: Record<Stage, string> = {
   done: "완료",
   stopped: "중단됨",
 };
-
-// 손글씨 칸을 잘라 둔 칸 (김해 양식 규칙 — app/graph.py HW_RULES). 칸 목록·표시명은 api.schema()
-export const HW_FIELDS = ["docno", "date"];

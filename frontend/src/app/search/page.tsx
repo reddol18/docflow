@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-import { api, type SearchHit } from "@/lib/api";
+import { api, type FieldDef, type Schema, type SearchHit } from "@/lib/api";
 import { Card } from "@/components/ui";
 
 const Q_MAX = 200; // 검색어 길이 상한 — 서버(`app/main.py`의 Q_MAX)와 같게
@@ -27,6 +27,24 @@ function Search() {
   const [answer, setAnswer] = useState<{ text: string; sources: SearchHit[] } | null>(null);
   const [busy, setBusy] = useState<"search" | "ask" | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [schema, setSchema] = useState<Schema | null>(null);
+
+  // 결과 열은 서버 스키마의 search_columns (칸 이름은 스키마마다 다르다 — https://github.com/reddol18/docflow/issues/72)
+  useEffect(() => {
+    let alive = true;
+    api.schema().then(
+      (x) => alive && setSchema(x),
+      (e) => alive && setErr(e instanceof Error ? e.message : String(e)),
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const byName = new Map((schema?.fields ?? []).map((f) => [f.name, f]));
+  const cols = (schema?.search_columns ?? []).map((n) => byName.get(n)).filter((f): f is FieldDef => !!f);
+  // 문서 화면으로 가는 링크를 다는 열: ISAD(G) 제목에 이은 칸, 없으면 첫 열
+  const linkCol = cols.find((f) => f.isad === "title")?.name ?? cols[0]?.name;
+  const cellOf = (h: SearchHit, k: string) => String(h[k] ?? "");
 
   const run = async (kind: "search" | "ask", query = q) => {
     if (!query.trim()) return;
@@ -97,10 +115,11 @@ function Search() {
             <thead className="text-left text-xs text-slate-500">
               <tr>
                 <th className="py-1.5 pr-3 font-medium">순위 (벡터/낱말)</th>
-                <th className="py-1.5 pr-3 font-medium">시행일자</th>
-                <th className="py-1.5 pr-3 font-medium">문서번호</th>
-                <th className="py-1.5 pr-3 font-medium">제목</th>
-                <th className="py-1.5 font-medium">수신</th>
+                {cols.map((c) => (
+                  <th key={c.name} className="py-1.5 pr-3 font-medium">
+                    {c.label}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
@@ -109,15 +128,20 @@ function Search() {
                   <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">
                     {i + 1} ({h.vector_rank ?? "–"}/{h.keyword_rank ?? "–"})
                   </td>
-                  <td className="py-2 pr-3 whitespace-nowrap tabular-nums">{h.date}</td>
-                  <td className="py-2 pr-3 whitespace-nowrap font-mono text-xs">{h.docno}</td>
-                  <td className="py-2 pr-3">
-                    <Link href={`/volumes/${encodeURIComponent(h.vol)}/documents`} className="text-blue-700 hover:underline">
-                      {h.title}
-                    </Link>
-                    <div className="font-mono text-[11px] text-slate-400">{h.doc_id}</div>
-                  </td>
-                  <td className="py-2 text-slate-600">{h.recipient}</td>
+                  {cols.map((c) =>
+                    c.name === linkCol ? (
+                      <td key={c.name} className="py-2 pr-3">
+                        <Link href={`/volumes/${encodeURIComponent(h.vol)}/documents`} className="text-blue-700 hover:underline">
+                          {cellOf(h, c.name) || "(빈 값)"}
+                        </Link>
+                        <div className="font-mono text-[11px] text-slate-400">{h.doc_id}</div>
+                      </td>
+                    ) : (
+                      <td key={c.name} className="py-2 pr-3 text-slate-700">
+                        {cellOf(h, c.name)}
+                      </td>
+                    ),
+                  )}
                 </tr>
               ))}
             </tbody>

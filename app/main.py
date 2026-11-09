@@ -22,7 +22,7 @@
   GET   /search                        ?q=&year_from=&year_to=&k= 벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침
   GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다
   GET   /graph                         흐름 그림 (mermaid)
-  GET   /schema                        색인 칸 스키마 (보이는 칸: 이름·표시명·단위·추출 방식·고칠 수 있나) — 화면이 칸 목록을 여기서 받는다
+  GET   /schema                        색인 칸 스키마 (보이는 칸: 이름·표시명·단위·추출 방식·고칠 수 있나·rule·손글씨 칸, 검색 열) — 화면이 칸 목록을 여기서 받는다
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
   GET   /report.csv                    같은 리포트 CSV
   GET   /export/check                  납품 출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건
@@ -469,9 +469,13 @@ def documents(vol: str, _: Viewer):
     return (G.get_state(cfg(vol)).values or {}).get("docs", [])
 
 
+# 잘라낸 칸 이름 = 손글씨 규칙이 쓰는 칸 (app/graph.py CELLS — 스키마 칸 이름과 상관없다)
+CROP_RX = re.compile(r"[\w.-]+_(" + "|".join(map(re.escape, flow.CELLS)) + r")\.png")
+
+
 @app.get("/crops/{vol}/{name}")
 def crop(vol: str, name: str, _: Viewer):
-    if not re.fullmatch(r"[\w.-]+_(docno|date)\.png", name):
+    if not CROP_RX.fullmatch(name):
         raise HTTPException(400)
     p = store.crop_file(vol, name)
     if not p.exists():
@@ -496,6 +500,7 @@ def head(vol: str, page: str, _: Viewer):
 LABEL = schema_fields.labels(schema_fields.SCHEMA)
 FLAG_FIELD = schema_fields.flag_keys(schema_fields.SCHEMA)  # 김해: 검토 표시는 일련번호(serial)에 붙지만 사람이 고치는 칸은 문서번호(docno)
 FLAG_OF = {v: k for k, v in FLAG_FIELD.items()}
+HW_OF = {f["name"]: c for f in schema_fields.SCHEMA["fields"] if (c := flow.hw_cell(f))}  # 칸 → 잘라낸 손글씨 칸 (rule로)
 
 
 @app.get("/review/{vol}", response_class=HTMLResponse)
@@ -523,11 +528,13 @@ img.crop{{max-height:60px;border:1px solid #999;display:block;margin:2px 0}}</st
             val = html.escape(d["fields"].get(k) or "")
             out.append(f"<div class=f><label>{html.escape(LABEL[k])}</label><input name='{did}__{k}' value=\"{val}\" "
                        f"maxlength={CELL_MAX}{ro}> <span class=flag>{html.escape(fl)}</span></div>")
-            if k in ("docno", "date") and (d.get("hw") or {}).get(k, {}).get("text") is not None:
+            cell = HW_OF.get(k)  # 칸 이름이 아니라 rule이 정한 잘라낸 칸 (https://github.com/reddol18/docflow/issues/72)
+            if cell and (d.get("hw") or {}).get(cell, {}).get("text") is not None:
                 # 인라인 onerror 대신 파일이 있을 때만 그린다 (CSP가 인라인 스크립트를 막는다)
-                if store.crop_path(vol, did, k).exists():
-                    out.append(f"<img class=crop src='/crops/{html.escape(vol)}/{html.escape(did)}_{k}.png'>")
-                out.append(f"<span class=flag>손글씨 판독: {html.escape(d['hw'][k]['text'])} (확신도 {d['hw'][k]['conf']})</span>")
+                if store.crop_path(vol, did, cell).exists():
+                    out.append(f"<img class=crop src='/crops/{html.escape(vol)}/{html.escape(did)}_{cell}.png'>")
+                hw = d["hw"][cell]
+                out.append(f"<span class=flag>손글씨 판독: {html.escape(hw['text'])} (확신도 {hw['conf']})</span>")
         out.append("</div></div>")
     out.append("<button type=submit>검토 끝 — 이어서 색인</button></form>" if editor else "</form>")
     return "".join(out)
@@ -774,10 +781,15 @@ def graph_view(_: Viewer):
 
 @app.get("/schema")
 def schema_view(_: Viewer):
-    """화면용 칸 목록 — 숨김 칸·추출 지시문·고정값은 내보내지 않는다"""
+    """화면용 칸 목록 — 숨김 칸·추출 지시문·고정값은 내보내지 않는다.
+    화면은 칸 이름이 아니라 여기 정보로 판단한다 (https://github.com/reddol18/docflow/issues/72):
+      rule  값을 만드는 코드 규칙 이름 (없으면 null) — 수신 보정 등 규칙별 안내
+      hw    보여 줄 잘라낸 손글씨 칸 (/crops/{vol}/{doc_id}_{hw}.png, 문서 hw[hw]). 없으면 null
+      search_columns  검색 결과 열 (스키마 search.columns, 기본 보이는 칸 전부)"""
     s = schema_fields.SCHEMA
-    return {"name": s["name"], "fields": [
+    return {"name": s["name"], "search_columns": list(s["search"]["columns"]), "fields": [
         {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
          "editable": f["name"] in EDITABLE, "flag_key": f.get("flag_key", f["name"]),
-         "isad": f.get("isad") or (f["name"] if "area" in f else None)}  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
+         "isad": f.get("isad") or (f["name"] if "area" in f else None),  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
+         "rule": f.get("rule"), "hw": flow.hw_cell(f)}
         for f in s["fields"] if f["name"] in schema_fields.shown(s)]}

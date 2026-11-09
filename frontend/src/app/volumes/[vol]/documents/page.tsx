@@ -7,7 +7,6 @@ import {
   can,
   cropImage,
   headImage,
-  HW_FIELDS,
   type Doc,
   type Fields,
   type Schema,
@@ -218,6 +217,8 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
               <div className="space-y-4">
                 {cells.map((f) => {
                   const k = f.name;
+                  const cell = f.hw; // 잘라낸 손글씨 칸 — 칸 이름이 아니라 스키마 rule로 서버가 정한다
+                  const hw = cell ? cur.hw[cell] : undefined;
                   const flags = cur.flags[f.flag_key];
                   const dirty = fixes[cur.doc_id]?.[k] !== undefined;
                   return (
@@ -236,20 +237,20 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                         {cur.b[k] && (
                           <div>
                             GPT 텍스트 추출: <span className="font-mono">{cur.b[k]?.value || "–"}</span> (확신도 {conf(cur.b[k]?.confidence)})
-                            {k === "recipient" && cur.info.recipient_fix && <span className="ml-1 text-amber-700">· 규칙 보정: {cur.info.recipient_fix}</span>}
+                            {f.rule === "recipient" && cur.info.recipient_fix && <span className="ml-1 text-amber-700">· 규칙 보정: {cur.info.recipient_fix}</span>}
                           </div>
                         )}
-                        {HW_FIELDS.includes(k) && cur.hw[k] && (
+                        {cell && hw && (
                           <div>
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
-                              src={cropImage(vol, cur.doc_id, k)}
+                              src={cropImage(vol, cur.doc_id, cell)}
                               alt={`${f.label} 손글씨 칸`}
                               className="my-1 max-h-14 rounded border border-slate-200 bg-white"
                               onError={(e) => (e.currentTarget.style.display = "none")}
                             />
-                            손글씨 판독: <span className="font-mono">{cur.hw[k]?.text || "–"}</span> (확신도 {conf(cur.hw[k]?.conf)})
-                            {k === "docno" && cur.info.head_ratio > 0.4 && (
+                            손글씨 판독: <span className="font-mono">{hw.text || "–"}</span> (확신도 {conf(hw.conf)})
+                            {cell === "docno" && cur.info.head_ratio > 0.4 && (
                               <span className="ml-1 text-amber-700">· 머리부 {Math.round(cur.info.head_ratio * 100)}%까지 넓혀 찾음</span>
                             )}
                           </div>

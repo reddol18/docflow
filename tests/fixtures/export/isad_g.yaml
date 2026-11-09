@@ -1,0 +1,14 @@
+# 시험용 납품 양식 — 기본 스키마 isad_g.yaml 칸 이름으로 (지어낸 양식)
+name: ISAD(G) 기본 양식 (시험)
+sheets:
+  volumes:
+    title: 철목록
+    columns:
+      - {name: 철, source: vol, required: true}
+  documents:
+    title: 건목록
+    columns:
+      - {name: 참조코드, source: field.reference_code}
+      - {name: 제목, source: field.title, required: true}
+      - {name: 생산일자, source: field.dates, format: date}
+      - {name: 생산부서, source: field.creator}

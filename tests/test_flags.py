@@ -90,6 +90,83 @@ def test_order_rule_and_mismatch_toggle():
     assert "date" not in run(docs, mismatch_date=False)[2]
 
 
+# ---------- 스키마 칸 이름으로: rule 이름으로 칸을 찾는다 (https://github.com/reddol18/docflow/issues/72) ----------
+
+HW = {"docno", "serial", "date"}
+GIMHAE = {"fields": [  # app/field_schemas/gimhae.yaml에서 표시 규칙이 보는 키만
+    {"name": "docno", "method": "rule", "rule": "docno", "flag_key": "serial", "prompt": "p"},
+    {"name": "serial", "method": "hidden", "rule": "serial", "derive_from": "docno"},
+    {"name": "date", "method": "rule", "rule": "date", "prompt": "p"},
+    {"name": "recipient", "method": "rule", "rule": "recipient", "prompt": "p"},
+    {"name": "title", "method": "llm_extract", "prompt": "p"}]}
+REN = {"docno": "doc_number", "serial": "serial_no", "date": "issued", "recipient": "addressee", "title": "subject"}
+
+
+def renamed(schema=GIMHAE, m=REN):
+    return {"fields": [{k: m.get(v, v) if k in ("name", "flag_key", "derive_from") else v for k, v in f.items()}
+                       for f in schema["fields"]]}
+
+
+def rdoc(d, m=REN):
+    return {**d, "fields": {m.get(k, k): v for k, v in d["fields"].items()}, "b": {m.get(k, k): v for k, v in d["b"].items()}}
+
+
+def messy_volume():
+    docs = clean_volume()
+    docs[1]["fields"]["recipient"] = "가나시 다라구 마바동 국장"
+    docs[2]["fields"]["docno"] = "-20"
+    docs[3]["info"]["b_serial"] = "999"
+    docs[3]["info"]["b_date"] = "1999-03-01"
+    docs[4]["b"]["title"]["confidence"] = 0.5
+    docs[4]["b"]["recipient"]["confidence"] = 0.5
+    docs[5]["fields"]["date"] = "1999-02-30"
+    return docs
+
+
+def test_for_schema_gimhae_same_as_flags():
+    docs = messy_volume()
+    want = F.flags(docs)
+    assert any(want) and F.for_schema(docs, GIMHAE, None, HW) == want
+    # 일련번호 표시는 문서번호 칸의 flag_key(serial)로, 수신은 LLM 사유가 결재란보다 먼저 (예전 순서)
+    assert want[4]["recipient"] == ["LLM"] and "앞부분 없음" in want[2]["serial"]
+
+
+def test_for_schema_renamed_fields_same_flags():
+    docs = messy_volume()
+    want = [{REN.get(k, k): v for k, v in fl.items()} for fl in F.flags(docs)]
+    assert F.for_schema([rdoc(d) for d in docs], renamed(), None, HW) == want
+    assert set().union(*want) == {"serial_no", "issued", "addressee", "subject"}
+
+
+def test_for_schema_skips_missing_roles_and_checks_llm_fields():
+    """일자 rule만 있는 스키마: 일자 규칙만 돌고, LLM 추출·통제어휘 칸은 확신도로, 요약·사람 입력 칸은 보지 않는다"""
+    schema = {"fields": [{"name": "made", "method": "rule", "rule": "date", "prompt": "p"},
+                         {"name": "subject", "method": "llm_extract", "prompt": "p"},
+                         {"name": "kind", "method": "vocab", "prompt": "p", "flag_key": "subject"},
+                         {"name": "summary", "method": "llm_generate", "prompt": "p"},
+                         {"name": "shelf", "method": "manual"}]}
+    docs = [{"fields": {"made": d["fields"]["date"], "subject": "가", "kind": "나", "summary": "다", "shelf": ""},
+             "b": {"made": {"confidence": 0.1}, "subject": {"confidence": 0.99}, "kind": {"confidence": 0.1},
+                   "summary": {"confidence": 0.1}},
+             "info": d["info"]} for d in clean_volume()]
+    docs[2]["fields"]["made"] = docs[2]["info"]["b_date"] = "1999-02-30"
+    out = F.for_schema(docs, schema, None, HW)
+    assert out[2] == {"made": ["형식"], "subject": ["LLM"]}  # 통제어휘 kind의 표시는 flag_key(subject)로
+    assert out[0] == {"subject": ["LLM"]}
+    assert F.for_schema(docs, {"fields": [{"name": "shelf", "method": "manual"}]}, None, HW) == [{} for _ in docs]
+
+
+def test_for_schema_llm_field_named_like_a_role():
+    """규칙 역할 이름과 같은 이름의 LLM 칸(date)이 다른 칸의 일자 규칙 표시와 섞이지 않는다"""
+    schema = {"fields": [{"name": "issued", "method": "rule", "rule": "date", "prompt": "p"},
+                         {"name": "date", "method": "llm_extract", "prompt": "p"}]}
+    docs = [{"fields": {"issued": d["fields"]["date"], "date": "x"}, "b": {"date": {"confidence": 0.1}}, "info": d["info"]}
+            for d in clean_volume()]
+    docs[1]["fields"]["issued"] = docs[1]["info"]["b_date"] = ""
+    out = F.for_schema(docs, schema, None, HW)
+    assert out[1] == {"issued": ["형식"], "date": ["LLM"]} and out[0] == {"date": ["LLM"]}
+
+
 def test_default_is_legacy_plus_documented_rules():
     assert set(F.DEFAULT["rules"]) <= set(F.RULES)
     assert {k: v for k, v in F.DEFAULT.items() if k != "rules"}.keys() == {k for k in F.LEGACY if k != "rules"}
