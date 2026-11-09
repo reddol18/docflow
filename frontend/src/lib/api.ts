@@ -178,7 +178,36 @@ export type VolumeWorkflow = { workflow: Workflow; ready: boolean; counts: Recor
 export const hasStageActions = (wf: Workflow | null | undefined) =>
   !!wf && (wf.stages.some((s) => s.kind === "review" && s.actions) || wf.stages[0]?.submit === "manual");
 
-const ROLE_ORDER: Role[] = ["viewer", "reviewer", "inspector", "admin"];
+// 표본 검사 (GET/POST /volumes/{vol}/inspection, POST /inspection/{vol}/{doc_id} — https://github.com/reddol18/docflow/issues/66)
+export type InspectionReason = "flagged" | "sample" | "field100";
+// 검사할 수 없는 까닭 (서버 main._inspect_block). null이면 검사 가능
+export type InspectBlock = "inspected" | "role" | "submitted" | "entered" | "other_stage" | "stage";
+export type InspectionPlan = {
+  vol: string;
+  rate: number;
+  fields100: string[];
+  flagged: number;
+  unflagged: number;
+  sample: number;
+  created_at: string;
+};
+export type InspectionDoc = {
+  doc_id: string;
+  reason: InspectionReason;
+  inspected_at: string | null;
+  inspected_by: string | null;
+  fixed_fields: string[] | null;
+  fields: Fields | null;
+  flags: Partial<Record<string, string[]>> | null;
+  check_fields: string[];
+  can_inspect: boolean;
+  block: InspectBlock | null;
+};
+export type InspectionView = { plan: InspectionPlan; docs: InspectionDoc[] };
+// 이 흐름의 표본 검사 단계 (없으면 검사 경로가 404)
+export const sampleStage = (wf: Workflow | null | undefined) => wf?.stages.find((s) => s.select === "sample") ?? null;
+
+const ROLE_ORDER: Role[] =["viewer", "reviewer", "inspector", "admin"];
 export const can = (me: Me | null | undefined, need: Role) => !!me && ROLE_ORDER.indexOf(me.role) >= ROLE_ORDER.indexOf(need);
 export const ROLE_LABEL: Record<Role, string> = { viewer: "보기", reviewer: "검토", inspector: "검사", admin: "관리" };
 
@@ -274,6 +303,21 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ stage, reason }),
+    }),
+  inspection: (vol: string) => call<InspectionView>(`/volumes/${enc(vol)}/inspection`),
+  // rate를 빼면 서버 기본 비율 (흐름 설정 rate 또는 INSPECT_RATE — 관리자 아니면 그 아래로 못 내린다)
+  createInspection: (vol: string, body: { rate?: number; fields100: string[] }) =>
+    call<{ plan: Omit<InspectionPlan, "vol" | "created_at">; docs: number }>(`/volumes/${enc(vol)}/inspection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  // fields를 비우면 '이상 없음', 고친 칸만 보내면 '고쳐서 저장'
+  inspect: (vol: string, docId: string, fields: Partial<Fields>) =>
+    call<{ doc_id: string; fixed_fields: string[] }>(`/inspection/${enc(vol)}/${enc(docId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields }),
     }),
   authConfig: () => call<AuthConfig>("/auth/config", { noRedirect: true }),
   me: () => call<{ user: Me }>("/auth/me", { noRedirect: true }),

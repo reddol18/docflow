@@ -1,5 +1,29 @@
+import Link from "next/link";
 import type { ReactNode } from "react";
 import { STAGE_LABEL, type Stage } from "@/lib/api";
+
+const VOLUME_TABS = [
+  { key: "progress", label: "진행 단계", path: "" },
+  { key: "documents", label: "결과·수정", path: "/documents" },
+  { key: "inspection", label: "검사", path: "/inspection" },
+] as const;
+
+// 철 화면의 탭 (진행 단계 · 결과·수정 · 검사 — https://github.com/reddol18/docflow/issues/66)
+export function VolumeTabs({ vol, active }: { vol: string; active: (typeof VOLUME_TABS)[number]["key"] }) {
+  return (
+    <nav className="flex gap-1 border-b border-slate-200 text-sm">
+      {VOLUME_TABS.map((t) => (
+        <Link
+          key={t.key}
+          href={`/volumes/${encodeURIComponent(vol)}${t.path}`}
+          className={`-mb-px border-b-2 px-3 py-1.5 ${t.key === active ? "border-slate-900 font-semibold text-slate-900" : "border-transparent text-slate-500 hover:text-slate-800"}`}
+        >
+          {t.label}
+        </Link>
+      ))}
+    </nav>
+  );
+}
 
 const STAGE_STYLE: Record<Stage, string> = {
   new: "bg-slate-100 text-slate-600",

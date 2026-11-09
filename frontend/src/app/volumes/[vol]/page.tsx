@@ -6,7 +6,7 @@ import { api, can, type GraphEvent } from "@/lib/api";
 import { useMe } from "@/lib/useMe";
 import { usePoll } from "@/lib/usePoll";
 import { currentRun, useEvents } from "@/lib/useEvents";
-import { Card, ErrorNote, Progress, StageBadge, usd } from "@/components/ui";
+import { Card, ErrorNote, Progress, StageBadge, usd, VolumeTabs } from "@/components/ui";
 
 type StepState = "idle" | "active" | "done" | "waiting" | "skipped" | "error";
 
@@ -127,6 +127,7 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
           </Link>
         </div>
       </div>
+      <VolumeTabs vol={vol} active="progress" />
 
       <Card title="LangGraph 진행 단계" right={<span className="text-xs text-slate-400">thread_id = {vol} · 체크포인트: Postgres</span>}>
         <div className="flex flex-wrap items-stretch gap-2">

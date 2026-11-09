@@ -17,7 +17,7 @@ import {
 import { usePoll } from "@/lib/usePoll";
 import { useMe } from "@/lib/useMe";
 import { useReviewTimer } from "@/lib/useReviewTimer";
-import { Card, ErrorNote, FlagChips, StageBadge } from "@/components/ui";
+import { Card, ErrorNote, FlagChips, StageBadge, VolumeTabs } from "@/components/ui";
 
 type Fixes = Record<string, Partial<Fields>>;
 
@@ -237,6 +237,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
           </button>
         )}
       </div>
+      <VolumeTabs vol={vol} active="documents" />
       {reviewing && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
           흐름이 <b>사람 검토(interrupt)</b>에서 멈춰 있습니다. 빨간 표시가 붙은 칸만 확인하고 고친 뒤 위 버튼을 누르면

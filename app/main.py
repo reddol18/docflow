@@ -12,7 +12,7 @@
   PATCH /documents/{vol}/{doc_id}      완료된 문서의 색인 칸 고치기 (재색인)
   GET   /documents/{vol}/{doc_id}/edits  수정 이력 (칸·이전 값·새 값·사용자·시각·단계 입력/검사)
   POST  /volumes/{vol}/inspection      검사 목록 만들기 (표시 문서 전부 + 표본 + 100% 검수 칸) — 검사자
-  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부)
+  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부·막힌 까닭 block)
   POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
   GET   /workflow                      검토 흐름 설정 (단계·맡는 역할·전수/표본·반려 규칙 — app/workflows/*.yaml)
   GET   /volumes/{vol}/workflow        문서마다 지금 단계·차례(재검수)·반려 사유·내가 승인/반려할 수 있나
@@ -650,11 +650,26 @@ def inspection_view(vol: str, user: Viewer):
     for r in rows:
         d = docs.get(r["doc_id"], {})
         mine = WORKFLOW["distinct_actors"] and other_stages(whole, acts, r["doc_id"], SAMPLE["name"])
+        block = _inspect_block(r, inspector, whole, mine, pos[r["doc_id"]]["stage"])
         out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
                     "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
-                    "can_inspect": inspector and r["inspected_at"] is None and not mine
-                    and pos[r["doc_id"]]["stage"] == SAMPLE["name"]})
+                    "can_inspect": block is None, "block": block})
     return {"plan": plan, "docs": out}
+
+
+def _inspect_block(row, inspector, whole, mine, stage):
+    """검사할 수 없는 까닭 (화면이 버튼 대신 보여 준다, https://github.com/reddol18/docflow/issues/66). None이면 검사 가능.
+    inspected 이미 검사함 / role 검사 역할 아님 / submitted 이 철의 검토 제출자 / entered 이 문서를 입력 단계에서 고침 /
+    other_stage 같은 문서의 다른 검수 단계를 맡음 / stage 아직 검사 단계에 오지 않음 (POST /inspection과 같은 규칙)"""
+    if row["inspected_at"] is not None:
+        return "inspected"
+    if not inspector:
+        return "role"
+    if mine:
+        return "submitted" if whole else "entered" if ENTRY["name"] in mine else "other_stage"
+    if stage != SAMPLE["name"]:
+        return "stage"
+    return None
 
 
 @app.post("/inspection/{vol}/{doc_id}")

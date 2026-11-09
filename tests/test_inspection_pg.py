@@ -100,6 +100,24 @@ def test_roles_cross_check_stage_and_error_rate(main):
     assert "추정 오류율" in c.get("/report.csv", headers=h("i")).text
 
 
+def test_block_reason_shown_instead_of_buttons(main):
+    """검사할 수 없는 문서는 까닭 코드를 함께 준다 — 화면이 버튼 대신 보여 준다 (https://github.com/reddol18/docflow/issues/66)"""
+    c = TestClient(main.app)
+    plan(c)
+    store.add_review_submitter("v1", 4)  # j: 이 철의 검토 제출자
+    assert c.patch("/documents/v1/d02", headers=h("k"), json={"recipient": "읍사무소"}).status_code == 200  # k: d02 입력
+
+    def blocks(who):
+        return {d["doc_id"]: (d["can_inspect"], d["block"]) for d in c.get("/volumes/v1/inspection", headers=h(who)).json()["docs"]}
+
+    assert set(blocks("r").values()) == {(False, "role")}  # 입력 역할은 읽기 전용
+    assert set(blocks("j").values()) == {(False, "submitted")}  # 검토 제출자는 모든 문서가 막힘
+    k = blocks("k")
+    assert k["d02"] == (False, "entered") and k["d01"] == (True, None)
+    assert c.post("/inspection/v1/d01", headers=h("i"), json={}).status_code == 200
+    assert blocks("a")["d01"] == (False, "inspected")
+
+
 def test_failed_fix_releases_and_still_counts(main, monkeypatch):
     """고치다 임베딩에서 실패하면 차지를 풀고, 다시 낸 제출에 차이가 없어도 앞서 저장된 수정을 고친 것으로 센다"""
     c = TestClient(main.app, raise_server_exceptions=False)
