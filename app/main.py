@@ -48,6 +48,7 @@ import re
 import secrets
 import shutil
 import sys
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from typing import Annotated, Literal
@@ -123,6 +124,12 @@ async def llm_off(request: Request, exc: llm.LLMOff):
     return JSONResponse(errors.public(exc), status_code=503)
 
 
+@app.exception_handler(store.LockBusy)
+async def lock_busy(request: Request, exc: store.LockBusy):
+    """문서·철 잠금을 store.LOCK_WAIT 안에 얻지 못함 (https://github.com/reddol18/docflow/issues/86)"""
+    return JSONResponse({"detail": "다른 사람이 처리 중 — 잠시 뒤 다시"}, status_code=409)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     try:
@@ -157,6 +164,9 @@ def audited(user, action, vol=None, doc_id=None, **info):
     except HTTPException as e:
         audit_safe(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
         raise
+    except store.LockBusy:  # 다른 요청이 같은 문서·철을 처리 중 → 409 (lock_busy 처리기)
+        audit_safe(user, action, vol, doc_id, "rejected_409", **info)
+        raise
     except Exception as e:
         audit_safe(user, action, vol, doc_id, "error", code=errors.code_of(e), **info)
         raise
@@ -171,11 +181,13 @@ def audit_safe(*args, **kw):
         errors.log_exception(f"audit {args[1]} {args[2]}")
 
 
-def submit(vol, arg, user=None):
-    """철 흐름을 뒤에서 돌린다. 끝난 결과도 감사 로그에 남긴다(run_done: ok / review_waiting / error+분류 코드)."""
-    if vol in running:
-        raise HTTPException(409, f"{vol} 이미 실행 중")
-    running[vol] = "queued"
+def submit(vol, arg, user=None, reserved=False):
+    """철 흐름을 뒤에서 돌린다. 끝난 결과도 감사 로그에 남긴다(run_done: ok / review_waiting / error+분류 코드).
+    reserved: 부른 쪽이 이미 running[vol]을 세웠다 (/run이 리셋 전에)"""
+    if not reserved:
+        if vol in running:
+            raise HTTPException(409, f"{vol} 이미 실행 중")
+        running[vol] = "queued"
 
     def job():
         running[vol] = "running"
@@ -252,13 +264,21 @@ def run(vol: str, user: Admin, review: str = "human"):
             raise HTTPException(400, "review=human|auto")
         if not any(store.pages_dir(vol).glob("*.jpg")):
             raise HTTPException(404, "올린 쪽이 없음")
-        if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
-            store.event(vol, "inspection", "reset", None, user=user.username)
-        # 검토 단계 위치도 처음으로, 실행 세대를 올린다 (승인·반려 기록 stage_log는 세대와 함께 남음)
-        info["stage_reset"] = moved = store.reset_stages(vol)
-        if moved:
-            store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
-        submit(vol, {"vol": vol, "review_mode": review}, user)
+        # 리셋 전에 실행 중 표시를 먼저 세운다 → 리셋하는 동안 수정·검사·승인·반려는 409 (색인이 끝난 철만 받으므로)
+        if vol in running:
+            raise HTTPException(409, f"{vol} 이미 실행 중")
+        running[vol] = "queued"
+        try:
+            if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
+                store.event(vol, "inspection", "reset", None, user=user.username)
+            # 검토 단계 위치도 처음으로, 실행 세대를 올린다 (승인·반려 기록 stage_log는 세대와 함께 남음)
+            info["stage_reset"] = moved = store.reset_stages(vol)
+            if moved:
+                store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
+            submit(vol, {"vol": vol, "review_mode": review}, user, reserved=True)
+        except BaseException:
+            running.pop(vol, None)
+            raise
     return {"vol": vol, "started": True}
 
 
@@ -348,20 +368,23 @@ def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Rev
 
 
 def _edit_document(vol, doc_id, fields, user, source="edit"):
-    snap = G.get_state(cfg(vol))
-    if snap.interrupts or vol in running:
-        raise HTTPException(409, "실행 중이거나 검토 대기 중")
-    docs = {d["doc_id"]: d for d in (snap.values or {}).get("docs", [])}
-    if doc_id not in docs:
-        raise HTTPException(404)
-    old = docs[doc_id]["fields"]
-    fix = schema_fields.normalize_input(schema_fields.SCHEMA,  # LLM 값과 같은 표기 규칙 (미상·연대·위치 등)
-                                        {k: str(v).strip() for k, v in fields.items() if k in EDITABLE})
-    fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
-    if not fix:
-        return docs[doc_id], []
-    d = dict(docs[doc_id], fields=flow.rederive({**old, **fix}, fix), edited=True)
-    G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
+    # 그래프 상태 읽기 → 쓰기는 철 잠금 안에서: 같은 철 다른 문서의 동시 수정이 서로 덮어쓰지 않게.
+    # 잠금 순서는 문서(부른 쪽) → 철로 고정 (https://github.com/reddol18/docflow/issues/86)
+    with store.vol_lock(vol):
+        snap = G.get_state(cfg(vol))
+        if snap.interrupts or vol in running:
+            raise HTTPException(409, "실행 중이거나 검토 대기 중")
+        docs = {d["doc_id"]: d for d in (snap.values or {}).get("docs", [])}
+        if doc_id not in docs:
+            raise HTTPException(404)
+        old = docs[doc_id]["fields"]
+        fix = schema_fields.normalize_input(schema_fields.SCHEMA,  # LLM 값과 같은 표기 규칙 (미상·연대·위치 등)
+                                            {k: str(v).strip() for k, v in fields.items() if k in EDITABLE})
+        fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
+        if not fix:
+            return docs[doc_id], []
+        d = dict(docs[doc_id], fields=flow.rederive({**old, **fix}, fix), edited=True)
+        G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
     store.save_documents([d])
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
@@ -582,6 +605,7 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
             if other:
                 raise HTTPException(403, "자기가 입력·수정한 문서는 검사할 수 없음 (교차검사)" if ENTRY["name"] in other
                                     else f"같은 문서의 다른 단계({', '.join(sorted(other))})를 맡은 사람은 검사할 수 없음")
+        gen = store.current_gen(vol)  # 확인 때 세대 — 그 사이 /run이 다시 돌리면 확정을 쓰지 않는다
         pos = positions(vol, [doc_id])[doc_id]
         if pos["stage"] != SAMPLE["name"]:
             raise HTTPException(409, "아직 검사 단계에 오지 않은 문서")
@@ -596,7 +620,8 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
         fixed = store.inspected_fields(vol, doc_id)
         store.finish_inspection(vol, doc_id, fixed)
         # 표본 단계는 마지막 단계라 검사가 끝나면 위치를 확정으로 옮기고 기록한다 (오류목록 내보내기가 같은 표에서 읽는다)
-        store.confirm_sample(vol, doc_id, SAMPLE["name"], pos["round"], user.id, fixed)
+        if not store.confirm_sample(vol, doc_id, SAMPLE["name"], pos["round"], user.id, fixed, gen):
+            raise HTTPException(409, "철을 다시 돌려 검사 목록이 바뀜")
         info.update(fields=fixed, stage=SAMPLE["name"], to=CONFIRMED)
     return {"doc_id": doc_id, "fixed_fields": fixed}
 
@@ -612,13 +637,15 @@ class StageRejectIn(BaseModel):
     reason: str = Field(min_length=1, max_length=REASON_MAX)  # 반려 사유 (필수)
 
 
-# 반려 사유에서 지우는 글자: 제어 문자(export.CONTROL), 방향 제어(U+202A–202E, U+2066–2069, LRM·RLM·ALM),
-# 폭 0 문자(U+200B–200D, U+2060, U+FEFF) — 화면·엑셀에서 보이는 글과 저장된 글이 달라지지 않게
-INVISIBLE = re.compile("[‪-‮⁦-⁩​-‏؜⁠﻿]")
+REASON_DROP = {"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"}  # 제어·서식(방향 제어·폭 0)·줄/문단 구분·대리·사용자 정의·미할당
 
 
 def clean_reason(s):
-    return INVISIBLE.sub("", export.CONTROL.sub("", s)).strip()
+    """반려 사유는 한 줄 글: 줄바꿈·탭은 빈칸으로 바꾸고, 보이지 않거나 화면·엑셀에서 다르게 보일 수 있는 글자
+    (unicodedata 분류 Cc·Cf·Zl·Zp 등)는 지운다. 빈칸은 하나로 줄인다"""
+    s = re.sub(r"[\t\n\r\v\f  \x85]+", " ", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in REASON_DROP)
+    return re.sub(r" {2,}", " ", s).strip()
 
 
 def _stage_action(vol, doc_id, name, user):
@@ -679,18 +706,18 @@ def stage_approve(vol: str, doc_id: str, body: StageApproveIn, user: StageUser):
     마지막 단계면 확정. 확인·칸 반영·이동을 문서 잠금(doc_lock) 안에서 차례로 한다 — 같은 차례를 두 번 넘기거나,
     확인 뒤 다른 요청이 단계를 바꾼 문서에 칸을 반영하지 않는다. 칸 반영이 실패하면 이동하지 않는다(다시 승인하면 된다)"""
     with audited(user, "stage_approve", vol, doc_id, stage=body.stage) as info, store.doc_lock(vol, doc_id):
+        gen = store.current_gen(vol)  # 확인 때 세대 — 그 사이 /run이 다시 돌리면 쓰지 않는다
         st, pos = _stage_action(vol, doc_id, body.stage, user)
-        row = store.ensure_stage(vol, doc_id, pos["stage"])
-        rnd = row["round"]
-        if row["stage"] != st["name"]:
-            raise HTTPException(409, "문서의 단계가 바뀜")
+        rnd = pos["round"]
         to = workflow.next_stage(WORKFLOW, st["name"])
-        changed = []
+        source = "edit" if st["kind"] == "entry" else f"stage:{st['name']}"
         if body.fields:
-            source = "edit" if st["kind"] == "entry" else f"stage:{st['name']}"
-            _, changed = _edit_document(vol, doc_id, body.fields, user, source=source)
-        if not store.move_stage(vol, doc_id, st["name"], rnd, "approve", to, rnd, user.id, fixed=changed):
-            raise HTTPException(409, "문서의 단계가 바뀜")  # 잠금 안이라 DB 밖 변경이 없으면 오지 않는다
+            _edit_document(vol, doc_id, body.fields, user, source=source)
+        # 고친 칸은 이력에서 센다 — 앞선 승인이 칸 반영 뒤 실패해 이번에 차이가 없어도 빠지지 않게
+        changed = store.stage_fixed_fields(vol, doc_id, st["name"], [source])
+        if not store.move_stage(vol, doc_id, st["name"], rnd, "approve", to, rnd, user.id, fixed=changed, gen=gen,
+                                init=workflow.initial(WORKFLOW)):
+            raise HTTPException(409, "철을 다시 돌렸거나 문서의 단계가 바뀜")
         info.update(to=to, round=rnd, recheck=rnd > 1, fields=changed)
     return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd, "fixed_fields": changed}
 
@@ -703,14 +730,14 @@ def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
         reason = clean_reason(body.reason)
         if not reason:
             raise HTTPException(422, "반려 사유를 적어야 함")
+        gen = store.current_gen(vol)
         st, pos = _stage_action(vol, doc_id, body.stage, user)
         if not st["reject"]:
             raise HTTPException(409, "이 단계는 반려할 수 없음")
-        row = store.ensure_stage(vol, doc_id, pos["stage"])
-        rnd, to = row["round"], st["reject_to"]
-        if row["stage"] != st["name"] or not store.move_stage(vol, doc_id, st["name"], rnd, "reject", to, rnd + 1,
-                                                              user.id, reason=reason):
-            raise HTTPException(409, "문서의 단계가 바뀜")
+        rnd, to = pos["round"], st["reject_to"]
+        if not store.move_stage(vol, doc_id, st["name"], rnd, "reject", to, rnd + 1, user.id, reason=reason, gen=gen,
+                                init=workflow.initial(WORKFLOW)):
+            raise HTTPException(409, "철을 다시 돌렸거나 문서의 단계가 바뀜")
         info.update(to=to, round=rnd + 1, reason_chars=len(reason))
     return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd + 1}
 
@@ -934,7 +961,10 @@ def _unconfirmed(volumes, stages):
             out[v] = set(ids)
         else:
             pos = positions(v, ids)
-            out[v] = {d for d in ids if pos[d]["status"] == "pending"}
+            # 검사 제외 문서는 그 철의 검사 목록이 모두 끝났을 때만 확정으로 센다 (목록이 없으면 제외 문서도 없다)
+            plan_done = bool(SAMPLE) and all(r["fixed_fields"] is not None for r in store.inspection_rows(v))
+            out[v] = {d for d in ids if pos[d]["status"] == "pending"
+                      or (pos[d]["status"] == "excluded" and not plan_done)}
     return out
 
 

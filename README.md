@@ -104,7 +104,10 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 - 문서 상태(`status`): `confirmed` 확정, `excluded` 표본 단계의 검사 목록 밖(검사 제외 — 출력 전 검증에서는 미확정이 아니고 입력 경로로 고칠 수 있다), `pending` 차례 기다림.
 - 위치는 `doc_stage`, 승인·반려 기록(사람·단계·차례·사유·고친 칸)은 `stage_log`(`GET /documents/{vol}/{doc_id}/stages`), 감사 로그에는 `stage_approve`·`stage_reject`(단계·이동·차례·재검수 여부, 사유는 길이만). 반려 사유의 제어·방향 제어·폭 0 문자는 지운다. 두 표는 일괄 삭제 대상.
 - 철을 처음부터 다시 돌리면(`/run`) 단계 위치를 지우고 실행 세대(`stage_gen`)를 올린다. 작업자 ≠ 검수자와 단계 기록 화면은 지금 세대만 본다(예전 세대 기록은 표에 남는다). 감사 로그 `run`에 지운 위치 수(`stage_reset`).
-- `count_unconfirmed: true`면 출력 전 검증(`/export/check`)이 마지막 단계 승인 전 건을 `unconfirmed`로 센다. 기본 흐름은 지금처럼 세지 않는다.
+- `count_unconfirmed: true`면 출력 전 검증(`/export/check`)이 마지막 단계 승인 전 건을 `unconfirmed`로 센다(다른 문제 칸과 같이 경고만 — 출력을 막지 않고, 일괄 삭제는 `allow_problems` 규칙 그대로). 기본 흐름도 센다(사용자 결정 2026-11-09): 확정은 표본 검사를 마친 문서와, 검사 목록이 만들어지고 그 철의 검사가 모두 끝난 뒤의 검사 제외 문서. 검사 목록이 없거나 검사가 남아 있으면 나머지는 미확정.
+- 문서 잠금은 `DOC_LOCK_WAIT_SEC`(기본 10초)까지 기다리고, 넘기면 409 "다른 사람이 처리 중". 그래프 상태 읽기→쓰기는 철 잠금 안에서(잠금 순서 문서 → 철).
+- 작업자 ≠ 검수자의 입력 판단(철 검토 제출·입력 경로 수정, `store.entered`)은 실행 세대로 거르지 않는다(의도 — 다시 돌리기 전 입력자도 계속 입력자로 보아 넓게 막는다). 단계 승인·반려·검수 수정 기록만 세대로 거른다.
+- 예전 판에서 끝나지 않은 검사 차지(`inspection.inspected_at`만 있고 `fixed_fields`가 비어 있음 — 요청이 죽은 경우)는 그대로 두면 그 문서를 검사할 수 없다. 관리자가 확인한 뒤 DB에서 푼다: `UPDATE inspection SET inspected_by = NULL, inspected_at = NULL WHERE vol = '<철>' AND doc_id = '<문서>' AND fixed_fields IS NULL;` (지금 판은 검사를 문서 잠금 안에서 하고 실패하면 차지를 풀어 새로 생기지 않는다)
 
 ## 측정 결과
 

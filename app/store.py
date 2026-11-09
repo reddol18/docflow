@@ -5,12 +5,13 @@ import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from app import fields
 from app.workflow import CONFIRMED
@@ -139,6 +140,7 @@ CREATE TABLE IF NOT EXISTS stage_log (
   id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), vol text NOT NULL, doc_id text NOT NULL,
   stage text NOT NULL, round int NOT NULL, action text NOT NULL, to_stage text NOT NULL, user_id bigint,
   reason text, fixed_fields text[], gen int NOT NULL DEFAULT 0);
+ALTER TABLE stage_log ADD COLUMN IF NOT EXISTS gen int NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS stage_log_doc ON stage_log (vol, doc_id);
 CREATE TABLE IF NOT EXISTS stage_gen (vol text PRIMARY KEY, gen int NOT NULL, since timestamptz NOT NULL)
 """
@@ -326,7 +328,9 @@ _VOL_ENTRANTS = ("SELECT user_id FROM review_submitters WHERE vol = %(vol)s "
 
 
 def entered(vol, user_id):
-    """이 사용자가 입력 단계에 손댄 범위: (철 전체를 검토 제출했나, 칸을 고친 문서 id 집합). 교차검사용 — 한 번에 센다"""
+    """이 사용자가 입력 단계에 손댄 범위: (철 전체를 검토 제출했나, 칸을 고친 문서 id 집합). 교차검사용 — 한 번에 센다.
+    실행 세대(stage_gen)로 거르지 않는다 (의도, https://github.com/reddol18/docflow/issues/86): 다시 돌리기 전에 입력을
+    맡았던 사람도 계속 입력한 사람으로 본다 — 작업자 ≠ 검수자를 넓게(안전 쪽으로) 막는다. 단계 승인·반려 기록만 세대로 거른다"""
     with pool.connection() as c:
         whole = c.execute(f"SELECT 1 FROM ({_VOL_ENTRANTS}) t WHERE user_id = %(uid)s LIMIT 1",  # noqa: S608 — 상수 SQL
                           {"vol": vol, "uid": user_id}).fetchone() is not None
@@ -431,30 +435,79 @@ _GEN = "coalesce((SELECT gen FROM stage_gen WHERE vol = %(v)s), 0)"
 _SINCE = "coalesce((SELECT since FROM stage_gen WHERE vol = %(v)s), '-infinity'::timestamptz)"
 
 
-def _lock_key(vol, doc_id):
-    return int.from_bytes(hashlib.sha256(f"docflow-doc/{vol}/{doc_id}".encode()).digest()[:8], "big", signed=True)
+LOCK_WAIT = float(os.environ.get("DOC_LOCK_WAIT_SEC", "10"))  # 잠금을 이만큼 기다려도 못 얻으면 LockBusy (main이 409로)
 
 
-_STRIPES = [threading.Lock() for _ in range(256)]  # 프로세스 안 잠금 (문서 키를 256칸에 나눠 담는다)
+class LockBusy(Exception):
+    """다른 요청이 같은 문서·철을 처리 중이라 LOCK_WAIT 안에 잠금을 얻지 못함"""
+
+
+def _lock_key(name):
+    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big", signed=True)
+
+
+# 프로세스 안 잠금 (키를 256칸에 나눠 담는다). RLock: 한 요청이 문서 잠금 뒤 철 잠금을 같은 칸에서 다시 잡을 수 있게
+_STRIPES = [threading.RLock() for _ in range(256)]
+_held = threading.local()  # 이 스레드(요청)가 쥔 잠금용 연결 — 겹친 잠금은 같은 연결에 건다 (요청마다 잠금 연결 하나)
 
 
 @contextmanager
-def doc_lock(vol, doc_id):
-    """문서 단위 잠금: 프로세스 안 잠금 + Postgres 세션 advisory lock (다른 프로세스·Pod 사이).
-    확인과 쓰기가 여러 연결에 걸치므로(그래프 상태·documents·edits·stage_log) 한 트랜잭션으로 묶지 않고, 잠금을 쥔 동안
-    다른 요청이 같은 문서를 확인·쓰지 못하게 한다. 잠금용 연결(lock_pool)은 따로 둔다 — 같은 풀이면 잠금 대기가 쓰기
-    연결을 다 잡아 멈출 수 있다. 트랜잭션을 열어 두지 않는다(xact lock이 아님): 트랜잭션 중인 연결이 있으면 다른 연결을
-    멈추는 시험 서버(PGlite)가 있다. 풀 때 실패하면 연결을 닫아 서버가 세션 잠금을 풀게 한다"""
-    key = _lock_key(vol, doc_id)
-    with _STRIPES[key % len(_STRIPES)], lock_pool.connection() as c:
-        c.execute("SELECT pg_advisory_lock(%s)", (key,))
+def _pg_lock(c, key, deadline):
+    """세션 advisory lock. 마감까지 pg_try_advisory_lock을 되풀이한다. 풀 때 실패하면 연결을 닫아 서버가 풀게 한다"""
+    while not c.execute("SELECT pg_try_advisory_lock(%s) AS ok", (key,)).fetchone()["ok"]:
+        if time.monotonic() >= deadline:
+            raise LockBusy("잠금 대기 시간 초과")
+        time.sleep(0.05)
+    try:
+        yield
+    finally:
         try:
-            yield
+            c.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        except Exception:
+            c.close()  # 닫힌 연결은 풀이 버린다 → 세션이 끝나며 잠금이 풀린다
+
+
+@contextmanager
+def named_lock(name):
+    """이름 잠금: 프로세스 안 잠금 + Postgres 세션 advisory lock (다른 프로세스·Pod 사이). 기다림은 LOCK_WAIT까지.
+    확인과 쓰기가 여러 연결에 걸치므로(그래프 상태·documents·edits·stage_log) 한 트랜잭션으로 묶지 않고, 잠금을 쥔 동안
+    다른 요청이 같은 대상을 확인·쓰지 못하게 한다. 잠금용 연결(lock_pool)은 따로 둔다 — 같은 풀이면 잠금 대기가 쓰기 연결을
+    다 잡아 멈출 수 있다. 트랜잭션을 열어 두지 않는다(xact lock이 아님): 트랜잭션 중인 연결이 있으면 다른 연결을 멈추는
+    시험 서버(PGlite)가 있다. 잠금 순서는 문서 → 철로 고정한다 (교착 없게)"""
+    key = _lock_key(name)
+    deadline = time.monotonic() + LOCK_WAIT
+    stripe = _STRIPES[key % len(_STRIPES)]
+    if not stripe.acquire(timeout=LOCK_WAIT):
+        raise LockBusy("잠금 대기 시간 초과")
+    try:
+        outer = getattr(_held, "conn", None)
+        if outer is not None:
+            with _pg_lock(outer, key, deadline):
+                yield
+            return
+        try:
+            c = lock_pool.getconn(timeout=max(0.1, deadline - time.monotonic()))
+        except PoolTimeout:
+            raise LockBusy("잠금 연결 대기 시간 초과") from None
+        _held.conn = c
+        try:
+            with _pg_lock(c, key, deadline):
+                yield
         finally:
-            try:
-                c.execute("SELECT pg_advisory_unlock(%s)", (key,))
-            except Exception:
-                c.close()  # 닫힌 연결은 풀이 버린다 → 세션이 끝나며 잠금이 풀린다
+            _held.conn = None
+            lock_pool.putconn(c)
+    finally:
+        stripe.release()
+
+
+def doc_lock(vol, doc_id):
+    """문서 하나를 바꾸는 일(입력 수정·검사·단계 승인/반려)의 확인과 쓰기"""
+    return named_lock(f"docflow-doc/{vol}/{doc_id}")
+
+
+def vol_lock(vol):
+    """철의 그래프 상태 읽고 쓰기(get_state → update_state) — 같은 철 다른 문서의 동시 수정이 서로 덮어쓰지 않게"""
+    return named_lock(f"docflow-vol/{vol}")
 
 
 def stage_rows(vol):
@@ -465,48 +518,99 @@ def stage_rows(vol):
 
 
 def ensure_stage(vol, doc_id, stage):
-    """처음 손댈 때 행을 만든다 (이미 있으면 그대로). 지금 행을 돌려준다"""
+    """행이 없으면 만든다 (이미 있으면 그대로). 지금 행"""
     with pool.connection() as c:
         c.execute("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING", (vol, doc_id, stage))
         return c.execute("SELECT * FROM doc_stage WHERE vol = %s AND doc_id = %s", (vol, doc_id)).fetchone()
 
 
-def move_stage(vol, doc_id, stage, rnd, action, to_stage, to_round, user_id, reason=None, fixed=None):
-    """단계 이동과 기록을 한 트랜잭션으로. 단계·차례가 그대로일 때만 (doc_lock 안에서 부른다). 옮겼으면 True.
-    반려면 사유와 반려한 단계를 문서에 남기고, 반려한 단계가 승인하거나 확정되면 지운다 (기록은 stage_log에 남음)"""
-    with pool.connection() as c, c.transaction():
-        n = c.execute(
-            "UPDATE doc_stage SET stage = %(to)s, round = %(tr)s, "
-            "last_reason = CASE WHEN %(rej)s THEN %(why)s WHEN rejected_from = %(s)s OR %(to)s = %(fin)s THEN NULL "
-            "ELSE last_reason END, "
-            "rejected_from = CASE WHEN %(rej)s THEN %(s)s WHEN rejected_from = %(s)s OR %(to)s = %(fin)s THEN NULL "
-            "ELSE rejected_from END, updated_at = now() "
-            "WHERE vol = %(v)s AND doc_id = %(d)s AND stage = %(s)s AND round = %(r)s",
-            {"to": to_stage, "tr": to_round, "rej": action == "reject", "why": reason, "fin": CONFIRMED,
-             "v": vol, "d": doc_id, "s": stage, "r": rnd}).rowcount
-        if n != 1:
-            return False
-        add_stage_log(vol, doc_id, stage, rnd, action, to_stage, user_id, reason, fixed, conn=c)
+def current_gen(vol):
+    with pool.connection() as c:
+        return c.execute(f"SELECT {_GEN} AS g", {"v": vol}).fetchone()["g"]  # noqa: S608 — 상수 조각만 끼움
+
+
+def _same_gen(c, vol, gen):
+    """트랜잭션 안에서 세대가 확인 때와 같은가 (stage_gen 행을 FOR SHARE로 잡아 /run의 세대 올리기와 엇갈리지 않게)"""
+    r = c.execute("SELECT gen FROM stage_gen WHERE vol = %s FOR SHARE", (vol,)).fetchone()
+    return (r["gen"] if r else 0) == gen
+
+
+def move_stage(vol, doc_id, stage, rnd, action, to_stage, to_round, user_id, reason=None, fixed=None, gen=None,
+               init=None):
+    """단계 이동과 기록을 한 트랜잭션으로 (doc_lock 안에서 부른다). 옮겼으면 True. 옮기지 않는 경우(False):
+    확인 때 읽은 세대(gen)가 바뀜(그 사이 /run이 다시 돌림), 문서의 단계·차례가 바뀜.
+    행이 없던 문서는 같은 트랜잭션에서 처음 단계(init) 행을 만든다. 반려면 사유와 반려한 단계를 문서에 남기고,
+    반려한 단계가 승인하거나 확정되면 지운다 (기록은 stage_log에 남음)"""
+    try:
+        with pool.connection() as c, c.transaction():
+            if gen is not None and not _same_gen(c, vol, gen):
+                return False
+            if init is not None:
+                c.execute("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                          (vol, doc_id, init))
+            n = c.execute(
+                "UPDATE doc_stage SET stage = %(to)s, round = %(tr)s, "
+                "last_reason = CASE WHEN %(rej)s THEN %(why)s WHEN rejected_from = %(s)s OR %(to)s = %(fin)s THEN NULL "
+                "ELSE last_reason END, "
+                "rejected_from = CASE WHEN %(rej)s THEN %(s)s WHEN rejected_from = %(s)s OR %(to)s = %(fin)s THEN NULL "
+                "ELSE rejected_from END, updated_at = now() "
+                "WHERE vol = %(v)s AND doc_id = %(d)s AND stage = %(s)s AND round = %(r)s",
+                {"to": to_stage, "tr": to_round, "rej": action == "reject", "why": reason, "fin": CONFIRMED,
+                 "v": vol, "d": doc_id, "s": stage, "r": rnd}).rowcount
+            if n != 1:
+                raise _Rollback  # 만든 처음 단계 행까지 되돌린다
+            add_stage_log(vol, doc_id, stage, rnd, action, to_stage, user_id, reason, fixed, conn=c)
+    except _Rollback:
+        return False
     return True
 
 
-def confirm_sample(vol, doc_id, stage, rnd, user_id, fixed):
-    """표본 검사가 끝난 문서를 확정으로 옮기고 기록한다 (한 트랜잭션). 행이 없던 문서(기본 흐름)는 만든다"""
+class _Rollback(Exception):
+    """move_stage 트랜잭션을 되돌리는 신호"""
+
+
+def confirm_sample(vol, doc_id, stage, rnd, user_id, fixed, gen):
+    """표본 검사가 끝난 문서를 확정으로 옮기고 기록한다 (한 트랜잭션). 행이 없던 문서(기본 흐름)는 만든다.
+    세대가 바뀌었거나(/run) 이 사용자의 검사 차지가 없어졌으면 쓰지 않고 False"""
     with pool.connection() as c, c.transaction():
+        if not _same_gen(c, vol, gen):
+            return False
+        if not c.execute("SELECT 1 FROM inspection WHERE vol = %s AND doc_id = %s AND inspected_at IS NOT NULL "
+                         "AND inspected_by IS NOT DISTINCT FROM %s", (vol, doc_id, user_id)).fetchone():
+            return False
         c.execute("INSERT INTO doc_stage (vol, doc_id, stage, round) VALUES (%(v)s, %(d)s, %(fin)s, %(r)s) "
                   "ON CONFLICT (vol, doc_id) DO UPDATE SET stage = %(fin)s, last_reason = NULL, rejected_from = NULL, "
                   "updated_at = now() WHERE doc_stage.stage = %(s)s",
                   {"v": vol, "d": doc_id, "fin": CONFIRMED, "r": rnd, "s": stage})
         add_stage_log(vol, doc_id, stage, rnd, "approve", CONFIRMED, user_id, None, fixed, conn=c)
+    return True
+
+
+def stage_fixed_fields(vol, doc_id, stage, sources):
+    """이 단계 차례에 고친 칸 (이력 기준): 문서가 지금 세대에 이 단계로 들어온 뒤(마지막 stage_log to_stage, 없으면
+    세대 시작) 이 단계 source(입력은 edit, 검수는 stage:<단계>)로 들어온 수정. 앞선 승인이 칸 반영 뒤 실패해
+    다시 승인할 때 차이가 없어도 고친 칸이 기록에서 빠지지 않게"""
+    with pool.connection() as c:
+        return sorted(r["field"] for r in c.execute(
+            "SELECT DISTINCT field FROM edits WHERE vol = %(v)s AND doc_id = %(d)s AND source = ANY(%(src)s) "  # noqa: S608
+            f"AND ts >= greatest({_SINCE}, (SELECT max(ts) FROM stage_log WHERE vol = %(v)s AND doc_id = %(d)s "
+            f"AND to_stage = %(s)s AND gen = {_GEN}))",
+            {"v": vol, "d": doc_id, "s": stage, "src": list(sources)}).fetchall())
 
 
 def backfill_inspected(stage):
-    """예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로 — 시작할 때마다, 남은 것만. 옮긴 행 수"""
-    with pool.connection() as c:
-        return c.execute("INSERT INTO doc_stage (vol, doc_id, stage) SELECT vol, doc_id, %s FROM inspection "
-                         "WHERE inspected_at IS NOT NULL AND fixed_fields IS NOT NULL ON CONFLICT (vol, doc_id) "
-                         "DO UPDATE SET stage = EXCLUDED.stage WHERE doc_stage.stage = %s",
-                         (CONFIRMED, stage)).rowcount
+    """예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로, 승인 기록(stage_log)도 함께 — 시작할 때마다, 남은 것만.
+    옮긴 행 수. 예전 판에서 끝나지 않은 검사 차지(inspected_at만 있고 fixed_fields 없음)는 건드리지 않는다 (README)"""
+    with pool.connection() as c, c.transaction():
+        return c.execute(
+            "WITH moved AS (INSERT INTO doc_stage (vol, doc_id, stage) SELECT vol, doc_id, %(fin)s FROM inspection "
+            "WHERE inspected_at IS NOT NULL AND fixed_fields IS NOT NULL ON CONFLICT (vol, doc_id) "
+            "DO UPDATE SET stage = EXCLUDED.stage WHERE doc_stage.stage = %(s)s RETURNING vol, doc_id) "
+            "INSERT INTO stage_log (vol, doc_id, stage, round, action, to_stage, user_id, fixed_fields, gen, ts) "
+            "SELECT i.vol, i.doc_id, %(s)s, 1, 'approve', %(fin)s, i.inspected_by, i.fixed_fields, "
+            "coalesce((SELECT gen FROM stage_gen g WHERE g.vol = i.vol), 0), i.inspected_at "
+            "FROM moved m JOIN inspection i ON i.vol = m.vol AND i.doc_id = m.doc_id",
+            {"fin": CONFIRMED, "s": stage}).rowcount
 
 
 def add_stage_log(vol, doc_id, stage, rnd, action, to_stage, user_id, reason=None, fixed=None, conn=None):

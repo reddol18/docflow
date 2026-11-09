@@ -15,7 +15,7 @@ def test_default_is_current_two_stage_flow():
     """설정 없이 띄우면 지금의 2단계: 입력(reviewer, 색인이 끝나면 넘어감) → 표본 검사(inspector, 반려 없음)"""
     wf = workflow.load(workflow.DEFAULT)
     assert workflow.load() == wf  # WORKFLOW 환경변수가 없으면 이 파일
-    assert (wf["distinct_actors"], wf["count_unconfirmed"]) == (True, False)
+    assert (wf["distinct_actors"], wf["count_unconfirmed"]) == (True, True)  # 미확정 세기: 사용자 결정 2026-11-09
     assert [(s["name"], s["role"], s["kind"], s["select"], s["reject"], s["rate"]) for s in wf["stages"]] == [
         ("entry", "reviewer", "entry", "all", False, None), ("inspect", "inspector", "review", "sample", False, None)]
     assert wf["stages"][0]["submit"] == "on_index"
@@ -96,6 +96,80 @@ def test_missing_file_is_workflow_error(tmp_path):
     (tmp_path / "bad.yaml").write_text("stages: [", encoding="utf-8")
     with pytest.raises(workflow.WorkflowError):
         workflow.load(tmp_path / "bad.yaml")
+
+
+def test_clean_reason_drops_invisible_and_control():
+    """반려 사유는 한 줄: 줄바꿈·탭 → 빈칸, 분류 Cc·Cf·Zl·Zp(방향 제어·폭 0·소프트 하이픈·줄 구분) 글자는 지운다"""
+    from app import main
+    assert main.clean_reason("가상\n사유\t둘") == "가상 사유 둘"
+    assert main.clean_reason("가‮상​ ⁦사­유﻿ 끝\x07") == "가상 사유 끝"
+    assert main.clean_reason("​‪ \x00\n") == ""
+    assert main.clean_reason("漢字·한글 1-2 (가상)") == "漢字·한글 1-2 (가상)"  # 보이는 글자는 그대로
+
+
+class _FakeConn:
+    def __init__(self, fail_unlock):
+        self.fail_unlock, self.closed, self.sql = fail_unlock, False, []
+
+    def execute(self, sql, args=None):
+        self.sql.append(sql.split("(")[0])
+        if "unlock" in sql and self.fail_unlock:
+            raise OSError("연결 끊김")
+        return type("R", (), {"fetchone": lambda _: {"ok": True}})()
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePool:
+    def __init__(self, conn):
+        self.conn, self.put = conn, 0
+
+    def getconn(self, timeout=None):
+        return self.conn
+
+    def putconn(self, c):
+        self.put += 1
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_lock_unlock_failure_closes_connection(monkeypatch, fail):
+    """advisory lock을 풀다 실패하면 연결을 닫는다 (닫힌 연결은 풀이 버리고, 세션이 끝나며 서버가 잠금을 푼다).
+    겹친 잠금(문서 → 철)은 같은 연결에 건다"""
+    from app import store
+    conn = _FakeConn(fail)
+    pool = _FakePool(conn)
+    monkeypatch.setattr(store, "lock_pool", pool)
+    with store.doc_lock("v", "d"), store.vol_lock("v"):
+        pass
+    assert conn.closed is fail and pool.put == 1
+    assert [s for s in conn.sql if "advisory" in s] == ["SELECT pg_try_advisory_lock", "SELECT pg_try_advisory_lock",
+                                                        "SELECT pg_advisory_unlock", "SELECT pg_advisory_unlock"]
+
+
+def test_lock_wait_has_deadline(monkeypatch):
+    """같은 키를 다른 스레드가 쥐고 있으면 LOCK_WAIT 뒤 LockBusy (끝없이 기다리지 않는다)"""
+    import threading
+
+    from app import store
+    monkeypatch.setattr(store, "lock_pool", _FakePool(_FakeConn(False)))
+    monkeypatch.setattr(store, "LOCK_WAIT", 0.2)
+    held, done = threading.Event(), threading.Event()
+
+    def hold():
+        with store.doc_lock("v", "d"):
+            held.set()
+            done.wait(5)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    held.wait(5)
+    try:
+        with pytest.raises(store.LockBusy), store.doc_lock("v", "d"):
+            pass
+    finally:
+        done.set()
+        t.join()
 
 
 def _start_app(env_workflow):

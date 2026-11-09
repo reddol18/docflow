@@ -163,7 +163,7 @@ def test_three_stage_flow_end_to_end(main, monkeypatch):
             for e in hist] == [
         ("entry", 1, "approve", "qc", "w", None, ["title"]),
         ("qc", 1, "reject", "entry", "q", "가상 사유: 제목 오기", None),
-        ("entry", 2, "approve", "qc", "w", None, []),
+        ("entry", 2, "approve", "qc", "w", None, ["title"]),  # 돌아온 뒤 입력 경로로 고친 칸 (이력에서 셈)
         ("qc", 2, "approve", "supervisor", "q", None, ["recipient"]),
         ("supervisor", 2, "approve", workflow.CONFIRMED, "s", None, [])]
     edits = c.get("/documents/v1/d01/edits", headers=h("v")).json()
@@ -250,7 +250,129 @@ def test_failed_fix_does_not_move(main, monkeypatch):
     assert approve(c, "q", "d03", "qc", title="가상").status_code == 500
     assert where(c)["d03"]["stage"] == "qc"
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
-    assert approve(c, "q", "d03", "qc", title="가상").json()["to"] == "supervisor"
+    r = approve(c, "q", "d03", "qc", title="가상").json()
+    # 앞선 시도에서 칸은 이미 반영됐다 → 이번 차이는 없지만 고친 칸은 이력에서 세어 기록에 남는다
+    assert (r["to"], r["fixed_fields"]) == ("supervisor", ["title"])
+    assert c.get("/documents/v1/d03/stages", headers=h("v")).json()[-1]["fixed_fields"] == ["title"]
+
+
+def test_run_reset_between_check_and_write(main, monkeypatch):
+    """확인 뒤 쓰기 전에 /run이 다시 돌리면(세대가 바뀜) 승인·반려·검사는 409이고 새 세대에 단계 행이 생기지 않는다.
+    /run은 리셋 전에 실행 중 표시를 먼저 세운다"""
+    use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
+    c = TestClient(main.app)
+    assert approve(c, "w", "d02", "entry").status_code == 200  # d02는 qc에
+    real_move = store.move_stage
+
+    def reset_then_move(*a, **k):
+        store.reset_stages("v1")
+        return real_move(*a, **k)
+
+    monkeypatch.setattr(store, "move_stage", reset_then_move)
+    assert approve(c, "w", "d01", "entry", title="가상").status_code == 409
+    assert reject(c, "q", "d02", "qc", "가상 사유").status_code == 409
+    assert store.stage_rows("v1") == {}  # 새 세대에 옛 확인으로 만든 행이 없다
+    assert c.get("/documents/v1/d01/stages", headers=h("v")).json() == []
+    monkeypatch.setattr(store, "move_stage", real_move)
+
+    # 기본 흐름 검사: 확정 쓰기 직전에 다시 돌림 → 409, 확정 행 없음
+    use_flow(main, monkeypatch, workflow.load(workflow.DEFAULT))
+    assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
+    real_confirm = store.confirm_sample
+
+    def reset_then_confirm(*a, **k):
+        store.reset_inspection("v1")
+        store.reset_stages("v1")
+        return real_confirm(*a, **k)
+
+    monkeypatch.setattr(store, "confirm_sample", reset_then_confirm)
+    assert c.post("/inspection/v1/d02", headers=h("q"), json={}).status_code == 409
+    assert store.stage_rows("v1") == {}
+    monkeypatch.setattr(store, "confirm_sample", real_confirm)
+
+    # /run: 리셋하는 동안 철은 이미 실행 중 → 그 사이 온 수정·승인은 _done_docs/_edit_document에서 409
+    seen = []
+    real_reset = store.reset_inspection
+    monkeypatch.setattr(store, "reset_inspection", lambda vol: seen.append(vol in main.running) or real_reset(vol))
+    store.pages_dir("v1").mkdir(parents=True)
+    (store.pages_dir("v1") / "p.jpg").write_bytes(b"\xff\xd8\xff")
+    assert c.post("/volumes/v1/run", headers=h("s")).status_code == 200
+    main.runner.submit(lambda: None).result()
+    assert seen == [True]
+
+
+def test_graph_state_write_holds_volume_lock(main, monkeypatch):
+    """그래프 상태 읽기→쓰기(update_state) 동안 철 잠금을 쥔다 — 같은 철 다른 문서의 수정은 기다리거나 409"""
+    monkeypatch.setattr(store, "LOCK_WAIT", 0.2)
+    c = TestClient(main.app)
+    real_update, seen = main.G.update_state, []
+
+    def update_state(cfg, v, as_node=None):
+        out = []
+
+        def other():
+            try:
+                with store.vol_lock("v1"):
+                    out.append("got")
+            except store.LockBusy:
+                out.append("busy")
+
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        seen.extend(out)
+        return real_update(cfg, v, as_node)
+
+    monkeypatch.setattr(main.G, "update_state", update_state)
+    assert c.patch("/documents/v1/d02", headers=h("w"), json={"title": "가상"}).status_code == 200
+    assert seen == ["busy"]
+
+
+def test_lock_busy_is_409(main, monkeypatch):
+    """다른 요청이 문서를 쥐고 있으면 LOCK_WAIT 뒤 409 '다른 사람이 처리 중', 감사 로그 rejected_409"""
+    use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
+    monkeypatch.setattr(store, "LOCK_WAIT", 0.3)
+    c = TestClient(main.app)
+    held, done = threading.Event(), threading.Event()
+
+    def hold():
+        with store.doc_lock("v1", "d01"):
+            held.set()
+            done.wait(10)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    held.wait(5)
+    try:
+        r = approve(c, "w", "d01", "entry")
+        assert r.status_code == 409 and "처리 중" in r.json()["detail"]
+        assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "x"}).status_code == 409
+    finally:
+        done.set()
+        t.join()
+    assert approve(c, "w", "d01", "entry").status_code == 200
+    assert any(r["action"] == "stage_approve" and r["result"] == "rejected_409" for r in store.audit_log())
+
+
+def test_db_from_first_commit_opens(main, pg_store):
+    """4a1d975 판으로 만든 DB(stage_log에 gen 없음, doc_stage에 busy 칸, stage_gen 없음)에서 시작해도 열린다"""
+    with pg_store.pool.connection() as conn:
+        for t in ("doc_stage", "stage_log", "stage_gen"):
+            conn.execute(f"DROP TABLE {t}")  # noqa: S608 — 고정된 표 이름
+        conn.execute("CREATE TABLE doc_stage (vol text NOT NULL, doc_id text NOT NULL, stage text NOT NULL, "
+                     "round int NOT NULL DEFAULT 1, busy_by bigint, busy_at timestamptz, last_reason text, "
+                     "rejected_from text, updated_at timestamptz DEFAULT now(), PRIMARY KEY (vol, doc_id))")
+        conn.execute("CREATE TABLE stage_log (id bigserial PRIMARY KEY, ts timestamptz DEFAULT clock_timestamp(), "
+                     "vol text NOT NULL, doc_id text NOT NULL, stage text NOT NULL, round int NOT NULL, "
+                     "action text NOT NULL, to_stage text NOT NULL, user_id bigint, reason text, fixed_fields text[])")
+        conn.execute("INSERT INTO stage_log (vol, doc_id, stage, round, action, to_stage, user_id) "
+                     "VALUES ('v1', 'd01', 'inspect', 1, 'approve', '_confirmed', 3)")
+    store.init_db()
+    main.startup_migrate()
+    c = TestClient(main.app)
+    assert [(e["stage"], e["username"]) for e in c.get("/documents/v1/d01/stages", headers=h("v")).json()] == [
+        ("inspect", "q")]
+    assert store.current_gen("v1") == 0 and where(c)["d02"]["stage"] == "inspect"
 
 
 def test_on_index_full_stage_patch_blocked(main, monkeypatch):
@@ -297,7 +419,9 @@ def test_sample_stage_after_full_stage_cannot_be_skipped(main, monkeypatch):
 
 
 def test_default_flow_unchanged(main):
-    """설정 없이(기본 흐름): 단계 경로는 아무것도 바꾸지 못하고, 검사·수정·출력 전 검증은 지금과 같다"""
+    """설정 없이(기본 흐름): 단계 경로는 아무것도 바꾸지 못하고, 검사·수정은 지금과 같다.
+    바뀐 것(사용자 결정 2026-11-09): 출력 전 검증이 미확정을 센다 — 검사 목록이 없거나 검사가 남아 있으면 검사 안 한 문서 모두,
+    철의 검사가 모두 끝나면 검사 제외 문서는 확정"""
     c = TestClient(main.app)
     assert main.WORKFLOW == workflow.load(workflow.DEFAULT)
     w = where(c, "q")
@@ -305,8 +429,9 @@ def test_default_flow_unchanged(main):
     assert approve(c, "w", "d02", "entry").status_code == 409  # 입력은 색인으로 끝났다
     assert approve(c, "q", "d02", "inspect").status_code == 409  # 검사는 /inspection 경로
     chk = c.get("/export/check", params={"vol": "v1"}, headers=h("v")).json()
-    assert "unconfirmed" not in chk and set(chk) == {"template", "volumes", "required_blank", "format", "not_reviewed",
-                                                     "problems", "problems_total"}
+    assert set(chk) == {"template", "volumes", "required_blank", "format", "not_reviewed", "unconfirmed",
+                        "problems", "problems_total"}
+    assert chk["unconfirmed"] == 3  # 검사 목록 없음 → 모두 미확정
     assert c.patch("/documents/v1/d02", headers=h("w"), json={"title": "가상 수정"}).status_code == 200
     assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 0.5, "seed": 3}).status_code == 200
     assert c.post("/inspection/v1/d01", headers=h("q"), json={}).status_code == 200  # 표시 문서는 늘 검사 목록에
@@ -327,6 +452,11 @@ def test_default_flow_unchanged(main):
             ("d01", workflow.CONFIRMED)]
     assert [(e["stage"], e["action"]) for e in c.get("/documents/v1/d01/stages", headers=h("v")).json()] == [
         ("inspect", "approve")]
+    # 검사가 남아 있으면 남은 표본 + 검사 제외 문서가 미확정, 다 끝나면 0
+    assert unconfirmed(c) == 2
+    for d in listed - {"d01"}:
+        assert c.post(f"/inspection/v1/{d}", headers=h("q"), json={}).status_code == 200
+    assert unconfirmed(c) == 0
 
 
 def test_old_database_opens(main, pg_store):
@@ -349,7 +479,10 @@ def test_old_database_opens(main, pg_store):
     assert [(d["doc_id"], d["can_inspect"]) for d in view] == [("d01", False), ("d02", True)]
     assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "x"}).status_code == 409
     assert c.post("/inspection/v1/d02", headers=h("q2"), json={}).status_code == 200
-    assert c.get("/documents/v1/d01/stages", headers=h("v")).json() == []
+    # 예전 검사도 승인 기록으로 옮겨진다 (검사한 사람·시각·고친 칸)
+    hist = c.get("/documents/v1/d01/stages", headers=h("v")).json()
+    assert [(e["stage"], e["action"], e["to_stage"], e["username"], e["fixed_fields"]) for e in hist] == [
+        ("inspect", "approve", workflow.CONFIRMED, "q", [])]
 
 
 def test_rerun_resets_stage_positions(main, monkeypatch):
