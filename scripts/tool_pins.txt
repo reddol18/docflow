@@ -1,0 +1,25 @@
+# 검사 도구 고정 (https://github.com/reddol18/docflow/issues/46) — 버전·해시는 이 파일 한 곳에만 둔다.
+# 읽는 곳: scripts/check.ps1 (Get-Tool, windows-x64), scripts/mac/scan_image.sh (trivy, darwin-*).
+# 릴리스의 체크섬 파일은 쓰지 않는다(자산과 같은 출처라 릴리스가 바뀌면 함께 바뀐다). 받은 자산은 자산 해시로,
+# 받아 둔 실행 파일은 실행할 때마다 실행 파일 해시로 확인하고, 다르면 실행하지 않고 멈춘다.
+#
+# 올리는 법 (버전을 바꿀 때만):
+#  1. 새 자산을 받아 sha256을 직접 계산하고, GitHub 릴리스 API의 자산 digest·릴리스 체크섬 파일과 셋이 같은지 본다
+#  2. 서명이 있으면 확인한다 — trivy: cosign verify-blob --bundle <자산>.sigstore.json
+#       --certificate-identity-regexp '^https://github\.com/aquasecurity/trivy/\.github/workflows/.+@refs/tags/v<버전>$'
+#       --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#     osv-scanner: slsa-verifier verify-artifact <자산> --provenance-path multiple.intoto.jsonl
+#       --source-uri github.com/google/osv-scanner --source-tag v<버전>
+#     gitleaks: 릴리스에 서명·출처 증명이 없다 (해시 고정만)
+#  3. 압축을 풀어 실행 파일 sha256도 계산해 적는다 (zip이 아닌 단일 실행 파일은 두 해시가 같다)
+#  4. PR에 1·2의 결과를 남긴다
+#
+# 2026-11-10 고정: 세 해시원(직접 계산·API digest·체크섬 파일) 일치, trivy 3개 cosign Verified OK (cosign v3.1.4),
+#   osv-scanner SLSA 검증 PASSED (slsa-verifier v2.7.1)
+#
+# 이름 버전 플랫폼 저장소 자산 자산_sha256 실행파일 실행파일_sha256
+gitleaks 8.30.1 windows-x64 gitleaks/gitleaks gitleaks_8.30.1_windows_x64.zip d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e gitleaks.exe 17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c
+osv 2.7.0 windows-x64 google/osv-scanner osv-scanner_windows_amd64.exe 9964ed64ec9a387391eb4cc006ad5c531154821aef29b793e02c448de4686438 osv-scanner_windows_amd64.exe 9964ed64ec9a387391eb4cc006ad5c531154821aef29b793e02c448de4686438
+trivy 0.75.0 windows-x64 aquasecurity/trivy trivy_0.75.0_windows-64bit.zip 4e43bd71a30f51aee39525f60f2b47043af77eb8df8fe082aae4372b69c6660f trivy.exe 3b4fcf6fec53c4c73c325cfd518c7264100695b19e6c59c6a777e4a67dc9f0e6
+trivy 0.75.0 darwin-x86_64 aquasecurity/trivy trivy_0.75.0_macOS-64bit.tar.gz 291edaa9778acbe4693d067b5ad60ee11570e5ac68296e85595417528ca641e4 trivy 484287e06ab2e4038c42ba396da8637aaaca0967e3e65840563706a0284169b4
+trivy 0.75.0 darwin-arm64 aquasecurity/trivy trivy_0.75.0_macOS-ARM64.tar.gz 4a77108cccf8e55c8d6823e1e759939a622277e66cd0daa3c1fc621ed69e4568 trivy 32b84c068e11e5381fc85d3fe2e8ac238659ab22524ce1b2b9dfcbd0b1f7331a

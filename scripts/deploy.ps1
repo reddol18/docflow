@@ -30,8 +30,14 @@ try {
     if ($branch -ne "main" -and -not $NoTag) { throw "main이 아닌 브랜치($branch)입니다. 시험 배포는 -NoTag" }
 
     if (-not $NoCheck) {
-        & (Join-Path $PSScriptRoot "check.ps1") -NoStatus  # 배포 검사는 main에서 돈다 — PR 병합 게이트 status는 올리지 않는다 (https://github.com/reddol18/docflow/issues/85)
-        if ($LASTEXITCODE) { throw "로컬 검사 실패. 배포하지 않습니다." }
+        # 배포 검사는 늘 기본 도구 폴더로 — 시험용 경로 변수는 검사 동안만 지우고 끝나면 되돌린다 (https://github.com/reddol18/docflow/issues/46)
+        $savedToolsDir = $env:DOCFLOW_TOOLS_DIR
+        Remove-Item Env:DOCFLOW_TOOLS_DIR -ErrorAction SilentlyContinue
+        try {
+            & (Join-Path $PSScriptRoot "check.ps1") -NoStatus  # 배포 검사는 main에서 돈다 — PR 병합 게이트 status는 올리지 않는다 (https://github.com/reddol18/docflow/issues/85)
+            $checkCode = $LASTEXITCODE
+        } finally { if ($null -ne $savedToolsDir) { $env:DOCFLOW_TOOLS_DIR = $savedToolsDir } }
+        if ($checkCode) { throw "로컬 검사 실패. 배포하지 않습니다." }
     }
 
     Write-Host "== 디스크 여유 확인"
@@ -47,7 +53,8 @@ try {
     if ($LASTEXITCODE) { throw "복사 실패 (app)" }
     scp -q k8s/docs.yaml "${Mac}:doc_platform/k8s/"
     if ($LASTEXITCODE) { throw "복사 실패 (k8s)" }
-    scp -q (Get-ChildItem scripts/mac/*.sh).FullName "${Mac}:doc_platform/scripts/"
+    # tool_pins.txt: scan_image.sh가 읽는 trivy 버전·고정 해시 (https://github.com/reddol18/docflow/issues/46)
+    scp -q (Get-ChildItem scripts/mac/*.sh).FullName scripts/tool_pins.txt "${Mac}:doc_platform/scripts/"
     if ($LASTEXITCODE) { throw "복사 실패 (scripts)" }
     # Windows scp가 새로 만든 폴더는 700 — 이미지 안 app 사용자가 못 읽는다 (Dockerfile chmod와 이중으로)
     ssh -o BatchMode=yes $Mac "chmod -R a+rX ~/doc_platform/app"
