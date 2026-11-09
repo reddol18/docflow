@@ -1,0 +1,8 @@
+node_modules
+.next
+.env*
+*.pem
+*.key
+*.tsbuildinfo
+next-env.d.ts
+Dockerfile

@@ -5,6 +5,11 @@
 # 루트 파일시스템 읽기 전용 — 쓰는 곳만 PVC·emptyDir로 연다. 막는 검사: scripts/check.ps1의 trivy config·semgrep.
 # 데이터 소유자: postgres 70(alpine postgres), qdrant 1000, docflow 1000. k3s local-path PVC는 hostPath라 fsGroup이 듣지 않는다 —
 # 소유자가 다르면 scripts/mac/owner_migrate.sh(맥 deploy.sh가 apply 전에 check로 막는다).
+# 암호화 (https://github.com/reddol18/docflow/issues/48): 바깥은 web 파드(next start + TLS 종단 + HSTS), 안쪽은 Postgres TLS(hostssl만,
+# docflow는 sslmode=verify-full), Qdrant TLS + API 키. 인증서는 이 PC의 내부 데모 CA(scripts/ca.ps1)가 서비스마다 따로 발급하고,
+# apply 전에 scripts/tls_secrets.ps1이 넣는다: Secret tls-web·tls-postgres·tls-qdrant(kubernetes.io/tls), qdrant-api-key(무작위),
+# ConfigMap docflow-ca(CA 인증서 — 공개 값). 없으면 맥 deploy.sh가 apply 전에 멈춘다.
+# 남은 평문: web(Next) → docflow:8000 (클러스터 안, 아래 NetworkPolicy로 web 파드만)
 apiVersion: v1
 kind: Namespace
 metadata: {name: docs, labels: {purpose: doc-platform}}
@@ -13,7 +18,7 @@ apiVersion: v1
 kind: ResourceQuota
 metadata: {name: docs-quota, namespace: docs}
 spec:
-  hard: {requests.cpu: "3", requests.memory: 4Gi, limits.memory: 7Gi, persistentvolumeclaims: "4"}
+  hard: {requests.cpu: "3", requests.memory: 4Gi, limits.memory: 8Gi, persistentvolumeclaims: "4"}  # 8Gi: web 파드(issues/48) 몫 640Mi
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -41,11 +46,35 @@ spec:
     ports: [{protocol: TCP, port: 5432}]
   - to: [{podSelector: {matchLabels: {app: qdrant}}}]
     ports: [{protocol: TCP, port: 6333}]
+  # 공인 IP 443만: 사설 대역 + 링크 로컬(169.254 — 클라우드 메타데이터)·루프백·CGNAT(100.64, 일부 클라우드 내부망)은 뺀다 (issues/48)
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
-        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+        except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, 100.64.0.0/10]
     ports: [{protocol: TCP, port: 443}]
+---
+# docflow API(8000)는 web 파드(Next)에서만. 이 PC 개발 서버는 kubectl port-forward라 NetworkPolicy를 거치지 않는다
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: docflow-from-web, namespace: docs}
+spec:
+  podSelector: {matchLabels: {app: docflow}}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: web}}}]
+    ports: [{protocol: TCP, port: 8000}]
+---
+# web은 docflow로만 나간다 (DNS는 allow-dns). 들어오는 것은 열지 않는다 — 지금 접근은 ssh 터널 + kubectl port-forward뿐.
+# 인그레스 컨트롤러를 두면 그 네임스페이스에서 8443만 여는 ingress 규칙을 더한다
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: web-egress, namespace: docs}
+spec:
+  podSelector: {matchLabels: {app: web}}
+  policyTypes: [Egress]
+  egress:
+  - to: [{podSelector: {matchLabels: {app: docflow}}}]
+    ports: [{protocol: TCP, port: 8000}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -56,6 +85,16 @@ spec:
   ingress:
   - from: [{podSelector: {matchLabels: {app: docflow}}}]
     ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6333}]
+---
+# Postgres 접속 규칙: 파드 안 소켓(준비 확인·kubectl exec psql)만 trust, TCP는 TLS + 비밀번호(scram)만 — 평문 TCP는 맞는 줄이 없어 거절.
+# PGDATA 안 pg_hba.conf는 건드리지 않는다 (되돌릴 때 옛 매니페스트만 apply하면 그 파일을 다시 쓴다)
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: pg-hba, namespace: docs}
+data:
+  pg_hba.conf: |
+    local   all  all       trust
+    hostssl all  all  all  scram-sha-256
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -77,9 +116,23 @@ spec:
       # 걸리는 볼륨이면 PGDATA 권한이 0770이 되어 postgres가 시작을 거부한다
       securityContext: {runAsNonRoot: true, runAsUser: 70, runAsGroup: 70, seccompProfile: {type: RuntimeDefault}}
       automountServiceAccountToken: false  # k8s API를 쓰지 않는다
+      # 서버 키: postgres는 키 파일이 실행 사용자(70) 소유 0600이어야 받는다. Secret 볼륨은 root 소유라
+      # (fsGroup은 위 이유로 안 씀) 같은 이미지·같은 uid로 메모리 emptyDir에 복사해 권한을 맞춘다 (issues/48)
+      initContainers:
+      - name: tls-copy
+        image: postgres:17.11-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac
+        command: [sh, -c, "cp /tls-src/tls.crt /tls-src/tls.key /tls/ && chmod 0600 /tls/tls.key && chmod 0644 /tls/tls.crt"]
+        resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: tls-src, mountPath: /tls-src, readOnly: true}
+        - {name: tls, mountPath: /tls}
       containers:
       - name: postgres
         image: postgres:17.11-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac  # 다이제스트 고정 (issues/46). 판을 올리면 다이제스트도
+        # TLS 켜기 (issues/48). 키·인증서를 바꾸면(scripts/tls_secrets.ps1) 파드를 다시 띄운다
+        args: [postgres, -c, ssl=on, -c, ssl_cert_file=/tls/tls.crt, -c, ssl_key_file=/tls/tls.key,
+               -c, ssl_min_protocol_version=TLSv1.2, -c, hba_file=/etc/pg-hba/pg_hba.conf]
         env:
         - {name: POSTGRES_USER, value: docflow}
         - {name: POSTGRES_DB, value: docflow}
@@ -93,10 +146,15 @@ spec:
         - {name: data, mountPath: /var/lib/postgresql/data}
         - {name: run, mountPath: /var/run/postgresql}  # 유닉스 소켓·잠금 파일
         - {name: tmp, mountPath: /tmp}
+        - {name: tls, mountPath: /tls, readOnly: true}
+        - {name: hba, mountPath: /etc/pg-hba, readOnly: true}
       volumes:
       - {name: data, persistentVolumeClaim: {claimName: pg-data}}
       - {name: run, emptyDir: {sizeLimit: 16Mi}}
       - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+      - {name: tls-src, secret: {secretName: tls-postgres, defaultMode: 0444}}  # 복사용 (init 컨테이너만 마운트)
+      - {name: tls, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
+      - {name: hba, configMap: {name: pg-hba}}
 ---
 apiVersion: v1
 kind: Service
@@ -120,7 +178,8 @@ spec:
     spec:
       # 같은 이미지(root 기본)를 uid 1000으로 돌린다 — qdrant 공식 helm 차트 기본값과 같은 방식(이미지 안 /qdrant는 읽기만).
       # 예전(root로 돌 때) 만든 저장소 파일은 root 소유라 처음 한 번 scripts/mac/owner_migrate.sh qdrant로 1000에 넘긴다
-      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      # fsGroup: 아래 Secret 키 파일(0440)을 1000이 읽게. local-path PVC는 hostPath라 fsGroup이 듣지 않는다(docflow와 같음)
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
       automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       containers:
       - name: qdrant
@@ -128,16 +187,27 @@ spec:
         env:
         - {name: QDRANT__TELEMETRY_DISABLED, value: "true"}
         - {name: QDRANT_INIT_FILE_PATH, value: /qdrant/init/.qdrant-initialized}  # 기본은 작업 폴더(/qdrant, 읽기 전용)
+        # TLS + API 키 (issues/48). 키 없이 부르면 401 — 상태 확인(/readyz 등)만 키 없이 열린다(qdrant 기본).
+        # 인증서는 cert_ttl(기본 3600초)마다 다시 읽는다. API 키를 바꾸면 qdrant·docflow를 함께 다시 띄운다
+        - {name: QDRANT__SERVICE__ENABLE_TLS, value: "true"}
+        - {name: QDRANT__TLS__CERT, value: /qdrant/tls/tls.crt}
+        - {name: QDRANT__TLS__KEY, value: /qdrant/tls/tls.key}
+        - {name: QDRANT__TLS__CA_CERT, value: /qdrant/ca/ca.crt}  # 노드 사이 TLS용 칸(단일 노드라 쓰지 않음) — 기본 경로에 파일이 없어 채워 둔다
+        - {name: QDRANT__SERVICE__API_KEY, valueFrom: {secretKeyRef: {name: qdrant-api-key, key: api-key}}}
         ports: [{containerPort: 6333}]
         resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
-        readinessProbe: {httpGet: {path: /readyz, port: 6333}, periodSeconds: 5}
+        readinessProbe: {httpGet: {path: /readyz, port: 6333, scheme: HTTPS}, periodSeconds: 5}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
         - {name: data, mountPath: /qdrant/storage}
         - {name: snapshots, mountPath: /qdrant/snapshots}  # 스냅숏은 만든 뒤 바로 내려받는다 (파드가 다시 뜨면 사라짐)
         - {name: init, mountPath: /qdrant/init}
         - {name: tmp, mountPath: /tmp}
+        - {name: tls, mountPath: /qdrant/tls, readOnly: true}
+        - {name: ca, mountPath: /qdrant/ca, readOnly: true}
       volumes:
+      - {name: tls, secret: {secretName: tls-qdrant, defaultMode: 0440}}
+      - {name: ca, configMap: {name: docflow-ca}}
       - {name: data, persistentVolumeClaim: {claimName: qdrant-data}}
       - {name: snapshots, emptyDir: {sizeLimit: 2Gi}}  # 저장소 PVC(2Gi)보다 작지 않게. PVC를 늘리면 함께 늘린다 (넘으면 kubelet이 파드를 내쫓는다)
       - {name: init, emptyDir: {sizeLimit: 1Mi}}
@@ -170,9 +240,12 @@ spec:
         image: docflow:dev
         imagePullPolicy: Never
         env:
-        - {name: PG_URL, value: "postgresql://docflow@postgres:5432/docflow"}
+        # TLS 필수 + 서버 인증서·이름 확인(verify-full: 내부 CA, 이름 postgres) — require보다 강하다 (가로채기 막음, issues/48)
+        - {name: PG_URL, value: "postgresql://docflow@postgres:5432/docflow?sslmode=verify-full&sslrootcert=/etc/docflow-ca/ca.crt"}
         - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
-        - {name: QDRANT_URL, value: "http://qdrant:6333"}
+        - {name: QDRANT_URL, value: "https://qdrant:6333"}
+        - {name: QDRANT_CA_FILE, value: /etc/docflow-ca/ca.crt}
+        - {name: QDRANT_API_KEY_FILE, value: /etc/qdrant/api-key}  # app/store.py qdrant_args — 없거나 비면 시작할 때 멈춤
         - {name: OCR_THREADS, value: "4"}
         - {name: DAILY_BUDGET_USD, value: "3.0"}  # 색인·수정 하루 예산 (KST)
         - {name: DAILY_QUERY_BUDGET_USD, value: "0.6"}  # 검색·질문 하루 예산 — 색인과 따로 (issues/7)
@@ -198,7 +271,7 @@ spec:
         # 첫 관리자: kubectl exec -it -n docs deploy/docflow -- python -m app.users add admin --role admin
         - {name: AUTH_MODES, value: "local"}
         - {name: SESSION_HOURS, value: "12"}
-        - {name: COOKIE_SECURE, value: "0"}  # 지금 데모는 http. https로 서비스하면 이 줄을 지운다 (코드 기본값이 Secure)
+        # 세션 쿠키는 코드 기본값 __Host-docflow_session(Secure). port-forward(루프백)로 온 요청만 http 이름 — app/auth.py 머리말 (issues/48)
         # OIDC를 켤 때 (AUTH_MODES에 oidc 추가). client secret은 Secret으로:
         #   kubectl create secret generic oidc -n docs --from-file=client-secret=<파일>
         # - {name: OIDC_ISSUER, value: "https://sso.example.go.kr/realms/docflow"}
@@ -223,6 +296,8 @@ spec:
         volumeMounts:
         - {name: data, mountPath: /data}
         - {name: openai, mountPath: /etc/openai, readOnly: true}
+        - {name: ca, mountPath: /etc/docflow-ca, readOnly: true}
+        - {name: qdrant-key, mountPath: /etc/qdrant, readOnly: true}
         - {name: tmp, mountPath: /tmp}
         # subPath 하나로 나누지 않는다 — kubelet이 만드는 subPath 폴더는 root 0750이라 1000이 못 쓸 수 있다
         - {name: pdx-temp, mountPath: /opt/paddlex/temp}
@@ -232,6 +307,8 @@ spec:
       volumes:
       - {name: data, persistentVolumeClaim: {claimName: docflow-data}}
       - {name: openai, secret: {secretName: openai, optional: true}}
+      - {name: ca, configMap: {name: docflow-ca}}
+      - {name: qdrant-key, secret: {secretName: qdrant-api-key, defaultMode: 0440}}  # fsGroup 1000이 읽는다
       # 업로드 임시 파일(Starlette가 1MB 넘는 파일 조각을 /tmp에 흘려 씀). 넘으면 kubelet이 docflow 파드를 내쫓는다 →
       # 앱이 동시에 받는 업로드 본문 합계를 UPLOAD_TMP_MB(기본 1536MB)로, 요청 본문 하나를 UPLOAD_MAX_BODY_MB(기본 210MB)로 묶는다 (app/upload.py, https://github.com/reddol18/docflow/issues/26)
       - {name: tmp, emptyDir: {sizeLimit: 2Gi}}
@@ -244,3 +321,61 @@ apiVersion: v1
 kind: Service
 metadata: {name: docflow, namespace: docs}
 spec: {selector: {app: docflow}, ports: [{port: 8000}]}
+---
+# 프런트 운영 서버 (https://github.com/reddol18/docflow/issues/48). 이미지 docflow-web:dev = frontend/Dockerfile
+# (빌드 때 next build, 기반 이미지 다이제스트 고정). 개발 서버(next dev)·HMR·개발 오버레이·CSP 'unsafe-eval' 없음.
+# 컨테이너 둘, 같은 이미지:
+#   next  next start — 파드 안 127.0.0.1:3000에서만 받는다 (평문은 파드 밖으로 나가지 않음)
+#   tls   frontend/tls-proxy.mjs — 8443 TLS 종단(인증서 tls-web, 이름 docflow.localhost) + 모든 응답에 HSTS → 127.0.0.1:3000
+# 접속: 맥에서 kubectl port-forward -n docs svc/web 8443:8443 (맥 127.0.0.1에만), 이 PC에서 ssh -L 8443:127.0.0.1:8443 → https://docflow.localhost:8443
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: docs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      # node 이미지의 node 사용자(1000). fsGroup: Secret 키 파일(0440)을 읽게 (PVC 없음)
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
+      containers:
+      - name: next
+        image: docflow-web:dev
+        imagePullPolicy: Never
+        command: [node_modules/.bin/next, start, -H, 127.0.0.1, -p, "3000"]  # 운영 서버 (next build는 이미지 빌드 때)
+        env:
+        - {name: NODE_ENV, value: production}
+        - {name: DOCFLOW_URL, value: "http://docflow:8000"}  # 흐림 route(src/lib/masked.ts)가 실행 때 읽는다. /api rewrite는 빌드 때 같은 값
+        - {name: NEXT_TELEMETRY_DISABLED, value: "1"}
+        - {name: HOME, value: /tmp}
+        resources: {requests: {cpu: 100m, memory: 192Mi}, limits: {memory: 512Mi}}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: next-cache, mountPath: /app/.next/cache}  # next start가 쓰는 유일한 곳
+        - {name: tmp, mountPath: /tmp}
+      - name: tls
+        image: docflow-web:dev
+        imagePullPolicy: Never
+        command: [node, tls-proxy.mjs]
+        env:
+        - {name: TLS_CERT, value: /tls/tls.crt}
+        - {name: TLS_KEY, value: /tls/tls.key}
+        ports: [{containerPort: 8443}]
+        resources: {requests: {cpu: 20m, memory: 48Mi}, limits: {memory: 128Mi}}
+        # /login까지 통과해야 준비 — next가 죽어 있으면 502라 준비 안 됨 (kubelet은 인증서를 확인하지 않는다)
+        readinessProbe: {httpGet: {path: /login, port: 8443, scheme: HTTPS}, periodSeconds: 10}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: tls, mountPath: /tls, readOnly: true}
+      volumes:
+      - {name: tls, secret: {secretName: tls-web, defaultMode: 0440}}
+      - {name: next-cache, emptyDir: {sizeLimit: 256Mi}}
+      - {name: tmp, emptyDir: {sizeLimit: 64Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: docs}
+spec: {selector: {app: web}, ports: [{port: 8443}]}

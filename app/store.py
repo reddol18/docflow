@@ -1083,11 +1083,39 @@ def get_documents(keys):
 _q = None
 
 
+def qdrant_args(env=os.environ):
+    """Qdrant 연결 인자 (https://github.com/reddol18/docflow/issues/48).
+    QDRANT_API_KEY_FILE  API 키 파일(k8s Secret 마운트). 주면 파일이 있고 비어 있지 않아야 한다 — 아니면 멈춤
+    QDRANT_CA_FILE       https 주소의 서버 인증서를 확인할 CA 파일 (내부 데모 CA). 없으면 시스템 CA
+    키를 http 주소로 보내지 않는다 (평문으로 키가 흐름) — 키가 있으면 https만."""
+    url = env.get("QDRANT_URL", QDRANT_URL)
+    args = {"url": url, "timeout": 30}
+    key_file = env.get("QDRANT_API_KEY_FILE")
+    if key_file:
+        try:
+            key = Path(key_file).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise RuntimeError(f"QDRANT_API_KEY_FILE을 읽지 못함: {type(e).__name__}") from None
+        if not key:
+            raise RuntimeError("QDRANT_API_KEY_FILE이 비어 있음")
+        if not url.startswith("https://"):
+            raise RuntimeError("QDRANT_API_KEY_FILE을 주면 QDRANT_URL은 https여야 한다")
+        args["api_key"] = key
+    ca = env.get("QDRANT_CA_FILE")
+    if ca:
+        import ssl
+        try:
+            args["verify"] = ssl.create_default_context(cafile=ca)
+        except OSError as e:
+            raise RuntimeError(f"QDRANT_CA_FILE을 읽지 못함: {type(e).__name__}") from None
+    return args
+
+
 def qdrant():
     global _q
     if _q is None:
         from qdrant_client import QdrantClient
-        _q = QdrantClient(url=QDRANT_URL, timeout=30)
+        _q = QdrantClient(**qdrant_args())
     return _q
 
 

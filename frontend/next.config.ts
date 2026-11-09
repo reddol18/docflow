@@ -1,10 +1,13 @@
 import type { NextConfig } from "next";
 
 // 브라우저는 /api/* 로만 부르고, Next 서버가 docflow API로 넘긴다 (CORS 불필요).
-// 로컬: ssh 터널 → kubectl port-forward 로 127.0.0.1:8000 이 docflow.
+// 로컬 개발 서버(npm run dev): ssh 터널 → kubectl port-forward 로 127.0.0.1:8000 이 docflow.
+// k8s web 파드(운영 빌드, frontend/Dockerfile): http://docflow:8000. rewrite 주소는 next build 때 정해진다 (https://github.com/reddol18/docflow/issues/48)
 const DOCFLOW_URL = process.env.DOCFLOW_URL ?? "http://127.0.0.1:8000";
 
 const nextConfig: NextConfig = {
+  poweredByHeader: false, // X-Powered-By: Next.js 를 내보내지 않는다
+
   // 대시보드는 브라우저에서 API를 계속 다시 읽는 화면이라 Cache Components(미리 렌더링)는 쓰지 않는다
   cacheComponents: false,
   turbopack: {

@@ -87,7 +87,8 @@ try {
     $r = Invoke-WebRequest "$Target/auth/login" -Method Post -Body $body -ContentType "application/json" `
         -Headers @{ "X-Docflow-CSRF" = "1" } -UseBasicParsing
     $pw = $null; $body = $null
-    $token = [regex]::Match(($r.Headers["Set-Cookie"] -join ";"), "docflow_session=([^;]+)").Groups[1].Value
+    # port-forward(루프백)라 http 이름 docflow_session이 온다 — https 앞단이면 __Host- 이름 (https://github.com/reddol18/docflow/issues/48)
+    $token = [regex]::Match(($r.Headers["Set-Cookie"] -join ";"), "(?:__Host-)?docflow_session=([^;]+)").Groups[1].Value
     if (-not $token) { throw "로그인은 됐는데 세션 쿠키가 없음 ($($r.StatusCode))" }
     [IO.File]::WriteAllText($hdr, "Authorization: Bearer $token", [Text.UTF8Encoding]::new($false))
 

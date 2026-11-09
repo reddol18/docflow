@@ -115,6 +115,29 @@ def test_oidc_config_check(monkeypatch):
         auth.OidcConfig(**ok).check(cookie_secure=False)  # https 콜백인데 Secure 쿠키를 끔
 
 
+def test_check_discovery_hosts():
+    """discovery 문서의 jwks_uri·token_endpoint·authorization_endpoint는 issuer와 같은 scheme·호스트·포트만 (https://github.com/reddol18/docflow/issues/48)"""
+    good = {"issuer": ISS, "jwks_uri": ISS + "/protocol/openid-connect/certs", "token_endpoint": "https://IDP.test:443/t",
+            "authorization_endpoint": ISS + "/auth?prompt=login", "userinfo_endpoint": "https://other.test/u"}  # 안 쓰는 주소는 보지 않음
+    assert auth.check_discovery(good, ISS) is good
+    for k in auth.DISCOVERY_URLS:
+        for bad in ("https://evil.test/x", "https://idp.test.evil.test/x", "https://idp.test@evil.test/x", "https://idp.test:444/x",
+                    "http://idp.test/x", "//idp.test/x", "/relative", "https://idp.test /x", "", None, 1, ["https://idp.test/x"]):
+            with pytest.raises(RuntimeError):
+                auth.check_discovery({**good, k: bad}, ISS)
+        with pytest.raises(RuntimeError):
+            auth.check_discovery({k2: v for k2, v in good.items() if k2 != k}, ISS)  # 빠짐
+    with pytest.raises(RuntimeError):
+        auth.check_discovery({**good, "issuer": "https://evil.test/realms/x"}, ISS)
+    h = "http://keycloak:8080/realms/x"  # 클러스터 안 시험 제공자 (OIDC_ALLOW_HTTP=1)
+    local = {"issuer": h, **{k: h + "/" + k for k in auth.DISCOVERY_URLS}}
+    with pytest.raises(RuntimeError):
+        auth.check_discovery(local, h)
+    assert auth.check_discovery(local, h, allow_http=True) is local
+    with pytest.raises(RuntimeError):
+        auth.check_discovery({**local, "jwks_uri": "http://keycloak:8081/certs"}, h, allow_http=True)
+
+
 def test_rate_limit(monkeypatch):
     monkeypatch.setattr(auth, "USER_RATE", (3, 300))
     monkeypatch.setattr(auth, "LOGIN_RATE", (2, 300))

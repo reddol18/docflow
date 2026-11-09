@@ -7,6 +7,11 @@
   off          인증 끄기. AUTH_DEV_ALLOW_OFF=1 이 함께 있어야만 된다 (개발용)
 
 세션: 무작위 토큰을 쿠키(HttpOnly, SameSite=Lax)로 주고 DB에는 SHA-256 해시만 둔다 → 로그아웃·만료·강제 종료 가능.
+쿠키 이름 (https://github.com/reddol18/docflow/issues/48): 기본은 `__Host-docflow_session`(Secure·Path=/·Domain 없음 —
+브라우저가 https에서만 받고 하위 도메인이 덮어쓰지 못한다). 예외 하나: 요청이 파드 안 루프백(127.0.0.1·::1)에서 왔을 때만
+http용 이름 `docflow_session`(Secure 없음)을 주고 읽는다 — `kubectl port-forward`(kubectl 권한자) 경로라 이 PC의
+localhost:3000 개발 서버(http)가 로그인할 수 있게. https 프런트(k8s web 파드)에서 온 요청은 파드 IP라 늘 `__Host-`.
+두 이름은 섞어 읽지 않는다 (루프백이 아닌 요청에 실린 `docflow_session`은 무시). OIDC state 쿠키도 같은 규칙.
 스크립트는 같은 토큰을 `Authorization: Bearer`로 보내도 된다. 쿠키가 아니므로 CSRF 확인을 하지 않는다.
 쿠키로 온 상태 변경 요청(POST·PATCH·DELETE)은 X-Docflow-CSRF 헤더나 Sec-Fetch-Site=same-origin 이 있어야 한다.
 
@@ -22,7 +27,8 @@ OIDC 설정 (oidc를 켤 때)
   OIDC_ALLOW_HTTP        1이면 http 발급자 허용 (클러스터 안 시험 제공자 전용). 기본은 https만
 
 그 밖에
-  COOKIE_SECURE          기본 1(Secure 쿠키). http로 데모할 때만 0. https 콜백인데 0이면 시작을 거부한다
+  COOKIE_SECURE          기본 1(Secure·`__Host-` 쿠키, 위 루프백 예외만 http 이름). 0이면 모든 요청에 http 이름(시험·http 전용 설치).
+                         https 콜백인데 0이면 시작을 거부한다
   LOGIN_RATE_USER        같은 계정 이름으로 5분에 로그인 몇 번까지 (기본 10)
   TRUST_PROXY            X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 → IP별 창(LOGIN_RATE_MAX, 기본 20)도 쓴다.
                          Next rewrites는 덮어쓰지 않으므로 지금 구성에서는 0
@@ -36,6 +42,7 @@ import dataclasses
 import datetime as dt
 import functools
 import hashlib
+import ipaddress
 import json
 import os
 import queue
@@ -58,10 +65,12 @@ from app import errors, store
 
 ROLES = ("viewer", "reviewer", "inspector", "admin")  # 뒤로 갈수록 넓다. reviewer=입력자, inspector=검사자 (https://github.com/reddol18/docflow/issues/10)
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
-COOKIE = "docflow_session"
-STATE_COOKIE = "docflow_oidc_state"
+COOKIE = "__Host-docflow_session"  # https (기본)
+STATE_COOKIE = "__Host-docflow_oidc_state"
+HTTP_COOKIE = "docflow_session"  # 루프백(port-forward) 요청·COOKIE_SECURE=0 전용 — 머리말 '쿠키 이름'
+HTTP_STATE_COOKIE = "docflow_oidc_state"
 SESSION_SEC = int(float(os.environ.get("SESSION_HOURS", "12")) * 3600)
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"  # 기본 Secure. http로 데모할 때만 명시적으로 0
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "1") != "0"  # 기본 Secure. 0은 시험·http 전용 설치만
 LOGIN_RATE = (int(os.environ.get("LOGIN_RATE_MAX", "20")), 300)  # 같은 IP에서 300초에 20번까지 (/auth/login, /auth/oidc/login)
 # X-Forwarded-For를 덮어쓰는 프록시 뒤에서만 1 (Next rewrites는 클라이언트 값을 그대로 넘기므로 안 됨)
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "0") == "1"
@@ -422,8 +431,38 @@ def drop_user_sessions(user_id):
         return c.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,)).rowcount
 
 
-def set_session_cookie(resp, token):
-    resp.set_cookie(COOKIE, token, max_age=SESSION_SEC, httponly=True, samesite="lax", secure=COOKIE_SECURE, path="/")
+def _loopback(request):
+    """요청이 파드 안 루프백에서 왔나 — kubectl port-forward 경로 (uvicorn은 127.0.0.1의 X-Forwarded-For만 믿는다)"""
+    host = request.client.host if request.client else ""
+    try:
+        a = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (getattr(a, "ipv4_mapped", None) or a).is_loopback
+
+
+def cookie_mode(request):
+    """(세션 쿠키 이름, state 쿠키 이름, Secure). 머리말 '쿠키 이름' — https는 __Host-, 루프백·COOKIE_SECURE=0만 http 이름"""
+    if not COOKIE_SECURE or _loopback(request):
+        return HTTP_COOKIE, HTTP_STATE_COOKIE, False
+    return COOKIE, STATE_COOKIE, True
+
+
+def _set_cookie(resp, request, state, value, max_age):
+    session, state_name, secure = cookie_mode(request)
+    # Path=/·Domain 없음·Secure — __Host- 접두어 조건 (브라우저가 하나라도 어기면 쿠키를 버린다)
+    resp.set_cookie(state_name if state else session, value, max_age=max_age, httponly=True, samesite="lax",
+                    secure=secure, path="/")
+
+
+def _drop_cookie(resp, request, state=False):
+    session, state_name, secure = cookie_mode(request)
+    # __Host- 쿠키는 지우는 Set-Cookie에도 Secure가 있어야 브라우저가 받는다
+    resp.delete_cookie(state_name if state else session, path="/", secure=secure, httponly=True, samesite="lax")
+
+
+def set_session_cookie(resp, request, token):
+    _set_cookie(resp, request, False, token, SESSION_SEC)
 
 
 # ---------- 요청마다: 누구인가, 무엇을 할 수 있나 ----------
@@ -435,7 +474,7 @@ def _token(request):
     a = request.headers.get("authorization", "")
     if a[:7].lower() == "bearer ":
         return a[7:].strip(), False
-    return request.cookies.get(COOKIE), True
+    return request.cookies.get(cookie_mode(request)[0]), True
 
 
 def check_csrf(request):
@@ -573,12 +612,42 @@ def _cached(key, fn, ttl=3600):
     return v
 
 
+DISCOVERY_URLS = ("jwks_uri", "token_endpoint", "authorization_endpoint")  # docflow가 따라가는 주소 (userinfo 등은 쓰지 않음)
+
+
+def _origin(url):
+    """(scheme, 호스트, 포트) — 사용자 정보(@)·빈 호스트·잘못된 포트는 None"""
+    p = urllib.parse.urlsplit(url)
+    try:
+        port = p.port or {"https": 443, "http": 80}.get(p.scheme)
+    except ValueError:
+        return None
+    if p.username is not None or p.password is not None or not p.hostname or port is None:
+        return None
+    return p.scheme, p.hostname.rstrip(".").lower(), port
+
+
+def check_discovery(d, issuer, allow_http=False):
+    """discovery 문서 확인 (https://github.com/reddol18/docflow/issues/48, API7): issuer가 설정과 같고,
+    docflow가 따라가는 주소(DISCOVERY_URLS)의 scheme·호스트·포트가 issuer와 같아야 한다 — 문서가 바뀌거나 가로채여도
+    키·토큰 교환·로그인 화면을 다른 서버(메타데이터·내부 주소 포함)로 보내지 않게. 발급자와 다른 호스트에 JWKS를 두는
+    제공자(예: 구글)는 받지 않는다 (남은 한계)."""
+    if d.get("issuer") != issuer:
+        raise RuntimeError("discovery 문서의 issuer가 설정과 다름")
+    want = _origin(issuer)
+    if want is None or (want[0] != "https" and not (allow_http and want[0] == "http")):
+        raise RuntimeError("OIDC issuer 주소가 잘못됨")
+    for k in DISCOVERY_URLS:
+        v = d.get(k)
+        if not isinstance(v, str) or any(ord(ch) < 33 for ch in v) or _origin(v) != want:
+            raise RuntimeError(f"discovery 문서의 {k} 호스트가 issuer와 다름")
+    return d
+
+
 def discovery():
     def load():
         d = _get_json(OIDC.issuer.rstrip("/") + "/.well-known/openid-configuration")
-        if d.get("issuer") != OIDC.issuer:
-            raise RuntimeError("discovery 문서의 issuer가 설정과 다름")
-        return d
+        return check_discovery(d, OIDC.issuer, OIDC.allow_http)
     return _cached("discovery", load)
 
 
@@ -714,14 +783,14 @@ def login(body: LoginBody, request: Request):
         raise _audited(HTTPException(401, FAIL_MSG))
     _drop_previous(request)
     resp = JSONResponse({"user": u.public()})
-    set_session_cookie(resp, new_session(u.id, "local"))
+    set_session_cookie(resp, request, new_session(u.id, "local"))
     audit_later(audit_event, u, "login", "ok", via="local")  # 세션을 만든 뒤에 — 만들다 실패하면 ok가 남지 않게
     return resp
 
 
 def _drop_previous(request):
     """로그인할 때 이 브라우저가 들고 있던 이전 세션은 서버에서도 지운다 (쿠키만 덮어쓰지 않고)."""
-    old = request.cookies.get(COOKIE)
+    old = request.cookies.get(cookie_mode(request)[0])
     if old:
         drop_session(old)
 
@@ -741,7 +810,7 @@ def logout(request: Request):
     if u:
         audit_later(audit_event, u, "logout", "ok", via="bearer" if not via_cookie else "cookie")
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(COOKIE, path="/")
+    _drop_cookie(resp, request)
     return resp
 
 
@@ -755,7 +824,11 @@ def oidc_login(request: Request, next: str = "/"):
     if "oidc" not in MODES:
         raise HTTPException(404)
     rate_limit(request)
-    d = discovery()
+    try:
+        d = discovery()
+    except (httpx.HTTPError, RuntimeError, ValueError) as e:  # 제공자에 못 닿음·discovery 문서가 틀림(호스트 대조 등)
+        print(f"OIDC discovery 실패: {type(e).__name__}", flush=True)
+        raise HTTPException(502, "SSO 제공자 설정을 확인할 수 없음") from None
     state, nonce, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(32), secrets.token_urlsafe(48)
     with store.pool.connection() as c:
         c.execute("DELETE FROM oidc_pending WHERE created_at < now() - make_interval(secs => %s)", (PENDING_SEC,))
@@ -768,7 +841,7 @@ def oidc_login(request: Request, next: str = "/"):
     ep = d["authorization_endpoint"]
     resp = RedirectResponse(ep + ("&" if "?" in ep else "?") + q, status_code=302)
     # 콜백의 state가 이 브라우저에서 시작한 로그인인지 확인하는 쿠키 (로그인 CSRF 방지)
-    resp.set_cookie(STATE_COOKIE, state, max_age=PENDING_SEC, httponly=True, samesite="lax", secure=COOKIE_SECURE, path="/")
+    _set_cookie(resp, request, True, state, PENDING_SEC)
     return resp
 
 
@@ -780,9 +853,9 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     if error:  # 제공자가 거절·취소 (error 값은 제공자가 정한 글이라 남기지 않는다)
         audit_later(login_failed, "oidc_error", "oidc")
         resp = RedirectResponse("/login?error=oidc", status_code=303)
-        resp.delete_cookie(STATE_COOKIE, path="/")
+        _drop_cookie(resp, request, state=True)
         return resp
-    mine = request.cookies.get(STATE_COOKIE)
+    mine = request.cookies.get(cookie_mode(request)[1])
     if not (code and state and mine and secrets.compare_digest(state, mine)):
         audit_later(login_failed, "oidc_state", "oidc")
         raise HTTPException(400, "로그인 요청이 맞지 않음 — 다시 시도")
@@ -805,7 +878,7 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
         print(f"OIDC 콜백 실패: {type(e).__name__}", flush=True)
         audit_later(login_failed, "oidc_verify", "oidc")
         resp = RedirectResponse("/login?error=oidc", status_code=303)
-        resp.delete_cookie(STATE_COOKIE, path="/")
+        _drop_cookie(resp, request, state=True)
         return resp
     if u is None:  # 역할을 못 정함·꺼진 계정 — 제공자 로그인은 됐지만 docflow가 거절
         audit_later(login_failed, "oidc_role", "oidc")
@@ -813,7 +886,7 @@ def oidc_callback(request: Request, code: str | None = None, state: str | None =
     else:
         _drop_previous(request)
         resp = RedirectResponse(p["next"] or "/", status_code=303)
-        set_session_cookie(resp, new_session(u.id, "oidc"))
+        set_session_cookie(resp, request, new_session(u.id, "oidc"))
         audit_later(audit_event, u, "login", "ok", via="oidc")  # 세션을 만든 뒤에
-    resp.delete_cookie(STATE_COOKIE, path="/")
+    _drop_cookie(resp, request, state=True)
     return resp
