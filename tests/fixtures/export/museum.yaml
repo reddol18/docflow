@@ -1,0 +1,20 @@
+# 시험용 납품 양식 — tests/fixtures/schemas/museum.yaml 칸 이름으로 (지어낸 양식)
+name: 가상 박물관 등록 양식 (시험)
+sheets:
+  volumes:
+    title: 묶음목록
+    columns:
+      - {name: 묶음번호, source: vol, required: true}
+      - {name: 건수, source: vol.docs, format: int}
+  documents:
+    title: 자료목록
+    columns:
+      - {name: 묶음번호, source: vol, required: true}
+      - {name: 순번, source: doc.seq, format: int, required: true}
+      - {name: 등록번호, source: field.reg_no}
+      - {name: 자료명, source: field.material_name, required: true}
+      - {name: 생산자, source: field.producer}
+      - {name: 생산일자, source: field.produced_on, format: date}
+      - {name: 유형, source: field.material_type}
+      - {name: 소장처, source: field.holder}
+      - {name: 쪽수, source: field.page_count, format: int}

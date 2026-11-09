@@ -40,12 +40,19 @@ HEAD_RATIOS = [0.40, 0.48, 0.56]  # 머리부가 쪽 위 몇 % 안에 있다고 
 
 # 색인 칸은 스키마(app/fields.py, FIELD_SCHEMA)에서. 스키마의 rule 칸은 아래 규칙이 값을 만든다 (merge).
 # docno·serial·date는 김해 양식의 손글씨 칸 판독 + LLM 값, recipient는 LLM 값을 배치로 고친 값, pages는 쪽수.
+# 칸 이름이 아니라 rule 이름으로 판단한다 — 기관 매핑이 칸 이름을 바꿔도 손글씨 칸·검토 표시가 그대로 돈다
+# (https://github.com/reddol18/docflow/issues/72). 검토 표시 규칙(app/flags.py)도 rule 이름으로 칸을 찾는다.
 SCHEMA = fields.SCHEMA
 RULES = ("docno", "serial", "date", "recipient", "pages")
-HW_RULES = {"docno", "serial", "date"}  # 손글씨 칸(문서번호·시행일자)을 찾아 읽어야 하는 규칙
+# 손글씨 칸을 찾아 읽어야 하는 규칙 → 그 규칙이 쓰는 잘라낸 칸 (layout.value_box 종류 = 잘라낸 파일 {doc_id}_{칸}.png
+# = 문서 hw 키). 일련번호는 문서번호 칸에서 나온다
+HW_CELLS = {"docno": "docno", "serial": "docno", "date": "date"}
+HW_RULES = flags.HW_RULES  # 검토 표시 규칙도 이 rule 칸은 LLM 확신도가 아니라 판독 확신도로 본다
+if set(HW_CELLS) != HW_RULES:  # 두 목록이 어긋나면 시작할 때 멈춘다
+    raise RuntimeError(f"HW_CELLS {sorted(HW_CELLS)} != flags.HW_RULES {sorted(HW_RULES)}")
+CELLS = tuple(dict.fromkeys(HW_CELLS.values()))  # 잘라낸 칸 전부 (찾는 순서)
 # 사람이 원천 칸을 고치면 다시 계산하는 규칙 (스키마 derive_from)
 DERIVE = {"serial": layout.serial_of}  # 원천 칸(derive_from) 값 → 이 칸 값
-FLAG_FIELDS = {"docno", "serial", "date", "recipient", "title"}  # app/flags.py 규칙이 보는 칸
 fields.check_rules(SCHEMA, RULES)
 
 
@@ -66,8 +73,19 @@ def rederive(values, changed, schema=None):
     return values
 
 
+def hw_cell(field):
+    """칸이 보여 줄 잘라낸 손글씨 칸 (없으면 None) — 화면(/schema hw)·검토 화면·잘라낸 칸 경로가 이것으로 판단"""
+    return HW_CELLS.get(field.get("rule"))
+
+
+def hw_cells(schema):
+    """이 스키마로 찾아 읽을 잘라낸 칸 (CELLS 순서)"""
+    need = {hw_cell(f) for f in schema["fields"]}
+    return [c for c in CELLS if c in need]
+
+
 def uses_hw(schema):
-    return any(f.get("rule") in HW_RULES for f in schema["fields"])
+    return bool(hw_cells(schema))
 
 
 def llm_kinds(schema):
@@ -87,14 +105,14 @@ def off_flags(d, schema=None):
     names = {f["name"] for f in fields.prompt_fields(schema)} if "extract" in skipped else set()
     if "read" in skipped:
         names |= {f["name"] for f in schema["fields"] if f.get("rule") in HW_RULES}
-    keys = {f.get("flag_key", f["name"]) for f in schema["fields"] if f["name"] in names}
+    keys = {fields.flag_key(f) for f in schema["fields"] if f["name"] in names}
     return {k: [OFF_FLAG] for k in sorted(keys)}
 
 
 def _llm_of(b, rule, schema=None):
-    """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게)"""
-    name = next((f["name"] for f in (schema or SCHEMA)["fields"] if f.get("rule") == rule), rule)
-    return (b.get(name) or {}).get("value") or ""
+    """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게). 그런 칸이 없으면 빈 값"""
+    f = fields.by_rule(schema or SCHEMA, rule)
+    return ((b.get(f["name"]) or {}).get("value") or "") if f else ""
 
 
 def traced(name, fn):
@@ -213,11 +231,15 @@ def fan_out(s: VolState):
 def validate(s: VolState):
     """검토 필요 표시. 앞뒤 문서·같은 분류번호 문서와 비교하는 규칙이 있어 철 단위로 한다 (규칙은 app/flags.py)."""
     docs = [dict(d) for d in s.get("docs", [])]
-    # 표시 규칙은 김해 칸(문서번호·일련번호·일자·수신·제목) 기준이다 — 그 칸이 없는 스키마면 표시하지 않는다
-    rated = FLAG_FIELDS <= set(fields.by_name(SCHEMA))
-    for d, fl in zip(docs, flags.flags(docs, FLAG_CONFIG) if rated else [{} for _ in docs]):
-        for k, v in off_flags(d).items():  # LLM을 건너뛴 문서는 스키마와 상관없이 표시
-            fl[k] = [*fl.get(k, []), *v]
+    # 표시 규칙은 칸을 rule 이름으로 찾는다 — 스키마에 없는 rule의 규칙만 건너뛰고, LLM 추출 칸은 확신도로 본다.
+    # 표시 원천을 더할 때(칸 검증 규칙 등)는 여기서 같은 {표시 키: [사유]}로 합친다
+    for d, fl in zip(docs, flags.for_schema(docs, SCHEMA, FLAG_CONFIG)):
+        # LLM을 건너뛴 문서는 스키마와 상관없이 표시. 그 칸의 'LLM'(낮은 확신도) 사유는 뺀다 — 건너뛴 추출의 확신도 0은
+        # LLM이 낮게 본 값이 아니라 부르지 않은 것이라, 'LLM 꺼짐' 하나가 사람에게 맞는 이유다 (손글씨 판독 확신도 0이
+        # 확신도 표시를 내지 않는 것과 같게). 다른 사유(일자 형식 등 — 빈 값이라 실제로 틀림)는 그대로 둔다
+        for k, v in off_flags(d).items():
+            rest = [x for x in fl.get(k, []) if x != "LLM"]
+            fl[k] = [*rest, *v]
         d["flags"] = fl
     return {"docs": docs}
 
@@ -282,13 +304,14 @@ def extract(s: DocState):
 
 
 def locate(s: DocState):
-    """손글씨 칸 찾기 — 스키마에 손글씨 규칙 칸(docno·serial·date)이 없으면 찾지 않는다 (비전 호출도 없음)"""
-    if not uses_hw(SCHEMA):
+    """손글씨 칸 찾기 — 스키마의 손글씨 규칙 칸(docno·serial·date rule)이 쓰는 칸만. 없으면 찾지 않는다 (비전 호출도 없음)"""
+    cells = hw_cells(SCHEMA)
+    if not cells:
         return {"boxes": {}, "box_fail": {}}
     items = store.load_ocr(s["vol"], s["doc_id"])["items"]
     ratio = HEAD_RATIOS[s["ratio_i"]]
     boxes, fail = {}, {}
-    for k in ["docno", "date"]:
+    for k in cells:
         boxes[k], fail[k] = layout.value_box(items, k, ratio)
     return {"boxes": boxes, "box_fail": fail}
 
@@ -328,7 +351,7 @@ def read(s: DocState):
 def merge(s: DocState):
     """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
     b = s["b"]
-    hw = {k: s["hw"].get(k) or {"text": "", "conf": 0.0} for k in ("docno", "date")}
+    hw = {k: s["hw"].get(k) or {"text": "", "conf": 0.0} for k in CELLS}
     b_doc = _llm_of(b, "docno")
     b_date = _llm_of(b, "date") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", _llm_of(b, "date")) else ""
     doc_text_ = hw["docno"]["text"]

@@ -62,3 +62,4 @@ search:
   keyword: [title, creator, scope_content]
   embed: [title, creator, dates, scope_content]
   year: dates
+  columns: [dates, reference_code, title, creator]  # 검색 결과 화면 열

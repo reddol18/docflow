@@ -1,0 +1,26 @@
+# 시험용 두 번째 고객 스키마 — 도로대장식 조서. 이름·값·코드는 모두 지어낸 것
+# (https://github.com/reddol18/docflow/issues/72#issuecomment-6729785050). 조서 분류(통제어휘)·고정 길이 식별자(RDID 23자리)·코드 4자리.
+# 고정 길이·코드표 검사는 https://github.com/reddol18/docflow/issues/87 (칸 검증 규칙)에서 이 스키마에 더한다.
+name: 가상 도로대장 조서 (시험)
+base: isad_g.yaml
+extract:
+  preamble: 입력은 가상 도로대장 조서 한 장을 OCR로 줄 단위로 옮긴 텍스트다.
+  rules: 칸마다 confidence(0~1)를 붙인다. 텍스트에 없는 것을 지어내지 않는다.
+fields:
+  - name: sheet_class
+    label: 조서 분류
+    level: document
+    method: vocab
+    isad: scope_content
+    prompt: 조서 분류
+    vocab: [총괄, 주요시설물제원, 기하구조, 토공·배수, 안전시설, 부대시설, 기타]
+  - {name: rdid, label: 도로 식별자, level: document, method: llm_extract, isad: reference_code,
+     prompt: 도로 식별자 (영문 대문자·숫자 23자리), normalize: [strip]}
+  - {name: road_rank, label: 도로 종류 코드, level: document, method: manual, isad: notes, note: 코드 4자리}
+  - {name: sheet_title, label: 조서명, level: document, method: llm_extract, isad: title, prompt: 조서 제목}
+  - {name: surveyed_on, label: 조사일자, level: document, method: llm_extract, isad: dates, prompt: 조사일자를 YYYY-MM-DD로}
+  - {name: sheets, label: 쪽수, level: document, method: rule, rule: pages, isad: extent}
+search:
+  keyword: [sheet_title, rdid, sheet_class]
+  embed: [sheet_title, sheet_class, rdid]
+  year: surveyed_on

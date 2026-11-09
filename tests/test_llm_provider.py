@@ -240,18 +240,26 @@ def test_off_runs_whole_flow_without_openai(tmp_path, monkeypatch, fake_openai, 
 
 
 def test_off_flags_other_schema(monkeypatch):
-    """김해 칸(FLAG_FIELDS)이 없는 스키마도 LLM을 건너뛴 문서는 표시되고 auto여도 사람 검토로"""
+    """김해 rule 칸이 없는 스키마: LLM을 건너뛴 문서는 'LLM 꺼짐'으로 표시되고 auto여도 사람 검토로.
+    건너뛴 추출은 확신도 0(fields.parse_extract — 실제 흐름과 같은 b)이지만 'LLM'(낮은 확신도) 사유는 붙이지 않는다 —
+    부르지 않은 것이지 LLM이 낮게 본 값이 아니다. 건너뛰지 않은 문서는 LLM 추출 칸(llm_extract·vocab)마다 확신도로 표시"""
     from test_fields import other
 
-    from app import graph
-    monkeypatch.setattr(graph, "SCHEMA", other())
-    doc = {"doc_id": "v1-0001", "fields": {"subject": "", "kind": "", "made": "", "shelf": ""},
-           "info": {"llm_skipped": ["extract"]}}
-    out = graph.validate({"docs": [doc, {**doc, "doc_id": "v1-0002", "info": {"llm_skipped": []}}]})["docs"]
+    from app import fields, graph
+    s = other()
+    monkeypatch.setattr(graph, "SCHEMA", s)
+    empty = {"subject": "", "kind": "", "made": "", "shelf": "", "owner": "가상시"}
+    off = {"doc_id": "v1-0001", "fields": empty, "b": fields.parse_extract(s, "{}"), "info": {"llm_skipped": ["extract"]}}
+    sure = {k: {"value": "가", "confidence": 0.99} for k in ("subject", "kind", "made")}
+    ok = {"doc_id": "v1-0002", "fields": empty, "b": sure, "info": {"llm_skipped": []}}
+    low = {**ok, "doc_id": "v1-0003", "b": {**sure, "kind": {"value": "가", "confidence": 0.1}}}
+    out = graph.validate({"docs": [off, ok, low]})["docs"]
+    assert all(b["confidence"] == 0.0 for b in off["b"].values())
     assert out[0]["flags"] == {"kind": [graph.OFF_FLAG], "made": [graph.OFF_FLAG], "subject": [graph.OFF_FLAG]}
-    assert out[1]["flags"] == {}  # 이 스키마엔 flags.py 규칙이 없다 — LLM을 건너뛰지 않은 문서는 표시 없음
+    assert out[1]["flags"] == {}  # 확신도 높은 LLM 값 — 표시 없음
+    assert out[2]["flags"] == {"kind": ["LLM"]}  # 김해 아닌 스키마도 LLM 확신도 표시 (https://github.com/reddol18/docflow/issues/72)
     assert graph.route_review({"review_mode": "auto", "docs": out}) == "review"
-    assert graph.route_review({"review_mode": "auto", "docs": out[1:]}) == "index"
+    assert graph.route_review({"review_mode": "auto", "docs": out[1:2]}) == "index"
 
 
 def test_off_edit_drops_vector(monkeypatch, fake_openai):

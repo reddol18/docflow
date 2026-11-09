@@ -14,6 +14,10 @@
   manual       사람이 입력 (처음엔 빈칸)
   hidden       화면·검색 결과에 안 보이는 칸 (`rule:`로 값을 만들 수 있다)
 rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 재료로 쓸 때 (김해 문서번호·일자·수신).
+코드(검토 표시·손글씨 칸·화면)는 칸 이름이 아니라 rule 이름과 이 파일의 표시 정보로 칸을 찾는다
+(https://github.com/reddol18/docflow/issues/72) — 기관 매핑은 칸 이름을 마음대로 지어도 된다.
+
+검색(search): keyword 낱말 검색 칸, embed 임베딩 머리 칸, year 연도 필터 칸, columns 검색 결과 화면 열 (기본 보이는 칸 전부).
 
 표기 규칙(normalize)은 칸 값에 차례로 적용하는 후처리다 (NORMALIZE).
 """
@@ -186,10 +190,10 @@ def parse(s, base=None):
             _str(ex, k, "extract")
     shown = [f["name"] for f in fl if f["method"] != "hidden" and f["level"] == "document"]
     se = s.get("search") or {}
-    if not isinstance(se, dict) or set(se) - {"keyword", "embed", "year"}:
-        raise SchemaError("search는 keyword·embed·year만")
-    for k in ("keyword", "embed"):
-        v = se.setdefault(k, shown)
+    if not isinstance(se, dict) or set(se) - {"keyword", "embed", "year", "columns"}:
+        raise SchemaError("search는 keyword·embed·year·columns만")
+    for k in ("keyword", "embed", "columns"):  # columns = 검색 결과 화면의 열 (순서대로)
+        v = se.setdefault(k, list(shown))
         # 숨김·철 단위 칸은 넣지 않는다 — 검색 순위로 숨긴 값이 드러나지 않게
         if not isinstance(v, list) or not v or any(n not in shown for n in v):
             raise SchemaError(f"search.{k}: 보이는 건 단위 칸 이름 목록이어야 함")
@@ -233,7 +237,7 @@ def doc_fields(s):
 
 def shown(s):
     """화면·검색 결과에 보이는 건 단위 칸 이름 (숨김 제외, 스키마 순서)"""
-    return tuple(f["name"] for f in s["fields"] if f["method"] != "hidden" and f["level"] == "document")
+    return tuple(f["name"] for f in s["fields"] if is_shown(f))
 
 
 def editable(s):
@@ -249,6 +253,22 @@ def labels(s):
 def flag_keys(s):
     """{검토 표시 키: 사람이 고치는 칸} — 김해는 일련번호(serial) 표시를 문서번호(docno) 칸에서 고친다"""
     return {f["flag_key"]: f["name"] for f in s["fields"] if "flag_key" in f}
+
+
+def flag_key(field):
+    """칸의 검토 표시가 붙는 키 (스키마 flag_key, 없으면 칸 이름) — 기본값은 여기 한 곳"""
+    return field.get("flag_key", field["name"])
+
+
+def by_rule(s, rule):
+    """rule 이름으로 칸 찾기 (없으면 None). 코드는 칸 이름 대신 이것으로 칸을 찾는다
+    (https://github.com/reddol18/docflow/issues/72 — 기관 매핑은 칸 이름을 마음대로 짓는다). 같은 rule이 둘이면 앞 칸"""
+    return next((f for f in s["fields"] if f.get("rule") == rule), None)
+
+
+def is_shown(f):
+    """화면·검색 결과에 보이는 건 단위 칸인가 (shown과 같은 기준)"""
+    return f["method"] != "hidden" and f["level"] == "document"
 
 
 def prompt_fields(s):

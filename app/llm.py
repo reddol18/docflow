@@ -259,13 +259,13 @@ ANSWER_PROMPT = """너는 1990년대 공문서 기록물 검색 도우미다. �
 
 
 def answer(question, docs, schema=None):
-    """docs = 검색 결과(보이는 칸 + body). 칸 표시명·순서는 색인 스키마에서. 제공자가 off면 LLMOff"""
+    """docs = 검색 결과(fields 아래 보이는 칸 + body). 칸 표시명·순서는 색인 스키마에서. 제공자가 off면 LLMOff"""
     schema = schema or fields.SCHEMA
     lab = fields.labels(schema)
     model = PROVIDER.model("chat")
     _guard()
     ctx = "\n\n".join(
-        f"[{d['doc_id']}] " + " / ".join(f"{lab[k]} {d.get(k, '')}" for k in fields.shown(schema)) + "\n"
+        f"[{d['doc_id']}] " + " / ".join(f"{lab[k]} {(d.get('fields') or {}).get(k, '')}" for k in fields.shown(schema)) + "\n"
         f"본문 앞부분: {d['body'][:600]}" for d in docs)
     r = client().chat.completions.create(
         model=model, temperature=0, max_tokens=ANSWER_MAX_TOKENS,

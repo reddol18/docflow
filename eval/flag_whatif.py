@@ -23,12 +23,23 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(HERE))
 from rescore import load_gt, ok_field  # noqa: E402
 
+from app import fields as S  # noqa: E402 — 색인 스키마 (FIELD_SCHEMA, 없으면 김해 매핑)
 from app import flags as F  # noqa: E402
 
+# 정답(rescore)의 칸(김해 4칸) → 스키마 칸: 그래프(app/graph.py validate)와 같은 길로 칸 이름 대신 rule·ISAD(G)로 찾는다
+# (https://github.com/reddol18/docflow/issues/72 — 칸 이름을 바꾼 김해 매핑에서도 같은 결과)
+SCHEMA = S.SCHEMA
 FIELDS = ["docno", "date", "recipient", "title"]
-FLAG_OF = {"docno": "serial", "date": "date", "recipient": "recipient", "title": "title"}
+_F = {**{r: S.by_rule(SCHEMA, r) for r in ("docno", "date", "recipient")},
+      "title": next((f for f in SCHEMA["fields"] if f.get("isad", f["name"]) == "title"), None)}
+NAME = {g: f["name"] for g, f in _F.items() if f}  # 정답 칸 → 스키마 칸 이름
+FLAG_OF = {g: S.flag_key(f) for g, f in _F.items() if f}  # 정답 칸 → 검토 표시 키 (김해 문서번호 → serial)
 
 ALL_RULES = {**F.DEFAULT, "rules": tuple(F.RULES)}
+
+
+def val(d, f):
+    return d["fields"][NAME[f]]
 
 
 def load(paths):
@@ -42,7 +53,7 @@ def load(paths):
 def recompute(vols, cfg):
     out = {}
     for docs in vols.values():
-        for d, fl in zip(docs, F.flags(docs, cfg)):
+        for d, fl in zip(docs, F.for_schema(docs, SCHEMA, cfg)):
             out[d["doc_id"]] = fl
     return out
 
@@ -51,12 +62,12 @@ def evaluate(docs, idx, fl):
     """칸별(틀린 것 중 표시 / 표시 비율)과 문서 단위(표시 비율 / 표시 없이 틀림)."""
     res = {}
     for f in FIELDS:
-        wrong = [p for p in idx if p not in docs or not ok_field(f, docs[p]["fields"][f], idx[p][f])]
+        wrong = [p for p in idx if p not in docs or not ok_field(f, val(docs[p], f), idx[p][f])]
         flagged = [p for p in idx if p in docs and fl[p].get(FLAG_OF[f])]
         caught = [p for p in wrong if p in docs and fl[p].get(FLAG_OF[f])]
         res[f] = (len(caught), len(wrong), len(flagged))
     n = len(idx)
-    bad = {p for p in idx if p not in docs or not all(ok_field(f, docs[p]["fields"][f], idx[p][f]) for f in FIELDS)}
+    bad = {p for p in idx if p not in docs or not all(ok_field(f, val(docs[p], f), idx[p][f]) for f in FIELDS)}
     doc_fl = {p for p in idx if p in docs and fl[p]}
     silent = sorted(bad - doc_fl)
     return res, len(doc_fl) / n, len(silent) / n, silent
@@ -97,9 +108,9 @@ def main():
         if a.detail == name:
             for p in silent:
                 d = docs.get(p)
-                bad = [f for f in FIELDS if not d or not ok_field(f, d["fields"][f], idx[p][f])]
+                bad = [f for f in FIELDS if not d or not ok_field(f, val(d, f), idx[p][f])]
                 for f in bad:
-                    print(f"    x {p} {f}: got={d['fields'][f] if d else None!r} gt={idx[p][f]!r}")
+                    print(f"    x {p} {f}: got={val(d, f) if d else None!r} gt={idx[p][f]!r}")
         if name == "기본":  # 철마다 (한 철에만 맞춘 규칙인지 보려고)
             for v in sorted(vols):
                 sub = {p: r for p, r in idx.items() if p.startswith(v + "-")}
@@ -110,7 +121,7 @@ def main():
 
     if a.sweep or a.loo:
         cfgs, flagged = sweep(vols, docs, idx)
-        bad = {p for p in idx if p not in docs or not all(ok_field(f, docs[p]["fields"][f], idx[p][f]) for f in FIELDS)}
+        bad = {p for p in idx if p not in docs or not all(ok_field(f, val(docs[p], f), idx[p][f]) for f in FIELDS)}
         print(f"설정 {len(cfgs)}개 (기준값은 이전보다 낮은 값과 0=끔 포함, 일자 불일치 규칙 끔 포함)")
         print(f"틀린 문서 {len(bad)}/{len(idx)}, 맞는 문서 {len(idx) - len(bad)}\n")
         if a.sweep:

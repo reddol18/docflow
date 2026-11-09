@@ -195,7 +195,13 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
                       {d.widened > 0 && <span className="ml-2 text-xs text-amber-700">범위 넓힘 ×{d.widened}</span>}
                     </td>
                     <td className="py-1.5 font-mono text-xs text-slate-600">
-                      {d.read ? `${String(d.read.docno ?? "")} · ${String(d.read.date ?? "")}` : ""}
+                      {/* read 이벤트 = {잘라낸 칸: 판독 글자} (칸은 스키마 rule이 정한다 — 김해: 문서번호·시행일자) */}
+                      {d.read
+                        ? Object.entries(d.read)
+                            .filter(([k, v]) => k !== "skipped" && typeof v === "string") // seconds 등 숫자는 뺀다
+                            .map(([, v]) => v as string)
+                            .join(" · ")
+                        : ""}
                     </td>
                   </tr>
                 ))}
