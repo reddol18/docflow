@@ -45,7 +45,7 @@ def main(pg_store, monkeypatch, tmp_path):
 
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snap, update_state=update_state,
                                                     invoke=lambda arg, cfg: None))
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     monkeypatch.setattr(main.store, "upsert_vectors", lambda docs, vecs: None)
     monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "x")
     return main
@@ -153,15 +153,15 @@ def test_confirm_conflict_releases_claim(main, monkeypatch):
 
 
 def test_failed_fix_releases_and_still_counts(main, monkeypatch):
-    """고치다 임베딩에서 실패하면 차지를 풀고, 다시 낸 제출에 차이가 없어도 앞서 저장된 수정을 고친 것으로 센다"""
+    """고치다 임베딩에서 실패하면 차지를 풀고(임베딩이 저장 전이라 값도 그대로), 다시 낸 제출이 고친 칸을 센다"""
     c = TestClient(main.app, raise_server_exceptions=False)
     plan(c)
     sample = next(d["doc_id"] for d in c.get("/volumes/v1/inspection", headers=h("i")).json()["docs"]
                   if d["reason"] == "sample")
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: (_ for _ in ()).throw(TimeoutError("embed")))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: (_ for _ in ()).throw(TimeoutError("embed")))
     assert c.post(f"/inspection/v1/{sample}", headers=h("i"), json={"fields": {"title": "새 제목"}}).status_code == 500
     assert store.inspection_row("v1", sample)["inspected_at"] is None  # 차지가 풀림
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     r = c.post(f"/inspection/v1/{sample}", headers=h("i"), json={"fields": {"title": "새 제목"}})
     assert r.json()["fixed_fields"] == ["title"]
 

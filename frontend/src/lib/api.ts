@@ -1,6 +1,10 @@
 // docflow API 타입과 호출. 모든 요청은 /api/* (next.config.ts rewrites → docflow).
 
-export type Stage = "new" | "queued" | "running" | "review" | "done" | "stopped";
+// budget: 비용 한도로 멈춤 (https://github.com/reddol18/docflow/issues/7) — 오류가 아니다. stopped처럼 /resume으로 이어 간다
+export type Stage = "new" | "queued" | "running" | "review" | "done" | "stopped" | "budget";
+
+// 오늘 예산 (KST). index = 색인·수정, query = 검색·질문 — 따로 센다. used 정산액, held 부르는 중인 호출의 예약
+export type Budget = { used: number; held: number; limit: number };
 
 export type Usage = { kind: string; calls: number; tin: number; tout: number; usd: number };
 
@@ -19,6 +23,7 @@ export type VolumeSummary = {
   indexed: number | null;
   usage: Usage[];
   spent_today_usd: number;
+  budget?: Partial<Record<"index" | "query", Budget>>;
 };
 
 // 색인 칸은 서버의 스키마(GET /schema, app/field_schemas/*.yaml)가 정한다 (https://github.com/reddol18/docflow/issues/9)
@@ -68,7 +73,7 @@ export type GraphEvent = {
   id: number;
   ts: string;
   node: string;
-  phase: "start" | "end" | "error" | "waiting";
+  phase: "start" | "end" | "error" | "waiting" | "budget"; // budget: 비용 한도로 멈춤 (오류 아님)
   doc_id: string | null;
   info: Record<string, unknown> | null;
 };
@@ -249,7 +254,8 @@ async function call<T>(path: string, init?: RequestInit & { noRedirect?: boolean
     let msg = `${r.status}`;
     try {
       const j = await r.json();
-      msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j);
+      // 한도·LLM 꺼짐(503)은 {code, message} 공개 문구로 온다 (app/errors.py)
+      msg = typeof j.detail === "string" ? j.detail : typeof j.message === "string" ? j.message : JSON.stringify(j.detail ?? j);
     } catch {}
     throw new ApiError(msg, r.status);
   }
@@ -363,4 +369,5 @@ export const STAGE_LABEL: Record<Stage, string> = {
   review: "검토 대기",
   done: "완료",
   stopped: "중단됨",
+  budget: "한도 멈춤",
 };

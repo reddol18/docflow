@@ -174,7 +174,8 @@ spec:
         - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
         - {name: QDRANT_URL, value: "http://qdrant:6333"}
         - {name: OCR_THREADS, value: "4"}
-        - {name: DAILY_BUDGET_USD, value: "3.0"}
+        - {name: DAILY_BUDGET_USD, value: "3.0"}  # 색인·수정 하루 예산 (KST)
+        - {name: DAILY_QUERY_BUDGET_USD, value: "0.6"}  # 검색·질문 하루 예산 — 색인과 따로 (issues/7)
         # LLM·임베딩 제공자 (app/llm.py 머리말, https://github.com/reddol18/docflow/issues/13): openai / local / off
         # local = 현장 내부 서버 전용 (Ollama·vLLM 등 OpenAI 호환). LLM_BASE_URL 호스트는 루프백·사설 IP·클러스터 내부 이름만
         #   (공인 주소면 시작할 때 멈춤). 모델 이름 4개(EXTRACT_MODEL·CELL_MODEL·EMBED_MODEL·CHAT_MODEL)도 필수 — 빠지면 시작할 때 멈춤.

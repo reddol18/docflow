@@ -58,7 +58,7 @@ def setup(tmp):
         f["name"]: {"value": fake_value(f, PAGES.index(lines[0])), "confidence": 0.5}
         for f in fields.prompt_fields(s or fields.SCHEMA)}
     llm.read_cell = lambda vol, k, png: ("가상 12345-100" if k == "docno" else "99. 3. 10.", 0.99)
-    llm.embed = lambda vol, texts: [[0.0]] * len(texts)
+    llm.embed = lambda vol, texts, **k: [[0.0]] * len(texts)
     for name in ("event", "save_documents", "upsert_vectors", "delete_doc_vectors", "add_review_submitter", "add_edits",
                  "audit", "add_export"):
         setattr(store, name, lambda *a, **k: None)
@@ -67,6 +67,11 @@ def setup(tmp):
     store.inspection_plan = lambda vol: None
     store.inspection_rows = lambda vol: []
     store.spent_today = lambda: 0.0
+    store.budget_today = lambda limits: {}
+    store.run_stop = lambda vol: None
+    store.set_run_stop = lambda vol, reason: None
+    store.take_quota = lambda *a: None  # /search 호출 제한 (DB 없음 — 늘 통과)
+    store.refund_quota = lambda *a: None
     store.usage_summary = lambda vol=None: []
     auth.MODES = frozenset({"local"})
     auth.session_user = lambda t: auth.User(1, "probe", "가상 관리자", "admin")

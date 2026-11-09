@@ -128,7 +128,9 @@ def traced(name, fn):
         try:
             out = fn(s)
         except Exception as e:
-            store.event(vol, name, "error", doc, **errors.public(e))  # 화면엔 분류 코드만, 상세는 main.submit이 서버 로그로
+            # 비용 한도는 오류가 아니라 멈춤 (https://github.com/reddol18/docflow/issues/7) — 진행 화면이 따로 그린다
+            phase = "budget" if isinstance(e, llm.BudgetExceeded) else "error"
+            store.event(vol, name, phase, doc, **errors.public(e))  # 화면엔 분류 코드만, 상세는 main.submit이 서버 로그로
             raise
         store.event(vol, name, "end", doc, seconds=round(time.time() - t0, 2), **_brief(name, out))
         return out

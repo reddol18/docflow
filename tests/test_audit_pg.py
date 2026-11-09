@@ -103,7 +103,7 @@ def test_audit_four_actions_and_no_leak(main, monkeypatch, capsys):
 
     # 4) 문서 수정 — 수신에 가상 실명
     monkeypatch.setattr(main, "G", fake_graph(docs=[doc]))
-    monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     monkeypatch.setattr(main.store, "upsert_vectors", lambda docs, vecs: None)
     monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "x")
     assert c.patch("/documents/v1/d1", headers=ADMIN, json={"recipient": FAKE_NAME}).status_code == 200

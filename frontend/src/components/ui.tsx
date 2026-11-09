@@ -46,6 +46,7 @@ const STAGE_STYLE: Record<Stage, string> = {
   review: "bg-amber-100 text-amber-800",
   done: "bg-emerald-100 text-emerald-700",
   stopped: "bg-rose-100 text-rose-700",
+  budget: "bg-amber-100 text-amber-800 ring-1 ring-amber-300", // 비용 한도 멈춤 — 오류(빨강)와 다르게
 };
 
 export function StageBadge({ stage }: { stage: Stage }) {

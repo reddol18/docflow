@@ -146,8 +146,8 @@ def test_llm_extract_keys_and_prompt_from_schema(monkeypatch):
                 "docno": {"value": "끼어든 칸"}}
         return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
                                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(body)))])
-    monkeypatch.setattr(llm, "_guard", lambda: None)
-    monkeypatch.setattr(llm, "_log", lambda *a: None)
+    monkeypatch.setattr(llm.store, "reserve_budget", lambda *a: 1)  # 비용 한도 예약·정산은 test_budget_pg에서
+    monkeypatch.setattr(llm.store, "settle_budget", lambda *a: None)
     monkeypatch.setattr(llm, "client", lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
     out = llm.extract("v", ["줄"], other())
     assert list(out) == ["subject", "kind", "made"]  # 스키마의 prompt 칸만, 스키마 순서. 모르는 칸(docno)은 버림
@@ -256,7 +256,7 @@ def test_fixed_values_fill_every_document(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "event", lambda *a, **k: None)
     monkeypatch.setattr(store, "save_documents", lambda docs: saved.extend(docs))
     monkeypatch.setattr(store, "upsert_vectors", lambda docs, vecs: None)
-    monkeypatch.setattr(llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
+    monkeypatch.setattr(llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     g = graph.build(MemorySaver())
     g.invoke({"vol": "v1", "review_mode": "auto"}, {"configurable": {"thread_id": "v1"}})
     docs = g.get_state({"configurable": {"thread_id": "v1"}}).values["docs"]

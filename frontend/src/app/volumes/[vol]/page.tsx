@@ -32,6 +32,7 @@ function nodeState(evs: GraphEvent[], node: string): StepState {
   const mine = evs.filter((e) => e.node === node && !e.doc_id);
   if (!mine.length) return "idle";
   const last = mine[mine.length - 1];
+  if (last.phase === "budget") return "waiting"; // 비용 한도 멈춤 — 오류가 아니다
   return last.phase === "start" ? "active" : last.phase === "error" ? "error" : "done";
 }
 
@@ -94,7 +95,16 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
       : indexState !== "idle"
         ? "skipped"
         : "idle";
-  const docState: StepState = !totalDocs ? "idle" : merged >= totalDocs ? "done" : docs.size ? "active" : "idle";
+  const budgetStop = s?.stage === "budget";
+  const docState: StepState = !totalDocs
+    ? "idle"
+    : merged >= totalDocs
+      ? "done"
+      : budgetStop
+        ? "waiting"
+        : docs.size
+          ? "active"
+          : "idle";
 
   const resume = async () => {
     setBusy(true);
@@ -119,8 +129,20 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
               끊긴 곳부터 다시
             </button>
           )}
+          {budgetStop && admin && (
+            <button onClick={resume} disabled={busy} className="rounded-md bg-amber-600 px-3 py-1.5 text-sm text-white">
+              멈춘 곳부터 이어 가기
+            </button>
+          )}
         </div>
       </div>
+      {budgetStop && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          오늘 색인 비용 한도
+          {s?.budget?.index ? ` (${usd(s.budget.index.used + s.budget.index.held)} / ${usd(s.budget.index.limit)})` : ""}에 닿아
+          멈췄습니다. 오류가 아니며 한 일은 남아 있습니다 — 다음 날(0시 KST)이나 한도를 올린 뒤 이어 가면 남은 문서만 처리합니다.
+        </div>
+      )}
       <VolumeTabs vol={vol} active="progress" reviewWaiting={waiting ? (s?.flagged_documents ?? 0) : null} />
 
       <Card title="LangGraph 진행 단계" right={<span className="text-xs text-slate-400">thread_id = {vol} · 체크포인트: Postgres</span>}>
@@ -229,7 +251,10 @@ export default function VolumePage({ params }: { params: Promise<{ vol: string }
           <Card title="이벤트 로그">
             <ol className="max-h-[320px] space-y-0.5 overflow-y-auto font-mono text-[11px] text-slate-600">
               {[...all].reverse().slice(0, 150).map((e) => (
-                <li key={e.id} className={e.phase === "error" ? "text-rose-600" : e.phase === "waiting" ? "text-amber-700" : ""}>
+                <li
+                  key={e.id}
+                  className={e.phase === "error" ? "text-rose-600" : e.phase === "waiting" || e.phase === "budget" ? "text-amber-700" : ""}
+                >
                   {new Date(e.ts).toLocaleTimeString("ko-KR", { hour12: false })} {e.node}.{e.phase}
                   {e.doc_id ? ` ${e.doc_id.split("-").pop()}` : ""}
                   {e.info ? ` ${JSON.stringify(e.info)}` : ""}
