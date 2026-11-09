@@ -189,6 +189,8 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
         return next;
       });
       setNote(`${d.doc_id} 저장 — Postgres·Qdrant·그래프 상태 갱신`);
+      // 기계 검수의 철 안 중복은 다른 문서 표시도 바꾼다 — 문서 목록을 다시 읽는다 (https://github.com/reddol18/docflow/issues/87)
+      setStageTick((n) => n + 1);
     } catch (e) {
       setNote(`실패: ${e instanceof Error ? e.message : e}`);
     } finally {

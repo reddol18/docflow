@@ -46,8 +46,22 @@ def _setup(case, tmp):
             t = t.replace(f"field.{old},", f"field.{new},").replace(f"field.{old}}}", f"field.{new}}}")
         (tmp / "tpl.yaml").write_text(t, encoding="utf-8")
         return p, tmp / "tpl.yaml"
+    if case == "road_ledger_rules":  # 칸 검증 규칙 스키마 — 코드표는 스키마 폴더 안 codes/, 양식은 도로대장 것 그대로
+        shutil.copytree(FIX / "schemas" / "codes", d / "codes")
+        shutil.copy(FIX / "schemas" / f"{case}.yaml", d / f"{case}.yaml")
+        return d / f"{case}.yaml", FIX / "export" / "road_ledger.yaml"
     shutil.copy(FIX / "schemas" / f"{case}.yaml", d / f"{case}.yaml")
     return d / f"{case}.yaml", FIX / "export" / f"{case}.yaml"
+
+
+# 칸 검증 규칙 스키마로 색인이 끝난 뒤 문서 수정(PATCH) 차례 — 값은 지어낸 것 (https://github.com/reddol18/docflow/issues/87)
+RID_A = "ABCDEFGHJK0123456789XYZ"  # 고정 길이 식별자 23자리 (지어낸 값)
+RID_B = "ZYXWVUTSRQ9876543210ABC"
+STEPS = {"road_ledger_rules": [
+    {"doc": 0, "fields": {"rdid": RID_A, "road_rank": "R101"}},  # 0번 문서: 모든 규칙 통과
+    {"doc": 1, "fields": {"rdid": RID_A, "road_rank": "R999"}},  # 1번 문서: 0번과 식별자 중복 + 코드표에 없는 코드
+    {"doc": 1, "fields": {"rdid": RID_B, "road_rank": "R201"}},  # 1번을 고치면 0번의 중복 표시도 사라진다
+]}
 
 
 @pytest.fixture(scope="module")
@@ -63,9 +77,12 @@ def probe(tmp_path_factory):
                        PYTHONUTF8="1")
             (tmp / "work").mkdir()
             out = tmp / "out.json"
-            p = subprocess.run([sys.executable, "-I", str(Path(__file__).parent / "schema_app_probe.py"), str(tmp / "work"),
-                                str(out)], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=300)
+            args = [str(tmp / "work"), str(out)]
+            if case in STEPS:
+                (tmp / "steps.json").write_text(json.dumps(STEPS[case], ensure_ascii=False), encoding="utf-8")
+                args.append(str(tmp / "steps.json"))
+            p = subprocess.run([sys.executable, "-I", str(Path(__file__).parent / "schema_app_probe.py"), *args], env=env,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
             assert p.returncode == 0, p.stderr[-3000:]  # 앱이 시작하고 흐름이 끝까지 돌아야 한다
             cache[case] = json.loads(out.read_text(encoding="utf-8"))
         return cache[case]
@@ -127,6 +144,57 @@ def test_second_customer_schema_runs_without_gimhae_names(probe, case):
     # LLM 확신도 표시는 추출 칸에만 (요약 llm_generate·사람 입력·규칙 칸 제외)
     llm_keys = {f["flag_key"] for f in r["schema"]["fields"] if f["method"] in ("llm_extract", "vocab")}
     assert set().union(*(d["flags"] for d in r["flagged"])) == llm_keys
+
+
+def test_schemas_without_rules_have_no_machine_flags(probe):
+    """규칙(validate) 없는 스키마: 기계 검수 표시가 없고 출력 전 검증 모양도 그대로(rule 건수 칸 없음) — 지금과 같다"""
+    for case in ("road_ledger", "museum", "isad_g", "gimhae_renamed"):
+        r = probe(case)
+        assert "rule" not in r["export_check"], case
+        assert not any(x.startswith("기계 검수") for d in r["docs"] for rs in d["flags"].values() for x in rs), case
+        assert not any(p["kind"] == "rule" for p in r["export_check"]["problems"]), case
+
+
+def _machine(fl):
+    return {k: [x for x in rs if x.startswith("기계 검수")] for k, rs in fl.items() if any(x.startswith("기계 검수") for x in rs)}
+
+
+def test_rules_schema_flags_machine_check_and_recomputes_on_edit(probe):
+    """도로대장식 규칙 스키마 (지어낸 값): 사람 검토 전에 기계 검수 표시가 붙고, 문서 수정 때 철 전체를 다시 본다.
+    출력 전 검증의 rule 문제는 검토 표시와 같은 규칙으로 센다"""
+    r = probe("road_ledger_rules")
+    _common(r)
+    # 사람 검토 전 (validate 노드): LLM 식별자 '가상 도로 식별자 i'는 길이·형식 위반, 사람 입력 코드는 빈칸(필수)
+    for d in r["flagged"]:
+        m = _machine(d["flags"])
+        assert m["rdid"] == ["기계 검수 · 도로 식별자 · 길이 23자 아님", "기계 검수 · 도로 식별자 · 형식(정규식) 불일치"]
+        assert m["road_rank"] == ["기계 검수 · 도로 종류 코드 · 필수 칸 빈칸"]
+        assert "sheet_title" not in m  # 30자 이내
+        assert "LLM" in d["flags"]["rdid"]  # 다른 표시(확신도)와 같이 붙는다
+    # 검토 화면이 깨진 규칙을 보인다 (값은 싣지 않는다)
+    assert "기계 검수 · 도로 종류 코드 · 필수 칸 빈칸" in r["review_html"]
+    ec = r["export_check"]
+    assert ec["rule"] == 3 * len(r["docs"])  # 문서마다 식별자 2 + 코드 1
+    p = next(x for x in ec["problems"] if x["kind"] == "rule" and x["field"] == "road_rank")
+    assert p["rule"] == "required" and p["column"] == "ROAD_RANK" and "value" not in p
+
+    s0, s1, s2 = r["steps"]
+    assert all(s["status"] == 200 for s in r["steps"])
+    # 1) 0번 문서를 맞는 값으로 → 0번 기계 검수 표시가 사라지고, 다른 표시(확신도)는 남는다
+    assert _machine(s0["flags"][0]) == {} and "LLM" in s0["flags"][0]["sheet_title"]
+    assert len(s0["saved"]) == 1  # 다른 문서 표시는 그대로 → 고친 문서만 저장
+    assert s0["export_check"]["rule"] == 3 * (len(r["docs"]) - 1)
+    # 2) 1번 문서가 0번과 같은 식별자 + 코드표에 없는 코드 → 두 문서 모두 중복, 1번은 코드표 위반. 0번도 다시 저장
+    assert _machine(s1["flags"][0]) == {"rdid": ["기계 검수 · 도로 식별자 · 철 안 중복"]}
+    assert _machine(s1["flags"][1]) == {"rdid": ["기계 검수 · 도로 식별자 · 철 안 중복"],
+                                        "road_rank": ["기계 검수 · 도로 종류 코드 · 코드표에 없는 값"]}
+    assert len(s1["saved"]) == 2
+    rules1 = sorted((x["doc_id"], x["rule"]) for x in s1["export_check"]["problems"] if x["kind"] == "rule"
+                    and x["field"] in ("rdid", "road_rank") and x["doc_id"] in s1["saved"])
+    assert [k for _, k in rules1] == ["unique", "code_table", "unique"]
+    # 3) 1번을 다른 맞는 값으로 → 0번의 중복 표시도 사라진다 (철 전체를 다시 봄)
+    assert _machine(s2["flags"][0]) == {} and _machine(s2["flags"][1]) == {}
+    assert s2["export_check"]["rule"] == 3 * (len(r["docs"]) - 2)
 
 
 def test_isad_g_search_has_title_and_date_columns(probe):

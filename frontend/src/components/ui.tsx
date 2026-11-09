@@ -58,7 +58,11 @@ export function FlagChips({ flags }: { flags?: string[] }) {
   return (
     <span className="flex flex-wrap gap-1">
       {flags.map((f) => (
-        <span key={f} className="rounded bg-rose-50 px-1.5 py-0.5 text-[11px] font-medium text-rose-700 ring-1 ring-rose-200">
+        // 기계 검수(스키마 칸 검증 규칙 위반, 서버 사유 '기계 검수 · 칸 · 규칙')는 색을 달리한다
+        <span
+          key={f}
+          className={`rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ${f.startsWith("기계 검수") ? "bg-amber-50 text-amber-800 ring-amber-200" : "bg-rose-50 text-rose-700 ring-rose-200"}`}
+        >
           {f}
         </span>
       ))}

@@ -30,7 +30,7 @@
   GET   /schema                        색인 칸 스키마 (보이는 칸·rule·손글씨 칸, 검색 열) — 화면이 칸 목록을 여기서 받는다
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
   GET   /report.csv                    같은 리포트 CSV
-  GET   /export/check                  납품 출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건
+  GET   /export/check                  출력 전 검증 (?vol=…, 없으면 끝난 철 전부): 필수 빈칸·형식 위반·검토 안 끝난 건·칸 규칙 위반
   GET   /export.xlsx                   납품 양식 엑셀 (철 목록·건 색인 시트, 쪽 순서 유지) — 관리자
   DELETE /volumes/{vol}                납품 뒤 사업 데이터 일괄 삭제 (?confirm=철 이름, 내보낸 철만) — 관리자
   /auth/*                              로그인·로그아웃·OIDC (app/auth.py)
@@ -60,7 +60,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app import auth, errors, export, inspection, llm, ocr, report, store, workflow
+from app import auth, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app.auth import Admin, Reviewer, Viewer
@@ -383,9 +383,14 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
         fix = {k: v for k, v in fix.items() if v != (old.get(k) or "")}
         if not fix:
             return docs[doc_id], []
-        d = dict(docs[doc_id], fields=flow.rederive({**old, **fix}, fix), edited=True)
-        G.update_state(cfg(vol), {"docs": [d]}, as_node="index")
-    store.save_documents([d])
+        docs[doc_id] = dict(docs[doc_id], fields=flow.rederive({**old, **fix}, fix), edited=True)
+        # 기계 검수(칸 검증 규칙)를 고친 값으로 다시 본다 — 철 안 중복은 다른 문서 표시도 바꾼다 (flags.refresh는 바뀐
+        # 문서만 새 객체). 규칙 없는 스키마는 이 문서 하나만 저장 — 지금과 같다
+        new = {x["doc_id"]: x for x in flags.refresh(list(docs.values()), schema_fields.SCHEMA)}
+        d = new[doc_id]
+        save = [d, *(x for k, x in new.items() if k != doc_id and x is not docs[k])]
+        G.update_state(cfg(vol), {"docs": save}, as_node="index")
+    store.save_documents(save)
     # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
     if llm.enabled():
@@ -921,6 +926,7 @@ def report_csv(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | Non
 
 # ---------- 납품 형식 출력·일괄 삭제 (https://github.com/reddol18/docflow/issues/12) ----------
 EXPORT_TEMPLATE = export.load_template()  # 양식 매핑이 틀리면 시작할 때 멈춘다 (EXPORT_TEMPLATE=경로, 기본 AI Hub 88 예시)
+RULES = bool(field_rules.ruled(schema_fields.SCHEMA))  # 칸 검증 규칙이 있으면 출력 전 검증에 rule 건수 칸 (https://github.com/reddol18/docflow/issues/87)
 EXPORT_VOLS_MAX = 200
 VolList = Annotated[list[str], Query(default_factory=list)]
 
@@ -972,10 +978,10 @@ def _unconfirmed(volumes, stages):
 def export_check(_: Viewer, vol: VolList):
     """출력 전 검증: 필수 열 빈칸·형식 위반·검토 안 끝난 건(·흐름 설정에 따라 미확정 건) 수와 어느 문서·열인지"""
     volumes, stages = _export_volumes(vol, need_done=False)
-    _, problems = export.build(EXPORT_TEMPLATE, volumes, _unconfirmed(volumes, stages))
+    _, problems = export.build(EXPORT_TEMPLATE, volumes, _unconfirmed(volumes, stages), schema_fields.SCHEMA)
     return {"template": EXPORT_TEMPLATE["name"], "volumes": [{"vol": v, "stage": stages[v], "docs": len(d)}
                                                              for v, _, d in volumes],
-            **export.summary(problems, WORKFLOW["count_unconfirmed"])}
+            **export.summary(problems, WORKFLOW["count_unconfirmed"], RULES)}
 
 
 @app.get("/export.xlsx")
@@ -983,7 +989,7 @@ def export_xlsx(user: Admin, vol: VolList):
     """납품 양식 엑셀. 검증 문제가 있어도 낸다 (빈칸은 빈칸으로) — 먼저 /export/check로 확인한다"""
     with audited(user, "export_request", None, vols=len(vol)) as info:
         volumes, stages = _export_volumes(vol, need_done=True)
-        sheets, problems = export.build(EXPORT_TEMPLATE, volumes, _unconfirmed(volumes, stages))
+        sheets, problems = export.build(EXPORT_TEMPLATE, volumes, _unconfirmed(volumes, stages), schema_fields.SCHEMA)
         body = export.to_xlsx(sheets)
         info.update(volumes=len(volumes), problems=len(problems))
     for v, _, docs in volumes:  # 철마다 출력 기록 — 일괄 삭제는 지금 내용을 문제 없이 내보낸 철만 받는다

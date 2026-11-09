@@ -1,6 +1,7 @@
 """검토 표시 규칙. 그래프(validate 노드)와 평가 스크립트(eval/flag_whatif.py)가 같은 코드를 쓴다.
 
-app.fields(스키마 도우미) 말고는 표준 라이브러리만 → 저장된 결과만으로 규칙·기준값을 바꿔 다시 계산할 수 있다.
+app.fields(스키마 도우미)·app.field_rules(칸 검증 규칙) 말고는 표준 라이브러리만 → 저장된 결과만으로 규칙·기준값을 바꿔
+다시 계산할 수 있다. 칸 검증 규칙 위반(기계 검수)은 machine·refresh (https://github.com/reddol18/docflow/issues/87).
 문서 dict는 graph.merge가 만드는 모양: fields / b / hw / info.
 """
 import collections
@@ -8,6 +9,7 @@ import datetime as dt
 import re
 from typing import NamedTuple
 
+from app import field_rules
 from app.fields import by_rule, flag_key, is_shown
 
 LEGACY = {
@@ -182,6 +184,43 @@ def flags(docs, cfg=None, t=LEGACY_TARGETS):
             if reasons:
                 o.setdefault(t.keys.get(k, k), []).extend(reasons)
         out.append(o)
+    return out
+
+
+def machine(docs, schema):
+    """칸 검증 규칙(스키마 validate — app/field_rules.py) 위반 → 문서마다 {표시 키: ['기계 검수 · 칸 · 규칙']}.
+    표시 키는 칸의 flag_key. 규칙이 없는 스키마는 모두 빈 dict (https://github.com/reddol18/docflow/issues/87)"""
+    out = []
+    for vs in field_rules.violations(docs, schema):
+        o = {}
+        for f, k in vs:
+            o.setdefault(flag_key(f), []).append(field_rules.reason(f, k))
+        out.append(o)
+    return out
+
+
+def is_machine(reason):
+    return reason.startswith(field_rules.MACHINE)
+
+
+def refresh(docs, schema):
+    """사람이 값을 고친 뒤 기계 검수 표시를 다시 계산한다 (철 전체 — 철 안 중복은 다른 문서 값에 달려 있다).
+    다른 표시(확신도·김해 규칙)는 그대로 둔다. 표시가 바뀐 문서만 새 dict, 나머지는 같은 객체를 돌려준다
+    (부른 쪽이 바뀐 문서만 저장한다). 규칙이 없는 스키마는 docs 그대로 — 지금과 같다.
+    검토 제출(graph.review)·문서 수정·검사·단계 승인(main._edit_document)이 이것 하나를 부른다."""
+    if not field_rules.ruled(schema):
+        return docs
+    out = []
+    for d, mf in zip(docs, machine(docs, schema)):
+        old = d.get("flags") or {}
+        fl = {}
+        for k, rs in old.items():
+            keep = [x for x in rs if not is_machine(x)]
+            if keep:
+                fl[k] = keep
+        for k, rs in mf.items():
+            fl.setdefault(k, []).extend(rs)
+        out.append(d if fl == old else dict(d, flags=fl))
     return out
 
 

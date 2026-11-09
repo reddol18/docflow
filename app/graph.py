@@ -232,14 +232,17 @@ def validate(s: VolState):
     """검토 필요 표시. 앞뒤 문서·같은 분류번호 문서와 비교하는 규칙이 있어 철 단위로 한다 (규칙은 app/flags.py)."""
     docs = [dict(d) for d in s.get("docs", [])]
     # 표시 규칙은 칸을 rule 이름으로 찾는다 — 스키마에 없는 rule의 규칙만 건너뛰고, LLM 추출 칸은 확신도로 본다.
-    # 표시 원천을 더할 때(칸 검증 규칙 등)는 여기서 같은 {표시 키: [사유]}로 합친다
-    for d, fl in zip(docs, flags.for_schema(docs, SCHEMA, FLAG_CONFIG)):
+    # 표시 원천을 더할 때는 여기서 같은 {표시 키: [사유]}로 합친다 — 칸 검증 규칙 위반(기계 검수, 스키마 validate)도
+    machine = flags.machine(docs, SCHEMA)
+    for d, fl, mf in zip(docs, flags.for_schema(docs, SCHEMA, FLAG_CONFIG), machine):
         # LLM을 건너뛴 문서는 스키마와 상관없이 표시. 그 칸의 'LLM'(낮은 확신도) 사유는 뺀다 — 건너뛴 추출의 확신도 0은
         # LLM이 낮게 본 값이 아니라 부르지 않은 것이라, 'LLM 꺼짐' 하나가 사람에게 맞는 이유다 (손글씨 판독 확신도 0이
         # 확신도 표시를 내지 않는 것과 같게). 다른 사유(일자 형식 등 — 빈 값이라 실제로 틀림)는 그대로 둔다
         for k, v in off_flags(d).items():
             rest = [x for x in fl.get(k, []) if x != "LLM"]
             fl[k] = [*rest, *v]
+        for k, v in mf.items():
+            fl.setdefault(k, []).extend(v)
         d["flags"] = fl
     return {"docs": docs}
 
@@ -270,7 +273,8 @@ def review(s: VolState):
             fix = fixes.get(d["doc_id"], {})
             d = dict(d, fields=rederive({**d["fields"], **fix}, fix), reviewed=True)
         docs.append(d)
-    return {"docs": docs}
+    # 고친 값으로 기계 검수(칸 검증 규칙)를 다시 본다 — 철 안 중복은 다른 문서에도 걸리므로 철 전체. 규칙 없는 스키마는 그대로
+    return {"docs": flags.refresh(docs, SCHEMA)}
 
 
 def doc_text(vol, d):
