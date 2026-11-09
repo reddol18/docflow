@@ -10,3 +10,11 @@ targetRules = ["generic-api-key"]
 paths = ['''^tests/test_audit_pg\.py$''']
 regexTarget = "secret"
 regexes = ['''^abcdefgh12345678$''']
+
+[[allowlists]]
+description = "frontend/tls-proxy.test.mjs 웹소켓 업그레이드 거부 시험의 RFC 6455 예시 키 'the sample nonce' (비밀값 아님, https://github.com/reddol18/docflow/issues/48)"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^frontend/tls-proxy\.test\.mjs$''']
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
