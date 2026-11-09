@@ -24,10 +24,14 @@ const nextConfig: NextConfig = {
   },
   async rewrites() {
     return {
-      // 흐림 빌드(외부 공개·캡처용): 원본 쪽 이미지는 서버에서 흐린 것만 내보낸다 (CSS 흐림은 이미지 주소로 우회 가능)
+      // 흐림 빌드(외부 공개·캡처용): 원본 쪽 이미지·잘라 둔 이미지(수신 줄 실명 등)는 서버에서 흐린 것만 내보낸다
+      // (CSS 흐림은 이미지 주소로 우회 가능). src/lib/masked.ts
       beforeFiles:
         process.env.NEXT_PUBLIC_MASK_IMAGES === "1"
-          ? [{ source: "/api/head/:vol/:page", destination: "/masked/head/:vol/:page" }]
+          ? [
+              { source: "/api/head/:vol/:page", destination: "/masked/head/:vol/:page" },
+              { source: "/api/crops/:vol/:name", destination: "/masked/crops/:vol/:name" },
+            ]
           : [],
       afterFiles: [],
       fallback: [{ source: "/api/:path*", destination: `${DOCFLOW_URL}/:path*` }],

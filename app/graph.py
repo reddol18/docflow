@@ -333,22 +333,28 @@ def widen(s: DocState):
     return {"ratio_i": s["ratio_i"] + 1}
 
 
-def crop_lines(s: DocState):
+def crop_lines(s: DocState, img=None):
     """수신·제목 등 인쇄 글자 줄을 잘라 둔다 (스키마 crop:, https://github.com/reddol18/docflow/issues/35).
-    OCR 상자만 쓰고 LLM은 부르지 않는다. 실패해도 문서 처리는 이어 간다 — 화면은 이미지 자리를 숨길 뿐"""
+    OCR 상자만 쓰고 LLM은 부르지 않는다. 수신은 보정 규칙·값(extract의 recipient_fix·recipient)과 같은 줄을 자른다.
+    실패해도 문서 처리는 이어 간다 — 화면은 이미지 자리를 숨길 뿐. 실패는 events에 분류 코드로만 남긴다 (값·이미지 없이)"""
     if not LINE_CROPS:
         return
     try:
-        line_crops.save(s["vol"], s["doc_id"], LINE_CROPS)
+        line_crops.save(s["vol"], s["doc_id"], LINE_CROPS, img=img, fix=s.get("recipient_fix"), value=s.get("recipient"))
     except Exception as e:  # noqa: BLE001 — 보여 주기용 이미지라 처리를 멈추지 않는다
         print(f"crop_lines {s['vol']}/{s['doc_id']} 실패: {type(e).__name__}", flush=True)
+        try:
+            store.event(s["vol"], "crop_lines", "error", s["doc_id"], **errors.public(e))
+        except Exception:  # noqa: BLE001, S110 — 기록 실패도 처리를 멈추지 않는다 (위 print가 남음)
+            pass
 
 
 def read(s: DocState):
-    crop_lines(s)
-    if not s["boxes"]:  # 손글씨 칸을 찾지 않는 스키마 — 쪽 이미지를 읽지 않는다
+    # 쪽 이미지는 한 번만 읽어 손글씨 칸과 줄 자르기가 같이 쓴다
+    img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg") if s["boxes"] else None
+    crop_lines(s, img)
+    if not s["boxes"]:  # 손글씨 칸을 찾지 않는 스키마 — 줄 자르기만 (필요하면 거기서 읽는다)
         return {"hw": {}}
-    img = ocr.read_image(store.pages_dir(s["vol"]) / f"{s['doc_id']}.jpg")
     H, W = img.shape[:2]
     hw, skipped = {}, []
     for k, b in s["boxes"].items():

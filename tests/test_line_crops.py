@@ -85,7 +85,9 @@ def test_fragmented_label_and_merged_rows():
     merged["items"] += [{"text": "참", "score": 0.9, "box": [205, 900, 265, 950], "line": 3},
                         {"text": "조:가상과장", "score": 0.9, "box": [305, 900, 605, 950], "line": 3}]
     box, src, _ = layout.line_box(merged, "recipient")
-    assert src == "head" and inside(box, 450, 825) and inside(box, 455, 925)
+    assert src == "head" and inside(box, 450, 825)
+    # 묶인 줄의 '참조'는 값 규칙(ref_office)도 못 읽어 수신 값에 붙지 않는다 → 이미지에도 넣지 않는다 (값과 같은 줄)
+    assert layout.ref_office(merged) == "" and not inside(box, 455, 925)
 
 
 def test_list_ref_uses_bottom_list_lines():
@@ -114,6 +116,92 @@ def test_not_found():
     assert layout.line_box({"page": "x", "lines": [], "items": []}, "title")[0] is None
     with pytest.raises(ValueError):
         layout.line_box(d, "docno")
+
+
+def test_fragment_labels_skip_other_items():
+    """첫 글자 못 읽은 항목명 대신 쓰는 꼴이 '발신'·'항목'·'품목'에 맞지 않는다"""
+    for word in ("발 신", "송신", "회 신"):
+        d = doc([(800, [(200, word, 160), (450, "가상기관장", 300)])], [(1200, [(200, "제목", 160), (450, "가상", 200)])])
+        assert layout.line_box(d, "recipient")[0] is None, word
+    for word in ("항 목", "품목", "과목"):
+        d = page(HEAD + [(1200, [(200, word, 160), (450, "가상 물품", 300)])])
+        assert layout.line_box(d, "title")[0] is None, word
+    d = page(HEAD + [(1200, [(200, "재 목", 160), (450, "가상 통보", 300)])])  # '제'를 '재'로 읽음
+    assert layout.line_box(d, "title")[0] is not None
+
+
+def test_stop_on_split_approval_word():
+    """'실','장'처럼 나뉘어 읽힌 결재란 단어에서도 멈춘다 (field_value와 같게)"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상상사", 300), (780, "실", 50), (860, "장", 50)])],
+            [(1200, [(200, "제목", 160), (450, "가상", 200)])])
+    box, _, _ = layout.line_box(d, "recipient")
+    assert box[2] < 780
+
+
+def ref_doc(ref_y=960, value="가상상사"):
+    return doc([(800, [(200, "수신", 160), (450, value, 400)]), (ref_y, [(200, "참조", 160), (450, "가상과장", 250)])],
+               [(1500 if ref_y > 1200 else 1200, [(200, "제목", 160), (450, "가상", 200)])])
+
+
+def test_ref_office_row_matches_value_rule():
+    """참조 부서장 줄은 값 규칙(ref_office·fix_recipient)과 같은 판단으로만 이미지에 들어간다"""
+    d = ref_doc()
+    assert layout.ref_office(d) == "가상과장"
+    assert inside(layout.line_box(d, "recipient")[0], 575, 985)
+    assert layout.fix_recipient(d, "가상상사") == ("가상상사 가상과장", "참조")
+    # 값을 알면 값대로: 부서장이 값에 들어 있을 때만
+    assert inside(layout.line_box(d, "recipient", fix="참조", value="가상상사 가상과장")[0], 575, 985)
+    assert not inside(layout.line_box(d, "recipient", fix="", value="가상상사")[0], 575, 985)
+    # 쪽 위 40% 밖의 참조 줄은 ref_office도 안 본다
+    far = ref_doc(ref_y=1450)
+    assert layout.ref_office(far) == "" and layout.line_box(far, "recipient")[0][3] < 1400
+    # 내부결재에는 붙이지 않는다 (fix_recipient와 같게)
+    internal = ref_doc(value="내부결재")
+    assert layout.fix_recipient(internal, "내부결재") == ("내부결재", "")
+    assert not inside(layout.line_box(internal, "recipient")[0], 575, 985)
+
+
+def test_list_choice_follows_recipient_fix():
+    tail = [(3000, [(200, "수신처 : 가상가과장, 가상나과장", 1200)])]
+    d = doc([(800, [(200, "수신", 160), (450, "처 참조", 300)])], [(1200, [(200, "제목", 160), (450, "가상", 200)])], tail)
+    assert layout.is_list_ref("처 참조")
+    assert layout.line_box(d, "recipient")[1] == "list"  # 값을 모르면 머리부 OCR 값으로
+    assert layout.line_box(d, "recipient", fix="목록", value="가상가과장, 가상나과장")[1] == "list"
+    assert layout.line_box(d, "recipient", fix="", value="수신처 참조")[1] == "head"  # 값이 목록으로 안 바뀐 문서
+    lines = d["lines"]
+    i, j, _ = layout.list_span(lines)
+    assert lines[i].startswith("수신처") and j == i + 1 and layout.bottom_list(lines) == "가상가과장, 가상나과장"
+
+
+def test_crop_lines_failure_recorded_without_values(monkeypatch):
+    from app import graph
+    events = []
+    monkeypatch.setattr(graph.line_crops, "save", lambda *a, **k: (_ for _ in ()).throw(OSError("/data/x 가상상사")))
+    monkeypatch.setattr(graph.store, "event", lambda *a, **k: events.append((a, k)))
+    graph.crop_lines({"vol": "v1", "doc_id": "d1", "recipient": "가상상사", "recipient_fix": ""})
+    (args, kw), = events
+    assert args == ("v1", "crop_lines", "error", "d1") and set(kw) == {"code", "message"}
+    assert "가상상사" not in str(kw)
+
+
+def test_mask_build_blurs_crops_on_server():
+    """흐림 빌드는 /api/crops도 서버 흐림 route로 돌린다 (CSS 흐림은 이미지 주소로 우회 가능)"""
+    fe = Path(__file__).resolve().parents[1] / "frontend"
+    cfg = (fe / "next.config.ts").read_text(encoding="utf-8")
+    mask = cfg[cfg.index('NEXT_PUBLIC_MASK_IMAGES === "1"'):cfg.index("afterFiles")]
+    assert '"/api/crops/:vol/:name", destination: "/masked/crops/:vol/:name"' in mask
+    assert '"/api/head/:vol/:page", destination: "/masked/head/:vol/:page"' in mask
+    route = (fe / "src/app/masked/crops/[vol]/[name]/route.ts").read_text(encoding="utf-8")
+    assert "maskedImage(" in route and "recipient|title" in route
+    lib = (fe / "src/lib/masked.ts").read_text(encoding="utf-8")
+    assert ".blur(" in lib
+
+
+def test_eval_save_refuses_repo_folder():
+    root = Path(__file__).resolve().parents[1]
+    out = subprocess.run([sys.executable, "-I", "eval/line_crops.py", "--save", str(root / "eval" / "tmp_crops")],
+                         cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert out.returncode == 2 and not (root / "eval" / "tmp_crops").exists()
 
 
 # ---------- 스키마 ----------
@@ -163,18 +251,69 @@ def test_save_writes_png_and_removes_stale(tmp_path, monkeypatch):
     assert not store.crop_path("v1", "p1", "title").exists()
 
 
-def test_backfill_counts_and_idempotent(tmp_path, monkeypatch):
+def test_save_missing_or_broken_image_removes_old(tmp_path, monkeypatch):
+    _put(tmp_path, monkeypatch, GOOD)
+    line_crops.save("v1", "p1", ["recipient", "title"])
+    store.page_path("v1", "p1").unlink()  # 쪽 이미지 없음 (read_image가 FileNotFoundError)
+    assert line_crops.save("v1", "p1", ["recipient", "title"]) == {"recipient": line_crops.NO_IMAGE, "title": line_crops.NO_IMAGE}
+    assert not store.crop_path("v1", "p1", "recipient").exists() and not store.crop_path("v1", "p1", "title").exists()
+    store.page_path("v1", "p1").write_bytes(b"not a jpeg")  # 디코딩 실패 (None)
+    assert line_crops.save("v1", "p1", ["title"]) == {"title": line_crops.NO_IMAGE}
+
+
+def test_save_uses_given_image(tmp_path, monkeypatch):
+    _put(tmp_path, monkeypatch, GOOD)
+    monkeypatch.setattr(line_crops.ocr, "read_image", lambda p: pytest.fail("이미 읽은 이미지를 다시 읽지 않는다"))
+    img = np.full((H, W, 3), 255, np.uint8)
+    assert line_crops.save("v1", "p1", ["recipient", "title"], img=img) == {"recipient": "saved", "title": "saved"}
+
+
+def stored(*ids, recipient_fix="", recipient="가상상사 대표"):
+    return [{"doc_id": i, "info": {"recipient_fix": recipient_fix}, "fields": {"recipient": recipient}} for i in ids]
+
+
+def test_backfill_uses_stored_docs_and_idempotent(tmp_path, monkeypatch):
     _put(tmp_path, monkeypatch, GOOD, name="v1-0001")
-    _put(tmp_path, monkeypatch, page([(500, [(200, "가상 둘째 쪽", 800)])]), name="v1-0002")  # 문서 시작 쪽 아님
+    _put(tmp_path, monkeypatch, GOOD, name="v1-0002")  # 시작 쪽처럼 보여도 저장된 문서가 아니면 건드리지 않는다
     lines = []
-    c = backfill_crops.run(["v1"], ["recipient", "title"], out=lines.append)
+    docs_of = {"v1": stored("v1-0001")}.get
+    c = backfill_crops.run(["v1"], ["recipient", "title"], out=lines.append, docs_of=docs_of)
     assert c["docs"] == 1 and c["saved"] == 2 and lines == ["v1: 문서 1건"]
     assert not store.crop_path("v1", "v1-0002", "title").exists()
-    c = backfill_crops.run(["v1"], ["recipient", "title"], out=lines.append)
+    c = backfill_crops.run(["v1"], ["recipient", "title"], out=lines.append, docs_of=docs_of)
     assert c["saved"] == 0 and c["exists"] == 2  # 다시 돌려도 같은 결과
-    c = backfill_crops.run(["v1"], ["title"], dry=True, force=True, out=lines.append)
+    c = backfill_crops.run(["v1"], ["title"], dry=True, force=True, out=lines.append, docs_of=docs_of)
     assert c["would_crop"] == 1
     assert backfill_crops.vols() == ["v1"]
+
+
+def test_backfill_continues_after_failure(tmp_path, monkeypatch):
+    _put(tmp_path, monkeypatch, GOOD, name="v1-0002")
+    c = backfill_crops.run(["v1"], ["title"], out=lambda s: None, docs_of=lambda v: stored("v1-0001", "v1-0002"))
+    assert c["failed"] == 1 and c["failed:FileNotFoundError"] == 1  # OCR 결과 없는 문서 (분류만, 값 없음)
+    assert c["saved"] == 1 and store.crop_path("v1", "v1-0002", "title").exists()
+
+
+def test_backfill_passes_stored_recipient_fix(tmp_path, monkeypatch):
+    """보충도 흐름처럼 저장된 수신 보정 규칙대로 자른다 — '목록'이면 아래 목록 줄"""
+    tail = [(3000, [(200, "수신처 : 가상가과장, 가상나과장", 1200)])]
+    d = doc([(800, [(200, "수신", 160), (450, "수신처 참조", 300)])], [(1200, [(200, "제목", 160), (450, "가상", 200)])], tail)
+    _put(tmp_path, monkeypatch, d, name="v1-0001")
+    seen = []
+    real = layout.line_box
+    monkeypatch.setattr(layout, "line_box", lambda d, k, **kw: (seen.append(kw), real(d, k, **kw))[1])
+    backfill_crops.run(["v1"], ["recipient"], out=lambda s: None,
+                       docs_of=lambda v: stored("v1-0001", recipient_fix="목록", recipient="가상가과장, 가상나과장"))
+    assert seen == [{"fix": "목록", "value": "가상가과장, 가상나과장"}]
+
+
+def test_backfill_vol_name_checked():
+    from app import main
+    assert backfill_crops.VOL_RX.pattern == main.VOL_RX.pattern
+    with pytest.raises(SystemExit):
+        backfill_crops.main(["--vol", ".."])
+    with pytest.raises(SystemExit):
+        backfill_crops.main(["--vol", "a/b"])
 
 
 def test_backfill_imports_no_llm():

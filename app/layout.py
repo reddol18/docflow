@@ -229,24 +229,36 @@ REF = re.compile(r"(?<![가-힣])" + sp("참조") + r"\s*[:：]?\s*")
 OFFICE = re.compile(r"^[가-힣()·]{2,}(과장|소장|담당관|실장|국장|처장|청장|서장|원장|단장)$")
 
 
-def bottom_list(lines):
-    """쪽 아래쪽 '수신처:' / '받는곳' 목록. 없으면 빈칸."""
-    tail = lines[-12:]
-    for i, ln in enumerate(tail):
-        m = LIST_HEAD.match(ln)
+def list_span(lines):
+    """쪽 아래쪽 '수신처:' / '받는곳' 목록 줄의 번호 범위 (lines[i:j]) 와 첫 줄의 값. 없으면 None.
+    bottom_list(값)와 list_box(잘라낼 상자)가 같이 쓴다 — 값과 이미지가 같은 줄"""
+    start = max(0, len(lines) - 12)
+    for i in range(start, len(lines)):
+        m = LIST_HEAD.match(lines[i])
         if not m or not m.group(2).strip() or m.group(2).strip().startswith("참조"):
             continue
-        out = [m.group(2)]
-        for nxt in tail[i + 1:]:  # 다음 줄은 쉼표로 이어지는 목록일 때만 붙인다
+        j = i + 1
+        while j < len(lines):  # 다음 줄은 쉼표로 이어지는 목록일 때만 붙인다
+            nxt = lines[j]
             if re.fullmatch(r"[\s\d\W]*", nxt) or re.match(r"^\s*(붙\s*임|끝)", nxt) or not re.search(r"[,，·]", nxt):
                 break
-            out.append(nxt)
-        return NOISE_TAIL.sub("", "".join(out)).strip(" :：,.")
-    return ""
+            j += 1
+        return i, j, m.group(2)
+    return None
 
 
-def ref_office(d):
-    """머리부 '참조' 줄의 부서장 값. 결재란 글자뿐이면 빈칸."""
+def bottom_list(lines):
+    """쪽 아래쪽 '수신처:' / '받는곳' 목록. 없으면 빈칸."""
+    span = list_span(lines)
+    if span is None:
+        return ""
+    i, j, first = span
+    return NOISE_TAIL.sub("", "".join([first, *lines[i + 1:j]])).strip(" :：,.")
+
+
+def ref_office_row(d):
+    """머리부 '참조' 줄의 부서장 값과 그 상자들 (항목명 + 값). 결재란 글자뿐이거나 없으면 ("", []).
+    ref_office(값)와 수신 줄 자르기가 같이 쓴다 — 값에 붙는 부서장 줄만 이미지에 들어간다"""
     page_w, page_h = page_size(d["items"])
     for row in rows_of(d["items"]):
         if row[0]["box"][1] > 0.4 * page_h:
@@ -256,9 +268,15 @@ def ref_office(d):
             continue
         v = re.sub(r"\s", "", v)
         if OFFICE.match(v) and len(v) <= 12 and not STOP.match(v) and not v.startswith("담당자"):
-            return v
-        return ""
-    return ""
+            hit = _labeled(row, REF, page_w, True, anywhere=True)
+            return v, (hit[0] if hit else [])
+        return "", []
+    return "", []
+
+
+def ref_office(d):
+    """머리부 '참조' 줄의 부서장 값. 결재란 글자뿐이면 빈칸."""
+    return ref_office_row(d)[0]
 
 
 def value_x0(row, rx):
@@ -370,15 +388,16 @@ def _union(boxes):
     return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
 
 
-def _labeled(row, rx, page_w, stop_words):
-    """항목명 줄에서 항목명부터 값 끝까지의 상자들과 값 시작 x, 값 글자. 항목명이 줄 앞(두 단어 안)에 없으면 None"""
+def _labeled(row, rx, page_w, stop_words, anywhere=False):
+    """항목명 줄에서 항목명부터 값 끝까지의 상자들과 값 시작 x, 값 글자. 항목명이 줄 앞(두 단어 안)에 없으면 None
+    (anywhere면 줄 어디든). 값은 field_value와 같은 곳에서 끊는다: 간격 5%, 결재란 단어('실','장'처럼 나뉜 것 포함)"""
     text, spans = _row_text(row)
     m = rx.search(text)
-    if not m or m.start() >= spans[min(1, len(spans) - 1)][1]:
+    if not m or (not anywhere and m.start() >= spans[min(1, len(spans) - 1)][1]):
         return None
     end = m.end()
     boxes, vals, vx0, last = [], [], None, None
-    for it, (s, e) in zip(row, spans):
+    for k, (it, (s, e)) in enumerate(zip(row, spans)):
         if e <= m.start():
             continue
         if e <= end:  # 항목명만 든 상자
@@ -386,9 +405,10 @@ def _labeled(row, rx, page_w, stop_words):
             last = it["box"][2]
             continue
         piece = it["text"][max(0, end - s):]
+        nxt = row[k + 1]["text"] if k + 1 < len(row) else ""
         if last is not None and it["box"][0] - last > 0.05 * page_w and vals:
             break
-        if stop_words and STOP.match(piece) and vals:
+        if stop_words and (STOP.match(piece) or STOP.match(piece + nxt)) and vals:
             break
         boxes.append(it["box"])
         if piece.strip():
@@ -400,8 +420,10 @@ def _labeled(row, rx, page_w, stop_words):
 
 
 # 항목명 첫 글자를 못 읽은 경우 ('신 내부결재', '스 신 부산시 …') — 왼쪽 항목명 열의 줄에만 쓴다
-FRAG = {"recipient": re.compile(r"^\s*(?:(?:(?:[가-힣]\s*)?신|수)(?=[\s:：!]|$)|받\s*[는음](?:\s*[이곳](?=[\s:：]))?)\s*[!:：]?\s*"),
-        "title": re.compile(r"^\s*(?:(?:[가-힣]\s*)?목|제)(?=[\s:：]|$)\s*[:：]?\s*")}
+# 앞 글자로 다른 항목명이 되는 꼴은 뺀다: '발신'·'송신'·'통신'·'회신'·'답신'·'착신', '항목'·'품목'·'과목'·'종목'·'세목'·'조목'·'명목'
+FRAG = {"recipient": re.compile(r"^\s*(?:(?:(?:(?![발송통회답착])[가-힣]\s*)?신|수)(?=[\s:：!]|$)"
+                                r"|받\s*[는음](?:\s*[이곳](?=[\s:：]))?)\s*[!:：]?\s*"),
+        "title": re.compile(r"^\s*(?:(?:(?![항품과종세조명])[가-힣]\s*)?목|제)(?=[\s:：]|$)\s*[:：]?\s*")}
 
 
 VIA = re.compile(r"^\s*(?:경\s*)?유\s*[.:：]?\s*$")
@@ -423,19 +445,6 @@ def _after_via(rows, top, col, page_w, left):
             return None, None  # 다음 항목명(참조·제목) — 값 줄이 없음
         return i, _labeled(row, NO_LABEL, page_w, True)
     return None, None
-
-
-def _ref_boxes(rows, cand, page_w):
-    """머리부 '참조' 줄이 부서장이면(fix_recipient가 수신 값에 붙이는 경우 — ref_office와 같은 판단) 그 상자들"""
-    for i in cand:
-        hit = _labeled(rows[i], REF, page_w, True)
-        if hit is None:
-            continue
-        v = re.sub(r"\s", "", hit[2])
-        if OFFICE.match(v) and len(v) <= 12 and not STOP.match(v) and not v.startswith("담당자"):
-            return hit[0]
-        return []
-    return []
 
 
 def _find_label(rows, cand, rx, page_w, stop_words):
@@ -467,7 +476,7 @@ def _next_rows(rows, i, vx0, page_w, h, max_rows, title):
             break
         if not title and y - prev_y > 3.5 * h:
             break
-        boxes, last = [], None
+        boxes, texts, last = [], [], None
         for j, it in enumerate(cols):
             nxt = cols[j + 1]["text"] if j + 1 < len(cols) else ""
             if last is not None and it["box"][0] - last > 0.05 * page_w:
@@ -475,10 +484,11 @@ def _next_rows(rows, i, vx0, page_w, h, max_rows, title):
             if not title and (STOP.match(it["text"]) or STOP.match(it["text"] + nxt)):
                 break
             boxes.append(it["box"])
+            texts.append(it["text"])
             last = it["box"][2]
         if not boxes:
             continue
-        out.append(boxes)
+        out.append((boxes, " ".join(texts)))
         prev_y = y
     return out
 
@@ -494,29 +504,26 @@ def list_box(d):
     if not items:
         return None
     page_w, _ = page_size(items)
-    rows = rows_of(d["items"])  # d["lines"]와 줄마다 맞는다 (bottom_list와 같은 끝 12줄)
-    n = len(rows)
-    for i in range(max(0, n - 12), n):
-        ln = _row_text(rows[i])[0]
-        m = LIST_HEAD.match(ln)
-        if not m or not m.group(2).strip() or m.group(2).strip().startswith("참조"):
-            continue
-        sel = [rows[i]]
-        for row in rows[i + 1:]:  # bottom_list와 같은 규칙: 쉼표로 이어지는 목록 줄만
-            nxt = _row_text(row)[0]
-            if re.fullmatch(r"[\s\d\W]*", nxt) or re.match(r"^\s*(붙\s*임|끝)", nxt) or not re.search(r"[,，·]", nxt):
-                break
-            sel.append(row)
-        boxes = [it["box"] for row in sel for it in row if it["text"].strip()
-                 and not (re.fullmatch(r"\d{1,3}", it["text"].strip()) and it is row[-1] and len(row) > 1)]  # 줄 끝 쪽 번호
-        h = min(b[3] - b[1] for b in boxes)
-        return _pad(_union(boxes), page_w, h)
-    return None
+    rows = rows_of(d["items"])  # d["lines"]와 줄마다 맞는다 (OCR 결과는 줄 번호마다 한 줄)
+    span = list_span(d["lines"])
+    if span is None or len(rows) != len(d["lines"]):
+        return None
+    sel = rows[span[0]:span[1]]
+    boxes = [it["box"] for row in sel for it in row if it["text"].strip()
+             and not (re.fullmatch(r"\d{1,3}", it["text"].strip()) and it is row[-1] and len(row) > 1)]  # 줄 끝 쪽 번호
+    if not boxes:
+        return None
+    h = min(b[3] - b[1] for b in boxes)
+    return _pad(_union(boxes), page_w, h)
 
 
-def line_box(d, kind):
+def line_box(d, kind, fix=None, value=None):
     """수신·제목 줄 상자 [x0,y0,x1,y1]. (상자 또는 None, 출처 'head'|'list', 못 찾은 사유).
-    d = 문서 첫 쪽 OCR. 수신이 '수신처 참조'고 쪽 아래 목록이 있으면 목록 줄을 자른다"""
+    d = 문서 첫 쪽 OCR. fix·value = 그 문서 수신 값에 적용된 보정 규칙(fix_recipient 반환, 문서 info.recipient_fix)과
+    최종 수신 값. 값과 이미지가 같은 줄을 가리키게 fix_recipient와 같은 판단을 쓴다 (모르면 None — 머리부 OCR 값으로):
+      목록  fix가 '목록'이면 쪽 아래 수신처 목록 줄 (bottom_list와 같은 list_span)
+      참조  머리부 '참조' 부서장(ref_office와 같은 ref_office_row)이 수신 값에 들어 있으면 그 줄도
+    이어지는 줄은 값과 상관없이 값 칸에서 이어지는 원본 줄 (값이 빠뜨린 줄을 사람이 보게)"""
     if kind not in LINE_KINDS:
         raise ValueError(kind)
     items = [it for it in d["items"] if it["text"].strip()]
@@ -535,7 +542,7 @@ def line_box(d, kind):
             i, hit = _after_via(rows, top, col, page_w, left)
     if hit is not None:
         boxes, vx0, val = hit
-        if not title and (is_list_ref(val) or re.match(r"처\s*참\s*조", val)):
+        if not title and (fix == "목록" if fix is not None else is_list_ref(val)):
             lb = list_box(d)
             if lb:
                 return lb, "list", ""
@@ -543,10 +550,19 @@ def line_box(d, kind):
         # 제목은 첫 줄이 오른쪽 끝 가까이까지 찼을 때만 다음 줄로 넘어간다 (아니면 다음 줄은 본문)
         wraps = not title or max(b[2] for b in boxes) > WRAP_X * page_w
         if vx0 is not None and wraps and not re.match(r"내\s*부\s*결", val):
-            for more in _next_rows(rows, i, vx0, page_w, h, 2 if title else 3, title):
-                boxes += more
+            # 이어지는 줄은 값과 상관없이 원본대로 넣는다 — LLM 값이 줄을 빠뜨렸으면 사람이 이미지에서 알아채야 하므로.
+            # 단 '참조' 부서장 줄은 아래 참조 판단(값 규칙과 같음)으로만 넣는다
+            office_boxes = [] if title else ref_office_row(d)[1]
+            for more, _text in _next_rows(rows, i, vx0, page_w, h, 2 if title else 3, title):
+                boxes += [b for b in more if b not in office_boxes]
         if not title:
-            boxes += _ref_boxes(rows, top, page_w)
+            office, ref = ref_office_row(d)
+            if value is not None:  # 최종 수신 값을 알면: 그 값에 부서장이 들어 있을 때 (붙였든 LLM이 이미 넣었든)
+                joins = bool(office) and norm(office) in norm(value)
+            else:  # 모르면 fix_recipient 조건을 머리부 OCR 값으로
+                joins = bool(val) and not re.match(r"내\s*부\s*결", val) and not is_list_ref(val)
+            if office and joins:
+                boxes += ref
         return _pad(_union(boxes), page_w, h), "head", ""
     return None, "", "항목명 못 찾음"
 
