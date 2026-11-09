@@ -58,12 +58,17 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 
 | 남는 곳 | 내용 | 원문 값 |
 |---|---|---|
-| `audit` 표 | 업로드·실행·이어 가기·검토 저장·문서 수정·작업 시간 보내기마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름. 뒤에서 돈 실행의 끝(`run_done`: `ok` / `review_waiting` / `error`)도 시작한 사람으로 | 없음 |
+| `audit` 표 | 로그인·로그아웃·잠금, 처리 함수 앞에서 거절된 변경 요청, 업로드·실행·이어 가기·검토 저장·문서 수정·작업 시간 보내기마다 시각, 사용자, 행위, 철·문서 id, 결과(`ok` / `rejected_<상태>` / `error`+분류 코드), 개수·칸 이름. 뒤에서 돈 실행의 끝(`run_done`: `ok` / `review_waiting` / `error`)도 시작한 사람으로 | 없음 |
 | `edits` 표 | 고친 칸의 이전 값·새 값·사용자 (https://github.com/reddol18/docflow/issues/10) | 있음 |
 | `events` 표 (진행 화면) | 노드 시작·끝·오류. 오류는 분류 코드(`budget`·`llm`·`db`·`vector`·`network`·`storage`·`internal`)와 짧은 문구만 | 일부 있음 — 손글씨 판독 값(문서번호·일자), 사용자 이름 |
 | 서버 로그 (표준 오류) | 오류 traceback. 키·Bearer/Basic·JWT, 이름이 key·secret·token·password로 끝나는 값, 주소 속 비밀번호는 `***`로 가림 (`app/errors.py`) | 예외 문구에 실명 등이 들어 있으면 남음 |
 
-- 로그인 안 함(401)·권한 없음(403)·요청 형식 검증 실패(422, FastAPI가 처리 함수 앞에서 막음)는 `audit`에 남지 않는다. 로그인·로그아웃도 아직 남기지 않는다.
+- **인증 사건** (https://github.com/reddol18/docflow/issues/63): 로그인 성공(`login`/`ok`, 방식 `local`·`oidc`), 실패(`login`/`failed` + 사유 분류), 로그아웃(`logout`/`ok`), 잠금(`lockout`/`locked` — 잠그게 된 실패는 실패 행 대신 이 한 행). 실패 사유: `bad_password`·`unknown_user`·`locked`·`disabled`·`no_password`·`busy`(동시 시도 중)·`csrf`·`rate_limited`, OIDC는 `oidc_error`·`oidc_state`·`oidc_expired`·`oidc_verify`·`oidc_role`. 응답은 지금처럼 늘 같은 문구라 사유는 감사 로그에만 있다.
+  - **남기지 않는 것:** 비밀번호, 세션 토큰·쿠키·헤더(해시 포함), 요청 본문, OIDC 코드·토큰·제공자 오류 글, **없는 계정으로 시도한 아이디**(아이디 칸에 비밀번호를 잘못 넣은 것일 수 있다 — 계정 칸을 비우고 `unknown_user`만). 있는 계정이면 그 계정의 id·이름을 남긴다.
+  - 세션 없는 로그아웃은 아무 일도 하지 않으므로 남기지 않는다.
+- **처리 함수 앞에서 거절된 요청:** 로그인 안 함(401)·역할·CSRF(403)·본문 검증(422)도 그 경로의 행위 이름으로 `rejected_<상태>` 한 행 (예: 보기 역할로 업로드 → `upload`/`rejected_403`, 사유 `role`). 대상은 GET이 아닌 경로 전부와 감사 표시가 붙은 GET(`/export.xlsx`·`/export/errors.xlsx`). 사유 분류(`no_session`·`bad_session`·`csrf`·`role`)·메서드·422 오류 개수, 규칙에 맞는 철·문서 id만 — 검증 오류 내용(입력 값이 들어 있다)은 넣지 않는다. 처리 함수 안(`audited()`)에서 난 거절은 거기서 남기므로 다시 남기지 않는다. 422는 GET이 아닌 경로가 처리 함수 앞에서 막힌 것이라 함께 남긴다(로그인한 사람의 잘못된 변경 시도도 흔적이 된다).
+- **표 채우기 막기:** 계정에 묶이지 않는 행(로그인 안 한 요청의 거절, 없는 계정·CSRF·시도 제한에 걸린 로그인 실패, OIDC 실패)은 누구나 무한히 만들 수 있다 → 프로세스마다 `AUDIT_ANON_MAX`행/60초(기본 30)까지만 쓰고, 넘쳐 버린 개수는 다음에 쓸 수 있을 때 `audit_suppressed`/`dropped`(`count`) 한 행으로 남긴다(서버 로그에도 한 줄). 기본값으로 1년 내내 넘쳐도 약 1,600만 행. 계정에 묶인 행은 계정별 시도 제한·잠금이 이미 묶고, 로그인한 사용자의 거절은 누구인지 남으므로 상한 밖이다.
+- **빠짐 막기:** GET이 아닌 경로 함수에는 `@auth.audit_as("행위")`를 붙인다. `tests/test_audit_routes.py`가 `app.routes`(include_router 안까지)를 돌며 표시 없는 변경 경로가 있으면 실패하고, `tests/test_audit_pg.py`가 변경 경로 전부를 로그인 없이 불러 행위 이름별 `rejected_401` 행을 확인한다. 성공 행은 처리 함수의 `audited()`가 남긴다(경로마다 시험).
 - 감사 기록 저장이 실패해도 요청은 원래 결과대로 끝나고, 실패는 서버 로그에 남는다.
 - **보존:** `audit`은 1년 (2026-11-06 확정). 앱이 시작할 때마다(배포·재시작) 1년 지난 행을 지운다 (`store.prune_audit`).
 - **납품 후 삭제 범위:** 쪽 이미지·OCR 결과·색인(`documents`)·벡터·`edits`(원문 값이 있음)·`events`는 지운다. `audit`은 원문 값이 없어 보존 기간까지 남긴다(누가 언제 무엇을 했는지는 납품 뒤에도 확인할 수 있어야 하므로).

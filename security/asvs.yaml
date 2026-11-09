@@ -66,7 +66,7 @@ items:
   - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 충족, evidence: "app/store.py 전 쿼리 %s(keyword_search :447-463은 자리표시자만, 칸 값은 fields jsonb 매개변수, migrate_documents의 f-string은 LEGACY_COLUMNS 상수 열 이름만), report.py 상수만, auth·users %s"}
 
   # ---------- V7 오류·로그 ----------
-  - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "앱은 예외 종류만(app/auth.py:577), 오류 traceback은 키·비밀번호·Bearer 꼴을 가림(app/errors.py mask, https://github.com/reddol18/docflow/issues/28). uvicorn 접근 로그에 OIDC code·state 쿼리 https://github.com/reddol18/docflow/issues/40"}
+  - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "앱은 예외 종류만(app/auth.py:577), 오류 traceback은 키·비밀번호·Bearer 꼴을 가림(app/errors.py mask, https://github.com/reddol18/docflow/issues/28). 인증 사건·거절 요청 감사 행은 사유 분류만 — 비밀번호·토큰·쿠키·본문·없는 계정 아이디 없음(app/auth.py audit_event, app/main.py _audit_rejected, tests/test_auth_pg.py test_auth_events_audited, https://github.com/reddol18/docflow/issues/63). uvicorn 접근 로그에 OIDC code·state 쿼리 https://github.com/reddol18/docflow/issues/40"}
   - {id: V7.4.1, level: 1, text: "사용자에게는 일반 오류 문구", status: 충족, evidence: "500은 일반 문구. 실행·노드 오류는 events에 분류 코드+짧은 문구만(app/errors.py public, app/main.py submit, app/graph.py traced), 예전 행의 info.error도 내보내지 않음(app/store.py events). 상세 traceback은 서버 로그에만. tests/test_audit_pg.py (https://github.com/reddol18/docflow/issues/28)"}
 
   # ---------- V8 데이터 보호 ----------

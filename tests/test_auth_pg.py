@@ -1,6 +1,7 @@
 """인증을 실제 Postgres에 돌린다: local 로그인·잠금·세션·로그아웃, OIDC 전체 흐름(가짜 제공자), 수정 이력.
 TEST_PG_URL이 없으면 건너뛴다. 표를 지우므로 운영 DB에 대고 돌리지 말 것."""
 import base64
+import collections
 import hashlib
 import io
 import json
@@ -25,7 +26,7 @@ ISS, CID = "https://idp.test/realms/x", "docflow"
 @pytest.fixture
 def db(pg_store):
     with pg_store.pool.connection() as c:
-        for t in ("sessions", "oidc_pending", "edits", "review_time", "users"):
+        for t in ("sessions", "oidc_pending", "edits", "review_time", "audit", "users"):
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
     return pg_store
 
@@ -35,6 +36,8 @@ def client(db, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"local", "oidc"}))
     monkeypatch.setattr(auth, "COOKIE_SECURE", False)  # 시험 클라이언트는 http → Secure 쿠키를 다시 보내지 않는다
     monkeypatch.setattr(auth, "_hits", {})  # 시험마다 IP 제한 창을 비운다
+    monkeypatch.setattr(auth, "_anon", collections.deque())  # 감사 로그 계정 없는 행 상한 창도
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0})
     app = FastAPI(dependencies=[Depends(auth.guard)])
     app.include_router(auth.router)
 
@@ -84,6 +87,65 @@ def test_local_login_session_logout(client, db, monkeypatch):
     client.post("/auth/logout", headers=CSRF)
     assert client.get("/p").status_code == 401
     assert client.get("/p", headers={"authorization": f"Bearer {token}"}).status_code == 401  # 로그아웃한 토큰 재사용
+
+
+def audit_rows(db):
+    with db.pool.connection() as c:
+        return c.execute("SELECT * FROM audit ORDER BY id").fetchall()
+
+
+def test_auth_events_audited(client, db, monkeypatch):
+    """로그인 성공·실패·로그아웃·잠금 각 1회 → 감사 행 4개, 비밀번호·세션 토큰 문자열 0건
+    (https://github.com/reddol18/docflow/issues/63)"""
+    monkeypatch.setattr(auth, "MAX_FAILS", 2)  # 두 번째 실패에서 잠금 → 실패 1회 + 잠금 1회
+    add_user(monkeypatch, "alice", "reviewer")
+    add_user(monkeypatch, "bob", "viewer")
+    assert login(client, "alice").status_code == 200
+    token = client.cookies.get(auth.COOKIE)
+    assert client.post("/auth/logout", headers=CSRF).status_code == 200
+    assert login(client, "bob", "wrong-password-1").status_code == 401
+    r = login(client, "bob", "wrong-password-2")
+    assert r.status_code == 401 and r.json()["detail"] == auth.FAIL_MSG  # 응답은 잠겼는지 드러내지 않는다
+
+    rows = audit_rows(db)
+    assert [(r["action"], r["result"], r["username"], r["info"]) for r in rows] == [
+        ("login", "ok", "alice", {"via": "local"}),
+        ("logout", "ok", "alice", {"via": "cookie"}),
+        ("login", "failed", "bob", {"via": "local", "reason": "bad_password"}),
+        ("lockout", "locked", "bob", {"via": "local", "minutes": auth.LOCK_MIN, "fails": 2})]
+    assert all(r["user_id"] and r["ts"] for r in rows)
+    text = json.dumps(rows, ensure_ascii=False, default=str)
+    for bad in (PW, "wrong-password-1", "wrong-password-2", token, hashlib.sha256(token.encode()).hexdigest()):
+        assert bad not in text
+
+
+def test_failed_login_reasons(client, db, monkeypatch):
+    """실패 사유 분류. 없는 계정으로 시도한 아이디는 남기지 않는다 (아이디 칸에 비밀번호를 넣은 것일 수 있다)"""
+    add_user(monkeypatch, "carol", "viewer")
+    typo = "correct-horse-battery-typed-as-id"
+    assert login(client, typo).status_code == 401
+    assert login(client, "carol", headers={}).status_code == 403  # CSRF 표시 없음
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET locked_until = now() + interval '5 minutes' WHERE username = 'carol'")
+    assert login(client, "carol").status_code == 401  # 잠긴 동안 (맞는 비밀번호여도)
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET locked_until = NULL, disabled = true WHERE username = 'carol'")
+    assert login(client, "carol").status_code == 401
+    monkeypatch.setattr(auth, "USER_RATE", (0, 300))
+    assert login(client, "carol").status_code == 429
+    rows = audit_rows(db)
+    assert [(r["action"], r["result"], r["username"], r["info"]["reason"]) for r in rows] == [
+        ("login", "failed", None, "unknown_user"), ("login", "failed", None, "csrf"),
+        ("login", "failed", "carol", "locked"), ("login", "failed", "carol", "disabled"),
+        ("login", "failed", None, "rate_limited")]
+    assert typo not in json.dumps(rows, ensure_ascii=False, default=str)
+
+
+def test_logout_without_session_not_audited(client, db):
+    """세션 없는 로그아웃은 아무 일도 안 한다 — 누구나 감사 행을 만들지 못하게 남기지 않는다"""
+    assert client.post("/auth/logout", headers=CSRF).status_code == 200
+    assert client.post("/auth/logout", headers={"authorization": "Bearer not-a-session"}).status_code == 200
+    assert audit_rows(db) == []
 
 
 def test_bearer_and_expiry(client, db, monkeypatch):
@@ -274,6 +336,29 @@ def test_oidc_flow(client, db, idp):
     assert (u["issuer"], u["subject"], u["password_hash"]) == (ISS, "sso-1", None)
     # 같은 state 다시 쓰기 → 거절
     assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 400
+
+
+def test_oidc_login_audited(client, db, idp):
+    seen, claims = idp
+    state = start(client, seen)
+    assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 303
+    assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 400  # 다시 쓰기 (state 쿠키 없음)
+    client.cookies.set(auth.STATE_COOKIE, state)
+    assert client.get("/auth/oidc/callback", params={"code": "c1", "state": state}).status_code == 400  # 쓴 state
+    assert client.get("/auth/oidc/callback", params={"error": "access_denied"}).status_code == 303
+    claims["groups"] = []
+    auth.OIDC.default_role = None  # 역할을 못 정하면 거절
+    state = start(client, seen)
+    assert client.get("/auth/oidc/callback", params={"code": "c2", "state": state}).headers["location"] == "/login?error=role"
+    rows = audit_rows(db)
+    assert [(r["action"], r["result"], r["username"], r["info"]) for r in rows] == [
+        ("login", "ok", "kim", {"via": "oidc"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_state"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_expired"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_error"}),
+        ("login", "failed", None, {"via": "oidc", "reason": "oidc_role"})]
+    text = json.dumps(rows, default=str)
+    assert "access_denied" not in text and seen["data"]["code_verifier"] not in text  # 제공자 오류 글·PKCE 값 없음
 
 
 def test_oidc_state_must_match_browser(client, db, idp):
