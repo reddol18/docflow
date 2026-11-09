@@ -323,7 +323,7 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 
 컨테이너 최소 권한 (https://github.com/reddol18/docflow/issues/29): 세 컨테이너 모두 root 아님(postgres 70, qdrant·docflow 1000)·읽기 전용 루트 파일시스템·capability 전부 버림·SA 토큰 없음. 쓰는 곳만 PVC·emptyDir(`k8s/docs.yaml` 주석).
 - k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
-- emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi. 업로드 크기·개수 상한이 아직 없어(https://github.com/reddol18/docflow/issues/26) 한 번에 2Gi를 넘게 올리면 kubelet이 docflow 파드를 내쫓는다.
+- emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi(업로드 본문을 Starlette가 흘려 쓰는 곳). 넘으면 kubelet이 docflow 파드를 내쫓으므로 앱이 업로드를 묶는다(`app/upload.py`, https://github.com/reddol18/docflow/issues/26): 파일 하나 `UPLOAD_MAX_MB`(기본 20, 넘으면 413), 요청 하나 `UPLOAD_MAX_FILES`장(기본 50, 넘으면 400), 픽셀 수 `UPLOAD_MAX_MPX`(기본 100MP — A3 600dpi ≈ 70MP, 넘으면 400), 스캔 수 `UPLOAD_MAX_SCANS`(기본 64, 넘으면 400), 요청 본문 `UPLOAD_MAX_BODY_MB`(기본 210 — 화면이 10장씩 보냄, 받은 바이트로 세어 413), 동시에 받는 본문 합계 `UPLOAD_TMP_MB`(기본 1536, 넘으면 429), 동시 디코드 검사 `UPLOAD_DECODE_SLOTS`(기본 2). 본문은 로그인·역할·CSRF 확인 뒤에 읽는다. 같은 이름의 다른 내용은 409, `?replace=true`면 바꾸고 그 쪽 OCR을 지운다. 새 쪽·교체는 처음·끝난 철만(실행 중·검토 대기·멈춤은 409), 끝난 철은 `/run`으로 다시.
 
 ## 개발 절차
 
