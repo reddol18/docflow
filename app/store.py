@@ -143,8 +143,11 @@ CREATE TABLE IF NOT EXISTS stage_log (
   reason text, fixed_fields text[], gen int NOT NULL DEFAULT 0);
 ALTER TABLE stage_log ADD COLUMN IF NOT EXISTS gen int NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS stage_log_doc ON stage_log (vol, doc_id);
-CREATE TABLE IF NOT EXISTS stage_gen (vol text PRIMARY KEY, gen int NOT NULL, since timestamptz NOT NULL)
+CREATE TABLE IF NOT EXISTS stage_gen (vol text PRIMARY KEY, gen int NOT NULL, since timestamptz NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, done_at timestamptz NOT NULL DEFAULT now())
 """
+# ↑ schema_migrations: 한 번만 돌리는 데이터 옮기기의 완료 표시 (전체를 훑는 옮기기를 시작할 때마다 다시 돌리지 않게).
+#   중간에 실패하면 표시를 남기지 않아 다음 시작에 이어서 한다
 # ↑ doc_stage·stage_log (https://github.com/reddol18/docflow/issues/86): 새 표만 더한다. 행이 없는 문서(예전 철)는
 #   흐름 설정의 처음 단계에 있는 것으로 본다 → 옛 철은 옮길 것 없이 그대로 열린다
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
@@ -207,8 +210,8 @@ def migrate_doc_key(c):
     """문서 키 doc_id → (vol, doc_id) (https://github.com/reddol18/docflow/issues/50). documents 기본 키만 doc_id 하나였다
     (다른 표 edits·events·audit·review_time·inspection·doc_stage·stage_log는 처음부터 vol 칸을 함께 가진다).
     기본 키를 한 트랜잭션에서 바꾼다 — 행은 그대로 두므로 사람이 고친 값·검사·감사 기록이 그대로 남는다.
-    이미 바뀌었으면 아무것도 안 한다 (시작할 때마다). 바꿨으면 True.
-    예전 키로 이미 덮어쓴 행(같은 쪽 이름의 두 철)은 되살리지 못한다 — 여러 철에 나온 doc_id 수를 로그로만 남긴다"""
+    이미 바뀌었으면 아무것도 안 한다 (카탈로그 한 번 읽기, 시작할 때마다). 바꿨으면 True.
+    예전 키로 섞인 행은 시작 마무리(main.repair_documents)가 철의 그래프 상태대로 바로잡는다"""
     name, cols = _pk_columns(c, "documents")
     if cols == ["vol", "doc_id"]:
         return False
@@ -216,11 +219,28 @@ def migrate_doc_key(c):
         if name:
             c.execute(f'ALTER TABLE documents DROP CONSTRAINT "{name}"')  # 카탈로그에서 읽은 제약 이름
         c.execute("ALTER TABLE documents ADD PRIMARY KEY (vol, doc_id)")
-    shared = c.execute("SELECT count(*) AS n FROM (SELECT doc_id FROM events WHERE doc_id IS NOT NULL "
-                       "GROUP BY doc_id HAVING count(DISTINCT vol) > 1) t").fetchone()["n"]
-    print(f"documents: 기본 키 {cols} → [vol, doc_id]. 여러 철에 나온 doc_id {shared}개 — 예전 키로는 documents 행·벡터가 "
-          "하나만 남았을 수 있다 (나중에 처리한 철). 그 철들은 다시 돌리거나 문서를 고치면 철마다 따로 저장된다", flush=True)
+    print(f"documents: 기본 키 {cols} → [vol, doc_id]. 여러 철에 나온 doc_id {shared_doc_ids(c)}개 — 섞인 행은 "
+          "시작 마무리에서 철의 상태대로 바로잡는다 (documents: 바로잡음 로그)", flush=True)
     return True
+
+
+def shared_doc_ids(c):
+    """여러 철에 나온 doc_id 수 (이벤트 기준) — 예전 키(doc_id 하나)에서 충돌했을 수 있는 문서"""
+    return c.execute("SELECT count(*) AS n FROM (SELECT doc_id FROM events WHERE doc_id IS NOT NULL "
+                     "GROUP BY doc_id HAVING count(DISTINCT vol) > 1) t").fetchone()["n"]
+
+
+DOC_KEY_MIGRATION = "doc_key_50"  # Qdrant 점 다시 매기기 + documents 행 바로잡기 (https://github.com/reddol18/docflow/issues/50)
+
+
+def migration_done(name):
+    with pool.connection() as c:
+        return c.execute("SELECT 1 FROM schema_migrations WHERE name = %s", (name,)).fetchone() is not None
+
+
+def mark_migration(name):
+    with pool.connection() as c:
+        c.execute("INSERT INTO schema_migrations (name) VALUES (%s) ON CONFLICT DO NOTHING", (name,))
 
 
 AUDIT_KEEP = "1 year"  # 감사 로그 보존 기간 (2026-11-06 확정, README)
@@ -240,8 +260,8 @@ def init():
         q.create_collection(COLLECTION, vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
         q.create_payload_index(COLLECTION, "year", PayloadSchemaType.INTEGER)
         q.create_payload_index(COLLECTION, "vol", PayloadSchemaType.KEYWORD)
-    else:
-        migrate_vectors()  # 예전 키(doc_id)의 점을 (vol, doc_id)로 — 옮길 것이 없으면 id만 훑는다
+    elif not migration_done(DOC_KEY_MIGRATION):
+        migrate_vectors()  # 예전 키(doc_id)의 점을 (vol, doc_id)로. 완료 표시는 main.startup_migrate가 행 바로잡기 뒤에 남긴다
 
 
 def add_usage(vol, kind, model, tin, tout, usd):
@@ -783,6 +803,32 @@ def _upsert_doc(c, d, schema):
         c.execute("UPDATE documents SET edited = true WHERE vol = %s AND doc_id = %s", (d["vol"], d["doc_id"]))
 
 
+def index_time(vol):
+    """철을 처음 색인한 시각 (index 노드 끝 이벤트). 없으면 None"""
+    with pool.connection() as c:
+        return c.execute("SELECT min(ts) AS t FROM events WHERE vol = %s AND node = 'index' AND phase = 'end'",
+                         (vol,)).fetchone()["t"]
+
+
+def restore_documents(vol, docs, created_at, schema=None):
+    """documents 행을 그래프 상태 그대로 다시 쓴다 (옮기기의 바로잡기 — https://github.com/reddol18/docflow/issues/50).
+    save_documents와 달리 edited도 상태대로 (켜고 끈다), 새로 만드는 행의 created_at은 철의 색인 시각
+    (리포트 '색인 문서 수'가 바로잡은 날에 부풀지 않게; 모르면 NULL — 리포트가 세지 않는다). 있던 행의 created_at은 그대로"""
+    schema = schema or fields.SCHEMA
+    with pool.connection() as c, c.transaction(), c.cursor() as cur:
+        cur.executemany(
+            """INSERT INTO documents (doc_id, vol, pages, fields, search_text, year, flags, reviewed, edited, created_at,
+                                      updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+               ON CONFLICT (vol, doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
+                 search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
+                 reviewed=EXCLUDED.reviewed, edited=EXCLUDED.edited, updated_at=now()""",
+            [(d["doc_id"], vol, d["pages"], json.dumps(d["fields"], ensure_ascii=False),
+              fields.search_text(schema, d["fields"]), fields.year_of(schema, d["fields"]),
+              json.dumps(d.get("flags"), ensure_ascii=False), d.get("reviewed", False), bool(d.get("edited")),
+              created_at) for d in docs])
+
+
 def save_edit(vol, d, flag_items, schema=None):
     """문서 수정 저장 — 고친 문서 d는 통째로, 철 안 중복이 바뀐 다른 문서는 검토 표시만 [(doc_id, flags)], 한 트랜잭션으로
     (https://github.com/reddol18/docflow/issues/87). 다른 문서의 칸 값·검토 여부는 건드리지 않는다 (그 문서를 동시에 고친 값을
@@ -948,8 +994,8 @@ def vector_search(vec, year_from=None, year_to=None, limit=20):
 def missing_vectors(keys):
     """(vol, doc_id) 중 Qdrant 점이 없는 것 — 시작 때 예전 키 충돌로 잃은 벡터를 세는 데 쓴다"""
     keys = list(keys)
-    if not keys:
-        return []
-    have = {str(p.id) for p in qdrant().retrieve(COLLECTION, ids=[point_id(v, d) for v, d in keys],
-                                                 with_payload=False, with_vectors=False)}
+    have = set()
+    for i in range(0, len(keys), 256):
+        have |= {str(p.id) for p in qdrant().retrieve(COLLECTION, ids=[point_id(v, d) for v, d in keys[i:i + 256]],
+                                                      with_payload=False, with_vectors=False)}
     return [k for k in keys if point_id(*k) not in have]

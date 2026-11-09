@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_
 VA, VB, PAGE = "vol-a", "vol-b", "p-0001"
 USERS = {"w": (2, "reviewer"), "v": (8, "viewer")}
 TABLES = ("documents", "edits", "events", "audit", "inspection", "inspection_plan", "review_submitters", "doc_stage",
-          "stage_log", "stage_gen", "exports", "review_time", "sessions", "users")
+          "stage_log", "stage_gen", "exports", "review_time", "sessions", "users", "schema_migrations")
 
 
 def h(name):
@@ -113,37 +113,56 @@ def test_same_page_name_in_two_volumes(env):
     assert payload(env, VA, PAGE) is None and payload(env, VB, PAGE) == before_b[1]
 
 
-def _old_shape(env):
-    """#50 이전(첫 판 꼴) documents 표: 기본 키 doc_id 하나 + 예전 고정 칸. 예전 키 충돌을 흉내 낸다 —
-    VA를 먼저, VB를 나중에 처리해 (VA, p-0001) 행에 VB의 칸 값이 들어가 있고(ON CONFLICT가 vol을 안 바꿨다),
-    Qdrant 옛 점 하나(VB 것)만 남았다. VA의 p-0002는 충돌 없는 문서 (사람 수정 이력·검사 기록이 있다)"""
+
+
+INDEXED_AT = "2026-01-02 03:04:05+09"  # 지어낸 첫 색인 시각
+
+
+def _legacy_table(rows):
+    """#50 이전 documents 표: 기본 키 doc_id 하나 + 예전 고정 칸(첫 판 꼴) + 뒤에 더한 edited·created_at.
+    rows = [(doc_id, vol, title, edited)] — 다른 칸은 지어낸 고정값"""
     with store.pool.connection() as c:
         c.execute("DROP TABLE documents")
         c.execute("CREATE TABLE documents (doc_id text PRIMARY KEY, vol text NOT NULL, pages text[] NOT NULL, "
                   "docno text, serial text, date text, recipient text, title text, flags jsonb, "
-                  "reviewed boolean DEFAULT false, updated_at timestamptz DEFAULT now())")
-        c.execute("INSERT INTO documents (doc_id, vol, pages, docno, serial, date, recipient, title, flags, reviewed) VALUES "
-                  "('p-0001', %s, '{p-0001}', '가상 1-1', '1', '1999-01-01', '가상시장', '가상 도로 허가 을', '{}', true), "
-                  "('p-0002', %s, '{p-0002}', '가상 1-2', '2', '1998-05-06', '가상군수', '가상 하천 점용 사람 고침', '{}', true)",
-                  (VA, VA))
+                  "reviewed boolean DEFAULT false, updated_at timestamptz DEFAULT now(), "
+                  "edited boolean DEFAULT false, created_at timestamptz DEFAULT now())")
+        for did, vol, title, edited in rows:
+            c.execute("INSERT INTO documents (doc_id, vol, pages, docno, serial, date, recipient, title, flags, reviewed, "
+                      "edited, created_at) VALUES (%s, %s, %s, '가상 1-1', '1', '1999-01-01', '가상시장', %s, '{}', true, "
+                      "%s, %s)", (did, vol, [did], title, edited, INDEXED_AT))
+
+
+def _legacy_points(points):
+    """옛 id(doc_id만)의 Qdrant 점. points = [(doc_id, vol, title, 벡터)]"""
+    from qdrant_client.models import PointStruct
+    env_q = store.qdrant()
+    env_q.upsert(store.COLLECTION, points=[
+        PointStruct(id=store.legacy_point_id(did), vector=vec,
+                    payload={"doc_id": did, "vol": vol, "year": 1999, "fields": {"title": title}})
+        for did, vol, title, vec in points])
+
+
+def _index_event(vol):
+    with store.pool.connection() as c:
+        c.execute("INSERT INTO events (ts, vol, node, phase) VALUES (%s, %s, 'index', 'end')", (INDEXED_AT, vol))
+
+
+def _old_shape(env):
+    """예전 키 충돌: VA를 먼저, VB를 나중에 처리해 (VA, p-0001) 행에 VB의 칸 값이 들어가 있고(ON CONFLICT가 vol을
+    안 바꿨다), Qdrant 옛 점 하나(VB 것)만 남았다. VA의 p-0002는 충돌 없는 문서 (사람 수정 이력·검사 기록이 있다)"""
+    _legacy_table([("p-0001", VA, "가상 도로 허가 을", False), ("p-0002", VA, "가상 하천 점용 사람 고침", True)])
+    with store.pool.connection() as c:
         c.execute("INSERT INTO edits (vol, doc_id, field, old, new, user_id, source) VALUES "
                   "(%s, 'p-0002', 'title', '가상 하천 점용', '가상 하천 점용 사람 고침', 2, 'edit')", (VA,))
         c.execute("INSERT INTO inspection_plan (vol, rate, fields100, seed, flagged, unflagged, sample) "
                   "VALUES (%s, 0.5, '{}', 1, 0, 2, 1)", (VA,))
         c.execute("INSERT INTO inspection (vol, doc_id, reason) VALUES (%s, 'p-0002', 'sample')", (VA,))
-        for v, d in ((VA, "p-0001"), (VA, "p-0002"), (VB, "p-0001")):
-            c.execute("INSERT INTO events (vol, node, phase, doc_id) VALUES (%s, 'merge', 'end', %s)", (v, d))
-    from qdrant_client.models import PointStruct
-    env.q.upsert(store.COLLECTION, points=[
-        PointStruct(id=store.legacy_point_id("p-0001"), vector=[1.0, 0.0],
-                    payload={"doc_id": "p-0001", "vol": VB, "year": 1999, "fields": {"title": "가상 도로 허가 을"}}),
-        PointStruct(id=store.legacy_point_id("p-0002"), vector=[0.0, 1.0],
-                    payload={"doc_id": "p-0002", "vol": VA, "year": 1998, "fields": {"title": "가상 하천 점용 사람 고침"}})])
-    a1 = doc(VA, "p-0001", "가상 도로 허가 갑")
-    a2 = dict(doc(VA, "p-0002", "가상 하천 점용 사람 고침", recipient="가상군수"), edited=True)
-    a2["fields"] = {**a2["fields"], "docno": "가상 1-2", "serial": "2", "date": "1998-05-06"}
-    env.states[VA] = {"docs": [a1, a2], "indexed": 2}
+    _legacy_points([("p-0001", VB, "가상 도로 허가 을", [1.0, 0.0]), ("p-0002", VA, "가상 하천 점용 사람 고침", [0.0, 1.0])])
+    env.states[VA] = {"docs": [doc(VA, "p-0001", "가상 도로 허가 갑"),
+                               dict(doc(VA, "p-0002", "가상 하천 점용 사람 고침"), edited=True)], "indexed": 2}
     env.states[VB] = {"docs": [doc(VB, "p-0001", "가상 도로 허가 을")], "indexed": 1}
+    _index_event(VB)
 
 
 def _start(env):
@@ -151,12 +170,20 @@ def _start(env):
     env.main.startup_migrate()
 
 
-def test_old_database_migrates_in_place(env, capsys):
+def _drop_volume(env, vol):
+    """예전 판에서 철을 일괄 삭제한 뒤 (쪽 폴더·그래프 상태 없음)"""
+    import shutil
+    shutil.rmtree(store.DATA / "pages" / vol)
+    env.states.pop(vol, None)
+
+
+def test_old_database_migrates_in_place(env, capsys, monkeypatch):
     """예전 판 DB·컬렉션에서 시작: 다시 처리하지 않고 키를 옮긴다. 사람 수정·검사 기록이 남고, 옛 철이 목록·검색에 그대로 나온다"""
     _old_shape(env)
     _start(env)
     log = capsys.readouterr().out
     assert "기본 키 ['doc_id'] → [vol, doc_id]" in log and "점 2개 id를 (vol, doc_id)로 옮김" in log
+    assert "행 2개를 철의 그래프 상태대로" in log  # (VA, p-0001) 바로잡기 + (VB, p-0001) 다시 만들기
     with store.pool.connection() as c:
         assert store._pk_columns(c, "documents")[1] == ["vol", "doc_id"]
         assert c.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1
@@ -165,8 +192,8 @@ def test_old_database_migrates_in_place(env, capsys):
     # 섞여 있던 (VA, p-0001) 행은 VA 상태대로 바로잡고, 잃었던 (VB, p-0001) 행은 VB 상태로 다시 만든다
     assert rows[(VA, "p-0001")]["fields"]["title"] == "가상 도로 허가 갑"
     assert rows[(VB, "p-0001")]["fields"]["title"] == "가상 도로 허가 을"
-    # 충돌 없던 문서는 손대지 않음 (예전 고정 칸 → fields, 사람이 고친 값 그대로)
-    assert rows[(VA, "p-0002")]["fields"]["title"] == "가상 하천 점용 사람 고침" and rows[(VA, "p-0002")]["year"] == 1998
+    # 충돌 없던 문서는 손대지 않음 (예전 고정 칸 → fields, 사람이 고친 값·수정 표시 그대로)
+    assert rows[(VA, "p-0002")]["fields"]["title"] == "가상 하천 점용 사람 고침" and rows[(VA, "p-0002")]["edited"]
     # Qdrant: 옛 id는 없어지고 새 id에 같은 벡터·payload (다시 임베딩하지 않음)
     assert env.q.retrieve(store.COLLECTION, [store.legacy_point_id("p-0001"), store.legacy_point_id("p-0002")]) == []
     assert payload(env, VB, "p-0001")["fields"]["title"] == "가상 도로 허가 을"
@@ -178,13 +205,78 @@ def test_old_database_migrates_in_place(env, capsys):
     assert hits == {(VA, "p-0001"), (VA, "p-0002"), (VB, "p-0001")}
     assert [e["new"] for e in c.get(f"/documents/{VA}/p-0002/edits", headers=h("v")).json()] == ["가상 하천 점용 사람 고침"]
 
-    # 다시 시작해도 같다 (옮길 것·바로잡을 것 없음)
+    # 다시 시작: 완료 표시가 있어 전체 훑기(Qdrant 점 훑기·철마다 상태 대조)를 하지 않는다
+    assert store.migration_done(store.DOC_KEY_MIGRATION)
+    monkeypatch.setattr(store, "migrate_vectors", lambda *a: pytest.fail("끝난 옮기기를 다시 훑음"))
+    monkeypatch.setattr(env.main, "repair_documents", lambda: pytest.fail("끝난 바로잡기를 다시 훑음"))
     snapshot = store.get_documents([(VA, "p-0001"), (VA, "p-0002"), (VB, "p-0001")])
     _start(env)
     log = capsys.readouterr().out
     assert "기본 키" not in log and "옮김" not in log and "바로잡음" not in log
     assert store.get_documents(list(snapshot)) == snapshot
     assert env.q.count(store.COLLECTION, exact=True).count == 2
+
+
+def test_migration_resumes_when_repair_fails(env, monkeypatch):
+    """바로잡기가 중간에 실패하면 완료 표시를 남기지 않는다 → 다음 시작에 이어서 끝낸다"""
+    _old_shape(env)
+    real = env.main.repair_documents
+    monkeypatch.setattr(env.main, "repair_documents", lambda: (_ for _ in ()).throw(RuntimeError("가상 실패")))
+    with pytest.raises(RuntimeError):
+        _start(env)
+    assert not store.migration_done(store.DOC_KEY_MIGRATION)
+    monkeypatch.setattr(env.main, "repair_documents", real)
+    _start(env)
+    assert store.migration_done(store.DOC_KEY_MIGRATION)
+    assert store.get_documents([(VB, "p-0001")])[(VB, "p-0001")]["fields"]["title"] == "가상 도로 허가 을"
+
+
+def test_later_volume_deleted_before_migration(env, capsys):
+    """예전 판에서 나중 철(VB)을 지운 뒤: 남은 (VA, p-0001) 행에 VB 값·수정 표시가 남아 있었다 → VA 상태대로.
+    (일괄 삭제는 vol = VB 행·벡터만 지웠다 — 섞인 행의 vol은 VA라 남았다)"""
+    _legacy_table([("p-0001", VA, "가상 도로 허가 을", True)])  # VB에서 고친 표시까지 섞임
+    _drop_volume(env, VB)
+    env.states[VA] = {"docs": [doc(VA, "p-0001", "가상 도로 허가 갑")], "indexed": 1}
+    _start(env)
+    row = store.get_documents([(VA, "p-0001")])[(VA, "p-0001")]
+    assert row["fields"]["title"] == "가상 도로 허가 갑"
+    assert row["edited"] is False  # 상태 기준으로 끈다
+    with store.pool.connection() as c:  # 있던 행의 created_at은 그대로
+        assert c.execute("SELECT %s::timestamptz = %s::timestamptz AS same", (row["created_at"], INDEXED_AT)).fetchone()["same"]
+    assert "벡터 없는 문서 1개" in capsys.readouterr().out
+
+
+def test_earlier_volume_deleted_before_migration(env):
+    """예전 판에서 먼저 철(VA)을 지운 뒤: 섞인 행의 vol이 VA라 함께 지워져 살아 있는 VB의 행이 없었다 → VB 상태로 다시 만든다.
+    created_at은 VB의 첫 색인 시각 (리포트 '색인 문서 수'가 옮긴 날에 부풀지 않게), 수정 표시는 상태대로"""
+    from app import report
+    _legacy_table([])
+    _legacy_points([("p-0001", VB, "가상 도로 허가 을", [1.0, 0.0])])
+    _drop_volume(env, VA)
+    env.states[VB] = {"docs": [dict(doc(VB, "p-0001", "가상 도로 허가 을"), edited=True)], "indexed": 1}
+    _index_event(VB)
+    _start(env)
+    row = store.get_documents([(VB, "p-0001")])[(VB, "p-0001")]
+    assert row["fields"]["title"] == "가상 도로 허가 을" and row["edited"] is True
+    with store.pool.connection() as c:
+        assert c.execute("SELECT %s::timestamptz = %s::timestamptz AS same", (row["created_at"], INDEXED_AT)).fetchone()["same"]
+    today = store.dt.datetime.now(store.KST).date()
+    assert sum(d.get("docs_indexed") or 0 for d in report.daily(today, today)) == 0
+    c = TestClient(env.main.app)
+    hits = {(x["vol"], x["doc_id"]) for x in c.get("/search", params={"q": "도로"}, headers=h("v")).json()}
+    assert hits == {(VB, "p-0001")}
+
+
+def test_repaired_row_without_index_event_not_counted(env):
+    """첫 색인 시각을 모르면 created_at을 비워 둔다 — 리포트가 세지 않는다"""
+    from app import report
+    _legacy_table([])
+    _drop_volume(env, VA)
+    env.states[VB] = {"docs": [doc(VB, "p-0001", "가상 도로 허가 을")], "indexed": 1}
+    _start(env)
+    assert store.get_documents([(VB, "p-0001")])[(VB, "p-0001")]["created_at"] is None
+    today = store.dt.datetime.now(store.KST).date()
+    assert sum(d.get("docs_indexed") or 0 for d in report.daily(today, today)) == 0
 
 
 def test_vector_migration_resumes_after_partial_run(env):

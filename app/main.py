@@ -449,27 +449,30 @@ def startup_migrate():
         n = store.backfill_inspected(SAMPLE["name"])
         if n:
             print(f"doc_stage: 예전 검사 끝난 문서 {n}건 → 확정", flush=True)
-    repair_shared_docs()
+    if G is not None and not store.migration_done(store.DOC_KEY_MIGRATION):
+        repair_documents()  # 실패하면 완료 표시를 남기지 않는다 → 다음 시작에 Qdrant 옮기기부터 이어서
+        store.mark_migration(store.DOC_KEY_MIGRATION)
 
 
-def repair_shared_docs():
-    """예전 키(doc_id 하나)에서는 같은 쪽 이름의 두 철을 처리하면 documents 행이 하나만 남았다 — 그 행의 vol은 먼저
-    처리한 철인데 칸 값은 나중 철 것이었다 (ON CONFLICT가 vol을 바꾸지 않았다). 철마다 문서의 원본은 그래프 상태
-    (철 화면·출력이 읽는 곳)이므로, 여러 철에 나온 doc_id(이벤트 기준)만 골라 색인이 끝난 철의 상태와 다르거나 없는 행을
-    상태대로 다시 쓴다 (LLM 호출 없음). 바로잡을 것이 없으면 아무것도 쓰지 않는다 (시작할 때마다).
-    잃은 벡터(옛 점은 나중 철 것 하나뿐)는 다시 만들지 않고 개수만 알린다 — 그 문서는 낱말 검색으로만 찾힌다.
-    고친 행 수"""
-    if G is None:
-        return 0
+def _row_differs(row, d):
+    return (row is None or row["fields"] != d["fields"] or (row["flags"] or {}) != (d.get("flags") or {})
+            or list(row["pages"]) != list(d["pages"]) or bool(row["reviewed"]) != bool(d.get("reviewed", False))
+            or bool(row["edited"]) != bool(d.get("edited")))
+
+
+def repair_documents():
+    """예전 키(doc_id 하나)로 섞인 documents 행 바로잡기 — 문서 키 옮기기에서 한 번 (https://github.com/reddol18/docflow/issues/50).
+    예전 키에서는 같은 쪽 이름의 두 철을 처리하면 행이 하나만 남았다: vol은 먼저 처리한 철, 칸 값은 나중 철
+    (ON CONFLICT가 vol을 안 바꿈). 그 뒤 한쪽 철을 지웠다면 남은 행에 지운 철 값이 남거나(나중 철을 지움), 살아 있는
+    철의 행이 아예 없어졌다(먼저 철을 지움 — 행의 vol이 그 철이라). 그래서 events가 아니라 색인이 끝난 모든 철의 그래프
+    상태(철 화면·출력이 읽는 원본, 사람이 고친 값도 여기 있다)와 행을 대조해, 없거나 다른 행을 상태대로 다시 쓴다
+    (LLM 호출 없음). 상태에 없는 행은 지우지 않는다. 잃은 벡터는 다시 만들지 않고 개수만 알린다 — 그 문서는 낱말
+    검색으로만 찾힌다. 고친 행 수"""
     with store.pool.connection() as c:
-        rows = c.execute("SELECT doc_id, array_agg(DISTINCT vol) AS vols FROM events WHERE doc_id IS NOT NULL "
-                         "GROUP BY doc_id HAVING count(DISTINCT vol) > 1").fetchall()
-    shared = {}
-    for r in rows:
-        for v in r["vols"]:
-            shared.setdefault(v, set()).add(r["doc_id"])
+        vols = {r["vol"] for r in c.execute("SELECT DISTINCT vol FROM documents").fetchall()}
+    vols = sorted(vols | set(volume_names()))
     fixed, keys = 0, []
-    for vol, ids in sorted(shared.items()):
+    for vol in vols:
         if not VOL_RX.fullmatch(vol):
             continue
         snap = G.get_state(cfg(vol))
@@ -478,26 +481,24 @@ def repair_shared_docs():
         # documents에 쓸 값이 아니다
         if v.get("indexed") is None or snap.next or snap.interrupts:
             continue
-        docs = [d for d in v.get("docs", []) if d["doc_id"] in ids]
+        docs = v.get("docs", [])
         have = store.get_documents([(vol, d["doc_id"]) for d in docs])
-        stale = [d for d in docs if (row := have.get((vol, d["doc_id"]))) is None
-                 or row["fields"] != d["fields"] or (row["flags"] or {}) != (d.get("flags") or {})
-                 or list(row["pages"]) != list(d["pages"])]
+        stale = [d for d in docs if _row_differs(have.get((vol, d["doc_id"])), d)]
         if stale:
-            store.save_documents([{**d, "vol": vol} for d in stale])
+            store.restore_documents(vol, stale, store.index_time(vol))
             fixed += len(stale)
         keys += [(vol, d["doc_id"]) for d in docs]
     lost = []
     if keys and llm.enabled():
-        try:
+        try:  # 개수 알림일 뿐 — 세지 못해도 옮기기는 끝낸다
             lost = store.missing_vectors(keys)
         except Exception:
             errors.log_exception("missing_vectors")
-    if fixed:
-        print(f"documents: 예전 키 충돌 바로잡음 — 행 {fixed}개를 철의 그래프 상태대로 다시 씀", flush=True)
+    print(f"documents: 문서 키 옮기기 바로잡음 — 철 {len(vols)}개 대조, 행 {fixed}개를 철의 그래프 상태대로 다시 씀",
+          flush=True)
     if lost:
-        print(f"qdrant: 예전 키 충돌로 벡터 없는 문서 {len(lost)}개 (철 {sorted({v for v, _ in lost})}) — 낱말 검색으로만 "
-              "찾힌다. 그 문서를 고치면(PATCH) 벡터를 다시 만든다", flush=True)
+        print(f"qdrant: 벡터 없는 문서 {len(lost)}개 (철 {sorted({v for v, _ in lost})}) — 낱말 검색으로만 찾힌다 "
+              "(예전 키 충돌로 덮어쓴 벡터). 그 문서의 칸을 고치면(PATCH) 벡터를 다시 만든다", flush=True)
     return fixed
 
 

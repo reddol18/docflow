@@ -161,10 +161,26 @@ def test_openai_budget_and_max_tokens(monkeypatch, fake_openai):
     seen = []
     monkeypatch.setattr(store, "spent_today", lambda: seen.append(1) or 0.0)
     llm.extract("v", ["가상 줄"])
-    llm.answer("가상 질문", [{"doc_id": "v1-0001", "body": "가상 본문"}])
+    llm.answer("가상 질문", [{"vol": "v1", "doc_id": "v1-0001", "body": "가상 본문"}])
     assert len(seen) == 2
     (_, ex), (_, an) = fake_openai.calls
     assert ex["max_tokens"] == 512 == llm.EXTRACT_MAX_TOKENS and an["max_tokens"] == 1024 == llm.ANSWER_MAX_TOKENS
+
+
+def test_answer_cites_volume_and_doc(monkeypatch, fake_openai):
+    """/ask 근거 표시는 [철/doc_id] — 두 철에 같은 쪽 이름이 있어도 어느 철 문서인지 가린다
+    (https://github.com/reddol18/docflow/issues/50). 지시문·목록 표시·답변 읽기가 같은 꼴 (모델 호출 없음)"""
+    from app import store
+    monkeypatch.setattr(store, "add_usage", lambda *a: None)
+    monkeypatch.setattr(store, "spent_today", lambda: 0.0)
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    llm.answer("가상 질문", [{"vol": "va", "doc_id": "p-0001", "body": "가상 갑"},
+                         {"vol": "vb", "doc_id": "p-0001", "body": "가상 을"}])
+    user = fake_openai.calls[-1][1]["messages"][1]["content"]
+    assert "[va/p-0001] " in user and "[vb/p-0001] " in user
+    assert "[철/문서]" in llm.ANSWER_PROMPT
+    assert llm.citations("가상 답 [vb/p-0001], [va/p-0001] 그리고 [vb/p-0001] [p-0002]") == [("vb", "p-0001"),
+                                                                                         ("va", "p-0001")]
     monkeypatch.setattr(store, "spent_today", lambda: llm.BUDGET)
     with pytest.raises(llm.BudgetExceeded):
         llm.extract("v", ["가상 줄"])

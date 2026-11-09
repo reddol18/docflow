@@ -83,6 +83,15 @@ def test_rrf_matches_search(monkeypatch):
     assert calls[:2] == calls[2:4]  # hybrid와 ranked가 같은 인자로 검색한다
 
 
+def test_doc_ranks_and_cite_recall_with_volume_keys():
+    """정답 세트(doc_id)와 비교: 다른 철의 같은 쪽 이름은 한 번만, 답변 근거는 [철/doc_id]에서 시험용 철을 빼고 센다"""
+    assert ss.doc_ranks([("va", "a"), ("vb", "a"), ("va", "b")]) == ["a", "b"]
+    assert ss.doc_ranks([{"vol": "va", "doc_id": "a"}, {"vol": "vb", "doc_id": "a"}]) == ["a"]
+    assert ss.cite_recall("답 [va/a] [test-1/b]", ["a", "b"]) == 0.5
+    assert ss.cite_recall("답 [a]", ["a"]) == 0.0  # 철 없는 예전 표시는 근거로 치지 않는다
+    assert ss.cite_recall("없다", []) is None
+
+
 def test_rrf_keeps_same_page_name_in_two_volumes():
     """같은 쪽 이름이 두 철에 있으면 RRF 점수를 따로 센다 (https://github.com/reddol18/docflow/issues/50)"""
     from app import main

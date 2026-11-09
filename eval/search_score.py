@@ -85,6 +85,22 @@ def is_test(vol):
     return vol.startswith("test")
 
 
+def doc_ranks(hits):
+    """검색 순위 [(vol, doc_id) 또는 {vol, doc_id}] → 정답 세트와 비교할 doc_id 순위. 정답 세트는 doc_id라, 다른 철의
+    같은 쪽 이름이 남아 있으면 처음 나온 것만 둔다 (한 문서를 두 번 세지 않게 — https://github.com/reddol18/docflow/issues/50)"""
+    return list(dict.fromkeys(h["doc_id"] if isinstance(h, dict) else h[1] for h in hits))
+
+
+def cite_recall(answer, must_cite):
+    """/ask 답변 글이 must_cite(doc_id)를 얼마나 근거로 달았나 — 근거 표시는 [철/doc_id] (app.llm.citations).
+    시험용 철을 단 근거는 세지 않는다. must_cite가 비면 None"""
+    from app import llm
+    if not must_cite:
+        return None
+    cited = {d for v, d in llm.citations(answer) if not is_test(v)}
+    return len(cited & set(must_cite)) / len(must_cite)
+
+
 def run(path):  # pragma: no cover — 파드 안에서만 (색인·임베딩 필요)
     from app import llm, main, store
     store.pool.open()
@@ -101,8 +117,7 @@ def run(path):  # pragma: no cover — 파드 안에서만 (색인·임베딩 �
         v = [r for r in v if not is_test(r["vol"])]
         kw = [r for r in kw if not is_test(r["vol"])]
         rr = [k for k in order if not is_test(k[0])]
-        results[qid] = {"vector": [r["doc_id"] for r in v], "keyword": [r["doc_id"] for r in kw],
-                        "rrf": [d for _, d in rr]}
+        results[qid] = {"vector": doc_ranks(v), "keyword": doc_ranks(kw), "rrf": doc_ranks(rr)}
         tops[qid] = {"vector": v[0]["score"] if v else 0.0, "rrf": fused[rr[0]] if rr else 0.0}
     s = score(results, queries)
     print(table(s))
