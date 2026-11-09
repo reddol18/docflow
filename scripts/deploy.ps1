@@ -58,21 +58,26 @@ try {
     if ($LASTEXITCODE) { throw "배포 실패 (위 로그). 태그를 남기지 않습니다." }
 
     # 이미지 안 설치 결과(pip freeze --all)를 저장소의 requirements.lock 판과 맞대 본다 (https://github.com/reddol18/docflow/issues/33).
-    # 이미지는 lock으로 설치하고 빌드 때 이미 맞대 보므로 차이는 없어야 한다 — 있으면 실제 어긋남(빌드 우회·다른 Dockerfile 등)
+    # 이미지는 lock으로 설치하고 빌드 안에서 이미 diff하므로(빌드 출력의 'lock 일치' 줄) 차이는 없어야 한다 — 있으면 실제 어긋남.
+    # 이미 롤아웃이 끝난 뒤라 여기서 실패해도 경고만 하고 태그는 남긴다 (배포된 코드와 태그가 어긋나지 않게)
     $freeze = Join-Path ([IO.Path]::GetTempPath()) "docflow-requirements.freeze"
+    Remove-Item $freeze -ErrorAction SilentlyContinue
     scp -q "${Mac}:doc_platform/requirements.freeze" $freeze
-    if ($LASTEXITCODE) { throw "이미지 패키지 목록(requirements.freeze) 받기 실패" }
-    $pins = { param($p) Get-Content $p | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { ($_.Trim() -split '\s+')[0] } }
-    $want = @(& $pins requirements.lock)
-    $got = @(& $pins $freeze)
-    Remove-Item $freeze
-    $onlyLock = @($want | Where-Object { $got -notcontains $_ })
-    $onlyImage = @($got | Where-Object { $want -notcontains $_ })
-    if ($onlyLock.Count -or $onlyImage.Count) {
-        $onlyLock | ForEach-Object { Write-Host "  lock   $_" }
-        $onlyImage | ForEach-Object { Write-Host "  이미지 $_" }
-        Write-Warning "이미지 안 패키지가 requirements.lock과 다릅니다 (위 목록). lock을 고치지 말고 원인을 확인하세요."
-    } else { Write-Host "== 이미지 패키지 = requirements.lock ($($want.Count)개)" }
+    if ($LASTEXITCODE -or -not (Test-Path $freeze) -or -not (Get-Item $freeze).Length) {
+        Write-Warning "이미지 패키지 목록(requirements.freeze)을 받지 못해 lock 비교를 건너뜁니다. 빌드 출력의 'lock 일치' 줄을 확인하세요."
+    } else {
+        $pins = { param($p) Get-Content $p | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { ($_.Trim() -split '\s+')[0] } }
+        $want = @(& $pins requirements.lock)
+        $got = @(& $pins $freeze)
+        $onlyLock = @($want | Where-Object { $got -notcontains $_ })
+        $onlyImage = @($got | Where-Object { $want -notcontains $_ })
+        if ($onlyLock.Count -or $onlyImage.Count) {
+            $onlyLock | ForEach-Object { Write-Host "  lock   $_" }
+            $onlyImage | ForEach-Object { Write-Host "  이미지 $_" }
+            Write-Warning "이미지 안 패키지가 requirements.lock과 다릅니다 (위 목록). lock을 고치지 말고 원인을 확인하세요."
+        } else { Write-Host "== 이미지 패키지 = requirements.lock ($($want.Count)개)" }
+    }
+    Remove-Item $freeze -ErrorAction SilentlyContinue
 
     if (-not $NoTag) {
         $tag = "deploy-" + (Get-Date -Format "yyyyMMdd-HHmm")

@@ -24,7 +24,7 @@ CODE = "## 코드 리뷰 (`/code-review high`)\n| 지적 | 반영 |\n|---|---|\n
 SEC = "## 보안 리뷰 (security-reviewer)\n| 지적 | 반영 |\n|---|---|\n| (낮) 로그 | 그대로 |"
 ISSUE_SEC = "## 목표\nx\n\n## 보안 영향\n- [x] 새 엔드포인트\n- [ ] 로그\n"
 ISSUE_PLAIN = "## 목표\nx\n\n## 보안 영향\n- [ ] 새 엔드포인트\n"
-DOCS = ("docs/process/2026-W45.md", "README.md", "requirements.lock")
+DOCS = ("docs/process/2026-W45.md", "README.md", "frontend/package-lock.json")
 
 
 def make_pr(body=CHECK_OK, comments=(SPEC, CODE), files=("app/main.py",), title="기능 (#7)", head=HEAD,
@@ -123,6 +123,25 @@ def test_quick_allowed_only_for_no_code_pr():
     # 코드 없는 PR이어도 막는 검사 frontend 등은 건너뛰면 안 된다
     skipped = QUICK.replace("| ruff | 통과 | 0 |", "| ruff | 건너뜀 | 0 |")
     assert missing(make_pr(body=skipped, comments=(), files=DOCS)) == ["로컬 검사"]
+
+
+def test_lock_row_added_later():
+    # check.ps1 lock 단계(https://github.com/reddol18/docflow/issues/33) 전 요약: 줄이 없으면 통과
+    assert missing(make_pr()) == []
+    with_lock = CHECK_OK.replace("| ruff | 통과 | 0 |\n", "| ruff | 통과 | 0 |\n| lock | 통과 | 0 |\n")
+    assert missing(make_pr(body=with_lock)) == []
+    # 줄이 있으면 통과여야 한다 — 건너뜀은 코드 없는 PR이어도 거부
+    skipped = with_lock.replace("| lock | 통과 | 0 |", "| lock | 건너뜀 | 0 |")
+    assert missing(make_pr(body=skipped)) == ["로컬 검사"]
+    assert missing(make_pr(body=skipped, comments=(), files=DOCS)) == ["로컬 검사"]
+    failed = with_lock.replace("| lock | 통과 | 0 |", "| lock | **실패** | 0 |")
+    assert missing(make_pr(body=failed)) == ["로컬 검사"]
+
+
+def test_requirements_change_needs_reviews():
+    # 이미지 입력이라 코드 없는 PR이 아니다: 리뷰 필요, -Quick 거부
+    assert missing(make_pr(comments=(), files=("requirements.lock",))) == ["계약 리뷰", "버그 리뷰"]
+    assert missing(make_pr(body=QUICK, files=("requirements.txt",))) == ["로컬 검사"]
 
 
 def test_local_check_template_line_is_not_evidence():

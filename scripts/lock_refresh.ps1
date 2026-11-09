@@ -6,7 +6,7 @@ requirements.lock(해시 고정)을 다시 만든다 — requirements.txt를 바
   .\scripts\lock_refresh.ps1 -Mac user@host
 
 순서: 맥 디스크 여유 확인(scripts/mac/disk_check.sh, 모자라면 중단) → Dockerfile·requirements.txt 복사
-      → scripts/mac/lock_refresh.sh (Dockerfile의 lock-resolve 단계만 빌드: linux/amd64에서 requirements.txt를 풀어 pip freeze --all)
+      → scripts/mac/lock_refresh.sh (Dockerfile의 lock-out 단계만 --platform linux/amd64로 빌드해 freeze 파일만 꺼냄, 이미지 태그 없음)
       → freeze를 받아 scripts/lock_hashes.py가 PyPI 해시를 붙여 requirements.lock을 쓴다 → 바뀐 판을 보여 준다.
 판 해석은 이미지 플랫폼에서 해야 해서(이 PC는 Windows) 맥 컨테이너 빌드로 한다. 배포·재시작은 하지 않는다.
 끝나면 바뀐 판을 확인하고 requirements.txt와 함께 커밋한다(PR). 배포(scripts/deploy.ps1)는 그 lock 그대로 설치한다.

@@ -11,4 +11,6 @@ sh ~/doc_platform/scripts/disk_check.sh
 colima nerdctl -- --namespace k8s.io build --pull --build-arg "APT_REFRESH=$(date +%G-W%V)" -t docflow:dev . \
     > ~/docflow_build.log 2>&1 || { tail -40 ~/docflow_build.log; exit 1; }
 tail -5 ~/docflow_build.log
+# 패키지가 requirements.lock 그대로인지 (Dockerfile이 설치 뒤 diff, https://github.com/reddol18/docflow/issues/33). 층을 캐시로 쓰면 줄이 안 나온다
+grep -o 'lock 일치: .*' ~/docflow_build.log | tail -1 || echo "lock 일치: 설치 층 캐시 사용 (그 층을 만든 빌드에서 확인됨)"
 colima nerdctl -- --namespace k8s.io images | grep docflow

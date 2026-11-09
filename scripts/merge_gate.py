@@ -34,7 +34,10 @@ _spec.loader.exec_module(wm)
 
 REPO = wm.REPO
 FIELDS = "number,title,body,comments,reviews,files,headRefOid,state,isDraft,closingIssuesReferences"
-CHECKS = ("frontend", "ruff", "pytest", "gitleaks", "osv", "semgrep")  # `scripts/check.ps1`의 막는 검사
+CHECKS = ("frontend", "ruff", "lock", "pytest", "gitleaks", "osv", "semgrep")  # `scripts/check.ps1`의 막는 검사
+# 나중에 생긴 막는 검사: 생기기 전 요약에는 줄이 없으므로 없으면 통과, 있으면 '통과'여야 한다(건너뜀 거부).
+# lock: https://github.com/reddol18/docflow/issues/33 (check.ps1 lock 단계)
+ADDED_LATER = {"lock"}
 REPORT_ONLY = {"trivy": ("보고만", "통과")}  # 막지 않는 검사: 돌리기는 해야 한다
 NO_CODE_SKIP = {"osv", "semgrep", "trivy"}  # 코드 없는 PR이 건너뛰어도 되는 검사 (check.ps1 -Quick)
 
@@ -74,6 +77,8 @@ def _check_ok(block, no_code):
     for c in CHECKS + tuple(REPORT_ONLY):
         v = rows.get(c)
         ok = REPORT_ONLY.get(c, ("통과",))
+        if v is None and c in ADDED_LATER:
+            continue  # 그 검사가 생기기 전 요약: 줄이 없으면 넘어간다 (줄이 있으면 아래 규칙 그대로)
         if v is None:
             bad.append(f"{c} 없음")
         elif v.startswith("건너뜀"):
@@ -115,7 +120,7 @@ def judge(pr, inline, issues):
     hint = "결과 댓글 없음 (댓글·리뷰 한 글 안에 '{}'와 '| 지적 | 반영 |' 표. PR 본문은 보지 않는다)"
     for k in wm.REVIEWS:
         if no_code:
-            rows.append((k, None, "코드 없는 PR (`docs/`·README·잠금 파일·의존성 목록만)"))
+            rows.append((k, None, "코드 없는 PR (`docs/`·README·package-lock 같은 잠금 파일만)"))
         else:
             got = has_review(comments, k)
             rows.append((k, got, "결과 댓글 있음" if got else hint.format(wm.MARKS[k].pattern)))
