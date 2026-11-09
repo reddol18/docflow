@@ -97,7 +97,7 @@ items:
 
   # ---------- API Security Top 10 ----------
   - {id: API1, text: "객체 수준 권한", status: 해당없음, evidence: "V4.2.1과 같음 (역할 확인 app/auth.py:281-297)"}
-  - {id: API2, text: "인증 깨짐", status: 일부, evidence: "기본 구조 튼튼(app/auth.py login_local·verify_id_token). 로그인 성공·실패(사유 분류)·로그아웃·잠금과 처리 함수 앞 401·403·422를 감사 로그에 — 실패 응답은 감사 쓰기·까닭 분류를 기다리지 않아 계정 유무가 시간으로 드러나지 않음(app/auth.py audit_later, tests/test_auth_pg.py test_failed_login_time_independent_of_account, https://github.com/reddol18/docflow/issues/63). V2.2.1·V3.4.1·V4.3.1 남음"}
+  - {id: API2, text: "인증 깨짐", status: 일부, evidence: "기본 구조 튼튼(app/auth.py login_local·verify_id_token). 로그인 성공·실패(사유 분류)·로그아웃·잠금과 처리 함수 앞 401·403·422를 감사 로그에 — 실패 응답은 감사 쓰기·까닭 분류를 기다리지 않아 없는 계정·잠김·꺼짐·상한 찬 때 사이에 DB 왕복이 같음(있는 계정의 틀린 비밀번호는 이전부터 시도 횟수 쓰기만큼 다르고 계정별 시도 제한이 묶음)(app/auth.py audit_later, tests/test_auth_pg.py test_failed_login_time_independent_of_account, https://github.com/reddol18/docflow/issues/63). V2.2.1·V3.4.1·V4.3.1 남음"}
   - {id: API3, text: "객체 속성 수준 권한 (과다 노출·대량 할당)", status: 일부, evidence: "수정은 EDITABLE만(app/main.py _edit_document). events의 예외 원문 노출은 해소(https://github.com/reddol18/docflow/issues/28). 남음: /documents는 상태 전체"}
   - {id: API4, text: "자원 소모 무제한", status: 일부, evidence: "로그인 제한·LLM 예산, q·k·폼 칸 상한(https://github.com/reddol18/docflow/issues/49). 업로드 크기·개수 무제한 https://github.com/reddol18/docflow/issues/26 , /search·/ask 호출 제한 없음 https://github.com/reddol18/docflow/issues/7"}
   - {id: API5, text: "기능 수준 권한", status: 충족, evidence: "app/auth.py:281-297 require(role), tests/test_auth.py 경로 순회(ADMIN_ROUTES에 /export.xlsx·DELETE /volumes/{vol}, https://github.com/reddol18/docflow/pull/67)"}

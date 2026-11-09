@@ -33,6 +33,7 @@ import atexit
 import base64
 import collections
 import dataclasses
+import datetime as dt
 import functools
 import hashlib
 import json
@@ -194,43 +195,79 @@ def _login_refused(username):
 
 ANON_AUDIT = (int(os.environ.get("AUDIT_ANON_MAX", "30")), 60)
 _anon: collections.deque = collections.deque()
-_anon_state = {"dropped": 0}
+_anon_state = {"dropped": 0, "overflow": 0}  # dropped: 상한 창에서 버림, overflow: 감사 쓰기 대기열이 차서 버림
 _anon_lock = threading.Lock()
-AUDIT_QUEUE_MAX = 10000  # 감사 쓰기 스레드 대기열 — 넘치면 버리고 개수만 audit_suppressed로
+AUDIT_QUEUE_MAX = 10000  # 감사 쓰기 스레드 대기열 — 넘치면 버리고 개수만 audit_suppressed/queue_full로
+FLUSH_SEC = 5.0  # 종료 때 남은 감사 행을 기다리는 마감 (DB가 느려도 종료가 막히지 않게)
 _audit_q: queue.Queue = queue.Queue(maxsize=AUDIT_QUEUE_MAX)
 _worker: list = []
 _worker_lock = threading.Lock()
+_tls = threading.local()  # 감사 쓰기 스레드가 지금 쓰는 행의 시각 (audit_later를 부른 때)
 
 
-def _work():
+def _say(msg):
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except BaseException:  # noqa: S110 — 알림 출력이 실패해도 감사 스레드는 살아야 한다
+        pass
+
+
+def _work(q):
+    """감사 쓰기 스레드. 어떤 예외(로거 실패 포함)에도 죽지 않는다 — 죽으면 이후 행이 모두 쌓이기만 한다"""
     while True:
-        fn, a, kw = _audit_q.get()
         try:
+            fn, a, kw, ts = q.get()
+        except BaseException:  # noqa: S112 — 대기열 읽기 실패는 다시 시도
+            continue
+        try:
+            _tls.ts = ts
             fn(*a, **kw)
-        except Exception:
-            errors.log_exception("audit worker")
+        except BaseException:
+            try:
+                errors.log_exception("audit worker")
+            except BaseException:
+                _say("감사 로그: 감사 쓰기 스레드 오류 (로그 출력도 실패)")
         finally:
-            _audit_q.task_done()
+            _tls.ts = None
+            try:
+                q.task_done()
+            except BaseException:  # noqa: S110 — task_done 짝이 어긋나도 루프는 이어 간다
+                pass
 
 
 def audit_later(fn, *a, **kw):
-    """감사 쓰기를 응답 뒤로 미룬다 (차례는 지킨다 — 스레드 하나). 대기열이 차면 버리고 개수만 남긴다"""
+    """감사 쓰기를 응답 뒤로 미룬다 (차례는 지킨다 — 스레드 하나). 행의 시각은 지금(부른 때).
+    스레드가 없거나 죽었으면 새로 띄운다. 대기열이 차면 버리고 개수만 남긴다"""
     with _worker_lock:
-        if not _worker:
-            t = threading.Thread(target=_work, name="audit-writer", daemon=True)
+        if not _worker or not _worker[-1].is_alive():
+            t = threading.Thread(target=_work, args=(_audit_q,), name="audit-writer", daemon=True)
             t.start()
-            _worker.append(t)
+            _worker[:] = [t]
     try:
-        _audit_q.put_nowait((fn, a, kw))
+        _audit_q.put_nowait((fn, a, kw, dt.datetime.now(dt.timezone.utc)))
     except queue.Full:
         with _anon_lock:
-            _anon_state["dropped"] += 1
+            if not _anon_state["overflow"]:
+                _say("감사 로그: 감사 쓰기 대기열이 차서 버림 (AUDIT_QUEUE_MAX)")
+            _anon_state["overflow"] += 1
 
 
-def audit_flush():
-    """미뤄 둔 감사 쓰기를 모두 끝낸다 — 앱 종료(lifespan·atexit)와 시험"""
-    if _worker:
-        _audit_q.join()
+def audit_flush(timeout=None):
+    """미뤄 둔 감사 쓰기를 끝낸다 — 앱 종료(lifespan·atexit)와 시험. 마감(기본 FLUSH_SEC)이 지나면 남은 개수를
+    서버 로그에 남기고 그만 기다린다. 다 썼으면 True"""
+    if not _worker:
+        return True
+    wait = FLUSH_SEC if timeout is None else timeout
+    end = time.monotonic() + wait
+    q = _audit_q
+    with q.all_tasks_done:
+        while q.unfinished_tasks:
+            left = end - time.monotonic()
+            if left <= 0:
+                _say(f"감사 로그: {wait}초 안에 못 쓴 감사 행 {q.unfinished_tasks}개 (종료 마감)")
+                return False
+            q.all_tasks_done.wait(left)
+    return True
 
 
 atexit.register(audit_flush)
@@ -245,7 +282,7 @@ def _anon_slot():
             _anon.popleft()
         if len(_anon) >= n:
             if not _anon_state["dropped"]:
-                print("감사 로그: 계정 없는 거절 기록이 많아 줄여 남김 (AUDIT_ANON_MAX)", file=sys.stderr, flush=True)
+                _say("감사 로그: 계정 없는 거절 기록이 많아 줄여 남김 (AUDIT_ANON_MAX)")
             _anon_state["dropped"] += 1
             return False, 0
         _anon.append(now)
@@ -253,22 +290,32 @@ def _anon_slot():
         return True, dropped
 
 
+def _summary(key, result, n):
+    """버린 개수 요약 행. 못 쓰면 개수를 되돌려 다음 요약에 넣는다"""
+    try:
+        store.audit(None, "audit_suppressed", None, None, result, count=n)
+    except Exception:
+        errors.log_exception("audit audit_suppressed")
+        with _anon_lock:
+            _anon_state[key] += n
+
+
 def audit_event(user, action, result, vol=None, doc_id=None, *, limited=False, **info):
     """감사 로그 한 행 — 앱의 모든 감사 쓰기가 여기로 온다 (main.audit_safe·audited도).
-    limited면 상한 창(ANON_AUDIT)에 넣는다. 기록 실패는 요청 결과를 바꾸지 않는다 (서버 로그로). 썼으면 True"""
+    limited면 상한 창(ANON_AUDIT)에 넣는다. 기록 실패는 요청 결과를 바꾸지 않는다 (서버 로그로). 썼으면 True.
+    요약 행: dropped(상한 창에서 버림), queue_full(감사 쓰기 대기열이 차서 버림)"""
+    with _anon_lock:
+        overflow, _anon_state["overflow"] = _anon_state["overflow"], 0
+    if overflow:
+        _summary("overflow", "queue_full", overflow)
     if limited:
         ok, dropped = _anon_slot()
         if not ok:
             return False
         if dropped:
-            try:
-                store.audit(None, "audit_suppressed", None, None, "dropped", count=dropped)
-            except Exception:  # 요약을 못 썼으면 개수를 되돌려 다음 요약에 넣는다. 본래 행은 따로 시도
-                errors.log_exception("audit audit_suppressed")
-                with _anon_lock:
-                    _anon_state["dropped"] += dropped
+            _summary("dropped", "dropped", dropped)
     try:
-        store.audit(user, action, vol, doc_id, result, **info)
+        store.audit(user, action, vol, doc_id, result, ts=getattr(_tls, "ts", None), **info)
         return True
     except Exception:
         errors.log_exception(f"audit {action} {result}")

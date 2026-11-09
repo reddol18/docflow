@@ -23,8 +23,9 @@ def test_every_mutating_route_is_audited():
 AUDIT_CALLS = {"audited", "audit_event"}  # 두째 인자가 행위 이름 (audit_event는 audit_later로 미뤄 부를 때 셋째)
 
 
-def _audit_actions(fn):
-    """경로 함수 몸에서 감사 쓰기가 쓰는 행위 이름들 (AST — 주석·문자열 속 글자는 세지 않는다)"""
+def _audit_actions(fn, results=False):
+    """경로 함수 몸에서 감사 쓰기가 쓰는 행위 이름들 (AST — 주석·문자열 속 글자는 세지 않는다).
+    results면 (행위, 결과) — audit_event(user, 행위, 결과)의 결과가 상수일 때"""
     tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
     out = set()
     for n in ast.walk(tree):
@@ -35,10 +36,24 @@ def _audit_actions(fn):
         if name == "audit_later" and args and isinstance(args[0], ast.Name):  # audit_later(fn, *args)
             name, args = args[0].id, args[1:]
         if name == "login_failed":
-            out.add("login")
+            out.add(("login", "failed") if results else "login")
         elif name in AUDIT_CALLS and len(args) >= 2 and isinstance(args[1], ast.Constant):
-            out.add(args[1].value)
+            if not results:
+                out.add(args[1].value)
+            elif name == "audit_event" and len(args) >= 3 and isinstance(args[2], ast.Constant):
+                out.add((args[1].value, args[2].value))
     return out
+
+
+def test_login_routes_write_success_row():
+    """로그인 경로(local·OIDC)는 실패 행만이 아니라 성공 행(login/ok)도 쓴다 — 성공 행을 지우면 잡는다"""
+    from app import main
+    logins = [r.endpoint for _, r in main.api_routes(main.app.routes)
+              if getattr(r.endpoint, "audit_action", None) == "login"]
+    assert len(logins) == 2
+    for fn in logins:
+        got = _audit_actions(fn, results=True)
+        assert ("login", "ok") in got and ("login", "failed") in got, fn.__name__
 
 
 def test_marked_routes_write_their_action():

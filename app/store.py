@@ -303,12 +303,13 @@ def events(vol, after=0, limit=500):
     return rows
 
 
-def audit(user, action, vol=None, doc_id=None, result="ok", **info):
+def audit(user, action, vol=None, doc_id=None, result="ok", ts=None, **info):
     """감사 로그: 누가·언제·무엇을(행위·철·문서)·결과. info에는 개수·칸 이름 같은 요약만 — 값·원문은 넣지 않는다
-    (값 이력은 edits 표). user는 auth.User 또는 None."""
+    (값 이력은 edits 표). user는 auth.User 또는 None. ts: 사건 시각 (응답 뒤에 쓰는 행은 요청 때 시각, 없으면 지금)"""
     with pool.connection() as c:
-        c.execute("INSERT INTO audit (user_id, username, action, vol, doc_id, result, info) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                  (getattr(user, "id", None), getattr(user, "username", None), action, vol, doc_id, result,
+        c.execute("INSERT INTO audit (ts, user_id, username, action, vol, doc_id, result, info) "
+                  "VALUES (coalesce(%s::timestamptz, now()),%s,%s,%s,%s,%s,%s,%s)",
+                  (ts, getattr(user, "id", None), getattr(user, "username", None), action, vol, doc_id, result,
                    json.dumps(info, ensure_ascii=False) if info else None))
 
 

@@ -30,7 +30,7 @@ def main(pg_store, monkeypatch, tmp_path):
     monkeypatch.setattr(auth, "session_user", lambda t: SESSIONS.get(t))
     monkeypatch.setattr(store, "DATA", tmp_path)
     monkeypatch.setattr(auth, "_anon", collections.deque())  # 계정 없는 행 상한 창을 시험마다 비운다
-    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0})
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
     return main
 
 

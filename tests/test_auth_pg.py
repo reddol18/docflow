@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 import threading
 import time
 import urllib.parse
@@ -39,7 +40,7 @@ def client(db, monkeypatch):
     monkeypatch.setattr(auth, "COOKIE_SECURE", False)  # 시험 클라이언트는 http → Secure 쿠키를 다시 보내지 않는다
     monkeypatch.setattr(auth, "_hits", {})  # 시험마다 IP 제한 창을 비운다
     monkeypatch.setattr(auth, "_anon", collections.deque())  # 감사 로그 계정 없는 행 상한 창도
-    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0})
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
     app = FastAPI(dependencies=[Depends(auth.guard)])
     app.include_router(auth.router)
 
@@ -193,6 +194,85 @@ def test_login_ok_only_after_session(client, db, monkeypatch):
     with pytest.raises(RuntimeError):
         login(client, "fay")
     assert audit_rows(db) == []
+
+
+def fresh_writer(monkeypatch, size=100):
+    """이 시험만의 감사 쓰기 대기열·스레드 (전역 스레드의 차례를 건드리지 않게)"""
+    monkeypatch.setattr(auth, "_audit_q", queue.Queue(maxsize=size))
+    monkeypatch.setattr(auth, "_worker", [])
+    monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
+
+
+def actions(db):
+    return [(r["action"], r["result"], r["info"]) for r in audit_rows(db)]
+
+
+def test_writer_survives_errors_and_respawns(db, monkeypatch):
+    """감사 쓰기 스레드는 일·로거가 터져도 죽지 않고, 죽어 있으면 다음 audit_later가 새로 띄운다"""
+    fresh_writer(monkeypatch)
+
+    def bad():
+        raise RuntimeError("일 실패 (가상)")
+
+    def bad_log(*a):
+        raise RuntimeError("로거 실패 (가상)")
+
+    monkeypatch.setattr(auth.errors, "log_exception", bad_log)
+    auth.audit_later(bad)
+    auth.audit_later(auth.audit_event, None, "after_error", "ok")
+    assert auth.audit_flush(5) and auth._worker[-1].is_alive()
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    monkeypatch.setattr(auth, "_audit_q", queue.Queue(maxsize=100))
+    auth._worker[:] = [dead]
+    auth.audit_later(auth.audit_event, None, "after_respawn", "ok")
+    assert auth.audit_flush(5) and auth._worker[-1] is not dead
+    assert [a for a, _, _ in actions(db)] == ["after_error", "after_respawn"]
+
+
+def test_flush_has_deadline(db, monkeypatch, capsys):
+    """DB가 느려도 종료가 막히지 않는다: 마감이 지나면 남은 개수를 서버 로그에 남기고 그만 기다린다"""
+    fresh_writer(monkeypatch)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 5)
+    auth.audit_later(auth.audit_event, None, "late", "ok")
+    t0 = time.monotonic()
+    assert auth.audit_flush(0.2) is False
+    assert time.monotonic() - t0 < 2
+    assert "못 쓴 감사 행" in capsys.readouterr().err
+    hold.set()
+    assert auth.audit_flush(5)
+
+
+def test_queue_overflow_counted_apart(db, monkeypatch, capsys):
+    """대기열이 차서 버린 것은 상한 창에서 버린 것과 따로 세고 요약 행도 따로 (queue_full)"""
+    fresh_writer(monkeypatch, size=1)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 5)
+    for _ in range(100):  # 감사 스레드가 붙잡는 일을 꺼내 갈 때까지
+        if auth._audit_q.qsize() == 0:
+            break
+        time.sleep(0.02)
+    auth.audit_later(auth.audit_event, None, "t1", "ok")
+    auth.audit_later(auth.audit_event, None, "t2", "ok")  # 넘침
+    assert auth._anon_state == {"dropped": 0, "overflow": 1}
+    assert "대기열이 차서" in capsys.readouterr().err
+    hold.set()
+    assert actions(db) == [("audit_suppressed", "queue_full", {"count": 1}), ("t1", "ok", None)]
+
+
+def test_deferred_row_keeps_request_time(db, monkeypatch):
+    """응답 뒤에 쓰는 행의 시각은 요청 때 — 나중에 바로 쓴 행보다 뒤로 가지 않는다"""
+    fresh_writer(monkeypatch)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 5)
+    auth.audit_later(auth.audit_event, None, "deferred", "ok")
+    time.sleep(0.05)
+    db.audit(None, "direct", result="ok")
+    hold.set()
+    rows = {r["action"]: r for r in audit_rows(db)}
+    assert rows["deferred"]["id"] > rows["direct"]["id"] and rows["deferred"]["ts"] < rows["direct"]["ts"]
 
 
 def test_logout_without_session_not_audited(client, db):
