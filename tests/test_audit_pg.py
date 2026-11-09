@@ -6,6 +6,8 @@ import os
 import time
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,7 +17,7 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_
 ADMIN = {"authorization": "Bearer a", "x-docflow-csrf": "1"}
 FAKE_KEY = "sk-proj-FAKEkey0000000000000000TEST"
 FAKE_NAME = "홍길순가상"
-JPG = b"\xff\xd8\xff\xe0" + b"0" * 64
+JPG = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()  # 업로드가 내용까지 검사한다 (issues/26)
 
 
 @pytest.fixture

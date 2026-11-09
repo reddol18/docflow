@@ -43,11 +43,11 @@
 https://github.com/reddol18/docflow/issues/86). 설정이 없으면 위의 입력 → 표본 검사 2단계 그대로.
 """
 import datetime as dt
+import filecmp
 import html
 import os
 import re
 import secrets
-import shutil
 import sys
 import threading
 import unicodedata
@@ -69,6 +69,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app import auth, error_list, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
+from app import upload as uploads  # 경로 함수 이름 upload와 겹치지 않게
 from app.auth import Admin, Reviewer, Viewer, audit_as
 from app.review_input import EDITABLE, changes, clean_fixes
 
@@ -77,7 +78,6 @@ VOL_RX = re.compile(r"(?!\.+\Z)[\w.-]{1,80}")
 Q_MAX = 200  # 검색어 길이 상한: 질의는 문서 제목(색인 칸 500자 안)보다 짧고, 임베딩·답변 입력 토큰을 묶는다
 CELL_MAX = 500  # 색인 칸 하나의 길이 상한 (제목도 이 안에 든다) — JSON·폼 검토와 검토 화면 입력칸이 같이 쓴다
 CellValue = Annotated[str, Field(max_length=CELL_MAX)]
-JPEG_MAGIC = b"\xff\xd8\xff"
 runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
 running: dict[str, str] = {}  # vol -> 상태 문자열
 G = None
@@ -110,6 +110,9 @@ _docs = os.environ.get("API_DOCS") == "1"
 app = FastAPI(title="docflow", lifespan=lifespan, dependencies=[Depends(auth.guard), Depends(vol_guard)],
               docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
 app.include_router(auth.router)
+# 업로드 본문 상한 — 본문은 처리 함수·로그인 확인보다 먼저 /tmp로 읽히므로 그 앞에서 묶는다 (app/upload.py)
+UPLOAD_PATH_RX = re.compile(r"/volumes/[^/]+/pages")
+app.add_middleware(uploads.BodyCap, match=lambda method, path: method == "POST" and UPLOAD_PATH_RX.fullmatch(path))
 
 # 응답 보안 헤더 (https://github.com/reddol18/docflow/issues/47, ASVS V14.4.3·V14.4.4·V14.4.7·V8.2.1)
 # API는 무엇도 그리지 않으므로 'none'. 서버가 그리는 HTML(/review)만 그 화면에 필요한 만큼 연다 (인라인 스크립트는 없다)
@@ -306,41 +309,99 @@ def healthz():
 
 @app.post("/volumes/{vol}/pages")
 @audit_as("upload")
-async def upload(vol: str, user: Admin, files: list[UploadFile] = File(...)):
-    with audited(user, "upload", vol, files=len(files)) as info:
-        out = await _upload(vol, files)
-        info["saved"] = out["saved"]
+def upload(vol: str, user: Admin, files: list[UploadFile] = File(...), replace: bool = False):
+    """쪽 이미지 올리기 (https://github.com/reddol18/docflow/issues/26, 검사·상한은 app/upload.py 머리말).
+    하나라도 틀리면 아무것도 저장하지 않는다. 같은 이름이 이미 있으면: 내용이 같으면 그대로 두고(unchanged — 끊긴 업로드를
+    다시 보내도 된다), 다르면 409. replace=true일 때만 바꾸고 그 쪽의 OCR 결과·잘라낸 칸을 지워 다음 /run에서 다시 OCR한다.
+    바꾸기는 철이 처음(new)이거나 끝난(done) 때만 — 실행 중·검토 대기·중간에 멈춘 철은 409 (이어 가면 옛 OCR로 만든
+    문서가 그대로 색인되므로). 끝난 철은 /run으로 다시 돌려야 색인에 반영된다(응답 rerun=true, 그 전 출력은 '바뀐 철')"""
+    with audited(user, "upload", vol, files=len(files), replace=replace) as info:
+        out = _upload(vol, files, replace)
+        info.update(saved=out["saved"], replaced=out["replaced"], unchanged=out["unchanged"])
     return out
 
 
-async def _upload(vol, files):
-    d = store.pages_dir(vol)
+PAGE_NAME_RX = re.compile(r"[\w.-]+\.jpg")
+
+
+def _upload(vol, files, replace):
+    if len(files) > uploads.MAX_FILES:
+        raise HTTPException(400, f"한 번에 {uploads.MAX_FILES}장까지")
     names = []
-    for f in files:  # 1) 이름과 앞 3바이트만 모두 확인한다 (파일 전체를 메모리에 올리지 않는다)
+    for i, f in enumerate(files, 1):  # 1) 이름부터 모두 본다 (규칙에 안 맞는 이름은 응답에 되돌려 주지 않는다)
         name = (f.filename or "").rsplit("/", 1)[-1]
-        if not re.fullmatch(r"[\w.-]+\.jpg", name):
-            raise HTTPException(400, f"bad file name {name}")
-        head = await f.read(len(JPEG_MAGIC))
-        await f.seek(0)
-        if head != JPEG_MAGIC:
-            raise HTTPException(400, f"not a JPEG: {name}")
+        if not PAGE_NAME_RX.fullmatch(name):
+            raise HTTPException(400, f"{i}번째 파일 이름이 규칙([영문·숫자·_.-].jpg)에 맞지 않음")
+        if name in names:
+            raise HTTPException(400, f"같은 이름이 두 번: {name}")
         names.append(name)
-    # 2) 임시 이름(.*.part — *.jpg 목록에 안 잡힘)으로 흘려 쓰고, 다 쓴 뒤에 한꺼번에 바꾼다
-    #    → 하나라도 틀리거나 쓰다 실패하면 저장되는 것이 없다 (같은 이름의 기존 쪽도 그대로)
-    d.mkdir(parents=True, exist_ok=True)
-    parts = []
+    d = store.pages_dir(vol)
+    created = not d.exists()  # 이번 요청이 만든 철 폴더면 실패할 때 지운다 (빈 철이 목록에 남지 않게)
+    # 2) 쪽 폴더 안 임시 파일에 조각 단위로 쓰며 검사 — 같은 파일 시스템이라 옮기기는 원자적이다.
+    #    /tmp(Starlette가 흘려 쓴 곳)에서 바로 옮기면 파일 시스템이 달라 복사가 되고 반쯤 쓴 *.jpg가 보일 수 있다
+    tmps = []
+    ok = False
     try:
         for f, name in zip(files, names):
-            tmp = d / f".{name}.part"
-            parts.append(tmp)
-            with tmp.open("wb") as out:
-                shutil.copyfileobj(f.file, out)
-        for tmp, name in zip(parts, names):
-            os.replace(tmp, d / name)
+            tmps.append(uploads.spool(f.file, d, name, name))
+        new, same, changed = [], [], []
+        for tmp, name in zip(tmps, names):
+            dest = d / name
+            if not dest.exists():
+                new.append((tmp, dest))
+            elif filecmp.cmp(tmp, dest, shallow=False):
+                same.append(name)
+            else:
+                changed.append((tmp, dest))
+        if changed and not replace:
+            shown = ", ".join(p.name for _, p in changed[:10]) + (" …" if len(changed) > 10 else "")
+            raise HTTPException(409, f"같은 이름의 쪽이 이미 있음 (바꾸려면 ?replace=true): {shown}")
+        stage = None
+        if changed:  # 바꾸는 동안 같은 철 실행·이어 가기·일괄 삭제는 409 (running)
+            if vol in running:
+                raise HTTPException(409, f"{vol} 실행 중 — 끝난 뒤 바꾼다")
+            stage = _stage(vol, G.get_state(cfg(vol)))
+            if stage not in ("new", "done"):
+                raise HTTPException(409, "검토 대기·중간에 멈춘 철 — 끝까지 마친 뒤(/review·/resume) 바꾼다")
+            running[vol] = "replacing"
+        try:
+            _place(vol, new, changed)
+        finally:
+            if changed:
+                running.pop(vol, None)
+        ok = True
     finally:
-        for tmp in parts:
-            tmp.unlink(missing_ok=True)
-    return {"vol": vol, "saved": len(names), "total": len(list(d.glob("*.jpg")))}
+        for tmp in tmps:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        if created and not ok:
+            try:
+                d.rmdir()  # 비어 있을 때만 지워진다 (같은 철에 동시에 올린 다른 요청의 파일은 건드리지 않는다)
+            except OSError:
+                pass
+    return {"vol": vol, "saved": len(new) + len(changed), "replaced": len(changed), "unchanged": len(same),
+            "rerun": bool(changed) and stage == "done", "total": len(list(d.glob("*.jpg")))}
+
+
+def _place(vol, new, changed):
+    """3) 새 쪽은 같은 이름이 없을 때만 놓고(그사이 다른 요청이 같은 이름을 만들었으면 이번에 놓은 것을 되돌리고 409),
+    바꿀 쪽은 OCR 결과·잘라낸 칸을 먼저 지운 뒤 바꾼다 — 사이에 멈춰도 '새 이미지 + 옛 OCR'은 남지 않는다
+    (옛 이미지 + OCR 없음 → 다음 실행이 옛 이미지를 다시 읽을 뿐)"""
+    placed = []
+    try:
+        for tmp, dest in new:
+            uploads.place_new(tmp, dest)
+            placed.append(dest)
+    except FileExistsError:
+        for p in placed:
+            p.unlink(missing_ok=True)
+        raise HTTPException(409, "같은 이름의 쪽을 다른 요청이 먼저 올림 — 다시 시도") from None
+    for tmp, dest in changed:
+        page = dest.stem
+        store.ocr_path(vol, page).unlink(missing_ok=True)
+        for cell in flow.CELLS:
+            store.crop_path(vol, page, cell).unlink(missing_ok=True)
+        os.replace(tmp, dest)
 
 
 @app.post("/volumes/{vol}/run")
