@@ -1,5 +1,6 @@
 #!/bin/sh
-# 맥에서: 이미지 다시 빌드(앱 코드만 바뀌면 캐시로 빠름) → docflow 재시작 → 준비될 때까지 기다림 → 이미지 안 패키지 목록 저장.
+# 맥에서: 이미지 다시 빌드(앱 코드만 바뀌면 캐시로 빠름) → docflow 재시작 → 준비될 때까지 기다림 → 이미지 안 패키지 목록 저장
+# → 이미지 취약점 요약(보고만, scan_image.sh --summary).
 # 보통은 Windows에서 scripts/deploy.ps1로 부른다(복사 + 이 스크립트 + 배포 태그).
 set -e
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
@@ -23,3 +24,9 @@ kubectl exec -n docs deploy/docflow -- cat /app/requirements.freeze > ~/doc_plat
   || { echo "경고: 이미지 패키지 목록을 꺼내지 못함" >&2; rm -f ~/doc_platform/requirements.freeze; }
 grep -iE '^(langgraph|langgraph-checkpoint|langgraph-checkpoint-postgres|psycopg|psycopg-pool|qdrant-client|openai|fastapi|uvicorn|paddleocr|paddlepaddle|paddlex)==' ~/doc_platform/requirements.freeze || true
 kubectl logs deploy/docflow -n docs --tail=5
+# 이미지 취약점 요약 — 보고만 (https://github.com/reddol18/docflow/issues/46). 롤아웃 뒤에 돌리고, 지적이 있든 스캔이
+# 실패하든(해시 불일치·디스크 부족 포함) 배포는 성공으로 끝난다. 막는 것은 범위 밖 (고칠 판 없는 CRITICAL이 있다)
+echo "== 이미지 스캔 (보고만)"
+scan_t0=$(date +%s)
+sh ~/doc_platform/scripts/scan_image.sh --summary </dev/null || echo "경고: 이미지 스캔을 끝내지 못함 — 배포는 그대로 (위 메시지)" >&2
+echo "이미지 스캔 $(( $(date +%s) - scan_t0 ))초"

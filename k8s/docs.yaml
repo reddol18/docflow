@@ -79,7 +79,7 @@ spec:
       automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       containers:
       - name: postgres
-        image: postgres:17.11-alpine
+        image: postgres:17.11-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac  # 다이제스트 고정 (issues/46). 판을 올리면 다이제스트도
         env:
         - {name: POSTGRES_USER, value: docflow}
         - {name: POSTGRES_DB, value: docflow}
@@ -124,7 +124,7 @@ spec:
       automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       containers:
       - name: qdrant
-        image: qdrant/qdrant:v1.20.0
+        image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2  # 다이제스트 고정 (issues/46)
         env:
         - {name: QDRANT__TELEMETRY_DISABLED, value: "true"}
         - {name: QDRANT_INIT_FILE_PATH, value: /qdrant/init/.qdrant-initialized}  # 기본은 작업 폴더(/qdrant, 읽기 전용)

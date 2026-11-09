@@ -16,7 +16,9 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
   semgrep    정적 분석 (OWASP·Python·TS)       예
   trivy      k8s·Dockerfile 설정 (HIGH 이상)   예 (issues/29부터)
 
-필요한 것: node(npx), uv(uvx). gitleaks·osv-scanner·trivy는 처음에 받아 %LOCALAPPDATA%\docflow-tools에 두고 체크섬을 확인한다.
+필요한 것: node(npx), uv(uvx). gitleaks·osv-scanner·trivy는 처음에 받아 %LOCALAPPDATA%\docflow-tools에 두고
+scripts/tool_pins.txt에 고정한 SHA256으로 확인한다 — 받을 때 자산, 부를 때마다 실행 파일. 다르면 실행하지 않고 그 검사 실패
+(https://github.com/reddol18/docflow/issues/46).
 끝에 PR 본문 '테스트' 칸에 붙일 요약을 출력한다.
 
 commit status (https://github.com/reddol18/docflow/issues/85): 끝에서 `scripts/gate_status.py`가 조건을 보고 HEAD에
@@ -33,7 +35,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $env:LOCALAPPDATA "docflow-tools"
-$V = @{ gitleaks = "8.30.1"; osv = "2.7.0"; trivy = "0.75.0"; semgrep = "1.180.0"; ruff = "0.14.3"
+$V = @{ semgrep = "1.180.0"; ruff = "0.14.3"  # gitleaks·osv·trivy는 scripts/tool_pins.txt (버전·해시)
         pglite = "0.5.14"; pgliteSocket = "0.2.17" }
 $Skip = @($Skip | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File로 부르면 "a,b"가 한 문자열로 온다
 if ($Quick) { $Skip += "osv", "semgrep", "trivy" }
@@ -49,21 +51,38 @@ function Step([string]$name, [bool]$blocking, [scriptblock]$body) {
     $results.Add([pscustomobject]@{ name = $name; ok = $ok; blocking = $blocking; sec = [int]$t.Elapsed.TotalSeconds })
 }
 
-function Get-Tool([string]$name, [string]$ver, [string]$asset, [string]$sums, [string]$repo, [string]$exe) {
-    $dir = Join-Path $tools "$name-$ver"
-    $path = Join-Path $dir $exe
-    if (Test-Path $path) { return $path }
-    New-Item -ItemType Directory -Force $dir | Out-Null
-    $base = "https://github.com/$repo/releases/download/v$ver"
-    $a = Join-Path $dir $asset
-    Invoke-WebRequest "$base/$asset" -OutFile $a -UseBasicParsing
-    $s = Join-Path $dir $sums
-    Invoke-WebRequest "$base/$sums" -OutFile $s -UseBasicParsing  # 내용으로 받으면 octet-stream이라 바이트 배열이 된다
-    $want = Get-Content $s | Where-Object { $_ -match "\s\*?$([regex]::Escape($asset))\s*$" } |
-        ForEach-Object { ($_ -split "\s+")[0] } | Select-Object -First 1
-    $got = (Get-FileHash $a -Algorithm SHA256).Hash
-    if (-not $want -or $got -ne $want.ToUpper()) { Remove-Item -Recurse -Force $dir; throw "$asset 체크섬 불일치" }
-    if ($asset -like "*.zip") { Expand-Archive -Force $a $dir } elseif ($asset -ne $exe) { Move-Item $a $path }
+# 버전·해시는 scripts/tool_pins.txt 한 곳에 고정한다 (https://github.com/reddol18/docflow/issues/46).
+# 릴리스의 체크섬 파일은 받지 않는다(자산과 같은 출처). 받을 때는 자산 해시, 받아 둔 실행 파일은 부를 때마다 실행 파일 해시를 본다.
+function Get-Pin([string]$name, [string]$platform = "windows-x64") {
+    $pins = Join-Path $PSScriptRoot "tool_pins.txt"
+    $rows = @(Get-Content -Encoding UTF8 $pins | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object {
+            $f = $_.Trim() -split '\s+'
+            [pscustomobject]@{ name = $f[0]; platform = $f[2]; n = $f.Count; ver = $f[1]; repo = $f[3]; asset = $f[4]
+                               assetSha = "$($f[5])".ToUpper(); exe = $f[6]; exeSha = "$($f[7])".ToUpper() }
+        } | Where-Object { $_.name -eq $name -and $_.platform -eq $platform })
+    if ($rows.Count -ne 1 -or $rows[0].n -ne 8) { throw "tool_pins.txt에 $name $platform 줄이 하나(8칸)여야 합니다 ($($rows.Count)개)" }
+    $rows[0]
+}
+
+function Get-Tool([string]$name) {
+    $p = Get-Pin $name
+    $toolsDir = if ($env:DOCFLOW_TOOLS_DIR) { $env:DOCFLOW_TOOLS_DIR } else { $tools }  # 시험용으로 바꿀 수 있다
+    $dir = Join-Path $toolsDir "$name-$($p.ver)"
+    $path = Join-Path $dir $p.exe
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        $a = Join-Path $dir $p.asset
+        Invoke-WebRequest "https://github.com/$($p.repo)/releases/download/v$($p.ver)/$($p.asset)" -OutFile $a -UseBasicParsing
+        $got = (Get-FileHash $a -Algorithm SHA256).Hash
+        if ($got -ne $p.assetSha) {
+            Remove-Item -Recurse -Force $dir
+            throw "$($p.asset) 해시가 tool_pins.txt와 다름 (받은 $got) — 받지 않고 멈춤"
+        }
+        if ($p.asset -like "*.zip") { Expand-Archive -Force $a $dir; Remove-Item $a } elseif ($p.asset -ne $p.exe) { Move-Item $a $path }
+    }
+    # 받아 둔 실행 파일도 매번 (바뀌었으면 지우지 않고 멈춘다 — 무엇이 바뀌었는지 볼 수 있게)
+    $got = (Get-FileHash $path -Algorithm SHA256).Hash
+    if ($got -ne $p.exeSha) { throw "$path 해시가 tool_pins.txt와 다름 ($got) — 실행하지 않음. 확인 뒤 $dir 를 지우면 다시 받는다" }
     return $path
 }
 
@@ -119,13 +138,12 @@ try {
     }
 
     Step "gitleaks" $true {
-        $gl = Get-Tool gitleaks $V.gitleaks "gitleaks_$($V.gitleaks)_windows_x64.zip" "gitleaks_$($V.gitleaks)_checksums.txt" `
-            "gitleaks/gitleaks" "gitleaks.exe"
+        $gl = Get-Tool gitleaks
         & $gl git . --no-banner --redact
     }
 
     Step "osv" $true {
-        $osv = Get-Tool osv $V.osv "osv-scanner_windows_amd64.exe" "osv-scanner_SHA256SUMS" "google/osv-scanner" "osv-scanner_windows_amd64.exe"
+        $osv = Get-Tool osv
         # --no-resolve: requirements.lock은 이미지에 깔리는 전체 목록(해시 포함)이라 다시 풀지 않는다 (풀면 setuptools 거짓 경보)
         # requirements.txt도 함께 본다 (lock 단계가 둘의 판이 같은지 막지만, 예전에 PyJWT 2.10.1이 lock에 없어 지나간 적이 있다)
         & $osv scan source --no-resolve --config osv-scanner.toml --lockfile requirements.txt:requirements.lock `
@@ -141,7 +159,7 @@ try {
     }
 
     Step "trivy" $true {
-        $tv = Get-Tool trivy $V.trivy "trivy_$($V.trivy)_windows-64bit.zip" "trivy_$($V.trivy)_checksums.txt" "aquasecurity/trivy" "trivy.exe"
+        $tv = Get-Tool trivy
         # 빌드 산출물은 건너뛴다 (next dev가 .next 안 파일을 잠가 두면 스캔이 멈춘다)
         & $tv config --quiet --severity HIGH,CRITICAL --exit-code 1 --skip-dirs frontend/node_modules --skip-dirs frontend/.next .
     }

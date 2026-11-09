@@ -330,6 +330,10 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 ## 개발 절차
 
 - 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).
+- 검사 도구·이미지 고정 (https://github.com/reddol18/docflow/issues/46): gitleaks·osv-scanner·trivy의 버전과 플랫폼별 SHA256(받는 자산·풀린 실행 파일)은 `scripts/tool_pins.txt` 한 곳에 둔다.
+  `scripts/check.ps1`·`scripts/mac/scan_image.sh`는 릴리스 체크섬 파일을 쓰지 않고 이 값과 비교하며, 받아 둔 실행 파일도 부를 때마다 다시 확인한다(다르면 실행하지 않음).
+  올리는 절차(cosign·SLSA 서명 확인 포함)는 그 파일 머리말. 배포(`scripts/mac/deploy.sh`) 끝에 `scan_image.sh --summary`가 이미지별 HIGH·CRITICAL 수를 남긴다(보고만, 배포는 막지 않음).
+  기반·외부 이미지(`Dockerfile` FROM, `k8s/docs.yaml` postgres·qdrant)는 `태그@sha256:` 다이제스트로 고정 — 판을 올리면 다이제스트도 바꾼다.
 - 파이썬 의존성: 이미지는 `requirements.lock`(전이 의존성까지 판·해시 고정)으로 `pip install --require-hashes --no-deps --only-binary :all:` 설치한다 — 같은 커밋이면 몇 번 빌드해도 같은 패키지 (https://github.com/reddol18/docflow/issues/33).
   `requirements.txt`를 바꿨을 때만 `.\scripts\lock_refresh.ps1`로 lock을 다시 만든다(맥 컨테이너에서 linux/amd64로 풀어 freeze 파일만 꺼내고 — 이미지 태그 없음 — `scripts/lock_hashes.py`가 PyPI 휠 해시를 붙임, 배포 없음) → 바뀐 판을 확인하고 함께 커밋. 안 맞으면 로컬 검사 `lock` 단계가 막는다.
 - **병합은 `scripts/merge.ps1`로만** 한다 (https://github.com/reddol18/docflow/issues/83). `.\scripts\merge.ps1 <PR> -DryRun`으로 먼저 확인한다.
