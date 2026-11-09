@@ -12,5 +12,7 @@ colima nerdctl -- --namespace k8s.io build --pull --build-arg "APT_REFRESH=$(dat
     > ~/docflow_build.log 2>&1 || { tail -40 ~/docflow_build.log; exit 1; }
 tail -5 ~/docflow_build.log
 # 패키지가 requirements.lock 그대로인지 (Dockerfile이 설치 뒤 diff, https://github.com/reddol18/docflow/issues/33). 층을 캐시로 쓰면 줄이 안 나온다
-grep -o 'lock 일치: .*' ~/docflow_build.log | tail -1 || echo "lock 일치: 설치 층 캐시 사용 (그 층을 만든 빌드에서 확인됨)"
+# 개수가 숫자인 줄만 (캐시면 로그에 RUN 명령 글자 "$(wc -l < /tmp/want)개 ..."가 찍혀 그것이 잡혔다). 파이프 끝 tail은 늘 성공하므로 빈 값으로 판단
+lock_line=$(grep -oE 'lock 일치: 이미지 패키지 [0-9]+개 = requirements\.lock' ~/docflow_build.log | tail -1)
+echo "${lock_line:-lock 일치: 설치 층 캐시 사용 (그 층을 만든 빌드에서 확인됨)}"
 colima nerdctl -- --namespace k8s.io images | grep docflow

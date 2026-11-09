@@ -332,6 +332,20 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
   `docs/`·README·잠금 파일만 바꾼 PR은(`requirements*.txt`·`requirements.lock`은 이미지 입력이라 코드로 봄) 리뷰 흔적을 요구하지 않고 osv·semgrep·trivy 건너뜀(`-Quick`)을 허용한다.
   실제 병합은 사용자 승인 뒤에만. 판정은 `scripts/merge_gate.py`가 하고, 흔적 찾기·코드 없음·보안 영향 함수는 주간 지표
   `scripts/weekly_metrics.py`와 공유한다. 주간 지표는 흔적이 있는지만 세고, 병합 검사가 더 엄격하다(head 기준, 표 필요, 건너뜀 거부, 리뷰는 PR 본문 제외).
+- **GitHub 쪽 강제 — commit status + main 브랜치 보호** (https://github.com/reddol18/docflow/issues/85, 클라우드 CI 없음).
+  main 보호가 PR head 커밋에 아래 두 status(success)가 모두 있어야 병합을 허락한다 — 웹 화면·`gh pr merge`도 같다.
+
+  | status | 올리는 것 | 올리는 조건 (아니면 아무것도 올리지 않음 — 'failure'도 안 올림) |
+  |---|---|---|
+  | `docflow/local-check` | `scripts/check.ps1` 끝 (`scripts/gate_status.py`) | 막는 검사 모두 통과, 건너뜀 없음(코드 없는 PR만 osv·semgrep·trivy 허용, `-Skip pg`도 건너뜀), 시작·끝 모두 커밋 안 된 변경 없음, 검사 중 HEAD 그대로, HEAD가 push돼 있음 |
+  | `docflow/review-gate` | `scripts/merge.ps1` (`merge_gate.py --status`) | 위 병합 판정 통과 + 열린 PR. `-DryRun`이어도 올린다 (`-NoStatus`로 끔) |
+
+  그래서 순서는: 커밋 → **push** → `.\scripts\check.ps1`(status 올림, 요약을 PR에 붙임) → 리뷰 댓글 → `.\scripts\merge.ps1 <PR>`.
+  status는 커밋에 붙으므로 push로 head가 바뀌면 둘 다 다시 받아야 한다. push 전에 돌린 검사는 status를 못 올리니 push 뒤 다시 돌린다.
+  확인: `gh api repos/reddol18/docflow/commits/<sha>/status --jq '.statuses[] | [.context,.state,.description] | @tsv'`.
+  보호 설정은 `scripts/protect_main.ps1`(먼저 `-DryRun`, 저장소 설정을 바꾸므로 사용자 승인 뒤에만): 필수 status 위 둘, strict 끔(켜면 main이 바뀔 때마다
+  다시 올리고 로컬 검사를 다시 돌려야 함, `-Strict`), 관리자도 적용(`enforce_admins`, 기본 켬 — 끄면 주인은 웹 화면에서 우회 가능), 리뷰 승인 요구 없음, force push·삭제 금지.
+  status 올리기가 고장 나 다 막히면 `.\scripts\protect_main.ps1 -EnforceAdmins $false`(주인만 우회 허용)로 풀고, 고친 뒤 다시 건다.
 
 ## 폴더
 

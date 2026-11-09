@@ -4,6 +4,7 @@
   uv run --no-project python -I scripts/merge_gate.py 84                       # 확인만 (병합 안 함)
   uv run --no-project python -I scripts/merge_gate.py 84 --merge               # 확인하고, 통과면 그 head로 squash 병합
   ... 84 --merge --expect-head <sha>                                           # 사용자가 확인한 head가 아니면 거부
+  ... 84 --status                                                              # 통과면 head에 docflow/review-gate status
 
 확인하는 흔적 (글자로 찾는다)
   로컬 검사   PR 본문(템플릿 줄 뺌)·댓글·리뷰의 `scripts/check.ps1` 요약 중, PR head 커밋에 대한 것("+ 커밋 안 된 변경" 아님)이고
@@ -17,11 +18,15 @@
 `scripts/weekly_metrics.py`와 함수를 공유한다(evidence·check_blocks·block_failed·_tables·issue_refs·is_no_code·needs_security·
 MARKS). 주간 지표는 흔적이 있는지만 세고, 이 검사가 더 엄격하다(head 기준, 표 필요, 건너뜀 거부, 리뷰는 본문 제외).
 병합: squash, 제목은 PR 제목 + " (#N)", 판정한 head 커밋 그대로만(`--match-head-commit`).
+--status: 판정 통과(열린 PR)면 head 커밋에 docflow/review-gate status(success)를 올린다 — main 브랜치 보호가 이것과
+  docflow/local-check(`scripts/gate_status.py`)를 요구하므로 웹 화면·`gh pr merge`로도 판정 없이는 병합할 수 없다
+  (https://github.com/reddol18/docflow/issues/85). 거부면 아무것도 올리지 않는다.
 한계: 흔적의 내용이 참인지는 모른다 (weekly_metrics와 같음).
 종료 코드: 0 통과(--merge면 병합함), 1 빠진 흔적,
            2 병합할 수 없음(이미 병합·닫힘·초안, --expect-head와 head 다름, 가리킨 이슈가 없음 등 — 메시지를 본다).
 """
 import argparse
+import datetime as dt
 import importlib.util
 import json
 import re
@@ -33,13 +38,16 @@ wm = importlib.util.module_from_spec(_spec)  # python -I로 돌리므로 import 
 _spec.loader.exec_module(wm)
 
 REPO = wm.REPO
-FIELDS = "number,title,body,comments,reviews,files,headRefOid,state,isDraft,closingIssuesReferences"
+FIELDS = "number,title,body,comments,reviews,files,headRefOid,state,isDraft,closingIssuesReferences,url"
 CHECKS = ("frontend", "ruff", "lock", "pytest", "gitleaks", "osv", "semgrep")  # `scripts/check.ps1`의 막는 검사
 # 나중에 생긴 막는 검사: 생기기 전 요약에는 줄이 없으므로 없으면 통과, 있으면 '통과'여야 한다(건너뜀 거부).
 # lock: https://github.com/reddol18/docflow/issues/33 (check.ps1 lock 단계)
 ADDED_LATER = {"lock"}
 REPORT_ONLY = {"trivy": ("보고만", "통과")}  # 막지 않는 검사: 돌리기는 해야 한다
 NO_CODE_SKIP = {"osv", "semgrep", "trivy"}  # 코드 없는 PR이 건너뛰어도 되는 검사 (check.ps1 -Quick)
+# main 브랜치 보호가 요구하는 commit status (https://github.com/reddol18/docflow/issues/85, `scripts/protect_main.ps1`)
+CONTEXT_CHECK = "docflow/local-check"  # `scripts/gate_status.py`가 check.ps1 끝에서 올린다
+CONTEXT_REVIEW = "docflow/review-gate"  # 이 파일이 --status로 판정 통과일 때 올린다
 
 
 class Stop(Exception):
@@ -48,6 +56,16 @@ class Stop(Exception):
 
 def gh(*args):
     return wm.sh("gh", *args)
+
+
+def post_status(sha, context, description, target_url=None, gh=None):
+    """success commit status 하나를 올린다 (실패면 SystemExit(메시지) — wm.sh와 같음). 'failure'는 올리지 않는다:
+    status가 없으면 보호 규칙이 막는다"""
+    args = ["api", "-X", "POST", f"repos/{REPO}/statuses/{sha}", "-f", "state=success",
+            "-f", f"context={context}", "-f", f"description={description[:140]}"]
+    if target_url:
+        args += ["-f", f"target_url={target_url}"]
+    (gh or globals()["gh"])(*args)
 
 
 def fetch(n):
@@ -140,7 +158,7 @@ def subject(pr):
     return pr["title"] if pr["title"].rstrip().endswith(tail) else f"{pr['title']} {tail}"
 
 
-def run(n, merge=False, expect_head=None):
+def run(n, merge=False, expect_head=None, status=False):
     pr, inline, issues = fetch(n)
     head = pr["headRefOid"]
     print(f"PR #{pr['number']} {pr['title']}")
@@ -159,6 +177,13 @@ def run(n, merge=False, expect_head=None):
     print("판정: 통과")
     if pr["state"] != "OPEN" or pr.get("isDraft"):
         raise Stop(f"병합할 수 없는 상태입니다 ({pr['state']}{', 초안' if pr.get('isDraft') else ''}).")
+    if status:
+        desc = f"merge_gate 판정 통과 (로컬 검사·리뷰 흔적) · {dt.datetime.now().astimezone():%Y-%m-%d %H:%M}"
+        try:
+            post_status(head, CONTEXT_REVIEW, desc, pr.get("url"))
+        except SystemExit as e:
+            raise Stop(f"commit status {CONTEXT_REVIEW}를 올리지 못함: {e}") from None
+        print(f"commit status {CONTEXT_REVIEW} = success 올림 ({head[:7]})")
     if not merge:
         return 0
     s = subject(pr)
@@ -172,10 +197,11 @@ def main(argv=None):
     ap.add_argument("pr", type=int)
     ap.add_argument("--merge", action="store_true", help="흔적이 다 있으면 판정한 head 그대로 squash 병합")
     ap.add_argument("--expect-head", help="사용자가 확인한 head 커밋. 지금 head가 다르면 거부(종료 코드 2)")
+    ap.add_argument("--status", action="store_true", help=f"판정 통과면 head 커밋에 {CONTEXT_REVIEW} status(success)를 올린다")
     a = ap.parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8")
     try:
-        return run(a.pr, a.merge, a.expect_head)
+        return run(a.pr, a.merge, a.expect_head, a.status)
     except Stop as e:
         print(f"병합하지 않습니다: {e}")
         return 2

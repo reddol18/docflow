@@ -38,6 +38,7 @@ def make_pr(body=CHECK_OK, comments=(SPEC, CODE), files=("app/main.py",), title=
 class FakeGh:
     def __init__(self, pr, issues=None, inline=()):
         self.pr, self.issues, self.inline, self.calls = pr, issues or {}, list(inline), []
+        self.status_fails = False
 
     def __call__(self, *args):
         self.calls.append(args)
@@ -45,6 +46,10 @@ class FakeGh:
             return json.dumps(self.pr)
         if args[:2] == ("pr", "merge"):
             return ""
+        if args[:3] == ("api", "-X", "POST"):  # commit status
+            if self.status_fails:
+                raise SystemExit("gh api 실패: HTTP 403")
+            return "{}"
         if args[0] == "api" and "--paginate" in args:
             return "\n".join(json.dumps(b) for b in self.inline) + "\n"  # --jq '.[].body | @json'
         if args[0] == "api":
@@ -57,6 +62,10 @@ class FakeGh:
     @property
     def merges(self):
         return [c for c in self.calls if c[:2] == ("pr", "merge")]
+
+    @property
+    def statuses(self):
+        return [c for c in self.calls if c[:3] == ("api", "-X", "POST")]
 
 
 PLAIN = {7: {"body": ISSUE_PLAIN}}
@@ -220,6 +229,44 @@ def test_no_code_pr_skips_reviews_but_not_local_check():
     assert missing(make_pr(comments=(), files=DOCS + (".github/pull_request_template.md",))) == ["계약 리뷰", "버그 리뷰"]
     # 코드 없는 PR이어도 보안 영향 체크가 있으면 보안 리뷰는 요구 (weekly_metrics와 같은 규칙)
     assert missing(make_pr(comments=(), files=DOCS), {7: ISSUE_SEC}) == ["보안 리뷰"]
+
+
+def test_status_posted_only_when_verdict_passes(monkeypatch, capsys):
+    """--status: 통과면 head에 docflow/review-gate success (https://github.com/reddol18/docflow/issues/85)"""
+    pr = make_pr()
+    pr["url"] = "https://github.com/reddol18/docflow/pull/90"
+    code, fake = run(monkeypatch, pr, PLAIN, "--status")
+    assert code == 0 and not fake.merges
+    (s,) = fake.statuses
+    assert s[3] == f"repos/{mg.REPO}/statuses/{HEAD}"
+    assert "state=success" in s and "context=docflow/review-gate" in s and f"target_url={pr['url']}" in s
+    assert "review-gate = success 올림" in capsys.readouterr().out
+    # 빠진 흔적이면 아무것도 올리지 않는다 ('failure'도 아님)
+    code, fake = run(monkeypatch, make_pr(comments=(SPEC,)), PLAIN, "--status")
+    assert code == 1 and fake.statuses == []
+    # 병합할 수 없는 상태(닫힘·초안)면 올리지 않는다
+    code, fake = run(monkeypatch, make_pr(state="CLOSED"), PLAIN, "--status")
+    assert code == 2 and fake.statuses == []
+    # --status 없으면 올리지 않는다 (기존 동작)
+    code, fake = run(monkeypatch, make_pr(), PLAIN)
+    assert code == 0 and fake.statuses == []
+
+
+def test_status_for_no_code_pr_without_reviews(monkeypatch):
+    code, fake = run(monkeypatch, make_pr(body=QUICK, comments=(), files=DOCS), PLAIN, "--status")
+    assert code == 0 and len(fake.statuses) == 1
+
+
+def test_status_before_merge_and_failure_stops_merge(monkeypatch, capsys):
+    code, fake = run(monkeypatch, make_pr(), PLAIN, "--merge", "--status")
+    assert code == 0
+    kinds = [c[:2] for c in fake.calls if c[:3] == ("api", "-X", "POST") or c[:2] == ("pr", "merge")]
+    assert kinds == [("api", "-X"), ("pr", "merge")]  # 보호 규칙이 요구하므로 병합 전에 올린다
+    fake = FakeGh(make_pr(), PLAIN)
+    fake.status_fails = True
+    monkeypatch.setattr(mg, "gh", fake)
+    assert mg.main(["90", "--merge", "--status"]) == 2 and not fake.merges
+    assert "올리지 못함" in capsys.readouterr().out
 
 
 def test_merged_or_draft_pr_is_not_merged(monkeypatch):

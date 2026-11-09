@@ -18,10 +18,16 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
 
 필요한 것: node(npx), uv(uvx). gitleaks·osv-scanner·trivy는 처음에 받아 %LOCALAPPDATA%\docflow-tools에 두고 체크섬을 확인한다.
 끝에 PR 본문 '테스트' 칸에 붙일 요약을 출력한다.
+
+commit status (https://github.com/reddol18/docflow/issues/85): 끝에서 `scripts/gate_status.py`가 조건을 보고 HEAD에
+docflow/local-check(success)를 올린다 — 막는 검사 모두 통과, 건너뜀 없음(코드 없는 PR만 osv·semgrep·trivy 허용),
+시작·끝 모두 커밋 안 된 변경 없음, HEAD가 그대로이고 push돼 있을 때만. 실패·건너뜀·변경 있음이면 올리지 않는다.
+main 브랜치 보호가 이 status를 병합 필수 조건으로 건다. 올리지 않으려면 -NoStatus (검사 결과·종료 코드는 같다).
 #>
 param(
     [switch]$Quick,
-    [string[]]$Skip = @()
+    [string[]]$Skip = @(),
+    [switch]$NoStatus
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
@@ -62,7 +68,8 @@ function Get-Tool([string]$name, [string]$ver, [string]$asset, [string]$sums, [s
 
 Push-Location $root
 try {
-    $sha = (git rev-parse --short HEAD).Trim()
+    $fullSha = (git rev-parse HEAD).Trim()
+    $sha = $fullSha.Substring(0, 7)
     $dirty = [bool](git status --porcelain)
 
     Step "frontend" $true {
@@ -143,10 +150,31 @@ try {
 $failed = @($results | Where-Object { $_.blocking -and $_.ok -eq $false })
 $mark = { param($r) if ($null -eq $r.ok) { "건너뜀" } elseif (-not $r.blocking) { "보고만 (출력 확인)" } elseif ($r.ok) { "통과" } else { "**실패**" } }
 Write-Host "`n---- PR '테스트' 칸에 붙일 요약 ----"
-Write-Host ("로컬 검사 ``scripts/check.ps1`` — 커밋 ``{0}``{1}, {2:yyyy-MM-dd HH:mm}" -f $sha, $(if ($dirty) { " + 커밋 안 된 변경" } else { "" }), (Get-Date))
+$at = "{0:yyyy-MM-dd HH:mm}" -f (Get-Date)
+Write-Host ("로컬 검사 ``scripts/check.ps1`` — 커밋 ``{0}``{1}, {2}" -f $sha, $(if ($dirty) { " + 커밋 안 된 변경" } else { "" }), $at)
 Write-Host "| 검사 | 결과 | 초 |"
 Write-Host "|---|---|---|"
 foreach ($r in $results) { Write-Host ("| {0} | {1} | {2} |" -f $r.name, (& $mark $r), $r.sec) }
-if ($failed.Count) { Write-Host "`n실패: $($failed.name -join ', ')" -ForegroundColor Red; exit 1 }
-Write-Host "`n막는 검사 모두 통과" -ForegroundColor Green
+if ($failed.Count) { Write-Host "`n실패: $($failed.name -join ', ')" -ForegroundColor Red }
+else { Write-Host "`n막는 검사 모두 통과" -ForegroundColor Green }
+
+# commit status docflow/local-check — 올릴지는 gate_status.py가 정한다 (실패여도 넘겨서 '올리지 않음' 이유를 보인다)
+if ($NoStatus) {
+    Write-Host "(-NoStatus: commit status 올리지 않음)"
+} else {
+    $stArgs = @("--start-sha", $fullSha, "--at", $at)
+    if ($dirty) { $stArgs += "--start-dirty" }
+    foreach ($r in $results) {
+        $state = if ($null -eq $r.ok) { "skip" } elseif ($r.ok) { "pass" } else { "fail" }
+        $stArgs += "--result", ("{0}:{1}:{2}" -f $r.name, [int]$r.blocking, $state)
+    }
+    foreach ($s in $Skip) { if (@($results.name) -notcontains $s) { $stArgs += "--skip-opt", $s } }  # 예: pg
+    $prevEnc = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    try {
+        Push-Location $root
+        uv run --quiet --no-project python -I scripts/gate_status.py local-check @stArgs | ForEach-Object { Write-Host $_ }
+    } finally { Pop-Location; [Console]::OutputEncoding = $prevEnc }
+}
+if ($failed.Count) { exit 1 }
 exit 0
