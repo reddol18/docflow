@@ -66,7 +66,7 @@ items:
   - {id: V5.3.4, level: 1, text: "SQL은 매개변수로", status: 충족, evidence: "app/store.py 전 쿼리 %s(keyword_search :447-463은 자리표시자만, 칸 값은 fields jsonb 매개변수, migrate_documents의 f-string은 LEGACY_COLUMNS 상수 열 이름만), report.py 상수만, auth·users %s"}
 
   # ---------- V7 오류·로그 ----------
-  - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "앱은 예외 종류만(app/auth.py:577), 오류 traceback은 키·비밀번호·Bearer 꼴을 가림(app/errors.py mask, https://github.com/reddol18/docflow/issues/28). 인증 사건·거절 요청 감사 행은 사유 분류만 — 비밀번호·토큰·쿠키·본문·없는 계정 아이디 없음(app/auth.py audit_event, app/main.py _audit_rejected, tests/test_auth_pg.py test_auth_events_audited, https://github.com/reddol18/docflow/issues/63). uvicorn 접근 로그에 OIDC code·state 쿼리 https://github.com/reddol18/docflow/issues/40"}
+  - {id: V7.1.1, level: 2, text: "로그에 비밀번호·세션 토큰 없음", status: 일부, evidence: "OIDC 콜백 실패는 예외 종류만(app/auth.py oidc_callback), 오류 traceback은 키·비밀번호·Bearer 꼴을 가림(app/errors.py mask, https://github.com/reddol18/docflow/issues/28). 인증 사건·거절 요청 감사 행은 사유 분류만 — 비밀번호·토큰·쿠키·본문·없는 계정 아이디 없음(app/auth.py audit_event, app/main.py _audit_rejected, tests/test_auth_pg.py test_auth_events_audited, https://github.com/reddol18/docflow/issues/63). uvicorn 접근 로그에 OIDC code·state 쿼리 https://github.com/reddol18/docflow/issues/40"}
   - {id: V7.4.1, level: 1, text: "사용자에게는 일반 오류 문구", status: 충족, evidence: "500은 일반 문구. 실행·노드 오류는 events에 분류 코드+짧은 문구만(app/errors.py public, app/main.py submit, app/graph.py traced), 예전 행의 info.error도 내보내지 않음(app/store.py events). 상세 traceback은 서버 로그에만. tests/test_audit_pg.py (https://github.com/reddol18/docflow/issues/28)"}
 
   # ---------- V8 데이터 보호 ----------
@@ -97,7 +97,7 @@ items:
 
   # ---------- API Security Top 10 ----------
   - {id: API1, text: "객체 수준 권한", status: 해당없음, evidence: "V4.2.1과 같음 (역할 확인 app/auth.py:281-297)"}
-  - {id: API2, text: "인증 깨짐", status: 일부, evidence: "기본 구조 튼튼(app/auth.py:126-151,397-415). V2.2.1·V3.4.1·V4.3.1 남음"}
+  - {id: API2, text: "인증 깨짐", status: 일부, evidence: "기본 구조 튼튼(app/auth.py login_local·verify_id_token). 로그인 성공·실패(사유 분류)·로그아웃·잠금과 처리 함수 앞 401·403·422를 감사 로그에 — 실패 응답은 감사 쓰기·까닭 분류를 기다리지 않아 계정 유무가 시간으로 드러나지 않음(app/auth.py audit_later, tests/test_auth_pg.py test_failed_login_time_independent_of_account, https://github.com/reddol18/docflow/issues/63). V2.2.1·V3.4.1·V4.3.1 남음"}
   - {id: API3, text: "객체 속성 수준 권한 (과다 노출·대량 할당)", status: 일부, evidence: "수정은 EDITABLE만(app/main.py _edit_document). events의 예외 원문 노출은 해소(https://github.com/reddol18/docflow/issues/28). 남음: /documents는 상태 전체"}
   - {id: API4, text: "자원 소모 무제한", status: 일부, evidence: "로그인 제한·LLM 예산, q·k·폼 칸 상한(https://github.com/reddol18/docflow/issues/49). 업로드 크기·개수 무제한 https://github.com/reddol18/docflow/issues/26 , /search·/ask 호출 제한 없음 https://github.com/reddol18/docflow/issues/7"}
   - {id: API5, text: "기능 수준 권한", status: 충족, evidence: "app/auth.py:281-297 require(role), tests/test_auth.py 경로 순회(ADMIN_ROUTES에 /export.xlsx·DELETE /volumes/{vol}, https://github.com/reddol18/docflow/pull/67)"}

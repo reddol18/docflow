@@ -92,6 +92,7 @@ async def lifespan(_):
     G = flow.build(saver)
     startup_migrate()
     yield
+    auth.audit_flush()  # 미뤄 둔 로그인·로그아웃 감사 행을 쓰고 닫는다
     store.lock_pool.close()
     store.pool.close()
 
@@ -169,7 +170,7 @@ def audited(user, action, vol=None, doc_id=None, **info):
         yield info
     except HTTPException as e:
         audit_safe(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
-        e.audited = True  # 예외 처리기(rejected_request)가 같은 거절을 다시 남기지 않게
+        e.audited = True  # 예외 처리기(rejected_http)가 같은 거절을 다시 남기지 않게
         raise
     except store.LockBusy:  # 다른 요청이 같은 문서·철을 처리 중 → 409 (lock_busy 처리기)
         audit_safe(user, action, vol, doc_id, "rejected_409", **info)
@@ -180,12 +181,10 @@ def audited(user, action, vol=None, doc_id=None, **info):
     audit_safe(user, action, vol, doc_id, "ok", **info)
 
 
-def audit_safe(*args, **kw):
-    """감사 기록이 실패해도 이미 끝난 처리를 500으로 바꾸거나 원래 거절(409 등)을 가리지 않는다 — 실패는 서버 로그로"""
-    try:
-        store.audit(*args, **kw)
-    except Exception:
-        errors.log_exception(f"audit {args[1]} {args[2]}")
+def audit_safe(user, action, vol=None, doc_id=None, result="ok", **info):
+    """감사 기록이 실패해도 이미 끝난 처리를 500으로 바꾸거나 원래 거절(409 등)을 가리지 않는다 — 실패는 서버 로그로.
+    쓰기는 auth.audit_event 한 곳 (처리 함수 안의 행은 바로 쓴다 — 교차검사가 audit의 review 행을 읽는다)"""
+    auth.audit_event(user, action, result, vol, doc_id, **info)
 
 
 # ---------- 처리 함수 앞에서 거절된 요청 (https://github.com/reddol18/docflow/issues/63) ----------
@@ -195,37 +194,61 @@ def audit_safe(*args, **kw):
 #   남김  행위·결과·메서드·사유 분류(no_session/bad_session/csrf/role)·422 오류 개수, 규칙에 맞는 철·문서 id
 #   안 남김  헤더·쿠키·토큰·본문·검증 오류 내용(입력 값이 들어 있다)·규칙에 안 맞는 경로 값
 #   중복  audited() 안에서 난 거절은 이미 남겼으므로(e.audited) 건너뛴다
-#   상한  사용자를 모르는 행(401 등)은 auth.audit_event의 계정 없는 행 상한(AUDIT_ANON_MAX/60초)
+#   상한  사용자를 모르는 행(401 등)과 CSRF 거절(공격 사이트가 일으킨다)은 auth.audit_event의 상한 창(AUDIT_ANON_MAX/60초)
+#   실패  감사 쓰기·분류가 실패해도 원래 401·403·422 응답은 그대로 (서버 로그로)
 REJECT_AUDIT = {401, 403, 422}
 ID_RX = re.compile(r"[\w.-]{1,120}")
 
 
-def _audit_rejected(request, status, exc, **info):
+def _session_owner(request):
+    """본문을 못 읽은 422(깨진 JSON 등)는 로그인 확인(guard)보다 먼저 난다 → 세션 토큰으로 사용자만 가볍게 찾는다.
+    guard가 같은 요청에 하는 조회와 같다. CSRF 확인은 하지 않는다 (누구 요청인지만 — 권한을 주지 않는다)"""
+    if not auth.MODES:
+        return auth.DEV_USER
+    token, _ = auth._token(request)
+    return auth.session_user(token) if token else None
+
+
+def _wants_audit(request, status, exc):
     if status not in REJECT_AUDIT or getattr(exc, "audited", False):
-        return
+        return False
     route = request.scope.get("route")
-    action = getattr(getattr(route, "endpoint", None), "audit_action", None)
-    if request.method in auth.SAFE_METHODS and action is None:
-        return  # 감사 대상이 아닌 읽기 경로
-    user = getattr(exc, "user", None) or getattr(request.state, "user", None)
-    pp = request.path_params
-    vol = pp.get("vol") if VOL_RX.fullmatch(pp.get("vol") or "") else None
-    doc_id = pp.get("doc_id") if ID_RX.fullmatch(pp.get("doc_id") or "") else None
-    if getattr(exc, "reason", None):
-        info["reason"] = exc.reason
-    auth.audit_event(user, action or "unaudited_route", f"rejected_{status}", vol, doc_id, limited=user is None,
-                     method=request.method, **info)
+    # 감사 대상이 아닌 읽기 경로는 건너뛴다
+    return request.method not in auth.SAFE_METHODS or bool(getattr(getattr(route, "endpoint", None), "audit_action", None))
+
+
+def _audit_rejected(request, status, exc):
+    try:
+        action = getattr(getattr(request.scope.get("route"), "endpoint", None), "audit_action", None)
+        user = getattr(exc, "user", None) or getattr(request.state, "user", None)
+        info = {"method": request.method}
+        if status == 422:
+            info["errors"] = len(exc.errors()) if hasattr(exc, "errors") else 0
+            if user is None:
+                user = _session_owner(request)
+        reason = getattr(exc, "reason", None)
+        if reason:
+            info["reason"] = reason
+        pp = request.path_params
+        vol = pp.get("vol") if VOL_RX.fullmatch(pp.get("vol") or "") else None
+        doc_id = pp.get("doc_id") if ID_RX.fullmatch(pp.get("doc_id") or "") else None
+        auth.audit_event(user, action or "unaudited_route", f"rejected_{status}", vol, doc_id,
+                         limited=user is None or reason == "csrf", **info)
+    except Exception:
+        errors.log_exception(f"audit rejected {status}")
 
 
 @app.exception_handler(StarletteHTTPException)
 async def rejected_http(request: Request, exc: StarletteHTTPException):
-    await run_in_threadpool(_audit_rejected, request, exc.status_code, exc)
+    if _wants_audit(request, exc.status_code, exc):
+        await run_in_threadpool(_audit_rejected, request, exc.status_code, exc)
     return await http_exception_handler(request, exc)
 
 
 @app.exception_handler(RequestValidationError)
 async def rejected_validation(request: Request, exc: RequestValidationError):
-    await run_in_threadpool(_audit_rejected, request, 422, exc, errors=len(exc.errors()))
+    if _wants_audit(request, 422, exc):
+        await run_in_threadpool(_audit_rejected, request, 422, exc)
     return await request_validation_exception_handler(request, exc)
 
 

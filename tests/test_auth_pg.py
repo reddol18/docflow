@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import threading
 import time
 import urllib.parse
 
@@ -25,6 +26,7 @@ ISS, CID = "https://idp.test/realms/x", "docflow"
 
 @pytest.fixture
 def db(pg_store):
+    auth.audit_flush()  # 앞 시험이 미뤄 둔 감사 행이 이 시험의 표에 끼지 않게
     with pg_store.pool.connection() as c:
         for t in ("sessions", "oidc_pending", "edits", "review_time", "audit", "users"):
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
@@ -90,6 +92,7 @@ def test_local_login_session_logout(client, db, monkeypatch):
 
 
 def audit_rows(db):
+    auth.audit_flush()  # 로그인·로그아웃 행은 감사 쓰기 스레드가 응답 뒤에 쓴다
     with db.pool.connection() as c:
         return c.execute("SELECT * FROM audit ORDER BY id").fetchall()
 
@@ -139,6 +142,57 @@ def test_failed_login_reasons(client, db, monkeypatch):
         ("login", "failed", "carol", "locked"), ("login", "failed", "carol", "disabled"),
         ("login", "failed", None, "rate_limited")]
     assert typo not in json.dumps(rows, ensure_ascii=False, default=str)
+
+
+def test_failed_login_time_independent_of_account(client, db, monkeypatch):
+    """실패 응답이 계정 유무·감사 상한에 따라 달라지지 않는다 (https://github.com/reddol18/docflow/issues/63 리뷰):
+    요청 스레드의 DB 왕복 수가 없는 계정·잠긴 계정·꺼진 계정·상한이 찬 때 모두 같고, 감사 쓰기를 기다리지 않는다"""
+    add_user(monkeypatch, "dave", "viewer")
+    add_user(monkeypatch, "erin", "viewer")
+    with db.pool.connection() as c:
+        c.execute("UPDATE users SET locked_until = now() + interval '5 minutes' WHERE username = 'dave'")
+        c.execute("UPDATE users SET disabled = true WHERE username = 'erin'")
+    real = db.pool.connection
+    trips = []
+
+    def counting(*a, **k):
+        if threading.current_thread().name != "audit-writer":
+            trips.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(db.pool, "connection", counting)
+    hold = threading.Event()
+    auth.audit_later(hold.wait, 10)  # 감사 쓰기 스레드를 붙잡아 둔다 — 응답은 그래도 바로 와야 한다
+    counts = {}
+    for name in ("nobody-x", "dave", "erin"):
+        trips.clear()
+        assert login(client, name).status_code == 401
+        counts[name] = len(trips)
+    assert not hold.is_set() and auth._audit_q.unfinished_tasks == 4  # 세 응답 모두 감사 쓰기 전에 왔다
+    hold.set()
+    auth.audit_flush()
+    monkeypatch.setattr(auth, "ANON_AUDIT", (0, 60))  # 상한이 찬 때
+    trips.clear()
+    assert login(client, "nobody-y").status_code == 401
+    counts["capped"] = len(trips)
+    assert set(counts.values()) == {1}, counts  # 자리잡기 UPDATE 한 번
+    monkeypatch.setattr(db.pool, "connection", real)
+    rows = audit_rows(db)
+    assert [(r["username"], r["info"]["reason"]) for r in rows] == [
+        (None, "unknown_user"), ("dave", "locked"), ("erin", "disabled")]  # 상한이 찬 넷째는 버림
+
+
+def test_login_ok_only_after_session(client, db, monkeypatch):
+    """세션을 만들다 실패하면 login/ok가 남지 않는다"""
+    add_user(monkeypatch, "fay", "viewer")
+
+    def boom(*a):
+        raise RuntimeError("세션 표 쓰기 실패 (가상)")
+
+    monkeypatch.setattr(auth, "new_session", boom)
+    with pytest.raises(RuntimeError):
+        login(client, "fay")
+    assert audit_rows(db) == []
 
 
 def test_logout_without_session_not_audited(client, db):
