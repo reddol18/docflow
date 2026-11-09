@@ -246,7 +246,7 @@ def _metered(vol, kind, model, scope, tin_max, tout_max, user_id=None):
     except BaseException:
         try:
             store.release_budget(hold)
-        except Exception:  # 예약을 못 지워도 원래 오류를 가리지 않는다 (예약은 store.HOLD_TTL 뒤 세지 않음)
+        except Exception:  # 예약을 못 지워도 원래 오류를 가리지 않는다 (남은 예약은 store.HOLD_TTL 뒤 예상 비용으로 보수 정산)
             print(f"[llm] 예약 {hold} 지우기 실패", file=sys.stderr, flush=True)
         raise
     tin, tout = _tokens(m.usage)

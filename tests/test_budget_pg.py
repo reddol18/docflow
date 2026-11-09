@@ -161,6 +161,44 @@ def test_unsettled_hold_settled_at_estimate(db, monkeypatch, capsys):
     store.release_budget(other)
 
 
+def test_late_settle_and_reserve_count_once(db, monkeypatch, capsys):
+    """늦은 정산과 만료 예약을 보수 정산하는 예약이 번갈아·동시에 돌아도 예약 하나는 한 번만 센다
+    (둘 다 예산 행 → 예약 행 순서로 잠근다). 불변식: used 증가분 = 남은 usage 행 합계, 예약마다 usage 행 하나"""
+    store = db
+    day = dt.date(2001, 1, 16)
+    start = fixed_day(monkeypatch, store, day)
+    # 번갈아: 예약 A → 만료 → 예약 B가 A를 예상 비용으로 정산 → A의 늦은 정산은 무시(경고) → B는 정상 정산
+    a = store.reserve_budget("index", day, start, 0.01, 1.0, ("t7-alt", "embed", "m", None))
+    monkeypatch.setattr(store, "HOLD_TTL", "0 seconds")
+    b = store.reserve_budget("index", day, start, 0.02, 1.0, ("t7-alt", "embed", "m", None))
+    monkeypatch.setattr(store, "HOLD_TTL", "15 minutes")
+    assert store.settle_budget(a, "index", day, 0.001, ("t7-alt", "embed", "m", 1, 0, None)) is False
+    assert "늦은 정산 무시" in capsys.readouterr().err
+    assert store.settle_budget(b, "index", day, 0.002, ("t7-alt", "embed", "m", 1, 0, None)) is True
+    assert ledger(store, "index", day) == (pytest.approx(0.012), 0)
+
+    # 동시에: 예약 8개를 만료시킨 뒤 늦은 정산 8개와 예약 8개(만료 예약을 보수 정산)를 섞어 돌린다
+    holds = [store.reserve_budget("index", day, start, 0.01, 1.0, ("t7-race", "embed", "m", None)) for _ in range(8)]
+    before = ledger(store, "index", day)[0]
+    monkeypatch.setattr(store, "HOLD_TTL", "0 seconds")
+
+    def late(h):
+        store.settle_budget(h, "index", day, 0.001, ("t7-race", "embed", "m", 1, 0, None))
+
+    def fresh(_):
+        store.reserve_budget("index", day, start, 0.0001, 1.0, ("t7-res", "embed", "m", None))
+    jobs = [(late, h) for h in holds] + [(fresh, i) for i in range(8)]
+    with ThreadPoolExecutor(4) as ex:
+        list(ex.map(lambda j: j[0](j[1]), jobs[::2] + jobs[1::2]))
+    store.prune_budget()  # 남은 예약(만료)을 모두 보수 정산
+    used, held = ledger(store, "index", day)
+    with store.pool.connection() as c:
+        rows = c.execute("SELECT vol, usd::float AS usd FROM usage WHERE vol IN ('t7-race', 't7-res')").fetchall()
+    assert held == 0
+    assert sum(r["vol"] == "t7-race" for r in rows) == 8 and sum(r["vol"] == "t7-res" for r in rows) == 8  # 한 번씩
+    assert used - before == pytest.approx(sum(r["usd"] for r in rows))  # 두 번 세기·빠짐 없음
+
+
 def test_prune_settles_expired_holds(db, monkeypatch):
     """시작할 때 만료 예약은 지우지 않고 예상 비용으로 정산한다 (지난 날 것은 그날 used에)"""
     store = db
