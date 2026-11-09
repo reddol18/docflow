@@ -405,7 +405,7 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     if llm.enabled():
         store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
     else:  # LLM_PROVIDER=off: 예전 값으로 만든 벡터를 남기지 않는다
-        store.delete_doc_vectors([doc_id])
+        store.delete_doc_vectors(vol, [doc_id])
     store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
     return d, list(fix), [x["doc_id"] for x in others]
 
@@ -443,11 +443,62 @@ STATUS_LABEL = {"confirmed": "확정", "excluded": "검사 제외(수정 가능)
 
 
 def startup_migrate():
-    """앱 시작 때 (lifespan): 예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로 — 남은 것만"""
+    """앱 시작 때 (lifespan): 예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로 — 남은 것만.
+    예전 문서 키(doc_id)로 섞인 documents 행을 철의 그래프 상태로 바로잡는다 (https://github.com/reddol18/docflow/issues/50)"""
     if SAMPLE:
         n = store.backfill_inspected(SAMPLE["name"])
         if n:
             print(f"doc_stage: 예전 검사 끝난 문서 {n}건 → 확정", flush=True)
+    repair_shared_docs()
+
+
+def repair_shared_docs():
+    """예전 키(doc_id 하나)에서는 같은 쪽 이름의 두 철을 처리하면 documents 행이 하나만 남았다 — 그 행의 vol은 먼저
+    처리한 철인데 칸 값은 나중 철 것이었다 (ON CONFLICT가 vol을 바꾸지 않았다). 철마다 문서의 원본은 그래프 상태
+    (철 화면·출력이 읽는 곳)이므로, 여러 철에 나온 doc_id(이벤트 기준)만 골라 색인이 끝난 철의 상태와 다르거나 없는 행을
+    상태대로 다시 쓴다 (LLM 호출 없음). 바로잡을 것이 없으면 아무것도 쓰지 않는다 (시작할 때마다).
+    잃은 벡터(옛 점은 나중 철 것 하나뿐)는 다시 만들지 않고 개수만 알린다 — 그 문서는 낱말 검색으로만 찾힌다.
+    고친 행 수"""
+    if G is None:
+        return 0
+    with store.pool.connection() as c:
+        rows = c.execute("SELECT doc_id, array_agg(DISTINCT vol) AS vols FROM events WHERE doc_id IS NOT NULL "
+                         "GROUP BY doc_id HAVING count(DISTINCT vol) > 1").fetchall()
+    shared = {}
+    for r in rows:
+        for v in r["vols"]:
+            shared.setdefault(v, set()).add(r["doc_id"])
+    fixed, keys = 0, []
+    for vol, ids in sorted(shared.items()):
+        if not VOL_RX.fullmatch(vol):
+            continue
+        snap = G.get_state(cfg(vol))
+        v = snap.values or {}
+        # 색인이 끝난 철만 (summary의 done과 같은 조건). 색인 전·다시 돌리는 중(검토 대기·멈춤)인 철의 상태는 아직
+        # documents에 쓸 값이 아니다
+        if v.get("indexed") is None or snap.next or snap.interrupts:
+            continue
+        docs = [d for d in v.get("docs", []) if d["doc_id"] in ids]
+        have = store.get_documents([(vol, d["doc_id"]) for d in docs])
+        stale = [d for d in docs if (row := have.get((vol, d["doc_id"]))) is None
+                 or row["fields"] != d["fields"] or (row["flags"] or {}) != (d.get("flags") or {})
+                 or list(row["pages"]) != list(d["pages"])]
+        if stale:
+            store.save_documents([{**d, "vol": vol} for d in stale])
+            fixed += len(stale)
+        keys += [(vol, d["doc_id"]) for d in docs]
+    lost = []
+    if keys and llm.enabled():
+        try:
+            lost = store.missing_vectors(keys)
+        except Exception:
+            errors.log_exception("missing_vectors")
+    if fixed:
+        print(f"documents: 예전 키 충돌 바로잡음 — 행 {fixed}개를 철의 그래프 상태대로 다시 씀", flush=True)
+    if lost:
+        print(f"qdrant: 예전 키 충돌로 벡터 없는 문서 {len(lost)}개 (철 {sorted({v for v, _ in lost})}) — 낱말 검색으로만 "
+              "찾힌다. 그 문서를 고치면(PATCH) 벡터를 다시 만든다", flush=True)
+    return fixed
 
 
 def positions(vol, doc_ids):
@@ -1086,11 +1137,13 @@ def query_words(q):
 
 
 def rrf(*lists):
-    """Reciprocal Rank Fusion 점수 {doc_id: 점수}. 검색 평가(`eval/search_score.py`)도 이 함수를 쓴다"""
+    """Reciprocal Rank Fusion 점수 {(vol, doc_id): 점수} — 문서 키는 철과 쪽 이름 둘 다
+    (https://github.com/reddol18/docflow/issues/50). 검색 평가(`eval/search_score.py`)도 이 함수를 쓴다"""
     score = {}
     for lst in lists:
         for rank, r in enumerate(lst):
-            score[r["doc_id"]] = score.get(r["doc_id"], 0) + 1 / (60 + rank + 1)
+            k = store.doc_key(r)
+            score[k] = score.get(k, 0) + 1 / (60 + rank + 1)
     return score
 
 
@@ -1098,7 +1151,7 @@ CANDIDATES = 30  # 방식마다 가져오는 후보 수
 
 
 def ranked(q, vec, year_from=None, year_to=None):
-    """/search의 순위 계산(질의 임베딩 뒤) → (벡터 결과, 낱말 결과, RRF 점수, RRF 순 doc_id).
+    """/search의 순위 계산(질의 임베딩 뒤) → (벡터 결과, 낱말 결과, RRF 점수, RRF 순 (vol, doc_id)).
     검색 평가(`eval/search_score.py`)도 이 함수를 그대로 부른다"""
     v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
     kw = store.keyword_search(query_words(q), year_from, year_to, limit=CANDIDATES)
@@ -1112,13 +1165,13 @@ def hybrid(q, year_from=None, year_to=None, k=10):
     v, kw, score, order = ranked(q, vec, year_from, year_to)
     top = order[:k]
     rows = store.get_documents(top)
-    vr = {r["doc_id"]: i + 1 for i, r in enumerate(v)}
-    kr = {r["doc_id"]: i + 1 for i, r in enumerate(kw)}
+    vr = {store.doc_key(r): i + 1 for i, r in enumerate(v)}
+    kr = {store.doc_key(r): i + 1 for i, r in enumerate(kw)}
     shown = schema_fields.shown(schema_fields.SCHEMA)  # 김해: 문서번호·시행일자·수신·제목
     # 칸 값은 fields 아래에 — 스키마 칸 이름이 순위·철 키(doc_id·vol·rrf …)를 덮지 않게 (https://github.com/reddol18/docflow/issues/72)
-    return [{"doc_id": d, "rrf": round(score[d], 5), "vector_rank": vr.get(d), "keyword_rank": kr.get(d),
-             "vol": rows[d]["vol"], "fields": {c: (rows[d]["fields"] or {}).get(c, "") for c in shown}}
-            for d in top if d in rows]
+    return [{"doc_id": k[1], "rrf": round(score[k], 5), "vector_rank": vr.get(k), "keyword_rank": kr.get(k),
+             "vol": k[0], "fields": {c: (rows[k]["fields"] or {}).get(c, "") for c in shown}}
+            for k in top if k in rows]
 
 
 @app.get("/search")

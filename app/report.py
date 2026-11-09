@@ -68,7 +68,7 @@ def daily(day_from: dt.date, day_to: dt.date):
 
     put(_rows(f"SELECT {_day('ts')} AS day, count(*) AS n FROM events "  # noqa: S608
               "WHERE node='ocr_page' AND phase='end' AND ts >= %s AND ts < %s GROUP BY 1", rng), "pages_ocr")
-    put(_rows(f"SELECT {_day('ts')} AS day, count(DISTINCT doc_id) AS n FROM events "  # noqa: S608
+    put(_rows(f"SELECT {_day('ts')} AS day, count(DISTINCT (vol, doc_id)) AS n FROM events "  # noqa: S608
               "WHERE node='merge' AND phase='end' AND ts >= %s AND ts < %s GROUP BY 1", rng), "docs_extracted")
     put(_rows(f"SELECT {_day('created_at')} AS day, count(*) AS n FROM documents "  # noqa: S608
               "WHERE created_at >= %s AND created_at < %s GROUP BY 1", rng), "docs_indexed")

@@ -287,7 +287,7 @@ def index(s: VolState):
     docs = s.get("docs", [])
     store.save_documents(docs)
     if not llm.enabled():  # LLM_PROVIDER=off: 문서는 저장하고 벡터는 넣지 않는다. 다시 돌린 철의 예전 벡터도 지운다
-        store.delete_doc_vectors([d["doc_id"] for d in docs])
+        store.delete_doc_vectors(s["vol"], [d["doc_id"] for d in docs])
         return {"indexed": len(docs), "embedded": 0}
     for i in range(0, len(docs), 64):
         chunk = docs[i:i + 64]

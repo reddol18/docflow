@@ -43,14 +43,14 @@ def test_save_search_vectors_and_hybrid(env, monkeypatch):
             doc("d3", "미상", "가상 도로 보수")]
     store.save_documents(docs)
     store.upsert_vectors(docs, [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]])
-    rows = store.get_documents(["d1", "d3"])
+    rows = {d: r for (_, d), r in store.get_documents([(VOL, "d1"), (VOL, "d3")]).items()}
     assert rows["d1"]["fields"] == docs[0]["fields"] and rows["d1"]["year"] == 1997 and rows["d3"]["year"] is None
     assert rows["d1"]["search_text"] == "가상 도로 점용 허가 가상시장 가상 12345-1"
     # 낱말 검색: 제목·수신·문서번호 (스키마 search.keyword), 연도 필터는 year 열
     assert [r["doc_id"] for r in store.keyword_search(["도로", "점용"])] == ["d1", "d2", "d3"]
     assert [r["doc_id"] for r in store.keyword_search(["도로"], 1998, 2000)] == ["d2"]
     assert [r["doc_id"] for r in store.keyword_search(["12345-1"], 1997, 1997)] == ["d1"]
-    pt = env.retrieve(store.COLLECTION, [store.point_id("d1")])[0]
+    pt = env.retrieve(store.COLLECTION, [store.point_id(VOL, "d1")])[0]
     assert pt.payload == {"doc_id": "d1", "vol": VOL, "year": 1997,
                           "fields": {"docno": "가상 12345-1", "date": "1997-03-04", "recipient": "가상시장",
                                      "title": "가상 도로 점용 허가"}}
@@ -74,7 +74,7 @@ def test_migrate_legacy_columns(env):
                   "('m2', %s, '{m2}', NULL, NULL, NULL, NULL, '가상 제목만', '{}')", (VOL, VOL))
         assert store.migrate_documents(c) == 2
         assert store.migrate_documents(c) == 0
-    rows = store.get_documents(["m1", "m2"])
+    rows = {d: r for (_, d), r in store.get_documents([(VOL, "m1"), (VOL, "m2")]).items()}
     assert rows["m1"]["fields"] == {"docno": "가상 1-2", "serial": "2", "date": "1995-05-06", "recipient": "가상 수신",
                                     "title": "가상 옛 제목"}
     assert rows["m1"]["year"] == 1995 and rows["m1"]["search_text"] == "가상 옛 제목 가상 수신 가상 1-2"

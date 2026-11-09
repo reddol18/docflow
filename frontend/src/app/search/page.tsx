@@ -139,7 +139,8 @@ function Search() {
             </thead>
             <tbody>
               {hits.map((h, i) => (
-                <tr key={h.doc_id} className="border-t border-slate-50 align-top">
+                // 문서 키는 철 + 쪽 이름 — 다른 철에 같은 쪽 이름이 있을 수 있다 (https://github.com/reddol18/docflow/issues/50)
+                <tr key={`${h.vol}/${h.doc_id}`} className="border-t border-slate-50 align-top">
                   <td className="py-2 pr-3 text-xs tabular-nums text-slate-500">
                     {i + 1} ({h.vector_rank ?? "–"}/{h.keyword_rank ?? "–"})
                   </td>
@@ -149,7 +150,9 @@ function Search() {
                         <Link href={`/volumes/${encodeURIComponent(h.vol)}/documents`} className="text-blue-700 hover:underline">
                           {cellOf(h, c.name) || "(빈 값)"}
                         </Link>
-                        <div className="font-mono text-[11px] text-slate-400">{h.doc_id}</div>
+                        <div className="font-mono text-[11px] text-slate-400">
+                          {h.vol} / {h.doc_id}
+                        </div>
                       </td>
                     ) : (
                       <td key={c.name} className="py-2 pr-3 text-slate-700">
