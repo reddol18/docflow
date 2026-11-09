@@ -89,15 +89,18 @@ def test_search_ask_limits(main, monkeypatch):
     assert c.get("/ask", params={"q": ok + "가"}, headers=ADMIN).status_code == 422
 
 
-def test_upload_requires_jpeg(main, tmp_path):
+def test_upload_requires_jpeg(main, tmp_path, monkeypatch):
+    # 내용까지 검사하므로 진짜 JPEG, 쓰는 업로드는 철 단계를 본다 (https://github.com/reddol18/docflow/issues/26)
+    snap = SimpleNamespace(values={}, next=(), interrupts=[])
+    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snap))
     c = TestClient(main.app)
-    jpg = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()  # 내용까지 검사하므로 진짜 JPEG (issues/26)
+    jpg = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
     jpg2 = cv2.imencode(".jpg", np.full((8, 8, 3), 200, np.uint8))[1].tobytes()
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
     files = [("files", ("a.jpg", jpg, "image/jpeg")), ("files", ("b.jpg", png, "image/jpeg"))]
     res = c.post("/volumes/v1/pages", files=files, headers=ADMIN)
     assert res.status_code == 400 and "b.jpg" in res.text
-    assert not (tmp_path / "pages" / "v1").exists()  # 하나라도 틀리면 아무것도 저장하지 않는다
+    assert not any((tmp_path / "pages" / "v1").iterdir())  # 하나라도 틀리면 아무것도 저장하지 않는다 (임시 파일도)
     res = c.post("/volumes/v1/pages", files=[("files", ("t.jpg", b"text", "image/jpeg"))], headers=ADMIN)
     assert res.status_code == 400
     res = c.post("/volumes/v1/pages", files=[("files", ("a.jpg", jpg, "image/jpeg"))], headers=ADMIN)

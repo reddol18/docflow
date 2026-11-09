@@ -17,7 +17,8 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_
 ADMIN = {"authorization": "Bearer a", "x-docflow-csrf": "1"}
 FAKE_KEY = "sk-proj-FAKEkey0000000000000000TEST"
 FAKE_NAME = "홍길순가상"
-JPG = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()  # 업로드가 내용까지 검사한다 (issues/26)
+# 업로드가 내용까지 검사한다 (https://github.com/reddol18/docflow/issues/26)
+JPG = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
 
 
 @pytest.fixture
@@ -55,13 +56,36 @@ def fake_graph(*, interrupts=(), docs=(), invoke=None):
                            update_state=lambda cfg, v, as_node=None: None)
 
 
+def test_unchanged_upload_keeps_export_current(main, monkeypatch):
+    """같은 내용만 다시 올린 업로드는 감사 결과 unchanged — 마지막 출력을 '바뀐 철'로 만들지 않는다
+    (store.last_export는 result='ok'인 upload만 센다, https://github.com/reddol18/docflow/issues/26)"""
+    monkeypatch.setattr(main, "G", fake_graph())
+    c = TestClient(main.app)
+
+    def up():
+        return c.post("/volumes/v9/pages", headers=ADMIN, files=[("files", ("p1.jpg", JPG, "image/jpeg"))])
+
+    with store.pool.connection() as conn:
+        conn.execute("DELETE FROM exports WHERE vol = 'v9'")
+    assert up().json()["saved"] == 1
+    store.add_export("v9", 0, 1)
+    assert store.last_export("v9")["current"] is True
+    res = up()
+    assert res.status_code == 200 and res.json()["unchanged"] == 1 and res.json()["saved"] == 0
+    assert store.last_export("v9")["current"] is True
+    assert [r["result"] for r in store.audit_log() if r["action"] == "upload"] == ["unchanged", "ok"]
+    with store.pool.connection() as conn:
+        conn.execute("DELETE FROM exports WHERE vol = 'v9'")
+
+
 def test_audit_four_actions_and_no_leak(main, monkeypatch, capsys):
     c = TestClient(main.app)
     doc = {"doc_id": "d1", "vol": "v1", "pages": ["p1"], "flags": {"title": ["확신도"]},
            "fields": {"docno": "가-1", "serial": "1", "date": "1999-01-01", "recipient": "시청", "title": "옛 제목"},
            "hw": {}, "reviewed": True}
 
-    # 1) 업로드
+    # 1) 업로드 (쓰는 업로드는 철 단계를 본다 — 처음 철)
+    monkeypatch.setattr(main, "G", fake_graph())
     assert c.post("/volumes/v1/pages", headers=ADMIN, files=[("files", ("p1.jpg", JPG, "image/jpeg"))]).status_code == 200
 
     # 2) 실행 — 흐름이 키 꼴 문자열이 든 예외로 실패한다

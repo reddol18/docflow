@@ -56,7 +56,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Annotated, Literal
 
 import cv2
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -64,6 +64,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import auth, error_list, errors, export, field_rules, flags, inspection, llm, ocr, report, store, workflow
@@ -110,7 +111,7 @@ _docs = os.environ.get("API_DOCS") == "1"
 app = FastAPI(title="docflow", lifespan=lifespan, dependencies=[Depends(auth.guard), Depends(vol_guard)],
               docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
 app.include_router(auth.router)
-# 업로드 본문 상한 — 본문은 처리 함수·로그인 확인보다 먼저 /tmp로 읽히므로 그 앞에서 묶는다 (app/upload.py)
+# 업로드 본문 상한 — 받은 바이트를 세며 본문 상한·/tmp 예산에서 끊는다 (app/upload.py). 본문은 처리 함수가 로그인 확인 뒤에 읽는다
 UPLOAD_PATH_RX = re.compile(r"/volumes/[^/]+/pages")
 app.add_middleware(uploads.BodyCap, match=lambda method, path: method == "POST" and UPLOAD_PATH_RX.fullmatch(path))
 
@@ -168,20 +169,24 @@ def check(vol):
 @contextmanager
 def audited(user, action, vol=None, doc_id=None, **info):
     """감사 로그 한 줄 (https://github.com/reddol18/docflow/issues/28): 성공 ok, 요청 거절 rejected_<상태>, 예외 error(분류 코드).
-    처리 중에 yield된 info에 개수·칸 이름 같은 요약을 더할 수 있다 — 값·원문은 넣지 않는다."""
+    처리 중에 yield된 info에 개수·칸 이름 같은 요약을 더할 수 있다 — 값·원문은 넣지 않는다.
+    성공 결과를 ok 말고 다른 이름으로 남기려면 info["result"] (예: 바뀐 것 없는 업로드 unchanged)"""
     try:
         yield info
     except HTTPException as e:
+        info.pop("result", None)
         audit_safe(user, action, vol, doc_id, f"rejected_{e.status_code}", **info)
         e.audited = True  # 예외 처리기(rejected_http)가 같은 거절을 다시 남기지 않게
         raise
     except store.LockBusy:  # 다른 요청이 같은 문서·철을 처리 중 → 409 (lock_busy 처리기)
+        info.pop("result", None)
         audit_safe(user, action, vol, doc_id, "rejected_409", **info)
         raise
     except Exception as e:
+        info.pop("result", None)
         audit_safe(user, action, vol, doc_id, "error", code=errors.code_of(e), **info)
         raise
-    audit_safe(user, action, vol, doc_id, "ok", **info)
+    audit_safe(user, action, vol, doc_id, info.pop("result", "ok"), **info)
 
 
 def audit_safe(user, action, vol=None, doc_id=None, result="ok", **info):
@@ -274,13 +279,11 @@ def unaudited_routes(application):
 def submit(vol, arg, user=None, reserved=False):
     """철 흐름을 뒤에서 돌린다. 끝난 결과도 감사 로그에 남긴다(run_done: ok / review_waiting / error+분류 코드).
     reserved: 부른 쪽이 이미 running[vol]을 세웠다 (/run이 리셋 전에)"""
-    if not reserved:
-        if vol in running:
-            raise HTTPException(409, f"{vol} 이미 실행 중")
-        running[vol] = "queued"
+    if not reserved and reserve(vol, "queued") is None:
+        raise HTTPException(409, f"{vol} 이미 실행 중")
 
     def job():
-        running[vol] = "running"
+        running[vol] = Busy("running")
         store.event(vol, "run", "start", None, resume=arg is None or isinstance(arg, Command))
         try:
             G.invoke(arg, cfg(vol))
@@ -309,99 +312,134 @@ def healthz():
 
 @app.post("/volumes/{vol}/pages")
 @audit_as("upload")
-def upload(vol: str, user: Admin, files: list[UploadFile] = File(...), replace: bool = False):
+async def upload(request: Request, vol: str, user: Admin, replace: bool = False):
     """쪽 이미지 올리기 (https://github.com/reddol18/docflow/issues/26, 검사·상한은 app/upload.py 머리말).
-    하나라도 틀리면 아무것도 저장하지 않는다. 같은 이름이 이미 있으면: 내용이 같으면 그대로 두고(unchanged — 끊긴 업로드를
-    다시 보내도 된다), 다르면 409. replace=true일 때만 바꾸고 그 쪽의 OCR 결과·잘라낸 칸을 지워 다음 /run에서 다시 OCR한다.
-    바꾸기는 철이 처음(new)이거나 끝난(done) 때만 — 실행 중·검토 대기·중간에 멈춘 철은 409 (이어 가면 옛 OCR로 만든
-    문서가 그대로 색인되므로). 끝난 철은 /run으로 다시 돌려야 색인에 반영된다(응답 rerun=true, 그 전 출력은 '바뀐 철')"""
-    with audited(user, "upload", vol, files=len(files), replace=replace) as info:
-        out = _upload(vol, files, replace)
+    본문은 여기서 읽는다 — 파일을 경로 인자(File)로 받으면 FastAPI가 로그인·역할·CSRF 확인보다 먼저 본문 전체를 /tmp에
+    흘려 쓰므로. 하나라도 틀리면 아무것도 저장하지 않는다. 같은 이름이 이미 있으면: 내용이 같으면 그대로 두고(unchanged —
+    끊긴 업로드를 다시 보내도 된다, 감사 결과도 unchanged라 출력 뒤 '바뀐 철'로 세지 않는다), 다르면 409.
+    replace=true일 때만 바꾸고 그 쪽의 OCR 결과·잘라낸 칸을 지워 다음 /run에서 다시 OCR한다.
+    쓰는 업로드(새 쪽·바꿀 쪽)는 철이 처음(new)이거나 끝난(done) 때만 — 실행 중·검토 대기·중간에 멈춘 철은 409 (이어 가면
+    옛 쪽 목록·OCR로 만든 문서가 그대로 색인되므로). 끝난 철은 /run으로 다시 돌려야 반영된다(응답 rerun=true)"""
+    with audited(user, "upload", vol, replace=replace) as info:
+        form = await _upload_form(request)
+        try:
+            files = form.getlist("files")
+            if (not files or len(files) != len(form.multi_items())
+                    or not all(isinstance(f, StarletteUploadFile) for f in files)):
+                raise HTTPException(400, "files 칸에 파일만 (multipart/form-data)")
+            info["files"] = len(files)
+            out = await run_in_threadpool(_upload, vol, files, replace)  # 디코드 검사가 이벤트 루프를 막지 않게
+        finally:
+            await form.close()
         info.update(saved=out["saved"], replaced=out["replaced"], unchanged=out["unchanged"])
+        if not out["saved"]:
+            info["result"] = "unchanged"  # store.last_export는 result='ok'인 upload만 '바뀜'으로 센다
     return out
 
 
-PAGE_NAME_RX = re.compile(r"[\w.-]+\.jpg")
+async def _upload_form(request):
+    """로그인·역할·CSRF 확인 뒤에 본문을 읽는다. 파일 수는 Starlette가 파싱하면서 센다(넘는 파일은 /tmp에 쓰기 전에 끊음).
+    파일 아닌 칸은 4개·64KB까지. 본문 바이트 상한·/tmp 예산은 BodyCap(app/upload.py)이 읽는 동안 끊는다(413·429)"""
+    try:
+        return await request.form(max_files=uploads.MAX_FILES, max_fields=4, max_part_size=64 * 1024)
+    except StarletteHTTPException as e:
+        if e.status_code != 400:
+            raise  # BodyCap의 413·429
+        if "Too many files" in str(e.detail):
+            raise HTTPException(400, f"한 번에 {uploads.MAX_FILES}장까지") from None
+        raise HTTPException(400, "multipart 본문을 읽을 수 없음") from None
+
+
+class Busy(str):
+    """running[vol] 값. str이라 화면·상태 응답엔 글자로 나가고, 객체마다 달라 '내가 세운 표시인가'를 is로 가린다"""
+
+
+def reserve(vol, what):
+    """running[vol]을 원자적으로 세운다 (dict.setdefault는 GIL 아래 한 번에 — 확인과 세우기 사이에 끼어들 수 없다).
+    세웠으면 그 표시, 이미 다른 일이 세워 두었으면 None"""
+    tok = Busy(what)
+    return tok if running.setdefault(vol, tok) is tok else None
+
+
+def release(vol, tok):
+    """내가 세운 표시일 때만 지운다 — 다른 요청이 세운 '실행 중'을 지워 실행 중인 철을 '실행 아님'으로 만들지 않게"""
+    if running.get(vol) is tok:
+        running.pop(vol, None)
 
 
 def _upload(vol, files, replace):
-    if len(files) > uploads.MAX_FILES:
-        raise HTTPException(400, f"한 번에 {uploads.MAX_FILES}장까지")
     names = []
     for i, f in enumerate(files, 1):  # 1) 이름부터 모두 본다 (규칙에 안 맞는 이름은 응답에 되돌려 주지 않는다)
         name = (f.filename or "").rsplit("/", 1)[-1]
-        if not PAGE_NAME_RX.fullmatch(name):
-            raise HTTPException(400, f"{i}번째 파일 이름이 규칙([영문·숫자·_.-].jpg)에 맞지 않음")
+        if not uploads.PAGE_RX.fullmatch(name):
+            raise HTTPException(400, f"{i}번째 파일 이름이 규칙({uploads.PAGE_RULE})에 맞지 않음")
         if name in names:
             raise HTTPException(400, f"같은 이름이 두 번: {name}")
         names.append(name)
+    pages = [n[:-len(".jpg")] for n in names]
     d = store.pages_dir(vol)
-    created = not d.exists()  # 이번 요청이 만든 철 폴더면 실패할 때 지운다 (빈 철이 목록에 남지 않게)
     # 2) 쪽 폴더 안 임시 파일에 조각 단위로 쓰며 검사 — 같은 파일 시스템이라 옮기기는 원자적이다.
-    #    /tmp(Starlette가 흘려 쓴 곳)에서 바로 옮기면 파일 시스템이 달라 복사가 되고 반쯤 쓴 *.jpg가 보일 수 있다
+    #    /tmp(Starlette가 흘려 쓴 곳)에서 바로 옮기면 파일 시스템이 달라 복사가 되고 반쯤 쓴 *.jpg가 보일 수 있다.
+    #    실패해도 쪽 폴더는 지우지 않는다 (빈 폴더는 해롭지 않고, 같은 새 철에 동시에 올리는 요청과 다투지 않게)
     tmps = []
-    ok = False
     try:
         for f, name in zip(files, names):
             tmps.append(uploads.spool(f.file, d, name, name))
         new, same, changed = [], [], []
-        for tmp, name in zip(tmps, names):
-            dest = d / name
+        for tmp, page in zip(tmps, pages):
+            dest = store.page_path(vol, page)
             if not dest.exists():
                 new.append((tmp, dest))
             elif filecmp.cmp(tmp, dest, shallow=False):
-                same.append(name)
+                same.append(page)
             else:
                 changed.append((tmp, dest))
         if changed and not replace:
             shown = ", ".join(p.name for _, p in changed[:10]) + (" …" if len(changed) > 10 else "")
             raise HTTPException(409, f"같은 이름의 쪽이 이미 있음 (바꾸려면 ?replace=true): {shown}")
         stage = None
-        if changed:  # 바꾸는 동안 같은 철 실행·이어 가기·일괄 삭제는 409 (running)
-            if vol in running:
-                raise HTTPException(409, f"{vol} 실행 중 — 끝난 뒤 바꾼다")
-            stage = _stage(vol, G.get_state(cfg(vol)))
-            if stage not in ("new", "done"):
-                raise HTTPException(409, "검토 대기·중간에 멈춘 철 — 끝까지 마친 뒤(/review·/resume) 바꾼다")
-            running[vol] = "replacing"
-        try:
-            _place(vol, new, changed)
-        finally:
-            if changed:
-                running.pop(vol, None)
-        ok = True
+        if new or changed:  # 쓰는 동안 같은 철 실행·이어 가기·일괄 삭제는 409 (running 표시)
+            tok = reserve(vol, "uploading")
+            if tok is None:
+                raise HTTPException(409, f"{vol} 실행 중 — 끝난 뒤 올린다")
+            try:
+                stage = _flow_stage(G.get_state(cfg(vol)))  # 표시를 세운 뒤에 읽는다 — 그사이 /run이 시작할 수 없다
+                if stage not in ("new", "done"):
+                    raise HTTPException(409, "검토 대기·중간에 멈춘 철 — 끝까지 마치거나(/review·/resume) "
+                                             "처음부터 다시 돌린(/run) 뒤 올린다")
+                _place(vol, new, changed)
+            finally:
+                release(vol, tok)
     finally:
         for tmp in tmps:
             if os.path.exists(tmp):
                 os.unlink(tmp)
-        if created and not ok:
-            try:
-                d.rmdir()  # 비어 있을 때만 지워진다 (같은 철에 동시에 올린 다른 요청의 파일은 건드리지 않는다)
-            except OSError:
-                pass
     return {"vol": vol, "saved": len(new) + len(changed), "replaced": len(changed), "unchanged": len(same),
-            "rerun": bool(changed) and stage == "done", "total": len(list(d.glob("*.jpg")))}
+            "rerun": stage == "done", "total": len(list(d.glob("*.jpg")))}
 
 
 def _place(vol, new, changed):
-    """3) 새 쪽은 같은 이름이 없을 때만 놓고(그사이 다른 요청이 같은 이름을 만들었으면 이번에 놓은 것을 되돌리고 409),
-    바꿀 쪽은 OCR 결과·잘라낸 칸을 먼저 지운 뒤 바꾼다 — 사이에 멈춰도 '새 이미지 + 옛 OCR'은 남지 않는다
-    (옛 이미지 + OCR 없음 → 다음 실행이 옛 이미지를 다시 읽을 뿐)"""
+    """3) 새 쪽은 같은 이름이 없을 때만 놓는다 — 그사이 다른 요청이 같은 이름을 만들었으면 409, 그 밖의 실패(디스크 등)도
+    이번에 놓은 새 쪽을 모두 되돌린다. 바꿀 쪽은 OCR 결과·잘라낸 칸을 먼저 지운 뒤 바꾼다 — 사이에 멈춰도
+    '새 이미지 + 옛 OCR'은 남지 않는다(옛 이미지 + OCR 없음 → 다음 실행이 옛 이미지를 다시 읽을 뿐). 바꾸기가 중간에
+    실패하면 새 쪽은 되돌리고, 이미 바꾼 쪽은 새 이미지 + OCR 없음으로 남는다 (어긋남 없음)"""
     placed = []
     try:
         for tmp, dest in new:
             uploads.place_new(tmp, dest)
             placed.append(dest)
-    except FileExistsError:
+        for tmp, dest in changed:
+            page = dest.stem
+            store.ocr_path(vol, page).unlink(missing_ok=True)
+            for cell in flow.CELLS:
+                store.crop_path(vol, page, cell).unlink(missing_ok=True)
+            os.replace(tmp, dest)
+    except BaseException as e:
         for p in placed:
             p.unlink(missing_ok=True)
-        raise HTTPException(409, "같은 이름의 쪽을 다른 요청이 먼저 올림 — 다시 시도") from None
-    for tmp, dest in changed:
-        page = dest.stem
-        store.ocr_path(vol, page).unlink(missing_ok=True)
-        for cell in flow.CELLS:
-            store.crop_path(vol, page, cell).unlink(missing_ok=True)
-        os.replace(tmp, dest)
+        if isinstance(e, FileExistsError):
+            raise HTTPException(409, "같은 이름의 쪽을 다른 요청이 먼저 올림 — 다시 시도") from None
+        raise
 
 
 @app.post("/volumes/{vol}/run")
@@ -415,9 +453,9 @@ def run(vol: str, user: Admin, review: str = "human"):
         if not any(store.pages_dir(vol).glob("*.jpg")):
             raise HTTPException(404, "올린 쪽이 없음")
         # 리셋 전에 실행 중 표시를 먼저 세운다 → 리셋하는 동안 수정·검사·승인·반려는 409 (색인이 끝난 철만 받으므로)
-        if vol in running:
+        tok = reserve(vol, "queued")  # 확인과 세우기를 한 번에 (업로드·일괄 삭제와 다투지 않게)
+        if tok is None:
             raise HTTPException(409, f"{vol} 이미 실행 중")
-        running[vol] = "queued"
         try:
             if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
                 store.event(vol, "inspection", "reset", None, user=user.username)
@@ -427,7 +465,7 @@ def run(vol: str, user: Admin, review: str = "human"):
                 store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
             submit(vol, {"vol": vol, "review_mode": review}, user, reserved=True)
         except BaseException:
-            running.pop(vol, None)
+            release(vol, tok)
             raise
     return {"vol": vol, "started": True}
 
@@ -446,13 +484,20 @@ def resume(vol: str, user: Admin):
 
 
 def _stage(vol, snap):
-    v = snap.values or {}
     if running.get(vol) == "queued":
         return "queued"
     if snap.interrupts:
         return "review"
     if vol in running:
         return "running"
+    return _flow_stage(snap)
+
+
+def _flow_stage(snap):
+    """그래프 상태만으로 본 단계 (running 표시는 보지 않는다): review / done / stopped / new"""
+    v = snap.values or {}
+    if snap.interrupts:
+        return "review"
     if v.get("indexed") is not None and not snap.next:
         return "done"
     if snap.next:
@@ -1311,11 +1356,13 @@ def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False
             raise HTTPException(409, "내보낸 뒤 내용이 바뀐 철 — 다시 내보낸 뒤 지운다")
         if last["problems"] and not allow_problems:
             raise HTTPException(409, f"마지막 출력에 검증 문제 {last['problems']}건 (지우려면 allow_problems=true)")
-        running[vol] = "purging"  # 지우는 동안 같은 철 실행(/run·/resume)은 409
+        tok = reserve(vol, "purging")  # 지우는 동안 같은 철 실행(/run·/resume)·업로드는 409
+        if tok is None:
+            raise HTTPException(409, "실행 중인 철")
         try:
             info.update(store.purge_volume(vol, G.checkpointer.delete_thread))
         finally:
-            running.pop(vol, None)
+            release(vol, tok)
     return {"vol": vol, "deleted": info}
 
 

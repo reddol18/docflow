@@ -1,20 +1,30 @@
 """쪽 이미지 올리기 검사 (https://github.com/reddol18/docflow/issues/26, ASVS V12.1·API4 자원 소비).
 
-받는 것: 진짜 JPEG만 — 앞 바이트(SOI 시그니처) + 끝(EOI, 잘린 전송) + 머리의 SOF 크기(픽셀 수 상한, 펼치기 전에)
-  + 실제 디코드 성공. 검사는 이 순서 — 압축 폭탄은 머리에서 걸러 펼치지 않는다.
+받는 것: 진짜 JPEG만. 검사 순서 — 펼치기(디코드) 전에 값싼 것부터:
+  1) 앞 바이트(SOI 시그니처)  2) 표지 구조를 끝(EOI)까지 걷기(jpeg_info): 크기(SOF)·스캔(SOS) 수, 끝이 잘렸으면 거절,
+     EOI 뒤에 붙은 것(카메라 트레일러·0 채움)은 받는다  3) 픽셀 수·스캔 수 상한  4) 실제 디코드(1/8 흑백, 동시 실행 제한)
 상한(환경변수로 바꿈, 기본값 근거):
-  UPLOAD_MAX_MB     파일 하나 20MB → 413. 600dpi 컬러 A3 스캔 JPEG(품질 90 안팎)도 10~15MB라 여유가 있다
-  UPLOAD_MAX_FILES  요청 하나 50장 → 400. 바이트가 아니라 요청 모양의 규칙이라 413(본문 크기)이 아니라 400.
-                    화면(UploadPanel)은 10장씩 나눠 보낸다
-  UPLOAD_MAX_MPX    픽셀 수 100MP → 400 (압축 폭탄). A3 600dpi = 7016×9921 ≈ 70MP에 약 40% 여유.
-                    컬러로 펼치면 약 300MB — OCR 단계(ocr.read_image)가 실제로 펼치는 크기의 상한이기도 하다
-  UPLOAD_TMP_MB     동시에 받는 업로드 본문 합계 1536MB → 429. Starlette가 1MB 넘는 파일 조각을 /tmp에 흘려 쓰는데
-                    k8s의 /tmp는 emptyDir 2Gi(넘으면 파드를 내쫓음) — 상한 크기 요청 하나(약 1GB)는 늘 들어가고 둘은 안 든다
-본문 상한: 요청 본문은 처리 함수보다 먼저(로그인 확인보다도 먼저) /tmp로 읽힌다 → BodyCap이 Content-Length를 먼저 보고
-  (파일 수 × 파일 상한 + 1MB) 넘으면 413, 없으면 411, 읽는 동안 선언보다 많이 오면 400으로 끊는다.
+  UPLOAD_MAX_MB      파일 하나 20MB → 413. 600dpi 컬러 A3 스캔 JPEG(품질 90 안팎)도 10~15MB라 여유가 있다
+  UPLOAD_MAX_FILES   요청 하나 50장 → 400. 바이트가 아니라 요청 모양의 규칙이라 413(본문 크기)이 아니라 400
+                     (바이트는 아래 본문 상한이 413). 쪽 한 장이 1MB 안팎이면 50장도 본문 상한 안에 든다
+  UPLOAD_MAX_BODY_MB 요청 본문 210MB → 413. 화면(UploadPanel)이 한 요청에 10장씩 보낸다 → 10 × 20MB + 여유 10MB
+  UPLOAD_MAX_MPX     픽셀 수 100MP → 400 (압축 폭탄). A3 600dpi = 7016×9921 ≈ 70MP에 약 40% 여유.
+                     컬러로 펼치면 약 300MB — OCR 단계(ocr.read_image)가 실제로 펼치는 크기의 상한이기도 하다
+  UPLOAD_MAX_SCANS   스캔(SOS) 64개 → 400 (스캔 폭탄: 프로그레시브 JPEG는 스캔마다 쪽 전체를 다시 훑는다 — 작은 파일에
+                     스캔 수천 개면 디코드가 수 분). 보통 프로그레시브는 10개 안팎. 이 PC 실측: 100MP 프로그레시브 6스캔
+                     0.35초, 64스캔 4.4초, 300스캔 17.9초 (2026-11-09)
+  UPLOAD_DECODE_SLOTS 동시에 디코드 검사하는 파일 2개. 프로그레시브는 계수 버퍼를 통째로 잡아 100MP면 약 570MB —
+                     둘이면 약 1.1GB로 docflow 메모리 상한(5Gi) 안. 프로그레시브 픽셀 상한을 따로 낮추지는 않았다
+                     (스캔 소프트웨어가 프로그레시브로 내보낸 A3 600dpi도 받아야 하고, 메모리는 이 슬롯이 묶는다)
+  UPLOAD_TMP_MB      동시에 받는 업로드 본문 합계 1536MB → 429. Starlette가 1MB 넘는 파일 조각을 /tmp에 흘려 쓰는데
+                     k8s의 /tmp는 emptyDir 2Gi(넘으면 파드를 내쫓음)
+본문 읽기: 처리 함수가 로그인·역할·CSRF 확인 뒤에 직접 읽는다(main.upload) → 로그인 안 한 요청은 본문을 /tmp에 쓰지 않는다.
+  BodyCap은 실제 받은 바이트를 세며 본문 상한·/tmp 예산에서 끊는다 (Content-Length가 없어도 — 프록시가 chunked로 바꿀 수 있다).
 """
 import os
+import re
 import tempfile
+import threading
 
 import cv2
 import numpy as np
@@ -23,23 +33,27 @@ from fastapi import HTTPException
 MB = 1024 * 1024
 MAX_BYTES = int(float(os.environ.get("UPLOAD_MAX_MB", "20")) * MB)
 MAX_FILES = int(os.environ.get("UPLOAD_MAX_FILES", "50"))
+MAX_BODY = int(float(os.environ.get("UPLOAD_MAX_BODY_MB", "210")) * MB)
 MAX_PIXELS = int(float(os.environ.get("UPLOAD_MAX_MPX", "100")) * 1_000_000)
+MAX_SCANS = int(os.environ.get("UPLOAD_MAX_SCANS", "64"))
+DECODE_SLOTS = threading.BoundedSemaphore(int(os.environ.get("UPLOAD_DECODE_SLOTS", "2")))
 TMP_BUDGET = int(float(os.environ.get("UPLOAD_TMP_MB", "1536")) * MB)
 JPEG_MAGIC = b"\xff\xd8\xff"
 CHUNK = MB
+# 쪽 파일 이름 규칙 (여기 한 곳): 글자·숫자·_ . - 로 된 1~96자 + .jpg (\w는 한글도 받는다)
+PAGE_RX = re.compile(r"[\w.-]{1,96}\.jpg")
+PAGE_RULE = "글자·숫자·_ . - 1~96자 + .jpg"
 # 프레임 시작(SOF) 표지 — 크기가 여기 있다. C4(허프만 표)·C8(예약)·CC(산술 조건)는 SOF가 아니다
-SOF = {m for m in range(0xC0, 0xD0)} - {0xC4, 0xC8, 0xCC}
-
-
-def body_cap():
-    """한 요청 본문 상한: 파일 상한 × 개수 상한 + 1MB(조각 머리·경계 문자열)"""
-    return MAX_FILES * MAX_BYTES + MB
+SOF = set(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+# 스캔의 압축 데이터 다음 표지: FF(+채움 FF) 뒤 00(바이트 채움)·D0~D7(RST, 스캔 안)이 아닌 것
+SCAN_END = re.compile(rb"\xff+[^\x00\xd0-\xd7\xff]")
 
 
 class BodyCap:
-    """업로드 경로의 요청 본문을 처리 함수 앞에서 묶는다 (순수 ASGI — 본문 읽기(receive)만 감싼다).
-    거절은 처음 receive에서 HTTPException으로 낸다 → FastAPI 예외 처리기·보안 헤더를 그대로 탄다.
-    reserved: 지금 받고 있는 업로드 본문의 선언 크기 합 (한 프로세스 안, 이벤트 루프 하나라 잠금이 필요 없다)"""
+    """업로드 경로의 요청 본문을 받은 바이트로 묶는다 (순수 ASGI — 본문 읽기(receive)만 감싼다).
+    Content-Length가 상한을 넘으면 처음 읽을 때 바로 413. 없거나 거짓이어도 실제 받은 바이트가 상한을 넘는 순간 413.
+    reserved: 지금 받고 있는 업로드 본문의 합 (한 프로세스 안, 이벤트 루프 하나라 잠금이 필요 없다) — /tmp 예산을 넘으면 429.
+    거절은 receive 안에서 HTTPException으로 낸다 → 본문을 읽는 처리 함수(main.upload)의 감사·예외 처리기를 그대로 탄다"""
     reserved = 0
 
     def __init__(self, app, match):
@@ -50,24 +64,23 @@ class BodyCap:
         if scope["type"] != "http" or not self.match(scope["method"], scope["path"]):
             return await self.app(scope, receive, send)
         raw = dict(scope["headers"]).get(b"content-length")
-        state = {"seen": 0, "held": 0}
+        state = {"first": True, "seen": 0, "held": 0}
 
         async def capped():
-            if state["seen"] == 0 and not state["held"]:
-                if raw is None or not raw.isdigit():
-                    raise HTTPException(411, "Content-Length 필요")
-                size = int(raw)
-                if size > body_cap():
-                    raise HTTPException(413, f"요청이 너무 큼 (상한 {body_cap() // MB}MB)")
-                if BodyCap.reserved + size > TMP_BUDGET:
-                    raise HTTPException(429, "다른 업로드를 받는 중 — 잠시 뒤 다시")
-                BodyCap.reserved += size
-                state["held"] = size
+            if state["first"]:
+                state["first"] = False
+                if raw is not None and raw.isdigit() and int(raw) > MAX_BODY:
+                    raise HTTPException(413, f"요청이 너무 큼 (상한 {MAX_BODY // MB}MB)")
             msg = await receive()
             if msg["type"] == "http.request":
-                state["seen"] += len(msg.get("body", b""))
-                if state["seen"] > state["held"]:
-                    raise HTTPException(400, "본문이 Content-Length보다 김")
+                n = len(msg.get("body", b""))
+                state["seen"] += n
+                if state["seen"] > MAX_BODY:
+                    raise HTTPException(413, f"요청이 너무 큼 (상한 {MAX_BODY // MB}MB)")
+                if BodyCap.reserved + n > TMP_BUDGET:
+                    raise HTTPException(429, "다른 업로드를 받는 중 — 잠시 뒤 다시")
+                BodyCap.reserved += n
+                state["held"] += n
             return msg
 
         try:
@@ -76,60 +89,77 @@ class BodyCap:
             BodyCap.reserved -= state["held"]
 
 
-def jpeg_dims(path):
-    """JPEG 머리에서 (너비, 높이)를 읽는다 — 이미지를 펼치지 않고. JPEG 구조가 아니거나 SOF가 없으면 None.
-    APP 조각(EXIF 썸네일 등)은 길이만큼 건너뛰므로 안에 든 다른 JPEG의 SOF를 잘못 읽지 않는다"""
-    with open(path, "rb") as f:
-        if f.read(2) != b"\xff\xd8":
+def jpeg_info(data):
+    """JPEG 표지를 SOI부터 첫 EOI까지 걷는다 — 이미지를 펼치지 않고. {w, h, scans, progressive} 또는 None
+    (JPEG 구조가 아님·SOF 없음·EOI 전에 끝남 = 잘린 파일). 스캔이 MAX_SCANS를 넘으면 거기서 멈추고 scans = MAX_SCANS + 1.
+    APP 조각(EXIF 썸네일 등)은 길이만큼 건너뛰므로 안에 든 다른 JPEG의 표지를 잘못 읽지 않는다. EOI 뒤는 보지 않는다"""
+    n = len(data)
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    i, info = 2, {"w": 0, "h": 0, "scans": 0, "progressive": False}
+    while True:
+        if i >= n or data[i] != 0xFF:
+            return None  # 표지 자리에 다른 바이트 — 깨진 구조, 또는 EOI 없이 끝남
+        while i < n and data[i] == 0xFF:  # 채움 바이트
+            i += 1
+        if i >= n:
             return None
-        while True:
-            b = f.read(1)
-            if not b:
-                return None
-            if b != b"\xff":
-                return None  # 표지 사이에 다른 바이트 — 깨진 구조
-            m = f.read(1)
-            while m == b"\xff":  # 채움 바이트
-                m = f.read(1)
-            if not m:
-                return None
-            m = m[0]
-            if m == 0x01 or 0xD0 <= m <= 0xD8:  # 길이 없는 표지
-                continue
-            if m in (0xD9, 0xDA):  # 끝(EOI)·스캔 시작(SOS)이 SOF보다 먼저
-                return None
-            ln = f.read(2)
-            if len(ln) < 2 or int.from_bytes(ln, "big") < 2:
-                return None
-            n = int.from_bytes(ln, "big") - 2
-            if m in SOF:
-                seg = f.read(5)
-                if len(seg) < 5:
-                    return None
-                h, w = int.from_bytes(seg[1:3], "big"), int.from_bytes(seg[3:5], "big")
-                return (w, h) if w and h else None  # 높이 0(DNL로 뒤에서 정함)은 받지 않는다
-            f.seek(n, os.SEEK_CUR)
+        m = data[i]
+        i += 1
+        if m == 0xD9:  # EOI
+            return info if info["w"] and info["h"] and info["scans"] else None
+        if m == 0x01 or 0xD0 <= m <= 0xD8:  # 길이 없는 표지
+            continue
+        if i + 2 > n:
+            return None
+        ln = int.from_bytes(data[i:i + 2], "big")
+        if ln < 2 or i + ln > n:
+            return None
+        if m in SOF:
+            if ln < 7 or info["w"]:
+                return None  # 짧은 SOF, 프레임 두 개
+            info["h"], info["w"] = int.from_bytes(data[i + 3:i + 5], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+            info["progressive"] = m in (0xC2, 0xC6, 0xCA, 0xCE)
+            if not info["w"] or not info["h"]:
+                return None  # 높이 0(DNL로 뒤에서 정함)은 받지 않는다
+        i += ln
+        if m == 0xDA:
+            if not info["w"]:
+                return None  # SOF보다 먼저 온 스캔
+            info["scans"] += 1
+            if info["scans"] > MAX_SCANS:
+                return info
+            end = SCAN_END.search(data, i)
+            if not end:
+                return None  # 압축 데이터 중간에서 끝남 (잘린 파일)
+            i = end.start()
 
 
-def ends_jpeg(path):
-    """끝(EOI, FFD9)으로 끝나는가 — 뒤에 붙은 0 채움은 허용. OpenCV(libjpeg)는 중간에 잘린 파일도 남은 곳을 회색으로 채워
-    '펼쳐짐'으로 돌려주므로(경고만 낸다), 전송 중 잘린 스캔이 반쪽 이미지로 OCR되지 않게 여기서 막는다"""
-    with open(path, "rb") as f:
-        f.seek(max(0, os.path.getsize(path) - 64))
-        return f.read().rstrip(b"\x00").endswith(b"\xff\xd9")
-
-
-def decodes(path):
-    """실제로 펼쳐지는가. 1/8 크기 흑백으로 펼친다(libjpeg DCT 축소) — 압축 데이터는 끝까지 읽으면서 메모리는 1/192.
+def decodes(data):
+    """실제로 펼쳐지는가. 1/8 크기 흑백으로 펼친다(libjpeg DCT 축소) — 압축 데이터는 끝까지 읽으면서 출력 메모리는 1/192.
     양자화 표가 없거나 프레임이 깨진 파일은 None (허프만 표가 없으면 libjpeg가 표준 표를 쓴다).
-    잘린 스캔 데이터는 libjpeg가 경고만 내므로 ends_jpeg가 따로 본다"""
-    img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_REDUCED_GRAYSCALE_8)
+    스캔 데이터 중간의 손상은 libjpeg가 경고만 내고 회색으로 채워 통과할 수 있다 (끝 잘림은 jpeg_info가 막는다)"""
+    with DECODE_SLOTS:
+        img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_REDUCED_GRAYSCALE_8)
     return img is not None and img.size > 0
+
+
+def check(data, label):
+    """다 받은 파일 바이트를 검사한다. 틀리면 HTTPException(400). label: 오류 문구에 넣을 이름(규칙을 통과한 이름만)"""
+    info = jpeg_info(data)
+    if info is None:
+        raise HTTPException(400, f"JPEG가 아님 (구조가 깨졌거나 끝이 잘림): {label}")
+    if info["w"] * info["h"] > MAX_PIXELS:
+        raise HTTPException(400, f"픽셀 수가 너무 많음 (상한 {MAX_PIXELS // 1_000_000}MP): {label}")
+    if info["scans"] > MAX_SCANS:
+        raise HTTPException(400, f"스캔이 너무 많음 (상한 {MAX_SCANS}): {label}")
+    if not decodes(data):
+        raise HTTPException(400, f"이미지를 펼칠 수 없음: {label}")
 
 
 def spool(src, folder, name, label):
     """올린 파일 하나를 folder 안 임시 파일(.<name>.*.part — *.jpg 목록에 안 잡힘)에 조각 단위로 쓰고 검사한다.
-    folder는 최종 위치와 같은 파일 시스템(쪽 폴더) → 검사 뒤 옮기기는 원자적 이름 바꾸기·링크다.
+    folder는 최종 위치와 같은 파일 시스템(쪽 폴더) → 검사 뒤 옮기기는 원자적 링크·이름 바꾸기다.
     검사에 떨어지면 임시 파일을 지우고 HTTPException. 통과하면 임시 파일 경로.
     label: 오류 문구에 넣을 이름 (이름 규칙을 통과한 이름만 — 파일 내용은 넣지 않는다)"""
     os.makedirs(folder, exist_ok=True)
@@ -144,15 +174,10 @@ def spool(src, folder, name, label):
                 if size > MAX_BYTES:
                     raise HTTPException(413, f"파일이 너무 큼 (상한 {MAX_BYTES // MB}MB): {label}")
                 out.write(chunk)
-        if size < len(JPEG_MAGIC) or not ends_jpeg(tmp):
+        if size < len(JPEG_MAGIC):
             raise HTTPException(400, f"JPEG가 아님: {label}")
-        dims = jpeg_dims(tmp)
-        if dims is None:
-            raise HTTPException(400, f"JPEG가 아님: {label}")
-        if dims[0] * dims[1] > MAX_PIXELS:
-            raise HTTPException(400, f"픽셀 수가 너무 많음 (상한 {MAX_PIXELS // 1_000_000}MP): {label}")
-        if not decodes(tmp):
-            raise HTTPException(400, f"이미지를 펼칠 수 없음: {label}")
+        with open(tmp, "rb") as f:
+            check(f.read(), label)  # MAX_BYTES 안이라 한 번에 읽는다
         return tmp
     except BaseException:
         os.unlink(tmp)

@@ -232,7 +232,7 @@ spec:
       - {name: data, persistentVolumeClaim: {claimName: docflow-data}}
       - {name: openai, secret: {secretName: openai, optional: true}}
       # 업로드 임시 파일(Starlette가 1MB 넘는 파일 조각을 /tmp에 흘려 씀). 넘으면 kubelet이 docflow 파드를 내쫓는다 →
-      # 앱이 동시에 받는 업로드 본문 합계를 UPLOAD_TMP_MB(기본 1536MB)로, 요청 하나를 50장×20MB+1MB로 묶는다 (app/upload.py, https://github.com/reddol18/docflow/issues/26)
+      # 앱이 동시에 받는 업로드 본문 합계를 UPLOAD_TMP_MB(기본 1536MB)로, 요청 본문 하나를 UPLOAD_MAX_BODY_MB(기본 210MB)로 묶는다 (app/upload.py, https://github.com/reddol18/docflow/issues/26)
       - {name: tmp, emptyDir: {sizeLimit: 2Gi}}
       - {name: pdx-temp, emptyDir: {sizeLimit: 256Mi}}
       - {name: pdx-locks, emptyDir: {sizeLimit: 1Mi}}
