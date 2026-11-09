@@ -20,7 +20,7 @@
     늦게 #M     나중 PR의 **제목**에 "PR #N"이 있고(예: "PR #38 버그 리뷰 반영") 그 PR에 그 리뷰 흔적이 있음.
                 분모에 넣고 제때 한 것과 따로 센다. 늦은 리뷰를 하면 제목을 이렇게 단다
     규칙 전     절차(템플릿·`scripts/check.ps1`)가 생긴 PR #30 병합 전에 열고, 그 뒤 하루 안에 병합한 PR (분모에서 뺌)
-    코드 없음   `docs/`·README·잠금 파일·의존성 목록만 바꾼 PR → 계약·버그 리뷰는 볼 것이 없다 (분모에서 뺌)
+    코드 없음   `docs/`·README·잠금 파일(requirements 제외)만 바꾼 PR → 계약·버그 리뷰는 볼 것이 없다 (분모에서 뺌)
 - 속도·품질·리뷰·계약 (표의 '어떻게 셌나' 칸): 이슈 시작→병합→배포 시간, 변경 실패율, 재작업률, 다시 열린 이슈,
   리뷰 지적 처리, 리뷰 뒤 버그, 완료 조건 충족률, 범위 변경 비율, 첫 로컬 검사 통과율. AI 비용은 집계 수단이 없어 –
   글에서 읽는 지표는 PR 템플릿·리뷰 댓글 형식('완료 조건별 결과' 표, '지적·반영' 표)을 따를 때만 잡힌다
@@ -54,7 +54,8 @@ RULES_SINCE = dt.datetime(2026, 11, 3, 23, 34, 20, tzinfo=dt.timezone.utc)  # PR
 RULES_GRACE = dt.timedelta(days=1)  # 규칙 전에 연 PR이라도 이보다 늦게 병합하면 규칙을 따른다
 REVIEWS = ("계약 리뷰", "버그 리뷰")  # 코드가 없으면 볼 것이 없는 리뷰
 # 절차를 바꾸는 .md(템플릿·에이전트·스킬)는 코드로 본다 → docs/와 README만
-NON_CODE = re.compile(r"^docs/|(^|/)README\.md$|\.lock$|(^|/)requirements[^/]*\.txt$|(^|/)package-lock\.json$|^\.gitattributes$")
+# requirements*.txt·requirements.lock은 코드로 본다: 이미지가 그대로 설치한다 (https://github.com/reddol18/docflow/issues/33)
+NON_CODE = re.compile(r"^docs/|(^|/)README\.md$|(^|/)(?!requirements\.lock$)[^/]*\.lock$|(^|/)package-lock\.json$|^\.gitattributes$")
 REWORK_DAYS = dt.timedelta(days=7)  # 재작업: 병합 뒤 이 안에 같은 코드 파일을 다른 PR이 고침
 FILES_CAP = 100  # gh pr view --json files 상한: 이만큼이면 잘렸을 수 있으니 코드 있음으로 본다
 
@@ -140,7 +141,8 @@ def issue_refs(title, body, closing):
 
 
 def is_no_code(files):
-    """`docs/`·README·잠금 파일·의존성 목록만 바꾼 PR (계약·버그 리뷰는 볼 것이 없다). 목록이 상한이면 잘렸을 수 있어 코드로 본다"""
+    """`docs/`·README·잠금 파일(requirements 제외 — 이미지 입력)만 바꾼 PR (계약·버그 리뷰는 볼 것이 없다).
+    목록이 상한이면 잘렸을 수 있어 코드로 본다"""
     return 0 < len(files) < FILES_CAP and all(NON_CODE.search(f) for f in files)
 
 

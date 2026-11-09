@@ -1,7 +1,7 @@
 # 맥·컨테이너에서 실행하는 셸 스크립트는 Windows에서 체크아웃해도 LF로 둔다 (CRLF면 sh가 "set: -: invalid option")
 *.sh text eol=lf
 Dockerfile text eol=lf
-# 맥에서 받아 오는 잠금 파일: 줄바꿈 차이로 deploy.ps1이 '바뀜' 경고를 내지 않게
+# 잠금 파일(scripts/lock_hashes.py가 LF로 씀): 체크아웃 줄바꿈이 바뀌어 diff가 생기지 않게
 requirements.lock text eol=lf
 # 평가 세트 diff: CRLF로 바뀌면 git apply가 깨진다
 evals/**/*.patch text eol=lf
