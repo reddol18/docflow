@@ -67,6 +67,32 @@ def test_cells_never_become_formulas():
     wb = load_workbook(io.BytesIO(export.to_xlsx(sheets)))
     cell = wb.worksheets[1].cell(row=2, column=6)
     assert cell.data_type == "s" and cell.value == "=HYPERLINK(\"http://example.invalid\")"  # 제어 문자는 빠짐
+    assert cell.quotePrefix  # 받은 사람이 칸을 고쳐도 수식이 되지 않게 (https://github.com/reddol18/docflow/issues/88)
+    assert not wb.worksheets[1].cell(row=2, column=3).quotePrefix  # 보통 글자 칸은 그대로
+
+
+def test_write_only_output_same_as_cell_by_cell():
+    """to_xlsx를 쓰기 전용 모드로 바꿔도 납품 엑셀의 값·형식(글자/숫자)이 칸마다 예전 방식(칸 하나씩 쓰기)과 같다"""
+    from openpyxl import Workbook
+    pages = ["p01", "p02", "p03"]
+    sheets, _ = export.build(T, [("1234567-1995-0001", pages, [doc("p01", ["p01", "p02"], title="+가상"),
+                                                              doc("p03", ["p03"], date="", docno="-1")])])
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, rows in sheets.items():
+        ws = wb.create_sheet(title)
+        for r, row in enumerate(rows, 1):
+            for c, v in enumerate(row, 1):
+                ws.cell(row=r, column=c).value = v
+                if isinstance(v, str):
+                    ws.cell(row=r, column=c).data_type = "s"
+    old = io.BytesIO()
+    wb.save(old)
+
+    def cells(body):
+        wb = load_workbook(io.BytesIO(body))
+        return [(ws.title, [(c.value, c.data_type) for row in ws.iter_rows() for c in row]) for ws in wb.worksheets]
+    assert cells(export.to_xlsx(sheets)) == cells(old.getvalue())
 
 
 @pytest.mark.parametrize("bad, msg", [

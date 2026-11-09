@@ -115,13 +115,13 @@ def test_error_list_matches_history(main, monkeypatch):
     assert by["시행일자"]["오류 내용"] == "검수 수정 · 품질관리자"
     final = [s for s in stages if s["stage"] in ("qc", "supervisor")][-2:]
     assert [(s["stage"], s["action"], s["round"]) for s in final] == [("qc", "approve", 2), ("supervisor", "approve", 2)]
-    assert by["시행일자"]["재검수 판정"] == "품질관리자: 합격 (검수 수정) (2차) · 감독관: 합격 (2차)"
-    assert by["수신"]["재검수 판정"] == "품질관리자: 합격 (2차) · 감독관: 합격 (2차)"
+    assert by["시행일자"]["재검수 판정"] == "품질관리자: 합격 (검수 수정) (2차) · 감독관: 합격"
+    assert by["수신"]["재검수 판정"] == "품질관리자: 합격 (2차) · 감독관: 합격"
     # 제목은 1차에 고쳤고 그 뒤 반려(1차)·합격(2차) — 마지막 판정만
-    assert by["제목"]["재검수 판정"] == "품질관리자: 합격 (2차) · 감독관: 합격 (2차)"
+    assert by["제목"]["재검수 판정"] == "품질관리자: 합격 (2차) · 감독관: 합격"
     d3 = rows[-1]
     assert (d3["오류 내용"], d3["조치"], d3["담당자"] or "", d3["재검수 판정"]) == (
-        "반려 · 품질관리자: 가상 사유: 쪽 누락", "미조치", "", "품질관리자: 재검수 전")  # 반려 자체는 재검수가 아니다
+        "반려 · 품질관리자: 가상 사유: 쪽 누락", "미조치", "", "품질관리자: 불합격(반려)")
 
     # 담당자: 기본은 가린 ID — 사용자 id·로그인 이름·표시 이름이 파일에 없다. 같은 사람은 같은 값
     actors = {x["칸"]: x["담당자"] for x in rows[:3]}
@@ -156,6 +156,24 @@ def test_error_list_matches_history(main, monkeypatch):
     assert not store.last_export("v1")  # 납품 출력 기록(일괄 삭제 근거)은 남기지 않는다
 
 
+def test_all_volumes_capped_and_one_at_a_time(main, monkeypatch, tmp_path):
+    c = TestClient(main.app)
+    (tmp_path / "pages" / "v1").mkdir(parents=True)
+    monkeypatch.setattr(main, "EXPORT_VOLS_MAX", 0)
+    r = c.get("/export/errors.xlsx", headers=h("s"))  # 철을 안 고르면 끝난 철 전부 — 그때도 철 수 상한
+    assert r.status_code == 400 and "vol" in r.json()["detail"]
+    monkeypatch.setattr(main, "EXPORT_VOLS_MAX", 200)
+    assert c.get("/export/errors.xlsx", headers=h("s")).status_code == 200
+    assert main._error_list_busy.acquire(blocking=False)
+    try:
+        assert c.get("/export/errors.xlsx?vol=v1", headers=h("s")).status_code == 409  # 만드는 중이면 바로 409
+    finally:
+        main._error_list_busy.release()
+    with store.pool.connection() as cn:
+        got = [x["result"] for x in cn.execute("SELECT result FROM audit WHERE action = 'error_list_request' ORDER BY id")]
+    assert got == ["rejected_400", "ok", "rejected_409"]
+
+
 def test_unfinished_volume_refused(main, monkeypatch):
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: SimpleNamespace(
         next=("review",), interrupts=[1], values={"docs": []})))
@@ -168,5 +186,5 @@ def test_since_filter_uses_generation_start(main):
     store.reset_stages("v1")
     store.add_edits("v1", [("d01", "title", "나", "다")], 2, "edit")
     got = store.gen_edits("v1")
-    assert [(e["old"], e["new"], e["user_name"]) for e in got] == [("나", "다", "가상 사용자 w")]
+    assert [(e["old"], e["new"], e["name"]) for e in got] == [("나", "다", "가상 사용자 w")]
     assert isinstance(got[0]["ts"], dt.datetime)

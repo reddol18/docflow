@@ -195,20 +195,23 @@ def to_xlsx(sheets):
     """모든 글자 칸을 문자열 형식으로 쓴다 — '='·'+'·'-'·'@'로 시작하는 값이 엑셀에서 수식으로 실행되지 않게
     (openpyxl은 '='로 시작하는 문자열을 수식으로 저장한다). 숫자 열(int)만 숫자로.
     그런 글자로 시작하는 칸은 따옴표 접두(quotePrefix)도 켠다 — 받은 사람이 칸을 열어 고치고 Enter를 쳐도 수식이 되지 않게
-    (값은 그대로, https://github.com/reddol18/docflow/issues/88)"""
+    (값은 그대로, https://github.com/reddol18/docflow/issues/88). 쓰기 전용(write_only) 통으로 행을 흘려 쓴다 —
+    큰 오류목록에서 칸 객체를 모두 메모리에 들고 있지 않게"""
     from openpyxl import Workbook
-    wb = Workbook()
-    wb.remove(wb.active)
+    from openpyxl.cell import WriteOnlyCell
+    wb = Workbook(write_only=True)
     for title, rows in sheets.items():
         ws = wb.create_sheet(title)
-        for r, row in enumerate(rows, 1):
-            for c, v in enumerate(row, 1):
-                cell = ws.cell(row=r, column=c)
-                cell.value = v
+        for row in rows:
+            out = []
+            for v in row:
+                cell = WriteOnlyCell(ws, value=v)
                 if isinstance(v, str):
                     cell.data_type = "s"
                     if v.startswith(FORMULA_LEAD):
                         cell.quotePrefix = True
+                out.append(cell)
+            ws.append(out)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

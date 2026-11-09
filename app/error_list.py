@@ -4,35 +4,37 @@
   - 문서의 지금 검토 표시 (documents.flags — 확신도·김해 규칙·기계 검수)
   - 수정 이력 edits (칸·이전 값·새 값·사용자·시각·단계 source) — 지금 실행 세대(stage_gen.since 뒤)만
   - 단계 승인·반려 기록 stage_log — 지금 세대(gen)만 (https://github.com/reddol18/docflow/issues/86)
-  - 칸 검증 규칙 (app/field_rules) — 고치기 전 값을 다시 검사해, 고쳐서 지금은 사라진 기계 검수 위반도 찾는다
+  - 칸 검증 규칙 (app/field_rules) — 고치기 전 값을 '지금 스키마 규칙'으로 다시 검사해, 고쳐서 사라진 위반도 찾는다
 
-행 하나 = 오류 하나. 오류는 (문서, 칸)마다 모은다 — 그 칸에 다음 중 하나라도 있으면 오류 행:
-  표시      지금 검토 표시가 붙어 있다 (기계 검수 사유는 '규칙')
-  규칙      처음 고치기 전 값이 칸 검증 규칙을 어겼다 (철 안 중복은 그 시각 다른 문서 값과 비교)
-  반려      검수 단계가 반려한 뒤 다음 단계 기록 전까지 고친 칸 (반려 사유)
-  검수 수정  검수 단계(표본 검사·설정 흐름 검수)에서 고친 칸 — 위 이유가 하나도 없을 때만
-그 밖의 입력 단계 수정(표시도 규칙 위반도 반려도 없는 칸)은 오류가 아니라 입력 작업이라 넣지 않는다.
-반려했는데 그 뒤 고친 칸이 없으면 문서 전체 행('(문서)') 하나.
+행 하나 = 실제 오류 하나 (사용자 결정 2026-11-09: 표시만 붙고 사람이 고치지 않은 칸은 오류가 아니다).
+(문서, 칸)마다 다음 중 하나면 오류 행:
+  (가) 고친 칸 — 그 칸에 검토 표시가 있거나 처음 고치기 전 값이 칸 검증 규칙을 어겼을 때 (입력 단계 수정이라도)
+  (나) 반려 뒤 다음 단계 기록 전까지 고친 칸. 반려 뒤 고친 칸이 없으면 문서 전체 행('(문서)') 하나
+  (다) 검수 단계(표본 검사·설정 흐름 검수)에서 고친 칸
+  (라) 지금도 남은 기계 검수 위반 — 고치지 않았으면 조치 '미조치'
+오류 내용은 그 칸의 표시 사유·규칙 위반·반려 사유를 ' / '로 잇는다 (이유가 없는 (다)는 '검수 수정 · 단계').
+표시(확신도 등)만 있고 수정이 없는 칸, 표시도 규칙 위반도 반려도 없는 입력 단계 수정은 넣지 않는다.
 
 같은 (문서, 칸)의 수정은 한 행으로 묶는다: 수정 전 값 = 첫 수정의 이전 값, 수정 후 값 = 마지막 수정의 새 값,
-담당자·조치일 = 마지막 수정. 재검수 판정 = 조치 뒤(마지막 수정 시각보다 늦은) 검수 단계마다 마지막 판정 —
-설정 흐름의 입력 다음 단계들 순서로 '단계 표시명: 합격 / 합격 (검수 수정) / 불합격(반려)', 재검수 차례면 '(2차)'.
-조치 뒤 판정이 아직 없는 단계는 '재검수 전', 판정이 하나도 없으면 '미판정'(표본 검사 목록 밖이면 '검사 제외').
+담당자·조치일 = 마지막 수정. 재검수 판정 = 검수 단계마다(흐름 순서) 그 문서의 마지막 판정:
+  합격 / 합격 (검수 수정)(그 단계가 이 칸을 고쳤다 — 지금 세대 수정 이력 기준) / 불합격(반려)
+  재검수 전 — 그 단계가 승인한 뒤 뒤 단계의 반려로 그 단계 앞까지 되돌아가 아직 다시 보지 않음
+  그 단계의 판정이 여러 번이면 '(N차)' (그 단계 판정 횟수). 판정이 하나도 없으면 '미판정'(표본 검사 목록 밖은 '검사 제외')
 
 이 모듈은 DB를 부르지 않는다 (순수 함수) — 값은 app/main.py가 store에서 읽어 넘긴다.
 """
-import datetime as dt
 import hashlib
 import hmac
 import os
+from collections import Counter
 from pathlib import Path
 
 import yaml
 
-from app import export, field_rules, fields
+from app import export, field_rules, fields, workflow
+from app.store import KST, stage_of_source
 
 DEFAULT_TEMPLATE = Path(__file__).parent / "export_templates" / "error_list.yaml"
-KST = dt.timezone(dt.timedelta(hours=9))
 ACTORS = ("masked", "name")  # 담당자 칸: 가린 ID(기본) | 표시 이름
 TOP_KEYS = {"name", "actor", "sheet"}
 SOURCES = {"vol", "doc.seq", "doc.id", "doc.first_page", "doc.last_page", "field.name", "field.label",
@@ -67,72 +69,85 @@ def load_template(path=None):
 
 # ---------- 오류 모으기 ----------
 
-def _stage_labels(wf):
-    labels = {s["name"]: s["label"] for s in wf["stages"]}
-    sample = next((s for s in wf["stages"] if s["select"] == "sample"), None)
-    labels.setdefault("inspect", sample["label"] if sample else "표본 검사")  # 이력 source 'inspect' = 표본 검사 단계
-    return labels
-
-
-def _review_stage(source):
-    """검수 단계에서 고친 수정이면 그 단계 이름 (inspect·stage:<단계>), 입력 단계 수정이면 None"""
-    if source == "inspect":
-        return "inspect"
-    if source.startswith("stage:"):
-        return source[len("stage:"):]
-    return None
+def _edit_stage(wf, source):
+    """수정 이력 source → 흐름의 단계 이름 (store.stage_of_source 하나로 판단). 'inspect'는 흐름의 표본 단계.
+    입력 단계 수정이면 None"""
+    st = stage_of_source(source)
+    if st == "entry":
+        return None
+    if st == "inspect":
+        sample = workflow.sample_stage(wf)
+        return sample["name"] if sample else st
+    return st
 
 
 def _date(ts):
     return ts.astimezone(KST).date().isoformat() if ts is not None else ""
 
 
-def _verdict(wf, labels, logs, since, field, status):
-    """조치(since 시각) 뒤 검수 단계마다 마지막 판정. since가 None이면 조치가 없음 — 마지막 판정 그대로"""
+def _verdict(wf, logs, fixed_at, field, status):
+    """검수 단계마다 마지막 판정. fixed_at = {(칸, 단계)} 그 단계가 고친 칸 (지금 세대 수정 이력).
+    승인 뒤에 뒤 단계가 반려해 그 단계 앞으로 되돌아갔으면(아직 다시 안 봄) '재검수 전'"""
+    idx = {s["name"]: s["index"] for s in wf["stages"]}
+    rejects = [x for x in logs if x["action"] == "reject"]
     parts = []
     for st in wf["stages"][1:]:
-        last = None
-        for x in logs:
-            if x["stage"] == st["name"] and x["action"] in ("approve", "reject"):
-                last = x
-        if last is None:
+        ds = [x for x in logs if x["stage"] == st["name"] and x["action"] in ("approve", "reject")]
+        if not ds:
             continue
-        if since is not None and last["ts"] <= since:
+        last = ds[-1]
+        if last["action"] == "reject":
+            word = "불합격(반려)"
+        elif any(r["id"] > last["id"] and idx.get(r["to_stage"], -1) < st["index"] for r in rejects):
             parts.append(f"{st['label']}: 재검수 전")
             continue
-        if last["action"] == "approve":
-            word = "합격 (검수 수정)" if field and field in (last.get("fixed_fields") or ()) else "합격"
         else:
-            word = "불합격(반려)"
-        if last["round"] > 1:
-            word += f" ({last['round']}차)"
+            word = "합격 (검수 수정)" if field and (field, st["name"]) in fixed_at else "합격"
+        if len(ds) > 1:
+            word += f" ({len(ds)}차)"
         parts.append(f"{st['label']}: {word}")
     if not parts:
         return "검사 제외" if status == "excluded" else "미판정"
     return " · ".join(parts)
 
 
-def _value_at(by_field, cur, field, ts):
-    """칸 값의 그 시각 바로 전 모습: ts 이후 첫 수정의 이전 값, 없으면 지금 값. 같은 시각(한 번에 제출한 검토)도 이전 값"""
-    for e in by_field.get(field, ()):
-        if e["ts"] >= ts:
-            return e["old"] or ""
-    return cur or ""
+class _Timeline:
+    """칸 하나의 문서별 '그 시각 바로 전 값' 색인 — 철 안 중복 다시 보기용. 지금 값 개수(Counter)를 한 번 만들고,
+    그 칸을 고친 문서만 시각에 맞춰 바꿔 센다 (고친 문서 수² — 문서 수×문서 수가 아니다)"""
+
+    def __init__(self, docs, ed, name):
+        self.cur = {d["doc_id"]: str((d.get("fields") or {}).get(name) or "").strip() for d in docs}
+        self.count = Counter(v for v in self.cur.values() if v)
+        self.edited = {did: by[name] for did, by in ed.items() if name in by and did in self.cur}
+
+    def duplicated(self, did, value, ts):
+        """ts 바로 전 철에서 value(앞뒤 빈칸 뗌)를 다른 문서도 가졌나"""
+        v = value.strip()
+        if not v:
+            return False
+        n = self.count[v] - (self.cur.get(did) == v)
+        for o, es in self.edited.items():
+            if o == did:
+                continue
+            then = next(((e["old"] or "").strip() for e in es if e["ts"] >= ts), self.cur[o])
+            n += (then == v) - (self.cur[o] == v)
+        return n > 0
 
 
 def collect(vol, docs, edits, logs, schema, wf, status):
     """철 하나의 오류 행 목록. docs는 쪽 순서(export.ordered_docs), edits·logs는 지금 세대 기록(id 순),
-    status는 {doc_id: positions의 status}. 행은 양식 원천 이름을 키로 갖는 dict (+ 담당자 _actor_id·_actor_name)"""
+    status는 {doc_id: positions의 status}. 행은 양식 원천 이름을 키로 갖는 dict (+ 담당자 _actor)"""
     flag_field = fields.flag_keys(schema)
     by = fields.by_name(schema)
     order = {f["name"]: i for i, f in enumerate(schema["fields"])}
-    labels = _stage_labels(wf)
+    labels = {s["name"]: s["label"] for s in wf["stages"]}
     ed = {}  # doc_id -> 칸 -> [수정]
     for e in edits:
         ed.setdefault(e["doc_id"], {}).setdefault(e["field"], []).append(e)
     lg = {}
     for x in logs:
         lg.setdefault(x["doc_id"], []).append(x)
+    unique = {f["name"]: _Timeline(docs, ed, f["name"]) for f in field_rules.ruled(schema) if f["validate"].unique}
     rows = []
     for seq, d in enumerate(docs, 1):
         did = d["doc_id"]
@@ -147,25 +162,28 @@ def collect(vol, docs, edits, logs, schema, wf, status):
             if kind not in e["kinds"]:
                 e["kinds"].append(kind)
 
-        # 표시: 지금 검토 표시 (표시 키 → 사람이 고치는 칸)
+        flagged = {}  # 칸 -> [(사유, 기계 검수인가)]
         for k, rs in (d.get("flags") or {}).items():
             for r in rs:
-                add(flag_field.get(k, k), r, "규칙" if field_rules.is_machine(r) else "표시")
-        # 규칙: 처음 고치기 전 값이 칸 검증 규칙을 어겼나 (고쳐서 사라진 기계 검수 위반)
+                flagged.setdefault(flag_field.get(k, k), []).append((r, field_rules.is_machine(r)))
+        # (가) 고친 칸: 표시가 있거나 고치기 전 값이 규칙을 어김
         for name, es in mine.items():
+            for r, machine in flagged.get(name, ()):
+                add(name, r, "규칙" if machine else "표시")
             f = by.get(name)
-            if not f or not isinstance(f.get("validate"), field_rules.Rules):
-                continue
-            r, before, t0 = f["validate"], es[0]["old"] or "", es[0]["ts"]
-            ks = list(field_rules.check_value(r, before))
-            if r.unique and before.strip():
-                others = {_value_at(ed.get(o["doc_id"], {}), (o.get("fields") or {}).get(name), name, t0).strip()
-                          for o in docs if o["doc_id"] != did}
-                if before.strip() in others:
+            if f and isinstance(f.get("validate"), field_rules.Rules):
+                before, t0 = es[0]["old"] or "", es[0]["ts"]
+                ks = list(field_rules.check_value(f["validate"], before))
+                if name in unique and unique[name].duplicated(did, before, t0):
                     ks.append("unique")
-            for k in ks:
-                add(name, field_rules.reason(f, k), "규칙")
-        # 반려: 반려 뒤 다음 단계 기록 전까지 고친 칸
+                for k in ks:
+                    add(name, field_rules.reason(f, k), "규칙")
+        # (라) 지금도 남은 기계 검수 위반 (고치지 않았으면 미조치)
+        for name, rs in flagged.items():
+            if any(machine for _, machine in rs):
+                for r, machine in rs:
+                    add(name, r, "규칙" if machine else "표시")
+        # (나) 반려 뒤 다음 단계 기록 전까지 고친 칸
         doc_rows = []
         for i, x in enumerate(dlogs):
             if x["action"] != "reject":
@@ -175,17 +193,26 @@ def collect(vol, docs, edits, logs, schema, wf, status):
             touched = [n for n, es in mine.items()
                        if any(e["ts"] > x["ts"] and (nxt is None or e["ts"] < nxt["ts"]) for e in es)]
             for n in touched:
+                for r, machine in flagged.get(n, ()):
+                    add(n, r, "규칙" if machine else "표시")
                 add(n, text, "반려")
             if not touched:
                 doc_rows.append((x, nxt, text))
-        # 검수 수정: 검수 단계에서 고쳤는데 다른 이유가 없는 칸
+        # (다) 검수 단계에서 고친 칸
+        fixed_at = set()
         for name, es in mine.items():
             for e in es:
-                st = _review_stage(e["source"])
-                if st and not errs.get(name):
-                    add(name, f"검수 수정 · {labels.get(st, st)}", "검수 수정")
+                st = _edit_stage(wf, e["source"])
+                if st:
+                    fixed_at.add((name, st))
+                    if not errs.get(name):
+                        for r, machine in flagged.get(name, ()):
+                            add(name, r, "규칙" if machine else "표시")
+                    if not errs.get(name):
+                        add(name, f"검수 수정 · {labels.get(st, st)}", "검수 수정")
 
         base = {"vol": vol, "doc.seq": seq, "doc.id": did, "doc.first_page": d["pages"][0], "doc.last_page": d["pages"][-1]}
+
         for name in sorted(errs, key=lambda n: (order.get(n, len(order)), n)):
             es = mine.get(name, [])
             last = es[-1] if es else None
@@ -193,16 +220,14 @@ def collect(vol, docs, edits, logs, schema, wf, status):
                          "error.reason": " / ".join(errs[name]["reasons"]), "error.kind": "·".join(errs[name]["kinds"]),
                          "value.before": (es[0]["old"] or "") if es else (cur.get(name) or ""),
                          "value.after": (last["new"] or "") if last else "",
-                         "action": "수정" if last else "수정 없음",
+                         "action": "수정" if last else "미조치",
                          "action.date": _date(last["ts"] if last else None),
-                         "verdict": _verdict(wf, labels, dlogs, last["ts"] if last else None, name, status.get(did)),
-                         "_actor_id": last["user_id"] if last else None, "_actor_name": last["user_name"] if last else None})
-        for x, nxt, text in doc_rows:
+                         "verdict": _verdict(wf, dlogs, fixed_at, name, status.get(did)), "_actor": last})
+        for _, nxt, text in doc_rows:
             rows.append({**base, "field.name": "", "field.label": DOC_LABEL, "error.reason": text, "error.kind": "반려",
                          "value.before": "", "value.after": "", "action": "재제출" if nxt else "미조치",
                          "action.date": _date(nxt["ts"] if nxt else None),
-                         "verdict": _verdict(wf, labels, dlogs, (nxt or x)["ts"], None, status.get(did)),
-                         "_actor_id": nxt["user_id"] if nxt else None, "_actor_name": nxt["user_name"] if nxt else None})
+                         "verdict": _verdict(wf, dlogs, fixed_at, None, status.get(did)), "_actor": nxt})
     return rows
 
 
@@ -217,9 +242,14 @@ def masked_id(key, user_id):
 
 
 def actor(t, key, row):
-    if t["actor"] == "name":
-        return row.get("_actor_name") or ""
-    return masked_id(key, row.get("_actor_id"))
+    """담당자 칸. name: 사용자의 표시 이름(SSO 사용자는 ' (SSO)' — 수정 이력 화면과 같은 구별). 표시 이름이 없으면
+    로그인 이름 대신 가린 ID. masked(기본): 가린 ID"""
+    who = row.get("_actor")
+    if not who:
+        return ""
+    if t["actor"] == "name" and who.get("name"):
+        return who["name"] + (" (SSO)" if who.get("sso") else "")
+    return masked_id(key, who.get("user_id"))
 
 
 def build(t, rows, key):
