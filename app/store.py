@@ -659,6 +659,24 @@ def stage_history(vol, doc_id):
                          {"v": vol, "d": doc_id}).fetchall()
 
 
+def gen_edits(vol):
+    """철의 지금 세대 수정 이력 (stage_gen.since 뒤, id 순) — 검수 오류목록용 (https://github.com/reddol18/docflow/issues/88).
+    user_id는 가린 ID를 만드는 데만 쓰고 파일에 싣지 않는다. user_name은 표시 이름(없으면 로그인 이름)"""
+    with pool.connection() as c:
+        return c.execute("SELECT e.id, e.ts, e.doc_id, e.field, e.old, e.new, e.source, e.user_id, "  # noqa: S608
+                         "coalesce(u.name, u.username) AS user_name FROM edits e LEFT JOIN users u ON u.id = e.user_id "
+                         f"WHERE e.vol = %(v)s AND e.ts >= {_SINCE} ORDER BY e.id", {"v": vol}).fetchall()
+
+
+def gen_stage_log(vol):
+    """철의 지금 세대 단계 승인·반려 기록 (id 순) — 검수 오류목록용. 예전 세대(다시 돌리기 전) 기록은 빼고 본다"""
+    with pool.connection() as c:
+        return c.execute("SELECT s.id, s.ts, s.doc_id, s.stage, s.round, s.action, s.to_stage, s.reason, "  # noqa: S608
+                         "s.fixed_fields, s.user_id, coalesce(u.name, u.username) AS user_name FROM stage_log s "
+                         f"LEFT JOIN users u ON u.id = s.user_id WHERE s.vol = %(v)s AND s.gen = {_GEN} ORDER BY s.id",
+                         {"v": vol}).fetchall()
+
+
 def reset_stages(vol):
     """철을 처음부터 다시 돌릴 때: 실행 세대를 하나 올리고 단계 위치를 지운다 (기록 stage_log는 세대와 함께 남긴다).
     지운 위치 행 수"""
