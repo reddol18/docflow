@@ -19,7 +19,8 @@
           출력은 max_tokens)을 Postgres 행 잠금으로 예약한다(store.reserve_budget). 정산액 + 예약 + 이번 예상이 한도를 넘으면
           부르지 않고 BudgetExceeded. 동시 호출이 몇 개든 정산 합계가 한도를 넘지 않는다 (실제 ≤ 예상이므로)
   정산:   끝나면 실제 토큰으로 계산한 비용으로 바꾼다. 응답에 usage가 없으면 예상 비용 그대로 (모자라게 세지 않게).
-          호출이 실패하면 예약만 지운다
+          호출이 실패하면 예약만 지운다. 정산 쓰기가 실패하거나 호출 중 프로세스가 죽으면 예약이 남아,
+          store.HOLD_TTL 뒤 예상 비용 그대로 정산된다 (보수 정산, usage kind '<종류>:unsettled')
   가격:   openai 모델은 PRICE에 있어야 한다 — 없으면 시작할 때(load_provider) 멈추고, 부를 때도 거부한다(UnpricedModel)
 429·5xx·시간 초과는 SDK가 지수 백오프로 재시도한다 (max_retries).
 """
@@ -36,7 +37,7 @@ from urllib.parse import urlsplit
 
 from openai import OpenAI
 
-from app import fields, store
+from app import errors, fields, store
 
 PROVIDERS = ("openai", "local", "off")
 MODEL_ENV = {"extract": "EXTRACT_MODEL", "cell": "CELL_MODEL", "embed": "EMBED_MODEL", "chat": "CHAT_MODEL"}
@@ -237,7 +238,7 @@ def _metered(vol, kind, model, scope, tin_max, tout_max, user_id=None):
         return
     est = estimate_usd(model, tin_max, tout_max)
     day, start = store.kst_day()
-    hold = store.reserve_budget(scope, day, start, est, LIMITS[scope])
+    hold = store.reserve_budget(scope, day, start, est, LIMITS[scope], (vol, kind, model, user_id))
     if hold is None:
         raise BudgetExceeded(f"{scope} 예산 한도 ${LIMITS[scope]} — 이번 호출 예상 ${est:.6f}를 예약할 수 없음")
     try:
@@ -256,7 +257,10 @@ def _metered(vol, kind, model, scope, tin_max, tout_max, user_id=None):
         usd = (tin * pi + tout * po) / 1e6
         if usd > est:  # 상한 계산이 틀렸다는 뜻 — 실제대로 정산하고 알린다
             print(f"[llm] {kind} 실제 비용 ${usd:.6f} > 예약 ${est:.6f}", file=sys.stderr, flush=True)
-    store.settle_budget(hold, scope, day, usd, (vol, kind, model, tin, tout, user_id))
+    try:
+        store.settle_budget(hold, scope, day, usd, (vol, kind, model, tin, tout, user_id))
+    except Exception:  # 호출은 끝났다 — 결과는 돌려준다. 예약은 남아 HOLD_TTL 뒤 예상 비용으로 보수 정산된다
+        errors.log_exception(f"[llm] {kind} 정산 실패 (예약 {hold}은 만료 뒤 예상 비용으로 정산)")
 
 
 def _tokens(usage):

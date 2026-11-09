@@ -152,7 +152,8 @@ CREATE TABLE IF NOT EXISTS budget_day (
   scope text NOT NULL, day date NOT NULL, used numeric(14,8) NOT NULL DEFAULT 0, PRIMARY KEY (scope, day));
 CREATE TABLE IF NOT EXISTS budget_hold (
   id bigserial PRIMARY KEY, scope text NOT NULL, day date NOT NULL, usd numeric(14,8) NOT NULL,
-  ts timestamptz NOT NULL DEFAULT clock_timestamp());
+  ts timestamptz NOT NULL DEFAULT clock_timestamp(), vol text, kind text, model text, user_id bigint);
+CREATE TABLE IF NOT EXISTS run_stop (vol text PRIMARY KEY, reason text NOT NULL, ts timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS budget_hold_day ON budget_hold (scope, day);
 CREATE TABLE IF NOT EXISTS api_quota (
   user_key text NOT NULL, route text NOT NULL, kind text NOT NULL, win timestamptz NOT NULL, n int NOT NULL,
@@ -163,6 +164,7 @@ CREATE TABLE IF NOT EXISTS api_quota (
 #   budget_day = 예산·날짜(KST)마다 한 행: 정산된 사용액. 예약할 때 이 행을 FOR UPDATE로 잡는다 (프로세스·Pod 사이 원자적).
 #   budget_hold = 부르는 중인 호출의 예약(예상 비용). 끝나면 지우고 실제 비용을 used에 더한다
 #   api_quota = /search·/ask 사용자별 분·일 호출 수
+#   run_stop = 철 실행이 멈춘 이유 (지금은 'budget' — 비용 한도). 실행·이어 가기를 시작하면 지운다
 # ↑ schema_migrations: 한 번만 돌리는 데이터 옮기기의 완료 표시 (전체를 훑는 옮기기를 시작할 때마다 다시 돌리지 않게).
 #   중간에 실패하면 표시를 남기지 않아 다음 시작에 이어서 한다
 # ↑ doc_stage·stage_log (https://github.com/reddol18/docflow/issues/86): 새 표만 더한다. 행이 없는 문서(예전 철)는
@@ -304,39 +306,63 @@ def spent_today():
 
 
 # ---------- 비용 한도: 예약(선차감) → 정산 (https://github.com/reddol18/docflow/issues/7) ----------
-# 예약: budget_day 행을 FOR UPDATE로 잡고(같은 예산의 다른 예약·정산은 기다린다) 정산액 + 살아 있는 예약 + 이번 예상이
+# 예약: budget_day 행을 FOR UPDATE로 잡고(같은 예산의 다른 예약·정산은 기다린다) 정산액 + 남은 예약 + 이번 예상이
 # 한도 안일 때만 예약 행(budget_hold)을 넣는다. 정산: 예약을 지우고 실제 비용을 used에 더하고 usage 행을 남긴다 (한 트랜잭션).
-# 호출이 실패하면 예약만 지운다. 프로세스가 호출 중에 죽으면 예약이 남는다 → HOLD_TTL이 지나면 세지 않는다
-# (SDK 재시도까지 다 해도 이보다 짧다: 60초 × 5번 + 백오프)
+# 호출이 실패하면 예약만 지운다.
+# 정산하지 못한 예약(호출 중 프로세스가 죽음, 정산 쓰기 실패)은 지우지 않는다 — HOLD_TTL이 지나면 예상 비용 그대로 정산한다
+# (보수 정산: used에 더하고 usage 행 kind '<종류>:unsettled'). 실제로 돈이 나갔는지 모르므로 모자라게 세지 않는다.
+# HOLD_TTL은 SDK 재시도까지 다 해도 끝날 시간보다 길게 (60초 × 5번 + 백오프)
 HOLD_TTL = "15 minutes"
+UNSETTLED = ":unsettled"
 # 이 판 이전에 남은 그날 사용량(scope 없음)을 예산 행을 처음 만들 때 넣는다 — 배포한 날 그때까지 쓴 돈도 한도에 든다.
-# 예전 행의 vol '-'는 검색·질문이었다 (main.hybrid·answer)
-_LEGACY_SCOPE = "CASE WHEN vol = '-' THEN 'query' ELSE 'index' END"
+# 예전 행의 vol '-'는 검색·질문이었다 (main.hybrid·answer). 범위는 그날 [0시, +1일) — 예약과 화면이 같은 식을 쓴다
+_LEGACY_SUM = ("(SELECT coalesce(sum(usd), 0) FROM usage WHERE scope IS NULL "
+               "AND CASE WHEN vol = '-' THEN 'query' ELSE 'index' END = %(s)s "
+               "AND ts >= %(start)s AND ts < %(start)s + interval '1 day')")
 
 
-def reserve_budget(scope, day, start, est, limit):
-    """예상 비용 est를 예약한다. 한도 안이면 예약 id, 넘으면 None"""
-    with pool.connection() as c:
-        c.execute("INSERT INTO budget_day (scope, day, used) "  # noqa: S608 — 상수 조각만 끼움
-                  f"SELECT %(s)s, %(d)s, coalesce(sum(usd), 0) FROM usage WHERE scope IS NULL AND {_LEGACY_SCOPE} = %(s)s "
-                  "AND ts >= %(start)s AND ts < %(start)s + interval '1 day' ON CONFLICT DO NOTHING",
-                  {"s": scope, "d": day, "start": start})
-        with c.transaction():
-            used = c.execute("SELECT used FROM budget_day WHERE scope = %s AND day = %s FOR UPDATE",
-                             (scope, day)).fetchone()["used"]
-            held = c.execute("SELECT coalesce(sum(usd), 0) AS h FROM budget_hold WHERE scope = %s AND day = %s "
-                             "AND ts > clock_timestamp() - %s::interval", (scope, day, HOLD_TTL)).fetchone()["h"]
-            if float(used) + float(held) + est > limit:
-                return None
-            return c.execute("INSERT INTO budget_hold (scope, day, usd) VALUES (%s,%s,%s) RETURNING id",
-                             (scope, day, est)).fetchone()["id"]
+def _settle_expired(c, scope=None, day=None):
+    """HOLD_TTL이 지난 예약을 예상 비용 그대로 정산한다 (scope·day를 주면 그 예산만). 부른 쪽 트랜잭션 안에서.
+    바뀐 예산·날짜 행 수"""
+    only = "AND scope = %(s)s AND day = %(d)s" if scope is not None else ""
+    return c.execute(
+        "WITH gone AS (DELETE FROM budget_hold WHERE ts <= clock_timestamp() - %(ttl)s::interval "  # noqa: S608 — 상수 조각
+        f"{only} RETURNING scope, day, usd, vol, kind, model, user_id, ts), "
+        "ins AS (INSERT INTO usage (ts, vol, kind, model, tin, tout, usd, scope, user_id) "
+        "SELECT ts, vol, coalesce(kind, 'llm') || %(mark)s, model, 0, 0, usd, scope, user_id FROM gone) "
+        "INSERT INTO budget_day AS b (scope, day, used) SELECT scope, day, sum(usd) FROM gone GROUP BY scope, day "
+        "ON CONFLICT (scope, day) DO UPDATE SET used = b.used + EXCLUDED.used",
+        {"ttl": HOLD_TTL, "s": scope, "d": day, "mark": UNSETTLED}).rowcount
+
+
+def reserve_budget(scope, day, start, est, limit, meta=None):
+    """예상 비용 est를 예약한다. 한도 안이면 예약 id, 넘으면 None.
+    meta = (vol, kind, model, user_id) — 정산하지 못하고 만료되면 보수 정산 usage 행에 쓴다"""
+    vol, kind, model, user_id = meta or (None, None, None, None)
+    args = {"s": scope, "d": day, "start": start}
+    with pool.connection() as c, c.transaction():
+        lock = "SELECT used FROM budget_day WHERE scope = %(s)s AND day = %(d)s FOR UPDATE"
+        if c.execute(lock, args).fetchone() is None:  # 그날 첫 예약 — 예전 사용량을 넣어 만든다 (그 뒤로는 합계를 다시 읽지 않음)
+            c.execute(f"INSERT INTO budget_day (scope, day, used) SELECT %(s)s, %(d)s, {_LEGACY_SUM} "  # noqa: S608
+                      "ON CONFLICT DO NOTHING", args)
+        c.execute(lock, args)
+        _settle_expired(c, scope, day)
+        used = c.execute("SELECT used FROM budget_day WHERE scope = %(s)s AND day = %(d)s", args).fetchone()["used"]
+        held = c.execute("SELECT coalesce(sum(usd), 0) AS h FROM budget_hold WHERE scope = %(s)s AND day = %(d)s",
+                         args).fetchone()["h"]
+        if float(used) + float(held) + est > limit:
+            return None
+        return c.execute("INSERT INTO budget_hold (scope, day, usd, vol, kind, model, user_id) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                         "RETURNING id", (scope, day, est, vol, kind, model, user_id)).fetchone()["id"]
 
 
 def settle_budget(hold, scope, day, usd, row):
-    """예약 hold를 실제 비용 usd로 정산하고 사용량 행 row = (vol, kind, model, tin, tout, user_id)를 남긴다 (한 트랜잭션)"""
+    """예약 hold를 실제 비용 usd로 정산하고 사용량 행 row = (vol, kind, model, tin, tout, user_id)를 남긴다 (한 트랜잭션).
+    예약이 이미 없으면(만료되어 예상 비용으로 보수 정산됨) 아무것도 하지 않는다 — 두 번 세지 않게"""
     vol, kind, model, tin, tout, user_id = row
     with pool.connection() as c, c.transaction():
-        c.execute("DELETE FROM budget_hold WHERE id = %s", (hold,))
+        if c.execute("DELETE FROM budget_hold WHERE id = %s", (hold,)).rowcount == 0:
+            return
         c.execute("UPDATE budget_day SET used = used + %s WHERE scope = %s AND day = %s", (usd, scope, day))
         c.execute(_USAGE_INSERT, (vol, kind, model, tin, tout, usd, scope, user_id))
 
@@ -348,25 +374,26 @@ def release_budget(hold):
 
 
 def budget_today(limits):
-    """화면용 오늘 예산 {scope: {used, held, limit}} — limits = {scope: 한도}. 행이 없는 예산은 예전 사용량으로 센다"""
+    """화면용 오늘 예산 {scope: {used, held, limit}} — limits = {scope: 한도}. 행이 없는 예산은 예전 사용량으로 센다.
+    held = 남은 예약 전부 (만료된 것도 예상 비용으로 정산될 몫이라 센다)"""
     day, start = kst_day()
     out = {}
     with pool.connection() as c:
         for scope, limit in limits.items():
             r = c.execute(
                 "SELECT coalesce((SELECT used FROM budget_day WHERE scope = %(s)s AND day = %(d)s), "  # noqa: S608
-                f"(SELECT coalesce(sum(usd), 0) FROM usage WHERE scope IS NULL AND {_LEGACY_SCOPE} = %(s)s "
-                "AND ts >= %(start)s))::float AS used, (SELECT coalesce(sum(usd), 0) FROM budget_hold WHERE scope = %(s)s "
-                "AND day = %(d)s AND ts > clock_timestamp() - %(ttl)s::interval)::float AS held",
-                {"s": scope, "d": day, "start": start, "ttl": HOLD_TTL}).fetchone()
+                f"{_LEGACY_SUM})::float AS used, (SELECT coalesce(sum(usd), 0) FROM budget_hold WHERE scope = %(s)s "
+                "AND day = %(d)s)::float AS held", {"s": scope, "d": day, "start": start}).fetchone()
             out[scope] = {"used": round(r["used"], 6), "held": round(r["held"], 6), "limit": limit}
     return out
 
 
 def prune_budget():
-    """지난 날의 예약·호출 수 행을 지운다 — 시작할 때마다. budget_day(날마다 예산당 한 행)는 남긴다"""
+    """시작할 때마다: 만료된 예약을 예상 비용으로 보수 정산(지난 날 것 포함 — 그날 used에), 지난 호출 수 행을 지운다.
+    budget_day(날마다 예산당 한 행)는 남긴다"""
     with pool.connection() as c:
-        c.execute("DELETE FROM budget_hold WHERE day < current_date - 1")
+        with c.transaction():
+            _settle_expired(c)
         c.execute("DELETE FROM api_quota WHERE win < now() - interval '2 days'")
 
 
@@ -393,6 +420,14 @@ def take_quota(user_key, route, windows):
     return None
 
 
+def refund_quota(user_key, route, windows):
+    """take_quota로 센 호출 한 번을 되돌린다 (그 호출의 창들 — 창이 바뀌었으면 그 창 행만 줄인다)"""
+    with pool.connection() as c, c.transaction():
+        for kind, win, _ in windows:
+            c.execute("UPDATE api_quota SET n = n - 1 WHERE user_key = %s AND route = %s AND kind = %s AND win = %s AND n > 0",
+                      (user_key, route, kind, win))
+
+
 def usage_summary(vol=None):
     sql = "SELECT kind, count(*) AS calls, sum(tin) AS tin, sum(tout) AS tout, sum(usd)::float AS usd FROM usage"
     args = ()
@@ -410,11 +445,21 @@ def event(vol, node, phase, doc_id=None, **info):
                   (vol, node, phase, doc_id, json.dumps(info, ensure_ascii=False) if info else None))
 
 
-def last_run_phase(vol):
-    """철 실행의 마지막 run 이벤트 단계 (start/end/error/budget) — 멈춘 철이 비용 한도로 멈췄나 가린다. 없으면 None"""
+def set_run_stop(vol, reason):
+    """철 실행이 멈춘 이유를 남긴다 (reason None이면 지움 — 실행·이어 가기 시작)"""
     with pool.connection() as c:
-        r = c.execute("SELECT phase FROM events WHERE vol = %s AND node = 'run' ORDER BY id DESC LIMIT 1", (vol,)).fetchone()
-    return r["phase"] if r else None
+        if reason is None:
+            c.execute("DELETE FROM run_stop WHERE vol = %s", (vol,))
+        else:
+            c.execute("INSERT INTO run_stop (vol, reason) VALUES (%s,%s) ON CONFLICT (vol) DO UPDATE "
+                      "SET reason = EXCLUDED.reason, ts = now()", (vol, reason))
+
+
+def run_stop(vol):
+    """철 실행이 멈춘 이유 ('budget') 또는 None"""
+    with pool.connection() as c:
+        r = c.execute("SELECT reason FROM run_stop WHERE vol = %s", (vol,)).fetchone()
+    return r["reason"] if r else None
 
 
 def events(vol, after=0, limit=500):
@@ -902,6 +947,7 @@ def purge_volume(vol, delete_thread):
     with pool.connection() as c, c.transaction():
         for t in PURGE_TABLES:
             out[t] = c.execute(f"DELETE FROM {t} WHERE vol = %s", (vol,)).rowcount  # noqa: S608 — 고정된 표 이름
+        c.execute("DELETE FROM run_stop WHERE vol = %s", (vol,))  # 값은 없지만 지운 철의 멈춤 이유가 남지 않게
     return out
 
 

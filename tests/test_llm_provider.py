@@ -157,8 +157,8 @@ def fake_budget(monkeypatch, ok=True):
     """예약·정산을 기록만 하는 가짜 (실제 Postgres 예약은 test_budget_pg). 기록: [("reserve", scope, est) | ("settle", …)]"""
     from app import store
     rec = []
-    monkeypatch.setattr(store, "reserve_budget", lambda scope, day, start, est, limit: rec.append(("reserve", scope, est))
-                        or (len(rec) if ok else None))
+    monkeypatch.setattr(store, "reserve_budget", lambda scope, day, start, est, limit, meta=None:
+                        rec.append(("reserve", scope, est)) or (len(rec) if ok else None))
     monkeypatch.setattr(store, "settle_budget", lambda hold, scope, day, usd, row: rec.append(("settle", scope, usd, row)))
     monkeypatch.setattr(store, "release_budget", lambda hold: rec.append(("release", hold)))
     return rec
@@ -338,6 +338,10 @@ def test_budget_stop_is_not_error(tmp_path, monkeypatch, fake_openai):
     audits = []
     monkeypatch.setattr(main, "audit_safe", lambda user, action, vol=None, doc_id=None, result="ok", **i:
                         audits.append((action, result)))
+    stops = {"v1": "budget"}  # 앞선 멈춤 — 실행을 시작하면 지워진다
+    monkeypatch.setattr(store, "set_run_stop", lambda vol, reason: stops.pop(vol, None) if reason is None
+                        else stops.__setitem__(vol, reason))
+    monkeypatch.setattr(store, "run_stop", lambda vol: stops.get(vol))
     main.submit("v1", {"vol": "v1", "review_mode": "auto"})
     main.runner.submit(lambda: None).result()  # 일꾼이 하나라 앞선 실행이 끝날 때까지 기다린다
 
@@ -349,10 +353,29 @@ def test_budget_stop_is_not_error(tmp_path, monkeypatch, fake_openai):
     assert fake_openai.made == [] and fake_openai.calls == []  # 예약이 안 되어 부르지 않음
     snap = main.G.get_state(main.cfg("v1"))
     assert snap.next  # 멈춘 곳이 남는다 → /resume
-    monkeypatch.setattr(store, "last_run_phase", lambda vol: runs[-1][0])
+    assert stops == {"v1": "budget"}  # 멈춤 이유는 상태(run_stop 표)에 — 이벤트로 짐작하지 않는다
     assert main._stage("v1", snap) == "budget" and main._flow_stage(snap) == "stopped"
-    monkeypatch.setattr(store, "last_run_phase", lambda vol: "error")  # 다른 까닭으로 끊긴 철은 그대로 stopped
+    stops.clear()  # 다른 까닭으로 끊긴 철(이유 없음)은 그대로 stopped
     assert main._stage("v1", snap) == "stopped"
+
+
+def test_budget_stop_cleared_when_run_fails_otherwise(tmp_path, monkeypatch, fake_openai):
+    """한도 멈춤 뒤 이어 간 실행이 다른 오류로 끊기면 단계는 budget이 아니라 stopped"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app import graph, main, store
+    _fake_volume(tmp_path, monkeypatch)
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    monkeypatch.setattr(store, "reserve_budget", lambda *a: (_ for _ in ()).throw(TimeoutError("가상 DB 시간 초과")))
+    monkeypatch.setattr(main, "G", graph.build(MemorySaver()))
+    monkeypatch.setattr(main, "audit_safe", lambda *a, **k: None)
+    stops = {"v1": "budget"}
+    monkeypatch.setattr(store, "set_run_stop", lambda vol, reason: stops.pop(vol, None) if reason is None
+                        else stops.__setitem__(vol, reason))
+    monkeypatch.setattr(store, "run_stop", lambda vol: stops.get(vol))
+    main.submit("v1", {"vol": "v1", "review_mode": "auto"})
+    main.runner.submit(lambda: None).result()
+    assert stops == {} and main._stage("v1", main.G.get_state(main.cfg("v1"))) == "stopped"
 
 
 def test_off_flags_other_schema(monkeypatch):
@@ -400,14 +423,55 @@ def test_off_edit_drops_vector(monkeypatch, fake_openai):
     assert fake_openai.made == []
 
 
+def test_edit_budget_stop_saves_nothing(monkeypatch, fake_openai):
+    """문서 수정의 임베딩이 예산에 걸리면(503) 값·이력·상태를 아무것도 저장하지 않는다 — 같은 값으로 다시 내면 그때
+    임베딩되고 저장된다 (값만 바뀌고 벡터가 낡은 채 남지 않게, https://github.com/reddol18/docflow/issues/7)"""
+    import contextlib
+
+    from app import main, store
+    doc = {"doc_id": "v1-0001", "vol": "v1", "pages": ["v1-0001"],
+           "fields": {"docno": "", "serial": "", "date": "", "recipient": "", "title": "옛 가상 제목"}}
+    state = {"docs": [doc]}
+    rec = SimpleNamespace(updated=[], saved=[], edits=[], vectors=[])
+
+    def update(c, v, as_node):
+        rec.updated.append(v)
+        state["docs"] = list(v["docs"])
+    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda c: SimpleNamespace(interrupts=(), values=state),
+                                                   update_state=update))
+    monkeypatch.setattr(store, "vol_lock", lambda vol: contextlib.nullcontext())
+    monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "가상 " + d["fields"]["title"])
+    monkeypatch.setattr(store, "save_documents", lambda docs: rec.saved.extend(docs))
+    monkeypatch.setattr(store, "add_edits", lambda vol, rows, uid, source: rec.edits.extend(rows))
+    monkeypatch.setattr(store, "event", lambda *a, **k: None)
+    monkeypatch.setattr(store, "upsert_vectors", lambda docs, vecs: rec.vectors.append(vecs))
+
+    def over(*a, **k):
+        raise llm.BudgetExceeded("index 예산 한도 (가상)")
+    monkeypatch.setattr(main.llm, "embed", over)
+    who = SimpleNamespace(id=1, username="가상")
+    with pytest.raises(llm.BudgetExceeded):
+        main._edit_document("v1", "v1-0001", {"title": "새 가상 제목"}, who)
+    assert rec.updated == [] and rec.saved == [] and rec.edits == [] and rec.vectors == []
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.5]] * len(texts))
+    d, changed, _ = main._edit_document("v1", "v1-0001", {"title": "새 가상 제목"}, who)  # 같은 값으로 다시
+    assert changed == ["title"] and d["fields"]["title"] == "새 가상 제목"
+    assert rec.saved == [d] and rec.edits == [("v1-0001", "title", "옛 가상 제목", "새 가상 제목")] and rec.vectors == [[[0.5]]]
+
+
 def test_off_search_and_ask_unavailable(monkeypatch, fake_openai):
     from app import main, store
     use(monkeypatch, {"LLM_PROVIDER": "off"})
     monkeypatch.setattr(store, "keyword_search", lambda *a, **k: pytest.fail("off면 낱말 검색으로 바꿔 답하지 않는다 (정하지 않음)"))
+    quota = []
+    monkeypatch.setattr(store, "take_quota", lambda key, route, wins: quota.append(("take", route)))
+    monkeypatch.setattr(store, "refund_quota", lambda key, route, wins: quota.append(("refund", route)))
     for call in (lambda: main.search("가상", None), lambda: main.ask("가상", None)):
         with pytest.raises(llm.LLMOff):
             call()
     assert fake_openai.made == []
+    # 503(LLM 꺼짐)은 사용자 탓이 아니라 호출 제한 1회를 되돌린다
+    assert quota == [("take", "search"), ("refund", "search"), ("take", "ask"), ("refund", "ask")]
     # 한 곳(예외 처리기)에서 503 + 공개 문구로 — 설정 이름은 응답에 넣지 않는다
     assert main.app.exception_handlers[llm.LLMOff] is main.llm_off
     req = SimpleNamespace(method="GET", url=SimpleNamespace(path="/search"))

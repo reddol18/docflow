@@ -68,8 +68,10 @@ def setup(tmp):
     store.inspection_rows = lambda vol: []
     store.spent_today = lambda: 0.0
     store.budget_today = lambda limits: {}
-    store.last_run_phase = lambda vol: None
+    store.run_stop = lambda vol: None
+    store.set_run_stop = lambda vol, reason: None
     store.take_quota = lambda *a: None  # /search 호출 제한 (DB 없음 — 늘 통과)
+    store.refund_quota = lambda *a: None
     store.usage_summary = lambda vol=None: []
     auth.MODES = frozenset({"local"})
     auth.session_user = lambda t: auth.User(1, "probe", "가상 관리자", "admin")

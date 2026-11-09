@@ -251,7 +251,8 @@ def test_failed_fix_does_not_move(main, monkeypatch):
     assert where(c)["d03"]["stage"] == "qc"
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]] * len(texts))
     r = approve(c, "q", "d03", "qc", title="가상").json()
-    # 앞선 시도에서 칸은 이미 반영됐다 → 이번 차이는 없지만 고친 칸은 이력에서 세어 기록에 남는다
+    # 임베딩은 저장 전에 하므로(https://github.com/reddol18/docflow/issues/7) 앞선 시도는 아무것도 저장하지 않았다 →
+    # 이번 시도가 칸을 반영하고, 고친 칸은 이력에서 세어 기록에 남는다
     assert (r["to"], r["fixed_fields"]) == ("supervisor", ["title"])
     assert c.get("/documents/v1/d03/stages", headers=h("v")).json()[-1]["fixed_fields"] == ["title"]
 

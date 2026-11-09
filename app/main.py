@@ -299,6 +299,7 @@ def submit(vol, arg, user=None, reserved=False):
         running[vol] = Busy("running")
         store.event(vol, "run", "start", None, resume=arg is None or isinstance(arg, Command))
         try:
+            store.set_run_stop(vol, None)  # 다시 돌리면 앞선 멈춤 이유는 없어진다
             G.invoke(arg, cfg(vol))
             snap = G.get_state(cfg(vol))
             print(f"run {vol} stopped/finished: next={snap.next}", flush=True)
@@ -309,9 +310,10 @@ def submit(vol, arg, user=None, reserved=False):
                 store.event(vol, "run", "end", None)
                 audit_safe(user, "run_done", vol, None, "ok")
         except llm.BudgetExceeded as e:
-            # 오류가 아니라 한도 멈춤 (https://github.com/reddol18/docflow/issues/7): 체크포인트까지 한 일은 남고, 철 단계는
-            # 'budget'으로 보인다 (_stage). 한도가 풀리면(다음 날·한도 올림) /resume으로 이어 간다
+            # 오류가 아니라 한도 멈춤 (https://github.com/reddol18/docflow/issues/7): 체크포인트까지 한 일은 남고, 멈춤 이유를
+            # run_stop 표에 남겨 철 단계가 'budget'으로 보인다 (_stage). 한도가 풀리면(다음 날·한도 올림) /resume으로 이어 간다
             print(f"run {vol} budget stop: {e}", file=sys.stderr, flush=True)
+            store.set_run_stop(vol, "budget")  # 철 단계의 근거 (run_stop 표)
             store.event(vol, "run", "budget", None, **errors.public(e))
             audit_safe(user, "run_done", vol, None, "budget_stop")
         except Exception as e:
@@ -511,7 +513,7 @@ def _stage(vol, snap):
     if vol in running:
         return "running"
     stage = _flow_stage(snap)
-    if stage == "stopped" and store.last_run_phase(vol) == "budget":
+    if stage == "stopped" and store.run_stop(vol) == "budget":
         return "budget"  # 비용 한도로 멈춤 — 끊긴 철(stopped)과 같이 /resume으로 이어 간다
     return stage
 
@@ -528,7 +530,13 @@ def _flow_stage(snap):
     return "new"
 
 
-def summary(vol):
+def day_totals():
+    """철과 상관없는 오늘 비용 값 — 응답마다 한 번만 읽는다 (철 목록이 철마다 다시 읽지 않게)"""
+    return {"spent_today_usd": round(store.spent_today(), 6),
+            "budget": store.budget_today(llm.LIMITS)}  # 오늘 예산 {index·query: {used, held, limit}}
+
+
+def summary(vol, totals=None):
     snap = G.get_state(cfg(vol))
     v = snap.values or {}
     docs = v.get("docs", [])
@@ -546,8 +554,7 @@ def summary(vol):
         "flagged_documents": sum(bool(d.get("flags")) for d in docs),
         "indexed": v.get("indexed"),
         "usage": store.usage_summary(vol),
-        "spent_today_usd": round(store.spent_today(), 6),
-        "budget": store.budget_today(llm.LIMITS),  # 오늘 예산 {index·query: {used, held, limit}}
+        **(totals or day_totals()),
     }
 
 
@@ -560,7 +567,8 @@ def volume_names():
 @app.get("/volumes")
 def volumes(_: Viewer):
     vols = volume_names()
-    return [summary(v) for v in vols]
+    totals = day_totals() if vols else None
+    return [summary(v, totals) for v in vols]
 
 
 @app.get("/volumes/{vol}")
@@ -611,6 +619,10 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
         new = {x["doc_id"]: x for x in flags.refresh(list(docs.values()), schema_fields.SCHEMA)}
         d = new[doc_id]
         others = [x for k, x in new.items() if k != doc_id and x is not docs[k]]
+        # 임베딩은 저장 전에 (https://github.com/reddol18/docflow/issues/7): 예산 한도(BudgetExceeded → 503)·LLM 오류면
+        # 아무것도 저장하지 않는다 — 값만 바뀌고 벡터가 낡은 채 남거나, 같은 값으로 다시 내도 차이가 없어 임베딩되지 않는 일이
+        # 없게. 철 잠금을 쥔 채 부른다 (같은 철 다른 문서 수정은 그동안 기다린다, store.LOCK_WAIT)
+        vec = llm.embed(vol, [flow.doc_text(vol, d)]) if llm.enabled() else None
         G.update_state(cfg(vol), {"docs": [d, *others]}, as_node="index")
         # Postgres 쓰기도 철 잠금 안에서 — 잠금 밖에서 쓰면 그 사이 다른 문서를 고친 요청의 값·표시를 낡은 것으로 덮는다.
         # 다른 문서는 표시만 쓴다 (칸 값·검토 여부는 그 문서를 고치는 요청 몫). 둘은 한 트랜잭션(store.save_edit).
@@ -619,10 +631,10 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
             store.save_edit(vol, d, [(x["doc_id"], x["flags"]) for x in others])
         else:
             store.save_documents([d])
-    # 이력은 값이 저장된 바로 뒤, 외부 호출(임베딩·Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
+    # 이력은 값이 저장된 바로 뒤, 외부 쓰기(Qdrant) 전에 — 그쪽이 실패해도 누가 무엇을 바꿨는지는 남는다
     store.add_edits(vol, [(doc_id, k, old.get(k), v) for k, v in fix.items()], user.id, source)
-    if llm.enabled():
-        store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
+    if vec is not None:
+        store.upsert_vectors([d], vec)
     else:  # LLM_PROVIDER=off: 예전 값으로 만든 벡터를 남기지 않는다
         store.delete_doc_vectors(vol, [doc_id])
     store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
@@ -1235,7 +1247,8 @@ def report_view(_: Viewer, day_from: dt.date | None = None, day_to: dt.date | No
     """공정·품질 리포트: 물량(철/건/면)·단계별 진척, 날짜별 처리량·검토 표시·수정률·검토 시간·비용."""
     lo, hi = _range(day_from, day_to)
     vols = volume_names()
-    return {"day_from": lo, "day_to": hi, "volume": report.volume_counts([summary(v) for v in vols]),
+    totals = day_totals() if vols else None
+    return {"day_from": lo, "day_to": hi, "volume": report.volume_counts([summary(v, totals) for v in vols]),
             "daily": report.daily(lo, hi), "review_time": report.review_time_summary(lo, hi),
             "inspection": store.inspection_stats(*report._bounds(lo, hi)),  # 철별 표본 검사·추정 오류율 (https://github.com/reddol18/docflow/issues/10)
             "columns": dict(report.COLUMNS)}
@@ -1455,47 +1468,61 @@ RATE = {route: {"min": int(os.environ.get(f"{route.upper()}_PER_MIN", per_min)),
         for route, per_min, per_day in (("ask", 10, 200), ("search", 30, 1000))}
 
 
+def _now():
+    return dt.datetime.now(store.KST)
+
+
 def _quota_windows(route, now=None):
-    now = now or dt.datetime.now(store.KST)
+    now = now or _now()
     _, day = store.kst_day(now)
     lim = RATE[route]
     wins = [("min", now.replace(second=0, microsecond=0), lim["min"]), ("day", day, lim["day"])]
     return [w for w in wins if w[2] > 0]
 
 
-def rate_limit(route):
-    def dep(user: Viewer):
-        key = str(user.id) if user.id is not None else f"name:{user.username}"
-        full = store.take_quota(key, route, _quota_windows(route))
-        if full:  # 누가 얼마나 막혔나는 서버 로그로 (질의 글자는 남기지 않는다)
-            print(f"[rate] {route} {full} 상한 — user {key}", file=sys.stderr, flush=True)
-        if full == "min":
-            raise HTTPException(429, f"{route} 호출이 많습니다 — 분당 {RATE[route]['min']}회", headers={"Retry-After": "60"})
-        if full == "day":
-            raise HTTPException(429, f"{route} 오늘 호출 한도 {RATE[route]['day']}회를 다 썼습니다",
-                                headers={"Retry-After": str(_until_tomorrow())})
-        return user
-    return dep
-
-
-SearchUser = Annotated[auth.User, Depends(rate_limit("search"))]  # viewer 이상 + 호출 제한
-AskUser = Annotated[auth.User, Depends(rate_limit("ask"))]
+@contextmanager
+def rate_limited(route, user):
+    """호출 한 번을 센다 — 경로 함수 안에서 부르므로 질의 검증(422)을 통과한 요청만 센다. 상한이면 429 + Retry-After
+    (분당: 지금 분이 끝날 때까지, 하루: 다음 날 0시 KST까지). 안에서 검색·질문 예산이 차거나(BudgetExceeded) LLM이
+    꺼져 있으면(LLMOff) — 둘 다 503 — 이 1회를 되돌린다. 사용자 탓이 아닌 거절로 쿼터를 깎지 않게"""
+    key = str(user.id) if getattr(user, "id", None) is not None else f"name:{getattr(user, 'username', 'dev')}"
+    now = _now()
+    wins = _quota_windows(route, now)
+    full = store.take_quota(key, route, wins)
+    if full:  # 누가 얼마나 막혔나는 서버 로그로 (질의 글자는 남기지 않는다)
+        print(f"[rate] {route} {full} 상한 — user {key}", file=sys.stderr, flush=True)
+    if full == "min":
+        raise HTTPException(429, f"{route} 호출이 많습니다 — 분당 {RATE[route]['min']}회",
+                            headers={"Retry-After": str(max(1, 60 - now.second))})
+    if full == "day":
+        raise HTTPException(429, f"{route} 오늘 호출 한도 {RATE[route]['day']}회를 다 썼습니다",
+                            headers={"Retry-After": str(_until_tomorrow())})
+    try:
+        yield
+    except (llm.BudgetExceeded, llm.LLMOff):  # 둘 다 503 — 설치·예산 쪽 거절
+        try:
+            store.refund_quota(key, route, wins)
+        except Exception:
+            errors.log_exception(f"[rate] {route} 되돌리기 실패")
+        raise
 
 
 @app.get("/search")
-def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: SearchUser, year_from: int | None = None,
+def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewer, year_from: int | None = None,
            year_to: int | None = None, k: Annotated[int, Query(ge=1, le=50)] = 10):
-    return hybrid(q, year_from, year_to, k, user)
+    with rate_limited("search", user):
+        return hybrid(q, year_from, year_to, k, user)
 
 
 @app.get("/ask")
-def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: AskUser, year_from: int | None = None,
+def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewer, year_from: int | None = None,
         year_to: int | None = None):
-    hits = hybrid(q, year_from, year_to, 5, user)
-    for h in hits:
-        h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
-    return {"answer": llm.answer(q, hits, user_id=getattr(user, "id", None)),
-            "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
+    with rate_limited("ask", user):
+        hits = hybrid(q, year_from, year_to, 5, user)
+        for h in hits:
+            h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
+        return {"answer": llm.answer(q, hits, user_id=getattr(user, "id", None)),
+                "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
 
 
 @app.get("/graph", response_class=PlainTextResponse)

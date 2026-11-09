@@ -108,6 +108,11 @@ def test_legacy_usage_counts_toward_today(db, monkeypatch):
         for vol, usd in (("-", 0.5), ("t7-legacy", 0.1)):
             c.execute("INSERT INTO usage (ts, vol, kind, model, tin, tout, usd) VALUES (%s,%s,'embed','m',1,0,%s)",
                       (start + dt.timedelta(hours=1), vol, usd))
+        # 다음 날 0시 정각 행은 그날 몫이 아니다 — 예약과 화면이 같은 범위 [0시, +1일)
+        c.execute("INSERT INTO usage (ts, vol, kind, model, tin, tout, usd) VALUES (%s,'t7-legacy','embed','m',1,0,0.3)",
+                  (start + dt.timedelta(days=1),))
+    shown = store.budget_today({"index": 0.6, "query": 0.6})  # 예산 행을 만들기 전 (예전 사용량으로)
+    assert shown["index"]["used"] == pytest.approx(0.1) and shown["query"]["used"] == pytest.approx(0.5)
     assert store.reserve_budget("query", day, start, 0.2, 0.6) is None  # 0.5 + 0.2 > 0.6
     hold = store.reserve_budget("index", day, start, 0.2, 0.6)  # 0.1 + 0.2 ≤ 0.6
     assert hold is not None
@@ -115,6 +120,60 @@ def test_legacy_usage_counts_toward_today(db, monkeypatch):
     assert shown["index"]["used"] == pytest.approx(0.1) and shown["index"]["held"] == pytest.approx(0.2)
     store.release_budget(hold)
     assert ledger(store, "index", day) == (pytest.approx(0.1), 0)
+    # 예산 행이 생긴 뒤에는 예전 사용량을 다시 읽지 않는다 (그 뒤 사용량은 정산으로만 늘어난다)
+    with store.pool.connection() as c:
+        c.execute("INSERT INTO usage (ts, vol, kind, model, tin, tout, usd) VALUES (%s,'t7-legacy','embed','m',1,0,0.4)",
+                  (start + dt.timedelta(hours=2),))
+    hold = store.reserve_budget("index", day, start, 0.2, 0.6)
+    assert hold is not None and ledger(store, "index", day)[0] == pytest.approx(0.1)
+    store.release_budget(hold)
+
+
+def test_unsettled_hold_settled_at_estimate(db, monkeypatch, capsys):
+    """정산 쓰기가 실패해도 호출 결과는 돌려주고 예약은 남는다 → 만료되면 예상 비용 그대로 used·usage에 들어간다
+    (프로세스가 호출 중에 죽은 경우와 같은 길). 늦게 온 정산은 두 번 세지 않는다"""
+    store = db
+    day = dt.date(2001, 1, 14)
+    fixed_day(monkeypatch, store, day)
+    monkeypatch.setattr(llm, "LIMITS", {"index": 1.0, "query": 1.0})
+    fake_embed_client(monkeypatch, lambda **a: usage_row(3))
+    est = llm.estimate_usd("text-embedding-3-small", llm.tokens_max("가상"), 0)
+    real_settle = store.settle_budget
+
+    def broken(*a, **k):
+        raise TimeoutError("가상 DB 끊김")
+    monkeypatch.setattr(store, "settle_budget", broken)
+    assert llm.embed("t7-unsettled", ["가상"]) == [[0.0]]  # 결과는 돌려준다
+    assert "정산 실패" in capsys.readouterr().err
+    assert ledger(store, "index", day) == (0.0, 1)  # 예약이 남아 한도를 잡고 있다
+    with store.pool.connection() as c:
+        hold = c.execute("SELECT id FROM budget_hold WHERE scope = 'index' AND day = %s", (day,)).fetchone()["id"]
+    monkeypatch.setattr(store, "HOLD_TTL", "0 seconds")  # 만료
+    monkeypatch.setattr(store, "settle_budget", real_settle)
+    other = store.reserve_budget("index", day, store.kst_day()[1], 0.001, 1.0)  # 다음 예약이 만료 예약을 보수 정산
+    used, held = ledger(store, "index", day)
+    assert used == pytest.approx(est) and held == 1
+    with store.pool.connection() as c:
+        rows = c.execute("SELECT kind, usd::float AS usd, tin FROM usage WHERE vol = 't7-unsettled'").fetchall()
+    assert rows == [{"kind": "embed" + store.UNSETTLED, "usd": pytest.approx(est), "tin": 0}]
+    store.settle_budget(hold, "index", day, 1e-9, ("t7-unsettled", "embed", "m", 3, 0, None))  # 늦은 정산 — 무시
+    assert ledger(store, "index", day)[0] == pytest.approx(est)
+    store.release_budget(other)
+
+
+def test_prune_settles_expired_holds(db, monkeypatch):
+    """시작할 때 만료 예약은 지우지 않고 예상 비용으로 정산한다 (지난 날 것은 그날 used에)"""
+    store = db
+    day = dt.date(2001, 1, 15)
+    start = fixed_day(monkeypatch, store, day)
+    hold = store.reserve_budget("index", day, start, 0.25, 1.0, ("t7-prune", "extract", "gpt-4.1-mini", None))
+    assert hold is not None
+    monkeypatch.setattr(store, "HOLD_TTL", "0 seconds")
+    store.prune_budget()
+    assert ledger(store, "index", day) == (pytest.approx(0.25), 0)
+    with store.pool.connection() as c:
+        r = c.execute("SELECT kind, model FROM usage WHERE vol = 't7-prune'").fetchone()
+    assert r == {"kind": "extract" + store.UNSETTLED, "model": "gpt-4.1-mini"}
 
 
 def user(uid, name="가상"):
@@ -127,17 +186,22 @@ def test_rate_limit_per_user(db, monkeypatch):
     from app import main
     monkeypatch.setattr(main, "RATE", {"ask": {"min": 3, "day": 5}, "search": {"min": 0, "day": 2}})
     now = dt.datetime(2001, 2, 1, 10, 0, 30, tzinfo=db.KST)  # 분이 바뀌어 시험이 흔들리지 않게 시각을 고정
-    windows = main._quota_windows
-    monkeypatch.setattr(main, "_quota_windows", lambda route, at=None: windows(route, at or now))
-    ask = main.rate_limit("ask")
+    monkeypatch.setattr(main, "_now", lambda: now)
+
+    def ask(u):
+        with main.rate_limited("ask", u):
+            pass
+
+    def search(u):
+        with main.rate_limited("search", u):
+            pass
     for _ in range(3):
         ask(user(7101))
     with pytest.raises(HTTPException) as e:
         ask(user(7101))
-    assert e.value.status_code == 429 and e.value.headers["Retry-After"] == "60"
+    assert e.value.status_code == 429 and e.value.headers["Retry-After"] == "30"  # 이 분이 끝날 때까지
     ask(user(7102))  # 다른 사용자는 영향 없음
     # 하루 쿼터 (분당 0 = 끔): 2번 뒤 429, Retry-After는 다음 날 0시까지
-    search = main.rate_limit("search")
     search(user(7101))
     search(user(7101))
     with pytest.raises(HTTPException) as e:
@@ -149,3 +213,19 @@ def test_rate_limit_per_user(db, monkeypatch):
     assert db.take_quota("7101", "ask", main._quota_windows("ask", nxt)) is None  # 하루 4번째
     assert db.take_quota("7101", "ask", main._quota_windows("ask", nxt)) is None  # 하루 5번째
     assert db.take_quota("7101", "ask", main._quota_windows("ask", nxt)) == "day"
+
+
+def test_rate_refunded_on_query_budget(db, monkeypatch):
+    """검색·질문 예산이 차서 503이면 그 호출 1회를 되돌린다 — 쿼터가 사용자 탓 아닌 거절로 줄지 않는다"""
+    from app import main
+    monkeypatch.setattr(main, "RATE", {"ask": {"min": 2, "day": 2}, "search": {"min": 0, "day": 0}})
+    monkeypatch.setattr(main, "_now", lambda: dt.datetime(2001, 2, 2, 9, 0, 10, tzinfo=db.KST))
+    for _ in range(3):  # 예산 거절 3번 — 모두 되돌려져 쿼터가 그대로
+        with pytest.raises(llm.BudgetExceeded), main.rate_limited("ask", user(7201)):
+            raise llm.BudgetExceeded("query 예산 한도 (가상)")
+    for _ in range(2):  # 상한 2번은 그대로 쓸 수 있다
+        with main.rate_limited("ask", user(7201)):
+            pass
+    with pytest.raises(HTTPException) as e, main.rate_limited("ask", user(7201)):
+        pass
+    assert e.value.status_code == 429
