@@ -122,9 +122,9 @@ def run(tmp, out, steps=None):
     r["status"] = c.get(f"/volumes/{VOL}").json()
     r["docs"] = c.get(f"/volumes/{VOL}/documents").json()
     saved = {d["doc_id"]: {"vol": VOL, "fields": d["fields"]} for d in r["docs"]}
-    store.vector_search = lambda vec, yf=None, yt=None, limit=20: [{"doc_id": k} for k in saved]
-    store.keyword_search = lambda words, yf=None, yt=None, limit=20: [{"doc_id": k} for k in saved]
-    store.get_documents = lambda ids: {k: saved[k] for k in ids if k in saved}
+    store.vector_search = lambda vec, yf=None, yt=None, limit=20: [{"vol": VOL, "doc_id": k} for k in saved]
+    store.keyword_search = lambda words, yf=None, yt=None, limit=20: [{"vol": VOL, "doc_id": k} for k in saved]
+    store.get_documents = lambda keys: {k: saved[k[1]] for k in keys if k[1] in saved}
     r["hits"] = c.get("/search", params={"q": "가상"}).json()
     r["export_check"] = c.get("/export/check", params={"vol": VOL}).json()
     x = c.get("/export.xlsx", params={"vol": VOL})

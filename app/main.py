@@ -405,7 +405,7 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     if llm.enabled():
         store.upsert_vectors([d], llm.embed(vol, [flow.doc_text(vol, d)]))
     else:  # LLM_PROVIDER=off: 예전 값으로 만든 벡터를 남기지 않는다
-        store.delete_doc_vectors([doc_id])
+        store.delete_doc_vectors(vol, [doc_id])
     store.event(vol, source, "end", doc_id, fields=list(fix), user=user.username)
     return d, list(fix), [x["doc_id"] for x in others]
 
@@ -443,11 +443,68 @@ STATUS_LABEL = {"confirmed": "확정", "excluded": "검사 제외(수정 가능)
 
 
 def startup_migrate():
-    """앱 시작 때 (lifespan): 예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로 — 남은 것만"""
+    """앱 시작 때 (lifespan): 예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로 — 남은 것만.
+    예전 문서 키(doc_id)로 섞인 documents 행을 철의 그래프 상태로 바로잡는다 (https://github.com/reddol18/docflow/issues/50)"""
     if SAMPLE:
         n = store.backfill_inspected(SAMPLE["name"])
         if n:
             print(f"doc_stage: 예전 검사 끝난 문서 {n}건 → 확정", flush=True)
+    if G is not None and not store.migration_done(store.DOC_KEY_MIGRATION):
+        repair_documents()  # 실패하면 완료 표시를 남기지 않는다 → 다음 시작에 Qdrant 옮기기부터 이어서
+        store.mark_migration(store.DOC_KEY_MIGRATION)
+
+
+def _row_differs(row, d):
+    return (row is None or row["fields"] != d["fields"] or (row["flags"] or {}) != (d.get("flags") or {})
+            or list(row["pages"]) != list(d["pages"]) or bool(row["reviewed"]) != bool(d.get("reviewed", False))
+            or bool(row["edited"]) != bool(d.get("edited")))
+
+
+def repair_documents():
+    """예전 키(doc_id 하나)로 섞인 documents 행 바로잡기 — 문서 키 옮기기에서 한 번 (https://github.com/reddol18/docflow/issues/50).
+    예전 키에서는 같은 쪽 이름의 두 철을 처리하면 행이 하나만 남았다: vol은 먼저 처리한 철, 칸 값은 나중 철
+    (ON CONFLICT가 vol을 안 바꿈). 그 뒤 한쪽 철을 지웠다면 남은 행에 지운 철 값이 남거나(나중 철을 지움), 살아 있는
+    철의 행이 아예 없어졌다(먼저 철을 지움 — 행의 vol이 그 철이라). 그래서 events가 아니라 색인이 끝난 모든 철의 그래프
+    상태(철 화면·출력이 읽는 원본, 사람이 고친 값도 여기 있다)와 행을 대조해, 없거나 다른 행을 상태대로 다시 쓴다
+    (LLM 호출 없음). 상태에 없는 행은 지우지 않는다. 잃은 벡터는 다시 만들지 않고 개수만 알린다 — 그 문서는 낱말
+    검색으로만 찾힌다. 고친 행 수"""
+    with store.pool.connection() as c:
+        vols = {r["vol"] for r in c.execute("SELECT DISTINCT vol FROM documents").fetchall()}
+    vols = sorted(vols | set(volume_names()))
+    fixed, keys, skipped = 0, [], []
+    for vol in vols:
+        if not VOL_RX.fullmatch(vol):
+            continue
+        snap = G.get_state(cfg(vol))
+        v = snap.values or {}
+        # 색인이 끝난 철만 (summary의 done과 같은 조건). 색인 전·다시 돌리는 중(검토 대기·멈춤)인 철의 상태는 아직
+        # documents에 쓸 값이 아니다
+        if v.get("indexed") is None or snap.next or snap.interrupts:
+            if v.get("indexed") is not None or snap.next or snap.interrupts:  # 상태가 아예 없는 철은 알릴 것 없음
+                skipped.append(f"{vol}({'검토 대기' if snap.interrupts else '멈춤·실행 중' if snap.next else '색인 전'})")
+            continue
+        docs = v.get("docs", [])
+        have = store.get_documents([(vol, d["doc_id"]) for d in docs])
+        stale = [d for d in docs if _row_differs(have.get((vol, d["doc_id"])), d)]
+        if stale:
+            store.restore_documents(vol, stale, store.index_time(vol))
+            fixed += len(stale)
+        keys += [(vol, d["doc_id"]) for d in docs]
+    lost = []
+    if keys and llm.enabled():
+        try:  # 개수 알림일 뿐 — 세지 못해도 옮기기는 끝낸다
+            lost = store.missing_vectors(keys)
+        except Exception:
+            errors.log_exception("missing_vectors")
+    print(f"documents: 문서 키 옮기기 바로잡음 — 철 {len(vols)}개 대조, 행 {fixed}개를 철의 그래프 상태대로 다시 씀",
+          flush=True)
+    if skipped:
+        print(f"documents: 바로잡기에서 건너뛴 철 {len(skipped)}개 {skipped} — 색인이 끝나면 그 철의 행은 다시 쓰인다 "
+              "(옮기기 완료 표시는 남긴다)", flush=True)
+    if lost:
+        print(f"qdrant: 벡터 없는 문서 {len(lost)}개 (철 {sorted({v for v, _ in lost})}) — 낱말 검색으로만 찾힌다 "
+              "(예전 키 충돌로 덮어쓴 벡터). 그 문서의 칸을 고치면(PATCH) 벡터를 다시 만든다", flush=True)
+    return fixed
 
 
 def positions(vol, doc_ids):
@@ -1086,11 +1143,13 @@ def query_words(q):
 
 
 def rrf(*lists):
-    """Reciprocal Rank Fusion 점수 {doc_id: 점수}. 검색 평가(`eval/search_score.py`)도 이 함수를 쓴다"""
+    """Reciprocal Rank Fusion 점수 {(vol, doc_id): 점수} — 문서 키는 철과 쪽 이름 둘 다
+    (https://github.com/reddol18/docflow/issues/50). 검색 평가(`eval/search_score.py`)도 이 함수를 쓴다"""
     score = {}
     for lst in lists:
         for rank, r in enumerate(lst):
-            score[r["doc_id"]] = score.get(r["doc_id"], 0) + 1 / (60 + rank + 1)
+            k = store.doc_key(r)
+            score[k] = score.get(k, 0) + 1 / (60 + rank + 1)
     return score
 
 
@@ -1098,7 +1157,7 @@ CANDIDATES = 30  # 방식마다 가져오는 후보 수
 
 
 def ranked(q, vec, year_from=None, year_to=None):
-    """/search의 순위 계산(질의 임베딩 뒤) → (벡터 결과, 낱말 결과, RRF 점수, RRF 순 doc_id).
+    """/search의 순위 계산(질의 임베딩 뒤) → (벡터 결과, 낱말 결과, RRF 점수, RRF 순 (vol, doc_id)).
     검색 평가(`eval/search_score.py`)도 이 함수를 그대로 부른다"""
     v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
     kw = store.keyword_search(query_words(q), year_from, year_to, limit=CANDIDATES)
@@ -1112,13 +1171,13 @@ def hybrid(q, year_from=None, year_to=None, k=10):
     v, kw, score, order = ranked(q, vec, year_from, year_to)
     top = order[:k]
     rows = store.get_documents(top)
-    vr = {r["doc_id"]: i + 1 for i, r in enumerate(v)}
-    kr = {r["doc_id"]: i + 1 for i, r in enumerate(kw)}
+    vr = {store.doc_key(r): i + 1 for i, r in enumerate(v)}
+    kr = {store.doc_key(r): i + 1 for i, r in enumerate(kw)}
     shown = schema_fields.shown(schema_fields.SCHEMA)  # 김해: 문서번호·시행일자·수신·제목
     # 칸 값은 fields 아래에 — 스키마 칸 이름이 순위·철 키(doc_id·vol·rrf …)를 덮지 않게 (https://github.com/reddol18/docflow/issues/72)
-    return [{"doc_id": d, "rrf": round(score[d], 5), "vector_rank": vr.get(d), "keyword_rank": kr.get(d),
-             "vol": rows[d]["vol"], "fields": {c: (rows[d]["fields"] or {}).get(c, "") for c in shown}}
-            for d in top if d in rows]
+    return [{"doc_id": k[1], "rrf": round(score[k], 5), "vector_rank": vr.get(k), "keyword_rank": kr.get(k),
+             "vol": k[0], "fields": {c: (rows[k]["fields"] or {}).get(c, "") for c in shown}}
+            for k in top if k in rows]
 
 
 @app.get("/search")

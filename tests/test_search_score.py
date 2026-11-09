@@ -63,20 +63,37 @@ def test_rrf_matches_search(monkeypatch):
 
     def vector_search(vec, yf, yt, limit):
         calls.append(("v", yf, yt, limit))
-        return [{"doc_id": "a", "score": 0.9}, {"doc_id": "b", "score": 0.8}, {"doc_id": "c", "score": 0.7}]
+        return [{"vol": "v", "doc_id": "a", "score": 0.9}, {"vol": "v", "doc_id": "b", "score": 0.8},
+                {"vol": "v", "doc_id": "c", "score": 0.7}]
 
     def keyword_search(words, yf, yt, limit):
         calls.append(("k", tuple(words), yf, yt, limit))
-        return [{"doc_id": "c"}, {"doc_id": "b"}]
+        return [{"vol": "v", "doc_id": "c"}, {"vol": "v", "doc_id": "b"}]
 
     monkeypatch.setattr(main.store, "vector_search", vector_search)
     monkeypatch.setattr(main.store, "keyword_search", keyword_search)
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
     row = {"vol": "v", "fields": {}}
-    monkeypatch.setattr(main.store, "get_documents", lambda ids: {d: row for d in ids})
-    got = [h["doc_id"] for h in main.hybrid("1999년 공장 등록", 1999, 1999, k=3)]
+    monkeypatch.setattr(main.store, "get_documents", lambda keys: {k: row for k in keys})
+    got = [(h["vol"], h["doc_id"]) for h in main.hybrid("1999년 공장 등록", 1999, 1999, k=3)]
     *_, order = main.ranked("1999년 공장 등록", [0.0], 1999, 1999)
-    assert got == order[:3] == ["c", "b", "a"]  # 두 쪽에 다 있는 c(1/63+1/61)·b(2/62)가 앞
+    assert got == order[:3] == [("v", "c"), ("v", "b"), ("v", "a")]  # 두 쪽에 다 있는 c(1/63+1/61)·b(2/62)가 앞
     assert calls[0] == ("v", 1999, 1999, main.CANDIDATES)
     assert calls[1] == ("k", ("공장", "등록"), 1999, 1999, main.CANDIDATES)
     assert calls[:2] == calls[2:4]  # hybrid와 ranked가 같은 인자로 검색한다
+
+
+def test_doc_ranks_and_cite_recall_with_volume_keys():
+    """정답 세트(doc_id)와 비교: 다른 철의 같은 쪽 이름은 한 번만, 답변 근거는 [철/doc_id]에서 시험용 철을 빼고 센다"""
+    assert ss.doc_ranks([("va", "a"), ("vb", "a"), ("va", "b")]) == ["a", "b"]
+    assert ss.doc_ranks([{"vol": "va", "doc_id": "a"}, {"vol": "vb", "doc_id": "a"}]) == ["a"]
+    assert ss.cite_recall("답 [va/a] [test-1/b]", ["a", "b"]) == 0.5
+    assert ss.cite_recall("답 [a]", ["a"]) == 0.0  # 철 없는 예전 표시는 근거로 치지 않는다
+    assert ss.cite_recall("없다", []) is None
+
+
+def test_rrf_keeps_same_page_name_in_two_volumes():
+    """같은 쪽 이름이 두 철에 있으면 RRF 점수를 따로 센다 (https://github.com/reddol18/docflow/issues/50)"""
+    from app import main
+    s = main.rrf([{"vol": "va", "doc_id": "p1"}, {"vol": "vb", "doc_id": "p1"}], [{"vol": "vb", "doc_id": "p1"}])
+    assert set(s) == {("va", "p1"), ("vb", "p1")} and s[("vb", "p1")] > s[("va", "p1")]

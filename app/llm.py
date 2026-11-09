@@ -20,6 +20,7 @@ import base64
 import ipaddress
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -255,17 +256,30 @@ def embed(vol, texts):
 
 
 ANSWER_PROMPT = """너는 1990년대 공문서 기록물 검색 도우미다. 아래 [문서] 목록만 근거로 질문에 답한다.
-답의 근거가 된 문서는 [doc_id]로 표시한다. 목록에 답이 없으면 없다고 말한다. 짧게 답한다."""
+답의 근거가 된 문서는 목록에 붙은 [철/문서] 표시를 그대로 옮겨 적는다. 목록에 답이 없으면 없다고 말한다. 짧게 답한다."""
+# 근거 표시는 철까지 — 다른 철에 같은 쪽 이름이 있을 수 있다 (https://github.com/reddol18/docflow/issues/50).
+# 철·doc_id에는 '/'·']'가 들어가지 않는다 (main.VOL_RX·쪽 파일 이름 규칙)
+CITE_RX = re.compile(r"\[([\w.-]+)/([\w.-]+)\]")
+
+
+def cite_key(vol, doc_id):
+    """답변 근거 표시 [vol/doc_id]의 안쪽"""
+    return f"{vol}/{doc_id}"
+
+
+def citations(text):
+    """답변 글의 근거 표시 → [(vol, doc_id)] (나온 순서, 중복 없이)"""
+    return list(dict.fromkeys(CITE_RX.findall(text or "")))
 
 
 def answer(question, docs, schema=None):
-    """docs = 검색 결과(fields 아래 보이는 칸 + body). 칸 표시명·순서는 색인 스키마에서. 제공자가 off면 LLMOff"""
+    """docs = 검색 결과(vol·doc_id, fields 아래 보이는 칸 + body). 칸 표시명·순서는 색인 스키마에서. 제공자가 off면 LLMOff"""
     schema = schema or fields.SCHEMA
     lab = fields.labels(schema)
     model = PROVIDER.model("chat")
     _guard()
     ctx = "\n\n".join(
-        f"[{d['doc_id']}] " + " / ".join(f"{lab[k]} {(d.get('fields') or {}).get(k, '')}" for k in fields.shown(schema)) + "\n"
+        f"[{cite_key(d['vol'], d['doc_id'])}] " + " / ".join(f"{lab[k]} {(d.get('fields') or {}).get(k, '')}" for k in fields.shown(schema)) + "\n"
         f"본문 앞부분: {d['body'][:600]}" for d in docs)
     r = client().chat.completions.create(
         model=model, temperature=0, max_tokens=ANSWER_MAX_TOKENS,

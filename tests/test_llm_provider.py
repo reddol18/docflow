@@ -161,10 +161,26 @@ def test_openai_budget_and_max_tokens(monkeypatch, fake_openai):
     seen = []
     monkeypatch.setattr(store, "spent_today", lambda: seen.append(1) or 0.0)
     llm.extract("v", ["가상 줄"])
-    llm.answer("가상 질문", [{"doc_id": "v1-0001", "body": "가상 본문"}])
+    llm.answer("가상 질문", [{"vol": "v1", "doc_id": "v1-0001", "body": "가상 본문"}])
     assert len(seen) == 2
     (_, ex), (_, an) = fake_openai.calls
     assert ex["max_tokens"] == 512 == llm.EXTRACT_MAX_TOKENS and an["max_tokens"] == 1024 == llm.ANSWER_MAX_TOKENS
+
+
+def test_answer_cites_volume_and_doc(monkeypatch, fake_openai):
+    """/ask 근거 표시는 [철/doc_id] — 두 철에 같은 쪽 이름이 있어도 어느 철 문서인지 가린다
+    (https://github.com/reddol18/docflow/issues/50). 지시문·목록 표시·답변 읽기가 같은 꼴 (모델 호출 없음)"""
+    from app import store
+    monkeypatch.setattr(store, "add_usage", lambda *a: None)
+    monkeypatch.setattr(store, "spent_today", lambda: 0.0)
+    monkeypatch.setattr(llm, "_key", lambda: "fake-key-for-test")
+    llm.answer("가상 질문", [{"vol": "va", "doc_id": "p-0001", "body": "가상 갑"},
+                         {"vol": "vb", "doc_id": "p-0001", "body": "가상 을"}])
+    user = fake_openai.calls[-1][1]["messages"][1]["content"]
+    assert "[va/p-0001] " in user and "[vb/p-0001] " in user
+    assert "[철/문서]" in llm.ANSWER_PROMPT
+    assert llm.citations("가상 답 [vb/p-0001], [va/p-0001] 그리고 [vb/p-0001] [p-0002]") == [("vb", "p-0001"),
+                                                                                         ("va", "p-0001")]
     monkeypatch.setattr(store, "spent_today", lambda: llm.BUDGET)
     with pytest.raises(llm.BudgetExceeded):
         llm.extract("v", ["가상 줄"])
@@ -201,7 +217,7 @@ def _fake_volume(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "event", lambda vol, node, status, doc=None, **k: rec.events.append((node, status, k)))
     monkeypatch.setattr(store, "save_documents", lambda docs: rec.saved.extend(docs))
     monkeypatch.setattr(store, "upsert_vectors", lambda docs, vecs: rec.vectors.append(docs))
-    monkeypatch.setattr(store, "delete_doc_vectors", lambda ids: rec.dropped.append(list(ids)))
+    monkeypatch.setattr(store, "delete_doc_vectors", lambda vol, ids: rec.dropped.append([vol, *ids]))
     return rec
 
 
@@ -232,7 +248,7 @@ def test_off_runs_whole_flow_without_openai(tmp_path, monkeypatch, fake_openai, 
     assert fake_openai.made == [] and fake_openai.calls == []  # OpenAI 클라이언트를 만들지도 부르지도 않음
     assert not state.next and state.values["indexed"] == 2 and state.values["embedded"] == 0  # 끝까지 돎
     assert [d["doc_id"] for d in rec.saved] == ["v1-0001", "v1-0003"] and rec.saved[0]["fields"]["title"] == "사람이 쓴 가상 제목"
-    assert rec.vectors == [] and rec.dropped == [["v1-0001", "v1-0003"]]  # 벡터는 넣지 않고 예전 벡터는 지움
+    assert rec.vectors == [] and rec.dropped == [["v1", "v1-0001", "v1-0003"]]  # 벡터는 넣지 않고 예전 벡터는 지움
     assert all(d["info"]["llm_skipped"] == ["extract", "read"] and d["reviewed"] for d in rec.saved)
     for node in ("extract", "read"):  # 진행 화면(events)에 건너뜀이 드러난다
         assert sum(n == node and s == "end" and k.get("skipped") == "llm_off" for n, s, k in rec.events) == 2
@@ -277,10 +293,10 @@ def test_off_edit_drops_vector(monkeypatch, fake_openai):
     monkeypatch.setattr(store, "add_edits", lambda vol, rows, uid, source: rec.edits.extend(rows))
     monkeypatch.setattr(store, "event", lambda *a, **k: None)
     monkeypatch.setattr(store, "upsert_vectors", lambda *a: pytest.fail("off면 벡터를 넣지 않는다"))
-    monkeypatch.setattr(store, "delete_doc_vectors", lambda ids: rec.dropped.append(list(ids)))
+    monkeypatch.setattr(store, "delete_doc_vectors", lambda vol, ids: rec.dropped.append([vol, *ids]))
     d, changed, _ = main._edit_document("v1", "v1-0001", {"title": "가상 제목"}, SimpleNamespace(id=1, username="가상"))
     assert changed == ["title"] and d["fields"]["title"] == "가상 제목" and rec.saved == [d]
-    assert rec.edits == [("v1-0001", "title", "", "가상 제목")] and rec.dropped == [["v1-0001"]]
+    assert rec.edits == [("v1-0001", "title", "", "가상 제목")] and rec.dropped == [["v1", "v1-0001"]]
     assert fake_openai.made == []
 
 

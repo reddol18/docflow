@@ -78,9 +78,10 @@ def load_ocr(vol, page):
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
-  doc_id text PRIMARY KEY, vol text NOT NULL, pages text[] NOT NULL,
+  doc_id text NOT NULL, vol text NOT NULL, pages text[] NOT NULL,
   fields jsonb NOT NULL DEFAULT '{}'::jsonb, search_text text, year int,
-  flags jsonb, reviewed boolean DEFAULT false, updated_at timestamptz DEFAULT now());
+  flags jsonb, reviewed boolean DEFAULT false, updated_at timestamptz DEFAULT now(),
+  PRIMARY KEY (vol, doc_id));
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS fields jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_text text;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS year int;
@@ -142,8 +143,11 @@ CREATE TABLE IF NOT EXISTS stage_log (
   reason text, fixed_fields text[], gen int NOT NULL DEFAULT 0);
 ALTER TABLE stage_log ADD COLUMN IF NOT EXISTS gen int NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS stage_log_doc ON stage_log (vol, doc_id);
-CREATE TABLE IF NOT EXISTS stage_gen (vol text PRIMARY KEY, gen int NOT NULL, since timestamptz NOT NULL)
+CREATE TABLE IF NOT EXISTS stage_gen (vol text PRIMARY KEY, gen int NOT NULL, since timestamptz NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, done_at timestamptz NOT NULL DEFAULT now())
 """
+# ↑ schema_migrations: 한 번만 돌리는 데이터 옮기기의 완료 표시 (전체를 훑는 옮기기를 시작할 때마다 다시 돌리지 않게).
+#   중간에 실패하면 표시를 남기지 않아 다음 시작에 이어서 한다
 # ↑ doc_stage·stage_log (https://github.com/reddol18/docflow/issues/86): 새 표만 더한다. 행이 없는 문서(예전 철)는
 #   흐름 설정의 처음 단계에 있는 것으로 본다 → 옛 철은 옮길 것 없이 그대로 열린다
 # ↑ 예전 판(https://github.com/reddol18/docflow/issues/28 이전)이 저장한 예외 원문을 표에서 지운다 (시작할 때마다, 남은 행만)
@@ -160,6 +164,7 @@ def init_db():
             if stmt.strip():
                 c.execute(stmt)
         migrate_documents(c)
+        migrate_doc_key(c)
     prune_audit()
 
 
@@ -179,14 +184,63 @@ def migrate_documents(c, schema=None):
     with c.transaction():
         pairs = ", ".join(f"'{k}', coalesce({k}, '')" for k in old)
         c.execute(f"UPDATE documents SET fields = jsonb_build_object({pairs}) || fields")  # noqa: S608 — 고정 열 이름
-        rows = c.execute("SELECT doc_id, fields FROM documents").fetchall()
+        rows = c.execute("SELECT vol, doc_id, fields FROM documents").fetchall()
         with c.cursor() as cur:
-            cur.executemany("UPDATE documents SET search_text = %s, year = %s WHERE doc_id = %s",
-                            [(fields.search_text(schema, r["fields"]), fields.year_of(schema, r["fields"]), r["doc_id"])
-                             for r in rows])
+            cur.executemany("UPDATE documents SET search_text = %s, year = %s WHERE vol = %s AND doc_id = %s",
+                            [(fields.search_text(schema, r["fields"]), fields.year_of(schema, r["fields"]), r["vol"],
+                              r["doc_id"]) for r in rows])
         c.execute("ALTER TABLE documents " + ", ".join(f"DROP COLUMN {k}" for k in old))
     print(f"documents: 예전 고정 열 {old} → fields jsonb ({len(rows)}행)", flush=True)
     return len(rows)
+
+
+def _pk_columns(c, table):
+    """표의 기본 키 열 (순서대로)과 제약 이름"""
+    rows = c.execute(
+        "SELECT con.conname, a.attname FROM pg_constraint con "
+        "JOIN pg_class t ON t.oid = con.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "JOIN unnest(con.conkey) WITH ORDINALITY k(attnum, ord) ON true "
+        "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+        "WHERE con.contype = 'p' AND t.relname = %s AND n.nspname = current_schema() ORDER BY k.ord",
+        (table,)).fetchall()
+    return (rows[0]["conname"] if rows else None), [r["attname"] for r in rows]
+
+
+def migrate_doc_key(c):
+    """문서 키 doc_id → (vol, doc_id) (https://github.com/reddol18/docflow/issues/50). documents 기본 키만 doc_id 하나였다
+    (다른 표 edits·events·audit·review_time·inspection·doc_stage·stage_log는 처음부터 vol 칸을 함께 가진다).
+    기본 키를 한 트랜잭션에서 바꾼다 — 행은 그대로 두므로 사람이 고친 값·검사·감사 기록이 그대로 남는다.
+    이미 바뀌었으면 아무것도 안 한다 (카탈로그 한 번 읽기, 시작할 때마다). 바꿨으면 True.
+    예전 키로 섞인 행은 시작 마무리(main.repair_documents)가 철의 그래프 상태대로 바로잡는다"""
+    name, cols = _pk_columns(c, "documents")
+    if cols == ["vol", "doc_id"]:
+        return False
+    with c.transaction():
+        if name:
+            c.execute(f'ALTER TABLE documents DROP CONSTRAINT "{name}"')  # 카탈로그에서 읽은 제약 이름
+        c.execute("ALTER TABLE documents ADD PRIMARY KEY (vol, doc_id)")
+    print(f"documents: 기본 키 {cols} → [vol, doc_id]. 여러 철에 나온 doc_id {shared_doc_ids(c)}개 — 섞인 행은 "
+          "시작 마무리에서 철의 상태대로 바로잡는다 (documents: 바로잡음 로그)", flush=True)
+    return True
+
+
+def shared_doc_ids(c):
+    """여러 철에 나온 doc_id 수 (이벤트 기준) — 예전 키(doc_id 하나)에서 충돌했을 수 있는 문서"""
+    return c.execute("SELECT count(*) AS n FROM (SELECT doc_id FROM events WHERE doc_id IS NOT NULL "
+                     "GROUP BY doc_id HAVING count(DISTINCT vol) > 1) t").fetchone()["n"]
+
+
+DOC_KEY_MIGRATION = "doc_key_50"  # Qdrant 점 다시 매기기 + documents 행 바로잡기 (https://github.com/reddol18/docflow/issues/50)
+
+
+def migration_done(name):
+    with pool.connection() as c:
+        return c.execute("SELECT 1 FROM schema_migrations WHERE name = %s", (name,)).fetchone() is not None
+
+
+def mark_migration(name):
+    with pool.connection() as c:
+        c.execute("INSERT INTO schema_migrations (name) VALUES (%s) ON CONFLICT DO NOTHING", (name,))
 
 
 AUDIT_KEEP = "1 year"  # 감사 로그 보존 기간 (2026-11-06 확정, README)
@@ -206,6 +260,8 @@ def init():
         q.create_collection(COLLECTION, vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
         q.create_payload_index(COLLECTION, "year", PayloadSchemaType.INTEGER)
         q.create_payload_index(COLLECTION, "vol", PayloadSchemaType.KEYWORD)
+    elif not migration_done(DOC_KEY_MIGRATION):
+        migrate_vectors()  # 예전 키(doc_id)의 점을 (vol, doc_id)로. 완료 표시는 main.startup_migrate가 행 바로잡기 뒤에 남긴다
 
 
 def add_usage(vol, kind, model, tin, tout, usd):
@@ -737,14 +793,42 @@ def _upsert_doc(c, d, schema):
     c.execute(
         """INSERT INTO documents (doc_id, vol, pages, fields, search_text, year, flags, reviewed, updated_at)
            VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
-           ON CONFLICT (doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
+           ON CONFLICT (vol, doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
              search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
              reviewed=EXCLUDED.reviewed, updated_at=now()""",
         (d["doc_id"], d["vol"], d["pages"], json.dumps(f, ensure_ascii=False),
          fields.search_text(schema, f), fields.year_of(schema, f),
          json.dumps(d["flags"], ensure_ascii=False), d.get("reviewed", False)))
     if d.get("edited"):
-        c.execute("UPDATE documents SET edited = true WHERE doc_id = %s", (d["doc_id"],))
+        c.execute("UPDATE documents SET edited = true WHERE vol = %s AND doc_id = %s", (d["vol"], d["doc_id"]))
+
+
+def index_time(vol):
+    """철을 처음 색인한 시각 (index 노드 끝 이벤트). 없으면 None"""
+    with pool.connection() as c:
+        return c.execute("SELECT min(ts) AS t FROM events WHERE vol = %s AND node = 'index' AND phase = 'end'",
+                         (vol,)).fetchone()["t"]
+
+
+def restore_documents(vol, docs, created_at, schema=None):
+    """documents 행을 그래프 상태 그대로 다시 쓴다 (옮기기의 바로잡기 — https://github.com/reddol18/docflow/issues/50).
+    save_documents와 달리 edited도 상태대로 (켜고 끈다), 새로 만드는 행의 created_at은 철의 색인 시각
+    (리포트 '색인 문서 수'가 바로잡은 날에 부풀지 않게; 모르면 NULL — 리포트가 세지 않는다). 있던 행의 created_at은 그대로.
+    있던 행의 updated_at도 그대로 둔다 — 바로잡기는 출력 내용(그래프 상태)을 바꾸지 않으므로, 내보낸 철이 '내보낸 뒤
+    바뀜'(last_export current False → 일괄 삭제 409)이 되지 않게"""
+    schema = schema or fields.SCHEMA
+    with pool.connection() as c, c.transaction(), c.cursor() as cur:
+        cur.executemany(
+            """INSERT INTO documents (doc_id, vol, pages, fields, search_text, year, flags, reviewed, edited, created_at,
+                                      updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+               ON CONFLICT (vol, doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
+                 search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
+                 reviewed=EXCLUDED.reviewed, edited=EXCLUDED.edited""",
+            [(d["doc_id"], vol, d["pages"], json.dumps(d["fields"], ensure_ascii=False),
+              fields.search_text(schema, d["fields"]), fields.year_of(schema, d["fields"]),
+              json.dumps(d.get("flags"), ensure_ascii=False), d.get("reviewed", False), bool(d.get("edited")),
+              created_at) for d in docs])
 
 
 def save_edit(vol, d, flag_items, schema=None):
@@ -766,7 +850,7 @@ def keyword_search(words, year_from=None, year_to=None, limit=20):
         return []
     hay = "coalesce(search_text,'')"
     score = " + ".join(f"(CASE WHEN {hay} ILIKE %s THEN 1 ELSE 0 END)" for _ in words)
-    sql = f"SELECT doc_id, ({score}) AS score FROM documents WHERE ({score}) > 0"  # noqa: S608 — 자리표시자만 끼움, 값은 매개변수
+    sql = f"SELECT vol, doc_id, ({score}) AS score FROM documents WHERE ({score}) > 0"  # noqa: S608 — 자리표시자만 끼움, 값은 매개변수
     args = [f"%{w}%" for w in words] * 2
     if year_from:
         sql += " AND year >= %s"
@@ -774,16 +858,27 @@ def keyword_search(words, year_from=None, year_to=None, limit=20):
     if year_to:
         sql += " AND year <= %s"
         args.append(int(year_to))
-    sql += " ORDER BY score DESC, doc_id LIMIT %s"
+    sql += " ORDER BY score DESC, doc_id, vol LIMIT %s"
     args.append(limit)
     with pool.connection() as c:
         return c.execute(sql, args).fetchall()
 
 
-def get_documents(ids):
+def doc_key(r):
+    """문서 키 (철, doc_id) — 같은 쪽 이름이 다른 철에도 있을 수 있다 (https://github.com/reddol18/docflow/issues/50)"""
+    return r["vol"], r["doc_id"]
+
+
+def get_documents(keys):
+    """keys = [(vol, doc_id)] → {(vol, doc_id): 행}"""
+    keys = list(keys)
+    if not keys:
+        return {}
     with pool.connection() as c:
-        rows = c.execute("SELECT * FROM documents WHERE doc_id = ANY(%s)", (list(ids),)).fetchall()
-    return {r["doc_id"]: r for r in rows}
+        rows = c.execute("SELECT d.* FROM documents d JOIN unnest(%s::text[], %s::text[]) k(vol, doc_id) "
+                         "ON d.vol = k.vol AND d.doc_id = k.doc_id",
+                         ([v for v, _ in keys], [d for _, d in keys])).fetchall()
+    return {doc_key(r): r for r in rows}
 
 
 _q = None
@@ -797,8 +892,58 @@ def qdrant():
     return _q
 
 
-def point_id(doc_id):
+def point_id(vol, doc_id):
+    """Qdrant 점 id — (철, doc_id)에서 만든다 (https://github.com/reddol18/docflow/issues/50).
+    철·doc_id에는 '/'가 들어가지 않으므로(main.VOL_RX·쪽 파일 이름 규칙) 이음 글자로 겹치지 않는다"""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"docflow/doc/{vol}/{doc_id}"))
+
+
+def legacy_point_id(doc_id):
+    """#50 이전 점 id (doc_id만으로) — 옮기기와 시험에서만 쓴다"""
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "docflow/" + doc_id))
+
+
+class VectorMigrationError(RuntimeError):
+    """Qdrant 점을 안전하게 옮기지 못함 — 시작을 멈추고 무엇을 할지 알린다"""
+
+
+def migrate_vectors(batch=256):
+    """Qdrant 점 id를 doc_id → (vol, doc_id)로 다시 매긴다 (https://github.com/reddol18/docflow/issues/50).
+    벡터를 다시 만들지 않는다 (임베딩 비용·LLM 호출 없음): payload의 vol·doc_id로 새 id를 셈해, id가 다른 점만
+    벡터·payload를 그대로 새 id로 넣고(wait) 그 다음에 옛 id를 지운다. 중간에 멈춰도 다시 돌리면 이어서 끝난다
+    (새 id 넣기는 같은 값 덮어쓰기, 옛 id 지우기는 없는 id면 그냥 지나감). 시작할 때마다 — 옮길 것이 없으면 id만 훑는다.
+    payload에 vol·doc_id가 없는 점이 있으면 아무것도 옮기지 않고 VectorMigrationError (조용히 버리지 않는다). 옮긴 점 수"""
+    from qdrant_client.models import PointIdsList, PointStruct
+    q = qdrant()
+    moves, bad, offset = [], [], None
+    while True:
+        pts, offset = q.scroll(COLLECTION, limit=batch, offset=offset, with_payload=["vol", "doc_id"],
+                               with_vectors=False)
+        for p in pts:
+            pl = p.payload or {}
+            if not pl.get("vol") or not pl.get("doc_id"):
+                bad.append(str(p.id))
+            elif str(p.id) != point_id(pl["vol"], pl["doc_id"]):
+                moves.append(p.id)
+        if offset is None:
+            break
+    if bad:
+        raise VectorMigrationError(
+            f"Qdrant '{COLLECTION}'에 vol·doc_id payload가 없는 점 {len(bad)}개 (예: {bad[:3]}) — 문서 키(vol, doc_id)로 "
+            "옮길 수 없어 시작을 멈춘다. 그 점들을 지우거나(그 철을 다시 돌리면 다시 만든다) 컬렉션을 백업한 뒤 지우고 "
+            "철을 다시 돌린다 (https://github.com/reddol18/docflow/issues/50)")
+    if not moves:
+        return 0
+    before = q.count(COLLECTION, exact=True).count
+    for i in range(0, len(moves), batch):
+        old = q.retrieve(COLLECTION, ids=moves[i:i + batch], with_payload=True, with_vectors=True)
+        q.upsert(COLLECTION, wait=True, points=[
+            PointStruct(id=point_id(p.payload["vol"], p.payload["doc_id"]), vector=p.vector, payload=p.payload)
+            for p in old])
+        q.delete(COLLECTION, points_selector=PointIdsList(points=[p.id for p in old]), wait=True)
+    after = q.count(COLLECTION, exact=True).count
+    print(f"qdrant: 점 {len(moves)}개 id를 (vol, doc_id)로 옮김 (점 수 {before} → {after})", flush=True)
+    return len(moves)
 
 
 def upsert_vectors(docs, vectors, schema=None):
@@ -808,7 +953,7 @@ def upsert_vectors(docs, vectors, schema=None):
     pts = []
     for d, v in zip(docs, vectors):
         f = d["fields"]
-        pts.append(PointStruct(id=point_id(d["doc_id"]), vector=v, payload={
+        pts.append(PointStruct(id=point_id(d["vol"], d["doc_id"]), vector=v, payload={
             "doc_id": d["doc_id"], "vol": d["vol"], "year": fields.year_of(schema, f),
             "fields": {k: f.get(k, "") for k in fields.shown(schema)}}))
     qdrant().upsert(COLLECTION, points=pts)
@@ -832,11 +977,11 @@ def delete_vectors(vol):
     return n
 
 
-def delete_doc_vectors(doc_ids):
-    """문서들의 벡터를 지운다 (LLM_PROVIDER=off로 다시 색인·수정한 문서 — 예전 값의 벡터를 남기지 않는다)"""
+def delete_doc_vectors(vol, doc_ids):
+    """철 vol의 문서들의 벡터를 지운다 (LLM_PROVIDER=off로 다시 색인·수정한 문서 — 예전 값의 벡터를 남기지 않는다)"""
     from qdrant_client.models import PointIdsList
     if doc_ids:
-        qdrant().delete(COLLECTION, points_selector=PointIdsList(points=[point_id(d) for d in doc_ids]), wait=True)
+        qdrant().delete(COLLECTION, points_selector=PointIdsList(points=[point_id(vol, d) for d in doc_ids]), wait=True)
 
 
 def vector_search(vec, year_from=None, year_to=None, limit=20):
@@ -845,4 +990,14 @@ def vector_search(vec, year_from=None, year_to=None, limit=20):
     if year_from or year_to:
         flt = Filter(must=[FieldCondition(key="year", range=Range(gte=year_from, lte=year_to))])
     res = qdrant().query_points(COLLECTION, query=vec, query_filter=flt, limit=limit)
-    return [{"doc_id": p.payload["doc_id"], "score": p.score} for p in res.points]
+    return [{"vol": p.payload["vol"], "doc_id": p.payload["doc_id"], "score": p.score} for p in res.points]
+
+
+def missing_vectors(keys):
+    """(vol, doc_id) 중 Qdrant 점이 없는 것 — 시작 때 예전 키 충돌로 잃은 벡터를 세는 데 쓴다"""
+    keys = list(keys)
+    have = set()
+    for i in range(0, len(keys), 256):
+        have |= {str(p.id) for p in qdrant().retrieve(COLLECTION, ids=[point_id(v, d) for v, d in keys[i:i + 256]],
+                                                      with_payload=False, with_vectors=False)}
+    return [k for k in keys if point_id(*k) not in have]

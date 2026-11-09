@@ -29,7 +29,8 @@ def pg_store():
     from app import store
     if os.environ.get("TEST_PG_NO_PREPARE"):  # PGlite 소켓 서버처럼 prepared statement에 약한 시험 서버용
         store.pool.kwargs["prepare_threshold"] = None
-    store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True})()
+    store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True,
+                                          "scroll": lambda self, *a, **k: ([], None)})()
     store.init()
     yield store
     store.lock_pool.close()
