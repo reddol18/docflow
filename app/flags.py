@@ -1,11 +1,14 @@
 """검토 표시 규칙. 그래프(validate 노드)와 평가 스크립트(eval/flag_whatif.py)가 같은 코드를 쓴다.
 
-외부 의존 없음(표준 라이브러리만) → 저장된 결과만으로 규칙·기준값을 바꿔 다시 계산할 수 있다.
+app.fields(스키마 도우미) 말고는 표준 라이브러리만 → 저장된 결과만으로 규칙·기준값을 바꿔 다시 계산할 수 있다.
 문서 dict는 graph.merge가 만드는 모양: fields / b / hw / info.
 """
 import collections
 import datetime as dt
 import re
+from typing import NamedTuple
+
+from app.fields import by_rule, flag_key, is_shown
 
 LEGACY = {
     "conf_serial": 0.9,   # 손글씨 판독 확신도가 이보다 낮으면 표시
@@ -51,58 +54,95 @@ def _serial(s):
 
 
 ROLES = ("docno", "serial", "date", "recipient")  # 규칙이 보는 칸 = 스키마에서 이 rule 이름을 가진 칸 (app/graph.py RULES)
+# 손글씨 칸 판독 값을 쓰는 규칙 — 이 칸들의 확신도는 LLM 자기 확신도가 아니라 판독(info.conf_*)으로 본다 (app/graph.py HW_CELLS 키)
+HW_RULES = frozenset({"docno", "serial", "date"})
 LLM_METHODS = ("llm_extract", "vocab")  # LLM 확신도를 보는 칸의 추출 방식 (llm_generate 요약은 원문에 맞춰 볼 값이 아니라 뺀다)
 
 
-def flags(docs, cfg=None, llm_keys=("recipient", "title")):
-    """docs(철 하나, 쪽 순서)에 대해 문서마다 {칸: [사유]}를 돌려준다.
+class Targets(NamedTuple):
+    """규칙이 볼 칸 (targets()가 스키마에서 만든다)
+    roles {역할: 칸 이름}            ROLES 중 스키마에 있는 것. 없는 역할의 규칙은 건너뛴다
+    llm   {규칙 안 키: 칸 이름}       LLM 확신도를 볼 칸. 규칙 안 키는 역할 칸이면 역할 이름(사유가 같은 목록에 붙게), 아니면 'llm:칸'
+    keys  {규칙 안 키: 표시 키}       결과 키 (칸의 flag_key)"""
+    roles: dict
+    llm: dict
+    keys: dict
 
-    docs의 fields 키는 규칙 역할 이름(ROLES — 김해 칸 이름과 같다). 없는 역할의 규칙은 건너뛴다 (그 rule 칸이 없는 스키마).
-    llm_keys: b[키]의 LLM 확신도가 conf_llm보다 낮으면 그 키에 'LLM'을 붙인다 (b에 없는 키는 건너뜀).
-    스키마의 칸 이름으로 부를 때는 for_schema를 쓴다."""
+
+# 김해 칸 이름 그대로인 문서용 (flags(docs) 기본값 — 규칙 시험·옛 호출). 스키마가 있으면 targets(schema)를 쓴다
+LEGACY_TARGETS = Targets(roles={r: r for r in ROLES}, llm={"recipient": "recipient", "llm:title": "title"},
+                         keys={"docno": "serial", "serial": "serial", "date": "date", "recipient": "recipient",
+                               "llm:title": "title"})
+
+
+def targets(schema):
+    """스키마에서 규칙이 볼 칸을 rule 이름으로 찾는다 (칸 이름은 기관마다 다르다 — https://github.com/reddol18/docflow/issues/72).
+    LLM 확신도는 화면에 보이는 건 단위 칸(숨김·철 단위 제외) 중 prompt가 있는 추출 칸만 — 손글씨 규칙 칸(HW_RULES, 판독
+    확신도로 따로 봄)과 요약(llm_generate) 제외. 다른 표시 원천(예: 칸 검증 규칙)을 더할 때도 표시 키는 flag_key로 맞춘다."""
+    roles = {r: f["name"] for r in ROLES if (f := by_rule(schema, r))}
+    role_of = {n: r for r, n in roles.items()}
+    llm = {role_of.get(f["name"], "llm:" + f["name"]): f["name"] for f in schema["fields"]
+           if "prompt" in f and is_shown(f) and f.get("rule") not in HW_RULES and (f["method"] in LLM_METHODS or "rule" in f)}
+    by = {f["name"]: f for f in schema["fields"]}
+    return Targets(roles, llm, {k: flag_key(by[n]) for k, n in {**roles, **llm}.items()})
+
+
+def for_schema(docs, schema, cfg=None):
+    """스키마 칸 이름을 쓰는 문서(graph.merge 모양)에 규칙을 돌려 문서마다 {표시 키: [사유]}"""
+    return flags(docs, cfg, targets(schema))
+
+
+def flags(docs, cfg=None, t=LEGACY_TARGETS):
+    """docs(철 하나, 쪽 순서)에 대해 문서마다 {표시 키: [사유]}를 돌려준다.
+    t(Targets)가 역할 → 칸 이름을 정한다 — 문서 칸 키로 규칙을 고르지 않는다. 기본은 김해 칸 이름(LEGACY_TARGETS)."""
     c = {**DEFAULT, **(cfg or {})}
     rules = set(c["rules"])
-    has = set(docs[0]["fields"]) if docs else set()
-    years = collections.Counter(d["fields"]["date"][:4] for d in docs if d["fields"].get("date"))
+    roles = t.roles
+
+    def v(d, r):  # 역할 r 칸의 값
+        return d["fields"].get(roles[r]) or ""
+    years = collections.Counter(v(d, "date")[:4] for d in docs if v(d, "date")) if "date" in roles else {}
     ok_years = {y for y, n in years.items() if n >= 3}
     out = []
     for i, d in enumerate(docs):
-        f, info = d["fields"], d.get("info") or {}
+        info = d.get("info") or {}
         nb = docs[max(0, i - 3):i] + docs[i + 1:i + 4]
-        fl = {k: [] for k in dict.fromkeys(("serial", "date", "recipient", *llm_keys))}
+        fl = {k: [] for k in dict.fromkeys(("serial", "date", "recipient", *t.llm))}
 
         # ---- 일자
-        if "date" in has:
-            day = _date(f["date"]) if f["date"] else None
+        if "date" in roles:
+            date = v(d, "date")
+            day = _date(date) if date else None
             if not day:
                 fl["date"].append("형식")
             else:
-                if f["date"][:4] not in ok_years:
+                if date[:4] not in ok_years:
                     fl["date"].append("범위")
-                nd = [x for x in (_date(o["fields"]["date"]) for o in nb) if x]
+                nd = [x for x in (_date(v(o, "date")) for o in nb) if x]
                 w = dt.timedelta(c["date_flow_days"])
                 if len(nd) >= 2 and not (min(nd) - w <= day <= max(nd) + w):
                     fl["date"].append("흐름")
                 if "day1" in rules and day.day == 1:
                     fl["date"].append("1일")
-                if "order" in rules and "serial" in has and _order_conflict(d, day, docs):
+                if "order" in rules and "serial" in roles and _order_conflict(d, day, docs, v):
                     fl["date"].append("순서")
             if info["conf_date"] and info["conf_date"] < c["conf_date"]:
                 fl["date"].append("확신도")
 
         # ---- 일련번호
-        if "serial" in has:
+        if "serial" in roles:
+            serial = v(d, "serial")
+            year = v(d, "date")[:4] if "date" in roles else ""
             if info["blank"]:
                 if info["conf_serial"] < c["conf_serial"]:
                     fl["serial"].append("빈칸")
-            elif _serial(f["serial"]) is None:
+            elif _serial(serial) is None:
                 fl["serial"].append("형식")
             else:
-                n = int(f["serial"])
-                ns = [_serial(o["fields"]["serial"]) for o in nb
-                      if _serial(o["fields"]["serial"]) is not None
-                      and o["info"]["prefix"] == info["prefix"]
-                      and o["fields"].get("date", "")[:4] == f.get("date", "")[:4]]
+                n = int(serial)
+                ns = [_serial(v(o, "serial")) for o in nb
+                      if _serial(v(o, "serial")) is not None and o["info"]["prefix"] == info["prefix"]
+                      and (v(o, "date")[:4] if "date" in roles else "") == year]
                 if len(ns) >= 2:
                     lo, hi = min(ns), max(ns)
                     m = max(50, 0.3 * hi)
@@ -110,87 +150,52 @@ def flags(docs, cfg=None, llm_keys=("recipient", "title")):
                         fl["serial"].append("흐름")
             if info["conf_serial"] and info["conf_serial"] < c["conf_serial"]:
                 fl["serial"].append("확신도")
-            if "doc_head" in rules and f.get("docno") and not re.match(r"[가-힣]", f["docno"]):
+            docno = v(d, "docno") if "docno" in roles else ""
+            if "doc_head" in rules and docno and not re.match(r"[가-힣]", docno):
                 fl["serial"].append("앞부분 없음")
 
         # ---- 불일치: GPT 텍스트 추출(B)과 손글씨 칸 판독이 다름. 비전 판독은 틀려도 확신도가 높아서
         # 확신도만으로는 틀린 일련번호의 56%, 일자의 23%만 잡혔다 (6개 철 129건)
-        if "serial" in has and info["b_serial"] and info["b_serial"] != f["serial"]:
+        if "serial" in roles and info["b_serial"] and info["b_serial"] != v(d, "serial"):
             fl["serial"].append("불일치")
-        if "date" in has and c["mismatch_date"] and info["b_date"] and info["b_date"] != f["date"]:
+        if "date" in roles and c["mismatch_date"] and info["b_date"] and info["b_date"] != v(d, "date"):
             fl["date"].append("불일치")
 
         # ---- LLM 확신도 (김해: 수신·제목)
         b = d.get("b") or {}
-        for k in llm_keys:
-            if k in b and b[k]["confidence"] < c["conf_llm"]:
+        for k, name in t.llm.items():
+            if name in b and b[name]["confidence"] < c["conf_llm"]:
                 fl[k].append("LLM")
         # ---- 수신
-        rec = (f.get("recipient") or "").strip()
-        if "recipient" in has and "rec_sign" in rules and SIGN.search(rec) \
-                and not re.search(r"(시장|군수|지사|청장|서장|본부장)\s*\S*과\s*장$", rec):
-            fl["recipient"].append("결재란")
-        if "recipient" in has and "rec_part" in rules and rec and rec != "내부결재":
-            has_addr = bool(ADDR.search(rec) or PLACE.search(rec))
-            if has_addr and not TAIL.search(rec) and not re.search(r"(장|관|처장|소장)$", rec):
-                fl["recipient"].append("이름 없음")
-            elif not has_addr and re.search(r"대표$", rec):
-                fl["recipient"].append("주소 없음")
-        out.append({k: v for k, v in fl.items() if v})
-    return out
-
-
-def flag_key(field):
-    """칸의 검토 표시가 붙는 키 (스키마 flag_key, 없으면 칸 이름)"""
-    return field.get("flag_key", field["name"])
-
-
-def targets(schema, hw_rules):
-    """스키마에서 규칙이 볼 칸을 rule 이름으로 찾는다 (칸 이름은 기관마다 다르다).
-    → roles {역할: 칸 이름} (ROLES 중 스키마에 있는 것),
-      llm {규칙 안 키: 칸 이름} — LLM 확신도를 볼 칸. prompt가 있는 추출 칸 중 손글씨 규칙 칸(hw_rules, 판독 확신도로
-        따로 봄)과 요약(llm_generate) 제외. 규칙 안 키는 역할 칸이면 역할 이름(사유가 같은 목록에 붙게), 아니면 'llm:칸'
-      keys {규칙 안 키: 표시 키(flag_key)}.
-    다른 표시 원천(예: 칸 검증 규칙)을 더할 때도 표시 키는 flag_key로 맞춘다."""
-    fs = schema["fields"]
-    roles = {r: next(f["name"] for f in fs if f.get("rule") == r) for r in ROLES if any(f.get("rule") == r for f in fs)}
-    role_of = {n: r for r, n in roles.items()}
-    llm = {role_of.get(f["name"], "llm:" + f["name"]): f["name"] for f in fs
-           if "prompt" in f and f.get("rule") not in hw_rules and (f["method"] in LLM_METHODS or "rule" in f)}
-    by = {f["name"]: f for f in fs}
-    keys = {k: flag_key(by[n]) for k, n in {**roles, **llm}.items()}
-    return roles, llm, keys
-
-
-def for_schema(docs, schema, cfg=None, hw_rules=()):
-    """스키마 칸 이름을 쓰는 문서(graph.merge 모양)에 규칙을 돌려 문서마다 {표시 키: [사유]}.
-    역할 칸 값을 역할 이름으로 옮긴 사본에 flags를 돌리고, 결과 키를 그 칸의 표시 키(flag_key)로 되돌린다.
-    김해 매핑은 역할 이름 = 칸 이름이라 flags(docs)와 같다."""
-    roles, llm, keys = targets(schema, hw_rules)
-    view = [{"fields": {r: d["fields"].get(n, "") for r, n in roles.items()},
-             "b": {k: (d.get("b") or {})[n] for k, n in llm.items() if n in (d.get("b") or {})},
-             "info": d.get("info") or {}} for d in docs]
-    out = []
-    for fl in flags(view, cfg, llm_keys=tuple(llm)):
+        if "recipient" in roles:
+            rec = v(d, "recipient").strip()
+            if "rec_sign" in rules and SIGN.search(rec) and not re.search(r"(시장|군수|지사|청장|서장|본부장)\s*\S*과\s*장$", rec):
+                fl["recipient"].append("결재란")
+            if "rec_part" in rules and rec and rec != "내부결재":
+                has_addr = bool(ADDR.search(rec) or PLACE.search(rec))
+                if has_addr and not TAIL.search(rec) and not re.search(r"(장|관|처장|소장)$", rec):
+                    fl["recipient"].append("이름 없음")
+                elif not has_addr and re.search(r"대표$", rec):
+                    fl["recipient"].append("주소 없음")
         o = {}
-        for k, v in fl.items():
-            o.setdefault(keys.get(k, k), []).extend(v)
+        for k, reasons in fl.items():
+            if reasons:
+                o.setdefault(t.keys.get(k, k), []).extend(reasons)
         out.append(o)
     return out
 
 
-def _order_conflict(d, day, docs, slack_days=3):
+def _order_conflict(d, day, docs, v, slack_days=3):
     """일련번호는 시간 순으로 매기므로, 같은 분류번호·연도에서 바로 앞 번호 문서보다 날짜가 이르거나
-    바로 뒤 번호 문서보다 늦으면 어긋남. (철 전체와 비교하면 다른 문서의 틀린 번호 하나가 여러 문서를 끌고 들어간다)"""
-    s, pre = _serial(d["fields"]["serial"]), d["info"]["prefix"]
+    바로 뒤 번호 문서보다 늦으면 어긋남. (철 전체와 비교하면 다른 문서의 틀린 번호 하나가 여러 문서를 끌고 들어간다)
+    v(문서, 역할) = 역할 칸 값"""
+    s, pre = _serial(v(d, "serial")), d["info"]["prefix"]
     if s is None or not pre:
         return False
-    same = [(_serial(o["fields"]["serial"]), _date(o["fields"]["date"])) for o in docs
+    same = [(_serial(v(o, "serial")), _date(v(o, "date"))) for o in docs
             if o is not d and o["info"]["prefix"] == pre]
     same = [(n, x) for n, x in same if n is not None and x is not None and x.year == day.year and n != s]
     prev = max((p for p in same if p[0] < s), default=None)
     nxt = min((p for p in same if p[0] > s), default=None)
     w = dt.timedelta(slack_days)
     return bool((prev and prev[1] > day + w) or (nxt and nxt[1] < day - w))
-
-

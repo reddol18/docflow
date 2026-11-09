@@ -21,7 +21,8 @@ def replay(graph, docs, b_of=None, recipient_of=None):
     """
     merged = []
     # 저장된 수신은 rule: recipient 칸에서 (기관 매핑이 칸 이름을 바꿔도 — https://github.com/reddol18/docflow/issues/72)
-    rec_name = next((f["name"] for f in graph.SCHEMA["fields"] if f.get("rule") == "recipient"), None)
+    by_rule = getattr(graph.fields, "by_rule", None)  # 없으면 옮기기 전 코드(앱 폴더 인자) — 그때는 김해 칸 이름
+    rec_name = (by_rule(graph.SCHEMA, "recipient") or {}).get("name") if by_rule else "recipient"
     for d in docs:
         b = b_of(d) if b_of else d["b"]
         rec, why = recipient_of(d, b) if recipient_of else (d["fields"].get(rec_name, ""), d["info"]["recipient_fix"])

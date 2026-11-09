@@ -55,11 +55,13 @@ def test_save_search_vectors_and_hybrid(env, monkeypatch):
                           "fields": {"docno": "가상 12345-1", "date": "1997-03-04", "recipient": "가상시장",
                                      "title": "가상 도로 점용 허가"}}
     assert [p["doc_id"] for p in store.vector_search([1.0, 0.0], 1999, 1999)] == ["d2"]
-    # /search 결과 모양은 예전과 같다 (doc_id·순위·vol·문서번호·시행일자·수신·제목)
+    # /search 결과: doc_id·순위·vol + fields(보이는 칸 — 문서번호·시행일자·수신·제목). 칸 값은 fields 아래라
+    # 스키마 칸 이름이 순위·철 키를 덮지 않는다 (https://github.com/reddol18/docflow/issues/72)
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[1.0, 0.0]])
     hits = main.hybrid("도로 점용", k=2)
     assert hits[0] == {"doc_id": "d1", "rrf": hits[0]["rrf"], "vector_rank": 1, "keyword_rank": 1, "vol": VOL,
-                       "docno": "가상 12345-1", "date": "1997-03-04", "recipient": "가상시장", "title": "가상 도로 점용 허가"}
+                       "fields": {"docno": "가상 12345-1", "date": "1997-03-04", "recipient": "가상시장",
+                                  "title": "가상 도로 점용 허가"}}
 
 
 def test_migrate_legacy_columns(env):

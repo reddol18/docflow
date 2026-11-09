@@ -1,5 +1,15 @@
-"""app/flags.py 검토 표시 규칙. 표준 라이브러리만 쓰므로 CI 0층에서 무거운 의존성 없이 돈다."""
+"""app/flags.py 검토 표시 규칙. LLM·DB 없이 돈다 (스키마 도우미 app.fields와 칸 이름 바꾸기 eval/rename_replay.py만 쓴다)."""
+import importlib.util
+from pathlib import Path
+
+import yaml
+
+from app import fields
 from app import flags as F
+
+_spec = importlib.util.spec_from_file_location("rename_replay", Path(__file__).parent.parent / "eval" / "rename_replay.py")
+rr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rr)
 
 
 def doc(i, serial="100", date="1999-03-10", recipient="가나시장", title="제목", b_serial=None, b_date=None,
@@ -90,25 +100,22 @@ def test_order_rule_and_mismatch_toggle():
     assert "date" not in run(docs, mismatch_date=False)[2]
 
 
+
 # ---------- 스키마 칸 이름으로: rule 이름으로 칸을 찾는다 (https://github.com/reddol18/docflow/issues/72) ----------
 
-HW = {"docno", "serial", "date"}
-GIMHAE = {"fields": [  # app/field_schemas/gimhae.yaml에서 표시 규칙이 보는 키만
-    {"name": "docno", "method": "rule", "rule": "docno", "flag_key": "serial", "prompt": "p"},
-    {"name": "serial", "method": "hidden", "rule": "serial", "derive_from": "docno"},
-    {"name": "date", "method": "rule", "rule": "date", "prompt": "p"},
-    {"name": "recipient", "method": "rule", "rule": "recipient", "prompt": "p"},
-    {"name": "title", "method": "llm_extract", "prompt": "p"}]}
-REN = {"docno": "doc_number", "serial": "serial_no", "date": "issued", "recipient": "addressee", "title": "subject"}
+def gimhae():
+    return fields.load(fields.DIR / "gimhae.yaml")
 
 
-def renamed(schema=GIMHAE, m=REN):
-    return {"fields": [{k: m.get(v, v) if k in ("name", "flag_key", "derive_from") else v for k, v in f.items()}
-                       for f in schema["fields"]]}
+def renamed_gimhae():
+    """칸 이름만 바꾼 김해 매핑 (eval/rename_replay.py와 같은 바꾸기)"""
+    return fields.parse(rr.renamed_schema(yaml.safe_load((fields.DIR / "gimhae.yaml").read_text(encoding="utf-8"))),
+                        fields.load(fields.BASE))
 
 
-def rdoc(d, m=REN):
-    return {**d, "fields": {m.get(k, k): v for k, v in d["fields"].items()}, "b": {m.get(k, k): v for k, v in d["b"].items()}}
+def S(*fs):
+    """시험용 스키마 dict — 표시 규칙이 보는 키만 (기본: 건 단위)"""
+    return {"fields": [{"level": "document", **f} for f in fs]}
 
 
 def messy_volume():
@@ -126,45 +133,62 @@ def messy_volume():
 def test_for_schema_gimhae_same_as_flags():
     docs = messy_volume()
     want = F.flags(docs)
-    assert any(want) and F.for_schema(docs, GIMHAE, None, HW) == want
+    assert any(want) and F.for_schema(docs, gimhae()) == want
+    assert F.targets(gimhae()) == F.LEGACY_TARGETS  # 김해 매핑에서 찾은 칸 = 김해 칸 이름 기본값
     # 일련번호 표시는 문서번호 칸의 flag_key(serial)로, 수신은 LLM 사유가 결재란보다 먼저 (예전 순서)
     assert want[4]["recipient"] == ["LLM"] and "앞부분 없음" in want[2]["serial"]
 
 
 def test_for_schema_renamed_fields_same_flags():
     docs = messy_volume()
-    want = [{REN.get(k, k): v for k, v in fl.items()} for fl in F.flags(docs)]
-    assert F.for_schema([rdoc(d) for d in docs], renamed(), None, HW) == want
+    want = [rr.rename_keys(fl, rr.RENAME) for fl in F.flags(docs)]
+    assert F.for_schema([rr.rename_doc(d, rr.RENAME) for d in docs], renamed_gimhae()) == want
     assert set().union(*want) == {"serial_no", "issued", "addressee", "subject"}
 
 
 def test_for_schema_skips_missing_roles_and_checks_llm_fields():
     """일자 rule만 있는 스키마: 일자 규칙만 돌고, LLM 추출·통제어휘 칸은 확신도로, 요약·사람 입력 칸은 보지 않는다"""
-    schema = {"fields": [{"name": "made", "method": "rule", "rule": "date", "prompt": "p"},
-                         {"name": "subject", "method": "llm_extract", "prompt": "p"},
-                         {"name": "kind", "method": "vocab", "prompt": "p", "flag_key": "subject"},
-                         {"name": "summary", "method": "llm_generate", "prompt": "p"},
-                         {"name": "shelf", "method": "manual"}]}
+    schema = S({"name": "made", "method": "rule", "rule": "date", "prompt": "p"},
+               {"name": "subject", "method": "llm_extract", "prompt": "p"},
+               {"name": "kind", "method": "vocab", "prompt": "p", "flag_key": "subject"},
+               {"name": "summary", "method": "llm_generate", "prompt": "p"},
+               {"name": "shelf", "method": "manual"})
     docs = [{"fields": {"made": d["fields"]["date"], "subject": "가", "kind": "나", "summary": "다", "shelf": ""},
              "b": {"made": {"confidence": 0.1}, "subject": {"confidence": 0.99}, "kind": {"confidence": 0.1},
                    "summary": {"confidence": 0.1}},
              "info": d["info"]} for d in clean_volume()]
     docs[2]["fields"]["made"] = docs[2]["info"]["b_date"] = "1999-02-30"
-    out = F.for_schema(docs, schema, None, HW)
+    out = F.for_schema(docs, schema)
     assert out[2] == {"made": ["형식"], "subject": ["LLM"]}  # 통제어휘 kind의 표시는 flag_key(subject)로
-    assert out[0] == {"subject": ["LLM"]}
-    assert F.for_schema(docs, {"fields": [{"name": "shelf", "method": "manual"}]}, None, HW) == [{} for _ in docs]
+    assert out[0] == {"subject": ["LLM"]}  # 손글씨 규칙 칸(made, rule date)은 LLM 확신도를 보지 않는다
+    assert F.for_schema(docs, S({"name": "shelf", "method": "manual"})) == [{} for _ in docs]
+
+
+def test_for_schema_ignores_hidden_and_volume_llm_fields():
+    """LLM 확신도는 화면에 보이는 건 단위 칸만 — 숨김 칸·철 단위 칸은 사람이 볼 곳이 없으니 표시하지 않는다"""
+    schema = S({"name": "subject", "method": "llm_extract", "prompt": "p"},
+               {"name": "secret", "method": "hidden", "prompt": "p"},
+               {"name": "series", "method": "llm_extract", "prompt": "p", "level": "volume"})
+    assert F.targets(schema).llm == {"llm:subject": "subject"}
+    docs = [{"fields": {}, "b": {n: {"confidence": 0.1} for n in ("subject", "secret", "series")}, "info": {}}]
+    assert F.for_schema(docs, schema) == [{"subject": ["LLM"]}]
 
 
 def test_for_schema_llm_field_named_like_a_role():
     """규칙 역할 이름과 같은 이름의 LLM 칸(date)이 다른 칸의 일자 규칙 표시와 섞이지 않는다"""
-    schema = {"fields": [{"name": "issued", "method": "rule", "rule": "date", "prompt": "p"},
-                         {"name": "date", "method": "llm_extract", "prompt": "p"}]}
+    schema = S({"name": "issued", "method": "rule", "rule": "date", "prompt": "p"},
+               {"name": "date", "method": "llm_extract", "prompt": "p"})
     docs = [{"fields": {"issued": d["fields"]["date"], "date": "x"}, "b": {"date": {"confidence": 0.1}}, "info": d["info"]}
             for d in clean_volume()]
     docs[1]["fields"]["issued"] = docs[1]["info"]["b_date"] = ""
-    out = F.for_schema(docs, schema, None, HW)
+    out = F.for_schema(docs, schema)
     assert out[1] == {"issued": ["형식"], "date": ["LLM"]} and out[0] == {"date": ["LLM"]}
+
+
+def test_flags_does_not_pick_rules_from_document_keys():
+    """규칙은 targets의 역할 → 칸 이름으로만 고른다: 문서에 김해 이름 키(date)가 있어도 역할이 없으면 일자 규칙은 돌지 않는다"""
+    docs = [{"fields": {"date": "아님"}, "b": {}, "info": d["info"]} for d in clean_volume()]
+    assert F.for_schema(docs, S({"name": "date", "method": "manual"})) == [{} for _ in docs]
 
 
 def test_default_is_legacy_plus_documented_rules():

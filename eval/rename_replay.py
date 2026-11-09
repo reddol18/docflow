@@ -32,7 +32,8 @@ BACK = {v: k for k, v in RENAME.items()}
 def renamed_schema(raw, m=RENAME):
     """김해 매핑 dict → 칸 이름만 바꾼 매핑 (rule·isad·지시문은 그대로). 칸을 가리키는 키(flag_key·derive_from·search)도 바꾼다"""
     s = json.loads(json.dumps(raw))
-    s["name"] += " (칸 이름 바꿈 시험)"
+    if "name" in s:
+        s["name"] += " (칸 이름 바꿈 시험)"
     for f in s["fields"]:
         for k in ("name", "flag_key", "derive_from"):
             if k in f:

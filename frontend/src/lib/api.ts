@@ -68,14 +68,14 @@ export type GraphEvent = {
   info: Record<string, unknown> | null;
 };
 
-// 검색 결과: 순위 정보 + 스키마의 보이는 칸 값 (칸 이름은 스키마마다 다르다 — 열은 Schema.search_columns)
+// 검색 결과: 순위 정보 + fields(스키마의 보이는 칸 값). 칸 이름은 스키마마다 다르다 — 열은 Schema.search_columns
 export type SearchHit = {
   doc_id: string;
   rrf: number;
   vector_rank: number | null;
   keyword_rank: number | null;
   vol: string;
-  [field: string]: string | number | null;
+  fields: Fields;
 };
 
 export type Timing = {

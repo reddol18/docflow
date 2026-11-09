@@ -83,7 +83,10 @@ def _common(r):
     assert fixed["fields"][r["fixed"]["field"]] == "사람이 고친 가상 값" and fixed["reviewed"]
     cols = r["schema"]["search_columns"]
     assert cols and set(cols) <= names
-    assert len(r["hits"]) == len(r["docs"]) and all(set(cols) <= set(h) for h in r["hits"])
+    assert len(r["hits"]) == len(r["docs"]) and all(set(cols) <= set(h["fields"]) for h in r["hits"])
+    # 칸 값은 fields 아래 — 순위·철 키는 스키마 칸 이름에 덮이지 않는다
+    assert all(set(h) == {"doc_id", "rrf", "vector_rank", "keyword_rank", "vol", "fields"} and h["vol"] == r["docs"][0]["vol"]
+               for h in r["hits"])
     assert r["export_status"] == 200 and r["export_check"]["not_reviewed"] == 0
     assert all(len(rows) == 1 + (len(r["docs"]) if i else 1) for i, rows in enumerate(r["xlsx"].values()))
     return names
@@ -98,7 +101,7 @@ def test_second_customer_schema_runs_without_gimhae_names(probe, case):
         assert not set(d["fields"]) & GIMHAE_NAMES and not set(d["flags"]) & GIMHAE_NAMES
         assert d["hw"] == {}  # 손글씨 규칙 칸이 없으면 잘라 읽지 않는다
     assert r["crops"] == [] and "손글씨 판독" not in r["review_html"]
-    assert all(not set(h) & GIMHAE_NAMES for h in r["hits"])
+    assert all(not set(h["fields"]) & GIMHAE_NAMES for h in r["hits"])
     # 화면 표시명이 검토 화면에 나온다
     for f in r["schema"]["fields"]:
         if f["editable"]:
@@ -110,9 +113,9 @@ def test_second_customer_schema_runs_without_gimhae_names(probe, case):
         assert rows[0][head.index("유형")] == "문서" and rows[0][head.index("소장처")] == "가상 박물관"
         assert rows[0][head.index("쪽수")] == 2 and rows[2][head.index("쪽수")] == 1
         assert r["schema"]["search_columns"] == ["produced_on", "reg_no", "material_name", "producer", "material_type"]
-    elif case == "court_filing":  # 세 번째 고객 — 소송기록 스캔식 (사건종류·분류 통제어휘, 면수 규칙)
+    elif case == "court_filing":  # 세 번째 고객 — 소송기록 스캔식 (지어낸 통제어휘 두 개, 면수 규칙)
         last = rows[-1]  # 고치지 않은 마지막 건
-        assert last[head.index("사건종류")] == "민사" and last[head.index("분류")] == "주장"
+        assert last[head.index("사건종류")] == "민사" and last[head.index("분류")] == "서면"
         assert last[head.index("제출일자")] == "1999-03-13" and last[head.index("면수")] == 1
         assert last[head.index("예외처리사유")] is None  # 사람 입력 칸 — 빈칸은 엑셀에서 빈 셀
         assert r["schema"]["search_columns"] == ["filed_on", "case_no", "case_kind", "doc_name", "doc_class"]
@@ -133,7 +136,7 @@ def test_isad_g_search_has_title_and_date_columns(probe):
     assert [label[c] for c in cols] == ["생산일자", "참조코드", "제목", "생산부서"]
     assert {"title", "dates"} <= set(cols)
     h = r["hits"][0]
-    assert h["dates"].startswith("1999-03-") and h["title"].startswith("가상 제목")
+    assert h["fields"]["dates"].startswith("1999-03-") and h["fields"]["title"].startswith("가상 제목")
 
 
 def test_renamed_docno_shows_crop_on_review(probe):

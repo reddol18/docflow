@@ -754,8 +754,9 @@ def hybrid(q, year_from=None, year_to=None, k=10):
     vr = {r["doc_id"]: i + 1 for i, r in enumerate(v)}
     kr = {r["doc_id"]: i + 1 for i, r in enumerate(kw)}
     shown = schema_fields.shown(schema_fields.SCHEMA)  # 김해: 문서번호·시행일자·수신·제목
+    # 칸 값은 fields 아래에 — 스키마 칸 이름이 순위·철 키(doc_id·vol·rrf …)를 덮지 않게 (https://github.com/reddol18/docflow/issues/72)
     return [{"doc_id": d, "rrf": round(score[d], 5), "vector_rank": vr.get(d), "keyword_rank": kr.get(d),
-             "vol": rows[d]["vol"], **{c: (rows[d]["fields"] or {}).get(c, "") for c in shown}}
+             "vol": rows[d]["vol"], "fields": {c: (rows[d]["fields"] or {}).get(c, "") for c in shown}}
             for d in top if d in rows]
 
 
@@ -789,7 +790,7 @@ def schema_view(_: Viewer):
     s = schema_fields.SCHEMA
     return {"name": s["name"], "search_columns": list(s["search"]["columns"]), "fields": [
         {"name": f["name"], "label": f["label"], "level": f["level"], "method": f["method"],
-         "editable": f["name"] in EDITABLE, "flag_key": f.get("flag_key", f["name"]),
+         "editable": f["name"] in EDITABLE, "flag_key": schema_fields.flag_key(f),
          "isad": f.get("isad") or (f["name"] if "area" in f else None),  # 기본 스키마 칸은 그 자체가 ISAD(G) 칸
          "rule": f.get("rule"), "hw": flow.hw_cell(f)}
         for f in s["fields"] if f["name"] in schema_fields.shown(s)]}

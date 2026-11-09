@@ -14,11 +14,11 @@ fields:
     method: vocab
     isad: scope_content
     prompt: 사건종류
-    vocab: [민사, 가사, 행정, 신청, 도산, 집행, 비송, 독촉, 형사]
+    vocab: [민사, 형사, 행정, 기타]
   - {name: doc_name, label: 문건명, level: document, method: llm_extract, isad: title, prompt: 문건명}
   - {name: filed_on, label: 제출일자, level: document, method: llm_extract, isad: dates, prompt: 제출일자를 YYYY-MM-DD로}
-  - {name: doc_class, label: 분류, level: document, method: vocab, isad: scope_content, prompt: 문건 분류, vocab: [주장, 첨부, 서증]}
-  - {name: exhibit_no, label: 서증번호, level: document, method: llm_extract, isad: reference_code, prompt: 서증번호 (서증일 때만)}
+  - {name: doc_class, label: 분류, level: document, method: vocab, isad: scope_content, prompt: 문건 분류, vocab: [서면, 첨부, 증거]}
+  - {name: exhibit_no, label: 서증번호, level: document, method: llm_extract, isad: reference_code, prompt: 증거 번호 (분류가 증거일 때만)}
   - {name: page_count, label: 면수, level: document, method: rule, rule: pages, isad: extent}
   - {name: exception_reason, label: 예외처리 사유, level: document, method: manual, isad: notes}
 search:

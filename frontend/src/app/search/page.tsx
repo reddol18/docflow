@@ -28,13 +28,15 @@ function Search() {
   const [busy, setBusy] = useState<"search" | "ask" | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [schema, setSchema] = useState<Schema | null>(null);
+  // 스키마 오류는 검색 오류와 따로 둔다 — 검색할 때 err를 지워도 결과 표를 못 그리는 이유는 남아야 한다
+  const [schemaErr, setSchemaErr] = useState<string | null>(null);
 
   // 결과 열은 서버 스키마의 search_columns (칸 이름은 스키마마다 다르다 — https://github.com/reddol18/docflow/issues/72)
   useEffect(() => {
     let alive = true;
     api.schema().then(
       (x) => alive && setSchema(x),
-      (e) => alive && setErr(e instanceof Error ? e.message : String(e)),
+      (e) => alive && setSchemaErr(e instanceof Error ? e.message : String(e)),
     );
     return () => {
       alive = false;
@@ -44,7 +46,7 @@ function Search() {
   const cols = (schema?.search_columns ?? []).map((n) => byName.get(n)).filter((f): f is FieldDef => !!f);
   // 문서 화면으로 가는 링크를 다는 열: ISAD(G) 제목에 이은 칸, 없으면 첫 열
   const linkCol = cols.find((f) => f.isad === "title")?.name ?? cols[0]?.name;
-  const cellOf = (h: SearchHit, k: string) => String(h[k] ?? "");
+  const cellOf = (h: SearchHit, k: string) => h.fields?.[k] ?? "";
 
   const run = async (kind: "search" | "ask", query = q) => {
     if (!query.trim()) return;
@@ -101,6 +103,7 @@ function Search() {
           ))}
         </div>
         {err && <p className="mt-2 text-sm text-rose-600">{err}</p>}
+        {schemaErr && <p className="mt-2 text-sm text-rose-600">색인 칸 목록(스키마)을 못 불러옴: {schemaErr}</p>}
       </Card>
 
       {answer && (
@@ -109,7 +112,19 @@ function Search() {
         </Card>
       )}
 
-      {hits && (
+      {hits && !cols.length && (
+        <Card title={`결과 ${hits.length}건`}>
+          <p className="text-sm text-slate-500">
+            {schemaErr
+              ? "색인 칸 목록(스키마)을 못 불러와 결과 표를 그리지 않습니다. 새로 고쳐 다시 시도하세요."
+              : schema
+                ? "스키마에 검색 결과 열(search.columns)이 없어 결과 표를 그리지 않습니다."
+                : "색인 칸 목록을 불러오는 중…"}
+          </p>
+        </Card>
+      )}
+
+      {hits && cols.length > 0 && (
         <Card title={`결과 ${hits.length}건`}>
           <table className="w-full text-sm">
             <thead className="text-left text-xs text-slate-500">

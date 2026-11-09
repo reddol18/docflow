@@ -89,8 +89,8 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 - 사람이 고친 값(검토·수정·검사)에도 같은 표기 규칙을 적용한다.
 - 칸 이름이 아니라 `rule` 이름으로 판단한다 (https://github.com/reddol18/docflow/issues/72) — 기관 매핑은 칸 이름을 마음대로 지어도 된다.
   - 손글씨 칸 판독: `rule`이 `docno`·`serial`·`date`인 칸만 잘라 읽는다 (`app/graph.py` `HW_CELLS`). `/schema`가 칸마다 `rule`과 보여 줄 잘라낸 칸(`hw`)을 내보내고, 검토 화면·잘라낸 칸 경로가 그것으로 판단한다.
-  - 검토 표시(`app/flags.py`): 김해 규칙(일자·일련번호·수신)은 그 `rule` 칸이 있을 때만 돈다. LLM 확신도 표시는 LLM 추출 칸(`llm_extract`·`vocab`, 수신 같은 규칙 칸의 LLM 값 포함, 손글씨 규칙 칸·`llm_generate` 요약 제외)마다 붙는다. 표시 키는 칸의 `flag_key`(없으면 칸 이름).
-  - 검색 화면 열은 스키마 `search.columns`(없으면 보이는 칸 전부, `/schema`의 `search_columns`).
+  - 검토 표시(`app/flags.py`): 김해 규칙(일자·일련번호·수신)은 그 `rule` 칸이 있을 때만 돈다. LLM 확신도 표시는 화면에 보이는 건 단위 LLM 추출 칸(`llm_extract`·`vocab`, 수신 같은 규칙 칸의 LLM 값 포함, 손글씨 규칙 칸·`llm_generate` 요약·숨김·철 단위 칸 제외)마다 붙는다. 표시 키는 칸의 `flag_key`(없으면 칸 이름). 칸 찾기는 `fields.by_rule`·`fields.flag_key`, 규칙이 볼 칸은 `flags.targets(schema)` 한 곳. LLM을 건너뛴 문서(`LLM_PROVIDER=off`)의 추출 칸은 'LLM 꺼짐'만 붙고 'LLM'(낮은 확신도)은 붙지 않는다.
+  - 검색 화면 열은 스키마 `search.columns`(없으면 보이는 칸 전부, `/schema`의 `search_columns`). `/search`·`/ask` 결과의 칸 값은 `fields` 아래에 있다.
   - 칸 이름을 바꾼 김해 매핑으로 칸 값·표시가 같은지: `eval/rename_replay.py <저장된 철 JSON…>`. 다른 고객 시험 스키마(지어낸 값)는 `tests/fixtures/schemas/`.
 - 철 단위 칸은 고정값·사람 입력만 된다 (철 단위 추출 없음).
 

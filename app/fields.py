@@ -237,7 +237,7 @@ def doc_fields(s):
 
 def shown(s):
     """화면·검색 결과에 보이는 건 단위 칸 이름 (숨김 제외, 스키마 순서)"""
-    return tuple(f["name"] for f in s["fields"] if f["method"] != "hidden" and f["level"] == "document")
+    return tuple(f["name"] for f in s["fields"] if is_shown(f))
 
 
 def editable(s):
@@ -253,6 +253,22 @@ def labels(s):
 def flag_keys(s):
     """{검토 표시 키: 사람이 고치는 칸} — 김해는 일련번호(serial) 표시를 문서번호(docno) 칸에서 고친다"""
     return {f["flag_key"]: f["name"] for f in s["fields"] if "flag_key" in f}
+
+
+def flag_key(field):
+    """칸의 검토 표시가 붙는 키 (스키마 flag_key, 없으면 칸 이름) — 기본값은 여기 한 곳"""
+    return field.get("flag_key", field["name"])
+
+
+def by_rule(s, rule):
+    """rule 이름으로 칸 찾기 (없으면 None). 코드는 칸 이름 대신 이것으로 칸을 찾는다
+    (https://github.com/reddol18/docflow/issues/72 — 기관 매핑은 칸 이름을 마음대로 짓는다). 같은 rule이 둘이면 앞 칸"""
+    return next((f for f in s["fields"] if f.get("rule") == rule), None)
+
+
+def is_shown(f):
+    """화면·검색 결과에 보이는 건 단위 칸인가 (shown과 같은 기준)"""
+    return f["method"] != "hidden" and f["level"] == "document"
 
 
 def prompt_fields(s):
