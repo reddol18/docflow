@@ -813,7 +813,9 @@ def index_time(vol):
 def restore_documents(vol, docs, created_at, schema=None):
     """documents 행을 그래프 상태 그대로 다시 쓴다 (옮기기의 바로잡기 — https://github.com/reddol18/docflow/issues/50).
     save_documents와 달리 edited도 상태대로 (켜고 끈다), 새로 만드는 행의 created_at은 철의 색인 시각
-    (리포트 '색인 문서 수'가 바로잡은 날에 부풀지 않게; 모르면 NULL — 리포트가 세지 않는다). 있던 행의 created_at은 그대로"""
+    (리포트 '색인 문서 수'가 바로잡은 날에 부풀지 않게; 모르면 NULL — 리포트가 세지 않는다). 있던 행의 created_at은 그대로.
+    있던 행의 updated_at도 그대로 둔다 — 바로잡기는 출력 내용(그래프 상태)을 바꾸지 않으므로, 내보낸 철이 '내보낸 뒤
+    바뀜'(last_export current False → 일괄 삭제 409)이 되지 않게"""
     schema = schema or fields.SCHEMA
     with pool.connection() as c, c.transaction(), c.cursor() as cur:
         cur.executemany(
@@ -822,7 +824,7 @@ def restore_documents(vol, docs, created_at, schema=None):
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                ON CONFLICT (vol, doc_id) DO UPDATE SET pages=EXCLUDED.pages, fields=EXCLUDED.fields,
                  search_text=EXCLUDED.search_text, year=EXCLUDED.year, flags=EXCLUDED.flags,
-                 reviewed=EXCLUDED.reviewed, edited=EXCLUDED.edited, updated_at=now()""",
+                 reviewed=EXCLUDED.reviewed, edited=EXCLUDED.edited""",
             [(d["doc_id"], vol, d["pages"], json.dumps(d["fields"], ensure_ascii=False),
               fields.search_text(schema, d["fields"]), fields.year_of(schema, d["fields"]),
               json.dumps(d.get("flags"), ensure_ascii=False), d.get("reviewed", False), bool(d.get("edited")),

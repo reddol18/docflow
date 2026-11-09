@@ -45,10 +45,11 @@ def env(pg_store, monkeypatch, tmp_path):
     monkeypatch.setattr(store, "DATA", tmp_path)
     for v in (VA, VB):
         (tmp_path / "pages" / v).mkdir(parents=True)
-    states = {}
+    states, nexts = {}, {}  # nexts: 철 → 다음 노드 (멈춤·검토 대기 흉내)
 
     def get_state(cfg):
-        return SimpleNamespace(next=(), interrupts=[], values=states.get(cfg["configurable"]["thread_id"], {}))
+        vol = cfg["configurable"]["thread_id"]
+        return SimpleNamespace(next=nexts.get(vol, ()), interrupts=[], values=states.get(vol, {}))
 
     def update_state(cfg, v, as_node=None):
         s = states[cfg["configurable"]["thread_id"]]
@@ -58,7 +59,7 @@ def env(pg_store, monkeypatch, tmp_path):
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=get_state, update_state=update_state))
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[1.0, 0.0]] * len(texts))
     monkeypatch.setattr(main.flow, "doc_text", lambda vol, d: "x")
-    yield SimpleNamespace(main=main, q=q, states=states)
+    yield SimpleNamespace(main=main, q=q, states=states, nexts=nexts)
     with store.pool.connection() as c:
         c.execute("DELETE FROM documents")
 
@@ -277,6 +278,24 @@ def test_repaired_row_without_index_event_not_counted(env):
     assert store.get_documents([(VB, "p-0001")])[(VB, "p-0001")]["created_at"] is None
     today = store.dt.datetime.now(store.KST).date()
     assert sum(d.get("docs_indexed") or 0 for d in report.daily(today, today)) == 0
+
+
+def test_repair_keeps_export_current_and_logs_skipped(env, capsys):
+    """바로잡기는 출력 내용(그래프 상태)을 바꾸지 않는다 → 내보낸 철의 '마지막 출력이 지금 내용과 같음'이 그대로
+    (updated_at을 건드리지 않음 — 일괄 삭제가 409가 되지 않게). PATCH 뒤 다시 돌린 철: 상태에는 수정 표시가 없고 행은 켜져 있다.
+    멈춘·검토 대기 철은 건너뛰고 이름을 로그에 남긴다 (완료 표시는 남김)"""
+    _legacy_table([("p-0001", VA, "가상 도로 허가 갑", True)])
+    env.states[VA] = {"docs": [doc(VA, "p-0001", "가상 도로 허가 갑")], "indexed": 1}
+    env.states[VB] = {"docs": [doc(VB, "p-0001", "가상 도로 허가 을")], "indexed": 1}
+    env.nexts[VB] = ("review",)
+    store.add_export(VA, 0, None)
+    assert store.last_export(VA)["current"] is True
+    _start(env)
+    assert store.get_documents([(VA, "p-0001")])[(VA, "p-0001")]["edited"] is False
+    assert store.last_export(VA)["current"] is True
+    log = capsys.readouterr().out
+    assert f"건너뛴 철 1개 ['{VB}(멈춤·실행 중)']" in log and "행 1개" in log
+    assert store.get_documents([(VB, "p-0001")]) == {} and store.migration_done(store.DOC_KEY_MIGRATION)
 
 
 def test_vector_migration_resumes_after_partial_run(env):

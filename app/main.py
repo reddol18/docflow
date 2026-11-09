@@ -471,7 +471,7 @@ def repair_documents():
     with store.pool.connection() as c:
         vols = {r["vol"] for r in c.execute("SELECT DISTINCT vol FROM documents").fetchall()}
     vols = sorted(vols | set(volume_names()))
-    fixed, keys = 0, []
+    fixed, keys, skipped = 0, [], []
     for vol in vols:
         if not VOL_RX.fullmatch(vol):
             continue
@@ -480,6 +480,8 @@ def repair_documents():
         # 색인이 끝난 철만 (summary의 done과 같은 조건). 색인 전·다시 돌리는 중(검토 대기·멈춤)인 철의 상태는 아직
         # documents에 쓸 값이 아니다
         if v.get("indexed") is None or snap.next or snap.interrupts:
+            if v.get("indexed") is not None or snap.next or snap.interrupts:  # 상태가 아예 없는 철은 알릴 것 없음
+                skipped.append(f"{vol}({'검토 대기' if snap.interrupts else '멈춤·실행 중' if snap.next else '색인 전'})")
             continue
         docs = v.get("docs", [])
         have = store.get_documents([(vol, d["doc_id"]) for d in docs])
@@ -496,6 +498,9 @@ def repair_documents():
             errors.log_exception("missing_vectors")
     print(f"documents: 문서 키 옮기기 바로잡음 — 철 {len(vols)}개 대조, 행 {fixed}개를 철의 그래프 상태대로 다시 씀",
           flush=True)
+    if skipped:
+        print(f"documents: 바로잡기에서 건너뛴 철 {len(skipped)}개 {skipped} — 색인이 끝나면 그 철의 행은 다시 쓰인다 "
+              "(옮기기 완료 표시는 남긴다)", flush=True)
     if lost:
         print(f"qdrant: 벡터 없는 문서 {len(lost)}개 (철 {sorted({v for v, _ in lost})}) — 낱말 검색으로만 찾힌다 "
               "(예전 키 충돌로 덮어쓴 벡터). 그 문서의 칸을 고치면(PATCH) 벡터를 다시 만든다", flush=True)
