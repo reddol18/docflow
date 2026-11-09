@@ -10,16 +10,12 @@ import {
   headImage,
   type Doc,
   type DocStage,
-  type Fields,
-  type Schema,
-  type Workflow,
 } from "@/lib/api";
+import { nextAfter, useFieldFixes, useSchemaWorkflow } from "@/lib/docEditing";
 import { usePoll } from "@/lib/usePoll";
 import { useMe } from "@/lib/useMe";
 import { useReviewTimer } from "@/lib/useReviewTimer";
-import { Card, ErrorNote, FlagChips, StageBadge } from "@/components/ui";
-
-type Fixes = Record<string, Partial<Fields>>;
+import { Card, ErrorNote, FlagChips, StageBadge, VolumeTabs } from "@/components/ui";
 
 // README 캡처용: 원본 쪽 이미지에 실명·서명·직인이 있어 공개 캡처에서는 흐리게 한다
 const MASK = process.env.NEXT_PUBLIC_MASK_IMAGES === "1";
@@ -33,32 +29,17 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const [error, setError] = useState<string | null>(null);
   const [onlyFlagged, setOnlyFlagged] = useState(true);
   const [sel, setSel] = useState<string | null>(null);
-  const [fixes, setFixes] = useState<Fixes>({});
+  const { fixes, value, setValue, drop: dropFixes, clear: clearFixes } = useFieldFixes();
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
-  const [schema, setSchema] = useState<Schema | null>(null);
-  const [wf, setWf] = useState<Workflow | null>(null);
+  // 칸 목록·표시명은 서버의 색인 스키마에서 (https://github.com/reddol18/docflow/issues/9)
+  // 검토 단계는 서버의 흐름 설정에서 (https://github.com/reddol18/docflow/issues/86)
+  const { schema, wf, error: metaError } = useSchemaWorkflow();
   const [stages, setStages] = useState<Record<string, DocStage>>({});
   const [stageTick, setStageTick] = useState(0);
   const [reasons, setReasons] = useState<Record<string, string>>({}); // 반려 사유는 문서마다 따로
   const reviewing = s?.stage === "review";
 
-  // 칸 목록·표시명은 서버의 색인 스키마에서 (https://github.com/reddol18/docflow/issues/9)
-  // 검토 단계는 서버의 흐름 설정에서 (https://github.com/reddol18/docflow/issues/86)
-  useEffect(() => {
-    let alive = true;
-    api
-      .schema()
-      .then((x) => alive && setSchema(x))
-      .catch((e) => alive && setError(e instanceof Error ? e.message : String(e)));
-    api
-      .workflow()
-      .then((x) => alive && setWf(x))
-      .catch((e) => alive && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      alive = false;
-    };
-  }, []);
   // 단계 승인·반려는 그것을 이 화면에서 하는 흐름일 때만 (기본 흐름은 버튼 없이 단계·확정·검사 제외 표시만)
   const staged = hasStageActions(wf);
   useEffect(() => {
@@ -106,23 +87,13 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   // 공정 리포트용 검토 시간: 지금 보고 있는 문서의 실제 작업 시간(자리 비움 제외)
   const timer = useReviewTimer(vol, cur?.doc_id, reviewing ? "review" : "edit", editor && (reviewing || s?.stage === "done"));
 
-  const value = (d: Doc, k: string) => fixes[d.doc_id]?.[k] ?? d.fields[k] ?? "";
-  const setValue = (d: Doc, k: string, v: string) =>
-    setFixes((prev) => {
-      const next = { ...prev, [d.doc_id]: { ...prev[d.doc_id] } };
-      if (v === (d.fields[k] ?? "")) delete next[d.doc_id][k];
-      else next[d.doc_id][k] = v;
-      if (!Object.keys(next[d.doc_id]).length) delete next[d.doc_id];
-      return next;
-    });
-
   const submitReview = async () => {
     setSaving(true);
     setNote(null);
     try {
       await api.submitReview(vol, fixes);
       await timer.flush(undefined, changedBy);
-      setFixes({});
+      clearFixes();
       setNote(`검토 반영 → 흐름 재개 (고친 칸 ${changed}개). 색인이 끝나면 결과가 갱신됩니다.`);
     } catch (e) {
       setNote(`실패: ${e instanceof Error ? e.message : e}`);
@@ -138,13 +109,6 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const canEdit = reviewing || (s?.stage === "done" && (entryEditable || !!cs?.can_approve));
   const reason = cur ? (reasons[cur.doc_id] ?? "") : "";
   const setReason = (docId: string, v: string) => setReasons((prev) => ({ ...prev, [docId]: v }));
-
-  const dropFixes = (docId: string) =>
-    setFixes((prev) => {
-      const next = { ...prev };
-      delete next[docId];
-      return next;
-    });
 
   const approveStage = async (d: Doc, st: DocStage) => {
     setSaving(true);
@@ -194,16 +158,10 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
       const stays = !onlyFlagged || list.some((x) => x.doc_id === d.doc_id && flagged(x));
       if (stays) setSel(d.doc_id);
       else {
-        const pos = shown.findIndex((x) => x.doc_id === d.doc_id);
         const ids = new Set(list.filter(flagged).map((x) => x.doc_id));
-        const next = [...shown.slice(pos + 1), ...shown.slice(0, Math.max(pos, 0))].find((x) => ids.has(x.doc_id));
-        setSel(next?.doc_id ?? null);
+        setSel(nextAfter(shown, d.doc_id, (x) => ids.has(x.doc_id))?.doc_id ?? null);
       }
-      setFixes((prev) => {
-        const next = { ...prev };
-        delete next[d.doc_id];
-        return next;
-      });
+      dropFixes(d.doc_id);
       setNote(
         `${d.doc_id} 저장 — Postgres·Qdrant·그래프 상태 갱신${reflagged.length ? ` (다른 문서 ${reflagged.length}건 기계 검수 표시 바뀜)` : ""}`,
       );
@@ -216,10 +174,10 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
 
   return (
     <div className="space-y-4">
-      <ErrorNote error={error} />
+      <ErrorNote error={error ?? metaError} />
       <div className="flex flex-wrap items-center gap-3">
-        <Link href={`/volumes/${encodeURIComponent(vol)}`} className="text-sm text-slate-500 hover:text-slate-800">
-          ← 진행 단계
+        <Link href="/" className="text-sm text-slate-500 hover:text-slate-800">
+          ← 대시보드
         </Link>
         <h1 className="font-mono text-lg font-semibold">{vol}</h1>
         {s && <StageBadge stage={s.stage} />}
@@ -237,6 +195,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
           </button>
         )}
       </div>
+      <VolumeTabs vol={vol} active="documents" reviewWaiting={reviewing ? (s?.flagged_documents ?? 0) : null} />
       {reviewing && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
           흐름이 <b>사람 검토(interrupt)</b>에서 멈춰 있습니다. 빨간 표시가 붙은 칸만 확인하고 고친 뒤 위 버튼을 누르면

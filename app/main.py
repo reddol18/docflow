@@ -12,7 +12,7 @@
   PATCH /documents/{vol}/{doc_id}      완료된 문서의 색인 칸 고치기 (재색인)
   GET   /documents/{vol}/{doc_id}/edits  수정 이력 (칸·이전 값·새 값·사용자·시각·단계 입력/검사)
   POST  /volumes/{vol}/inspection      검사 목록 만들기 (표시 문서 전부 + 표본 + 100% 검수 칸) — 검사자
-  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부)
+  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부·막힌 까닭 block)
   POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
   GET   /workflow                      검토 흐름 설정 (단계·맡는 역할·전수/표본·반려 규칙 — app/workflows/*.yaml)
   GET   /volumes/{vol}/workflow        문서마다 지금 단계·차례(재검수)·반려 사유·내가 승인/반려할 수 있나
@@ -507,17 +507,17 @@ def repair_documents():
     return fixed
 
 
-def positions(vol, doc_ids):
+def positions(vol, doc_ids, listed=None):
     """문서마다 지금 위치 {doc_id: {stage, round, last_reason, rejected_from, status}}. stage는 저장된 위치 그대로
     (doc_stage 행이 없으면 흐름의 처음 단계 — 예전 철·기본 흐름). status:
       confirmed  마지막 단계까지 승인됨 (표본 검사가 끝난 문서 포함)
       excluded   표본 단계에 와 있는데 검사 목록 밖 — 검사 없이 넘어간 것으로 보아 출력 전 검증에서는 미확정이 아니고,
                  확정과 달리 입력 경로로 고칠 수 있다 (지금 동작)
-      pending    그 밖 (그 단계 차례를 기다림)"""
+      pending    그 밖 (그 단계 차례를 기다림)
+    listed: 이미 읽은 검사 목록 문서 id 집합 (검사 목록이 있을 때만 — 주면 목록을 다시 읽지 않는다)"""
     rows = store.stage_rows(vol)
     init = workflow.initial(WORKFLOW)
-    listed = None
-    if SAMPLE and store.inspection_plan(vol):
+    if listed is None and SAMPLE and store.inspection_plan(vol):
         listed = {r["doc_id"] for r in store.inspection_rows(vol)}
     out = {}
     for d in doc_ids:
@@ -645,16 +645,36 @@ def inspection_view(vol: str, user: Viewer):
     inspector = bool(SAMPLE) and auth.role_at_least(user.role, SAMPLE["role"])
     whole, acts = acted_stages(vol, user) if inspector and user.id is not None else (False, {})
     rows = store.inspection_rows(vol)
-    pos = positions(vol, [r["doc_id"] for r in rows])
+    ids = [r["doc_id"] for r in rows]
+    pos = positions(vol, ids, listed=set(ids))  # 목록은 이미 읽었다 — positions가 다시 읽지 않게
     out = []
     for r in rows:
         d = docs.get(r["doc_id"], {})
         mine = WORKFLOW["distinct_actors"] and other_stages(whole, acts, r["doc_id"], SAMPLE["name"])
+        block = _inspect_block(r, inspector, user, whole, mine, pos[r["doc_id"]]["stage"])
         out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
                     "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
-                    "can_inspect": inspector and r["inspected_at"] is None and not mine
-                    and pos[r["doc_id"]]["stage"] == SAMPLE["name"]})
+                    "can_inspect": block is None, "block": block})
     return {"plan": plan, "docs": out}
+
+
+def _inspect_block(row, inspector, user, whole, mine, stage):
+    """검사할 수 없는 까닭 (화면이 버튼 대신 보여 준다, https://github.com/reddol18/docflow/issues/66). None이면 검사 가능.
+    inspected 이미 검사함 / in_progress 누가 차지해 검사 중(아직 안 끝남) / role 검사 역할 아님 /
+    user 사용자를 알 수 없음(인증 끈 개발 모드 — POST가 늘 403) / submitted 이 철의 검토 제출자 /
+    entered 이 문서를 입력 단계에서 고침 / other_stage 같은 문서의 다른 검수 단계를 맡음 /
+    stage 아직 검사 단계에 오지 않음 (POST /inspection과 같은 규칙)"""
+    if row["inspected_at"] is not None:
+        return "inspected" if row["fixed_fields"] is not None else "in_progress"
+    if not inspector:
+        return "role"
+    if user.id is None:
+        return "user"
+    if mine:
+        return "submitted" if whole else "entered" if ENTRY["name"] in mine else "other_stage"
+    if stage != SAMPLE["name"]:
+        return "stage"
+    return None
 
 
 @app.post("/inspection/{vol}/{doc_id}")
@@ -682,17 +702,19 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
             raise HTTPException(409, "아직 검사 단계에 오지 않은 문서")
         if not store.claim_inspection(vol, doc_id, user.id):
             raise HTTPException(409, "이미 검사함")
+        # 고치기·끝내기·확정 중 어디서 실패해도(확정의 세대 확인 409 포함) 차지를 풀어 다시 검사할 수 있게 한다.
+        # 푸는 것은 이 사용자의 차지일 때만 — 그 사이 목록이 새로 만들어졌으면 남의 행을 건드리지 않는다
         try:
             _, changed, _ = _edit_document(vol, doc_id, body.fields, user, source="inspect")
+            # 고친 칸은 이력에서 센다 — 앞선 시도가 저장 뒤(임베딩 등)에서 실패해 이번 제출에 차이가 없어도 빠지지 않게
+            fixed = store.inspected_fields(vol, doc_id)
+            store.finish_inspection(vol, doc_id, fixed)
+            # 표본 단계는 마지막 단계라 검사가 끝나면 위치를 확정으로 옮기고 기록한다 (오류목록 내보내기가 같은 표에서 읽는다)
+            if not store.confirm_sample(vol, doc_id, SAMPLE["name"], pos["round"], user.id, fixed, gen):
+                raise HTTPException(409, "철을 다시 돌려 검사 목록이 바뀜")
         except BaseException:
-            store.release_inspection(vol, doc_id)
+            store.release_inspection(vol, doc_id, user.id)
             raise
-        # 고친 칸은 이력에서 센다 — 앞선 시도가 저장 뒤(임베딩 등)에서 실패해 이번 제출에 차이가 없어도 빠지지 않게
-        fixed = store.inspected_fields(vol, doc_id)
-        store.finish_inspection(vol, doc_id, fixed)
-        # 표본 단계는 마지막 단계라 검사가 끝나면 위치를 확정으로 옮기고 기록한다 (오류목록 내보내기가 같은 표에서 읽는다)
-        if not store.confirm_sample(vol, doc_id, SAMPLE["name"], pos["round"], user.id, fixed, gen):
-            raise HTTPException(409, "철을 다시 돌려 검사 목록이 바뀜")
         info.update(fields=fixed, stage=SAMPLE["name"], to=CONFIRMED)
     return {"doc_id": doc_id, "fixed_fields": fixed}
 
