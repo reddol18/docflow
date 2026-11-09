@@ -5,7 +5,6 @@
 B의 값이 되돌아가지 않고(다른 문서는 표시만 쓴다), 늦게 끝난 저장이 낡은 표시를 쓰지 않아야 한다(쓰기는 철 잠금 안)."""
 import os
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -104,14 +103,22 @@ def test_concurrent_edit_not_reverted_and_no_stale_flags(main, monkeypatch):
         if first_id == "d01" and not started:
             started.append(1)
             b.start()
-            time.sleep(0.5)  # B가 끼어들 틈
+            # B가 끼어들 틈: B가 끝나거나(잠금 밖 저장이면 여기서 끝난다) 막힐 때까지(철 잠금 안 저장이면 A를 기다린다).
+            # 다만 PGlite(연결 4개)에서는 B가 잠금 연결을 못 얻어 A 뒤로 밀릴 수도 있다 — 그래서 아래 '쓰기 때 철 잠금을 쥐었나'를
+            # 따로 확인한다 (시간과 상관없이 반영 전 코드에서 실패)
+            b.join(timeout=3)
+
+    vol_stripe = store._STRIPES[store._lock_key("docflow-vol/v1") % len(store._STRIPES)]
+    held = []  # A·B의 documents 쓰기마다 그 스레드가 철 잠금(프로세스 안 RLock)을 쥐고 있었나
 
     def slow_docs(docs, schema=None):
+        held.append(vol_stripe._is_owned())
         if docs:
             interleave(docs[0]["doc_id"])
         return real_docs(docs, schema)
 
     def slow_edit(vol, d, items, schema=None):
+        held.append(vol_stripe._is_owned())
         interleave(d["doc_id"])
         return real_edit(vol, d, items, schema)
 
@@ -123,6 +130,8 @@ def test_concurrent_edit_not_reverted_and_no_stale_flags(main, monkeypatch):
     b.join(timeout=30)
     assert not b.is_alive(), "B 수정이 30초 안에 끝나지 않음 (잠금 교착?)"
     assert ra.status_code == 200 and b_result["res"].status_code == 200
+    # Postgres 쓰기는 모두 철 잠금 안에서 (그래프 상태 읽기·쓰기와 같은 구간)
+    assert held and all(held), f"철 잠금 밖에서 documents를 썼다: {held}"
     db = rows()
     # B의 값이 남는다 (A가 d02 칸 값을 낡은 값으로 덮지 않음)
     assert db["d02"]["fields"]["title"] == "가상 제목 B" and db["d01"]["fields"]["title"] == "가상 제목 2"
