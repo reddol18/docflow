@@ -8,15 +8,20 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd); [ -f "$ROOT/Dockerfile" ] || ROOT=$(cd "$HERE/../.." && pwd)  # 맥 배치 / 저장소
 CURL="/usr/bin/curl -fsS --proto =https --tlsv1.2"
 
+rc=0
+# 태그 목록: 받기 실패면 '확인 못 함' (빈 목록을 '새 태그 없음'으로 읽지 않게)
+tags() {  # 저장소 질의 grep식 개수
+  T=$($CURL "https://hub.docker.com/v2/repositories/$1/tags?$2") || { echo "$1: 태그 확인 못 함"; rc=1; return; }
+  printf '%s' "$T" | grep -o "$3" | head -"$4"
+}
 echo "-- 최근 태그"
-$CURL "https://hub.docker.com/v2/repositories/qdrant/qdrant/tags?page_size=40&ordering=last_updated" | grep -o '"name":"v[0-9.]*"' | head -6
-$CURL "https://hub.docker.com/v2/repositories/library/postgres/tags?page_size=60&name=17" | grep -o '"name":"17\.[0-9]*-alpine"' | head -4
-$CURL "https://hub.docker.com/v2/repositories/library/python/tags?page_size=60&name=3.11" | grep -o '"name":"3\.11\.[0-9]*-slim-bookworm"' | head -4
+tags qdrant/qdrant "page_size=40&ordering=last_updated" '"name":"v[0-9.]*"' 6
+tags library/postgres "page_size=60&name=17" '"name":"17\.[0-9]*-alpine"' 4
+tags library/python "page_size=60&name=3.11" '"name":"3\.11\.[0-9]*-slim-bookworm"' 4
 
 echo "-- 고정한 태그의 지금 다이제스트"
 PINNED=$( { sed -n 's/^FROM[[:space:]]*\([^[:space:]]*@sha256:[0-9a-f]*\).*/\1/p' "$ROOT/Dockerfile"
             sed -n 's/^[[:space:]]*image:[[:space:]]*\([^[:space:]]*@sha256:[0-9a-f]*\).*/\1/p' "$ROOT/k8s/docs.yaml"; } | sort -u)
-rc=0
 for IMG in $PINNED; do
   NAME=${IMG%@*}; WANT=${IMG#*@}
   REPO=${NAME%:*}; TAG=${NAME##*:}

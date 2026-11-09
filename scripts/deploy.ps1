@@ -30,10 +30,14 @@ try {
     if ($branch -ne "main" -and -not $NoTag) { throw "main이 아닌 브랜치($branch)입니다. 시험 배포는 -NoTag" }
 
     if (-not $NoCheck) {
-        # 배포 검사는 늘 기본 도구 폴더로 (시험용 경로 변수는 지운다, https://github.com/reddol18/docflow/issues/46)
+        # 배포 검사는 늘 기본 도구 폴더로 — 시험용 경로 변수는 검사 동안만 지우고 끝나면 되돌린다 (https://github.com/reddol18/docflow/issues/46)
+        $savedToolsDir = $env:DOCFLOW_TOOLS_DIR
         Remove-Item Env:DOCFLOW_TOOLS_DIR -ErrorAction SilentlyContinue
-        & (Join-Path $PSScriptRoot "check.ps1") -NoStatus  # 배포 검사는 main에서 돈다 — PR 병합 게이트 status는 올리지 않는다 (https://github.com/reddol18/docflow/issues/85)
-        if ($LASTEXITCODE) { throw "로컬 검사 실패. 배포하지 않습니다." }
+        try {
+            & (Join-Path $PSScriptRoot "check.ps1") -NoStatus  # 배포 검사는 main에서 돈다 — PR 병합 게이트 status는 올리지 않는다 (https://github.com/reddol18/docflow/issues/85)
+            $checkCode = $LASTEXITCODE
+        } finally { if ($null -ne $savedToolsDir) { $env:DOCFLOW_TOOLS_DIR = $savedToolsDir } }
+        if ($checkCode) { throw "로컬 검사 실패. 배포하지 않습니다." }
     }
 
     Write-Host "== 디스크 여유 확인"

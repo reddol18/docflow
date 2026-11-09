@@ -98,7 +98,8 @@ function Get-Tool([string]$name) {
             $got = (Get-FileHash $e -Algorithm SHA256).Hash
             if ($got -ne $p.exeSha) { throw "!! 검사 도구 무결성 실패: $($p.asset) 안 $($p.exe) 해시가 tool_pins.txt와 다름 ($got) — 받지 않고 멈춤" }
             New-Item -ItemType Directory -Force $dir | Out-Null
-            Move-Item $e $path  # 같은 드라이브 안 이름 바꾸기
+            # 같은 드라이브 안 이름 바꾸기. 실패해도 그 사이 다른 실행이 제자리에 놓았으면 아래 해시 확인으로 간다
+            try { Move-Item $e $path -ErrorAction Stop } catch { if (-not (Test-Path $path)) { throw } }
         } finally { Remove-Item -Recurse -Force $new -ErrorAction SilentlyContinue }
     }
     # 받아 둔 실행 파일도 매번 (바뀌었으면 지우지 않고 멈춘다 — 무엇이 바뀌었는지 볼 수 있게)
