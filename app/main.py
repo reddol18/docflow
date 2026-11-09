@@ -83,7 +83,9 @@ async def lifespan(_):
     saver = PostgresSaver(store.pool)
     saver.setup()
     G = flow.build(saver)
+    startup_migrate()
     yield
+    store.lock_pool.close()
     store.pool.close()
 
 
@@ -244,14 +246,17 @@ async def _upload(vol, files):
 @app.post("/volumes/{vol}/run")
 def run(vol: str, user: Admin, review: str = "human"):
     ok_mode = review in ("human", "auto")
-    with audited(user, "run", vol, review=review if ok_mode else "invalid"):  # 사용자가 넣은 임의 문자열은 남기지 않는다
+    # 사용자가 넣은 임의 문자열은 남기지 않는다
+    with audited(user, "run", vol, review=review if ok_mode else "invalid") as info:
         if not ok_mode:
             raise HTTPException(400, "review=human|auto")
         if not any(store.pages_dir(vol).glob("*.jpg")):
             raise HTTPException(404, "올린 쪽이 없음")
         if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
             store.event(vol, "inspection", "reset", None, user=user.username)
-        if moved := store.reset_stages(vol):  # 검토 단계 위치도 처음으로 (승인·반려 기록 stage_log는 남음)
+        # 검토 단계 위치도 처음으로, 실행 세대를 올린다 (승인·반려 기록 stage_log는 세대와 함께 남음)
+        info["stage_reset"] = moved = store.reset_stages(vol)
+        if moved:
             store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
         submit(vol, {"vol": vol, "review_mode": review}, user)
     return {"vol": vol, "started": True}
@@ -332,7 +337,7 @@ def volume_events(vol: str, _: Viewer, after: int = 0):
 def edit_document(vol: str, doc_id: str, fields: dict[str, CellValue], user: Reviewer):
     """색인이 끝난 문서를 사람이 고친다: 그래프 상태·Postgres·Qdrant를 함께 바꾼다.
     검토 대기 중인 철은 /review/{vol}/json 으로 흐름을 이어 가야 하므로 여기서는 받지 않는다."""
-    with audited(user, "edit", vol, doc_id) as info:
+    with audited(user, "edit", vol, doc_id) as info, store.doc_lock(vol, doc_id):  # 확인과 쓰기 사이에 단계가 못 바뀌게
         row = store.inspection_row(vol, doc_id)
         if row and row["inspected_at"] is not None:  # 검사가 끝난 문서를 입력 경로로 바꾸면 검사 결과가 무의미해진다
             raise HTTPException(409, "검사가 끝난 문서는 고칠 수 없음")
@@ -397,20 +402,38 @@ StageUser = Annotated[auth.User, auth.require(min((s["role"] for s in WORKFLOW["
 SampleUser = Annotated[auth.User, auth.require(SAMPLE["role"] if SAMPLE else "inspector")]
 
 
-def positions(vol, doc_ids, raw=False):
-    """문서마다 지금 위치 {doc_id: {stage, round, last_reason, rejected_from, busy_at}}.
-    doc_stage 행이 없으면 흐름의 처음 단계 (예전 철·기본 흐름). raw가 아니면 표본 단계에 있는 문서 중
-    검사 목록 밖이거나 검사가 끝난 문서는 확정(CONFIRMED)으로 본다"""
+STATUS_LABEL = {"confirmed": "확정", "excluded": "검사 제외(수정 가능)"}
+
+
+def startup_migrate():
+    """앱 시작 때 (lifespan): 예전 판에서 검사가 끝난 문서(단계 행 없음)를 확정 행으로 — 남은 것만"""
+    if SAMPLE:
+        n = store.backfill_inspected(SAMPLE["name"])
+        if n:
+            print(f"doc_stage: 예전 검사 끝난 문서 {n}건 → 확정", flush=True)
+
+
+def positions(vol, doc_ids):
+    """문서마다 지금 위치 {doc_id: {stage, round, last_reason, rejected_from, status}}. stage는 저장된 위치 그대로
+    (doc_stage 행이 없으면 흐름의 처음 단계 — 예전 철·기본 흐름). status:
+      confirmed  마지막 단계까지 승인됨 (표본 검사가 끝난 문서 포함)
+      excluded   표본 단계에 와 있는데 검사 목록 밖 — 검사 없이 넘어간 것으로 보아 출력 전 검증에서는 미확정이 아니고,
+                 확정과 달리 입력 경로로 고칠 수 있다 (지금 동작)
+      pending    그 밖 (그 단계 차례를 기다림)"""
     rows = store.stage_rows(vol)
     init = workflow.initial(WORKFLOW)
-    sampled = None
-    if SAMPLE and not raw and store.inspection_plan(vol):
-        sampled = {r["doc_id"]: r["inspected_at"] for r in store.inspection_rows(vol)}
+    listed = None
+    if SAMPLE and store.inspection_plan(vol):
+        listed = {r["doc_id"] for r in store.inspection_rows(vol)}
     out = {}
     for d in doc_ids:
-        p = dict(rows.get(d) or {"stage": init, "round": 1, "last_reason": None, "rejected_from": None, "busy_at": None})
-        if sampled is not None and p["stage"] == SAMPLE["name"] and (d not in sampled or sampled[d] is not None):
-            p["stage"] = CONFIRMED
+        p = dict(rows.get(d) or {"stage": init, "round": 1, "last_reason": None, "rejected_from": None})
+        if p["stage"] == CONFIRMED:
+            p["status"] = "confirmed"
+        elif listed is not None and p["stage"] == SAMPLE["name"] and d not in listed:
+            p["status"] = "excluded"
+        else:
+            p["status"] = "pending"
         out[d] = p
     return out
 
@@ -448,9 +471,11 @@ def _distinct_check(vol, doc_id, user, stage_name):
 
 
 def _entry_edit_allowed(vol, doc_id, user):
-    """입력 경로(PATCH)로 고칠 수 있는 문서인가: 확정됐거나 검수 단계로 넘어간 문서는 409 (반려되어 돌아오면 고친다).
-    기본 흐름(입력 on_index → 표본 검사)은 검사 전 문서를 지금처럼 고칠 수 있다"""
-    stage = positions(vol, [doc_id], raw=True)[doc_id]["stage"]
+    """입력 경로(PATCH)로 고칠 수 있는 문서인가 (workflow.editable_positions): 입력 단계에 있는 문서만.
+    예외는 입력 on_index 바로 다음이 표본 단계인 흐름(기본 흐름) — 검사 전·검사 목록 밖 문서를 지금처럼 고칠 수 있다.
+    확정됐거나 검수 단계에 있는 문서는 409 (검수자가 승인하며 고치거나, 반려되어 입력으로 돌아오면 고친다).
+    doc_lock 안에서 부른다"""
+    stage = positions(vol, [doc_id])[doc_id]["stage"]
     if stage == CONFIRMED:
         raise HTTPException(409, "확정된 문서는 고칠 수 없음")
     if stage not in workflow.editable_positions(WORKFLOW):
@@ -526,7 +551,7 @@ def inspection_view(vol: str, user: Viewer):
     inspector = bool(SAMPLE) and auth.role_at_least(user.role, SAMPLE["role"])
     whole, acts = acted_stages(vol, user) if inspector and user.id is not None else (False, {})
     rows = store.inspection_rows(vol)
-    pos = positions(vol, [r["doc_id"] for r in rows], raw=True)
+    pos = positions(vol, [r["doc_id"] for r in rows])
     out = []
     for r in rows:
         d = docs.get(r["doc_id"], {})
@@ -543,8 +568,9 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
     """검사 결과. 문서를 먼저 차지하고(동시 제출 막기) 고친 칸은 문서 수정과 같은 길(그래프 상태·Postgres·Qdrant)로
     반영한다. 이력 단계는 inspect. 고치다 실패하면 차지를 풀어 다시 검사할 수 있게 한다.
     교차검사: 이 문서를 입력 단계에서 고쳤거나 이 철의 검토를 제출한 사람은 검사할 수 없다.
-    흐름 설정의 표본 단계(기본 흐름은 inspect)에 와 있는 문서만 — 앞 단계를 건너뛰고 검사하지 못한다."""
-    with audited(user, "inspect", vol, doc_id) as info:
+    흐름 설정의 표본 단계(기본 흐름은 inspect)에 와 있는 문서만 — 앞 단계를 건너뛰고 검사하지 못한다.
+    확인부터 확정까지 문서 잠금(doc_lock) 안에서 — 확인과 쓰기 사이에 다른 단계 처리·입력 수정이 끼어들지 못한다."""
+    with audited(user, "inspect", vol, doc_id) as info, store.doc_lock(vol, doc_id):
         _need_sample()
         _done_docs(vol)
         if not store.inspection_row(vol, doc_id):
@@ -556,7 +582,7 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
             if other:
                 raise HTTPException(403, "자기가 입력·수정한 문서는 검사할 수 없음 (교차검사)" if ENTRY["name"] in other
                                     else f"같은 문서의 다른 단계({', '.join(sorted(other))})를 맡은 사람은 검사할 수 없음")
-        pos = positions(vol, [doc_id], raw=True)[doc_id]
+        pos = positions(vol, [doc_id])[doc_id]
         if pos["stage"] != SAMPLE["name"]:
             raise HTTPException(409, "아직 검사 단계에 오지 않은 문서")
         if not store.claim_inspection(vol, doc_id, user.id):
@@ -569,8 +595,8 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
         # 고친 칸은 이력에서 센다 — 앞선 시도가 저장 뒤(임베딩 등)에서 실패해 이번 제출에 차이가 없어도 빠지지 않게
         fixed = store.inspected_fields(vol, doc_id)
         store.finish_inspection(vol, doc_id, fixed)
-        # 단계 기록: 표본 단계는 마지막 단계라 검사가 끝나면 확정 (오류목록 내보내기가 다른 단계와 같은 표에서 읽는다)
-        store.add_stage_log(vol, doc_id, SAMPLE["name"], pos["round"], "approve", CONFIRMED, user.id, fixed=fixed)
+        # 표본 단계는 마지막 단계라 검사가 끝나면 위치를 확정으로 옮기고 기록한다 (오류목록 내보내기가 같은 표에서 읽는다)
+        store.confirm_sample(vol, doc_id, SAMPLE["name"], pos["round"], user.id, fixed)
         info.update(fields=fixed, stage=SAMPLE["name"], to=CONFIRMED)
     return {"doc_id": doc_id, "fixed_fields": fixed}
 
@@ -586,20 +612,29 @@ class StageRejectIn(BaseModel):
     reason: str = Field(min_length=1, max_length=REASON_MAX)  # 반려 사유 (필수)
 
 
+# 반려 사유에서 지우는 글자: 제어 문자(export.CONTROL), 방향 제어(U+202A–202E, U+2066–2069, LRM·RLM·ALM),
+# 폭 0 문자(U+200B–200D, U+2060, U+FEFF) — 화면·엑셀에서 보이는 글과 저장된 글이 달라지지 않게
+INVISIBLE = re.compile("[‪-‮⁦-⁩​-‏؜⁠﻿]")
+
+
+def clean_reason(s):
+    return INVISIBLE.sub("", export.CONTROL.sub("", s)).strip()
+
+
 def _stage_action(vol, doc_id, name, user):
     """단계 승인·반려 전에 서버가 보는 것: 색인 끝난 철의 문서인가, 설정에 있는 /workflow 단계인가, 그 단계의 역할인가,
-    문서가 지금 그 단계에 있나(건너뛰기·확정 문서 막기), 같은 문서의 다른 단계를 맡지 않았나"""
+    문서가 지금 그 단계에 있나(건너뛰기·확정 문서 막기), 같은 문서의 다른 단계를 맡지 않았나. doc_lock 안에서 부른다"""
     if doc_id not in {d["doc_id"] for d in _done_docs(vol)}:
         raise HTTPException(404, "문서 없음")
     st = workflow.stage(WORKFLOW, name)
     if st is None:
         raise HTTPException(404, "흐름에 없는 단계")
-    if st["select"] == "sample":
+    if not workflow.actionable(WORKFLOW, name):
         raise HTTPException(409, "표본 검사 단계는 /inspection 경로로")
     if not auth.role_at_least(user.role, st["role"]):
         raise HTTPException(403, f"{st['role']} 역할 필요")
     pos = positions(vol, [doc_id])[doc_id]
-    if pos["stage"] == CONFIRMED:
+    if pos["status"] == "confirmed":
         raise HTTPException(409, "이미 확정된 문서")
     if pos["stage"] != name:
         raise HTTPException(409, "문서가 지금 이 단계에 있지 않음")
@@ -620,16 +655,20 @@ def workflow_view(vol: str, user: Viewer):
     ids = [d["doc_id"] for d in (snap.values or {}).get("docs", [])] if ready else []
     pos = positions(vol, ids)
     whole, acts = acted_stages(vol, user) if ids and user.id is not None else (False, {})
+    editable_at = workflow.editable_positions(WORKFLOW)
     out, counts = [], {}
     for d in ids:
         p = pos[d]
         st = workflow.stage(WORKFLOW, p["stage"])
         counts[p["stage"]] = counts.get(p["stage"], 0) + 1
-        can = (st is not None and st["select"] != "sample" and auth.role_at_least(user.role, st["role"])
+        can = (workflow.actionable(WORKFLOW, p["stage"]) and auth.role_at_least(user.role, st["role"])
                and not (WORKFLOW["distinct_actors"] and (user.id is None or other_stages(whole, acts, d, st["name"]))))
-        out.append({"doc_id": d, "stage": p["stage"], "label": st["label"] if st else ("확정" if p["stage"] == CONFIRMED else None),
-                    "round": p["round"], "recheck": p["round"] > 1, "confirmed": p["stage"] == CONFIRMED,
+        out.append({"doc_id": d, "stage": p["stage"], "status": p["status"],
+                    "label": STATUS_LABEL.get(p["status"]) or (st["label"] if st else None),
+                    "round": p["round"], "recheck": p["round"] > 1, "confirmed": p["status"] == "confirmed",
                     "last_reason": p["last_reason"], "rejected_from": p["rejected_from"],
+                    # 입력 경로(PATCH)로 고칠 수 있나 — 서버 규칙과 같음 (역할·작업자≠검수자는 PATCH가 다시 본다)
+                    "editable": p["stage"] in editable_at,
                     "can_approve": can, "can_reject": can and st["reject"]})
     return {"workflow": workflow.public(WORKFLOW), "ready": ready, "counts": counts, "docs": out}
 
@@ -637,24 +676,21 @@ def workflow_view(vol: str, user: Viewer):
 @app.post("/workflow/{vol}/{doc_id}/approve")
 def stage_approve(vol: str, doc_id: str, body: StageApproveIn, user: StageUser):
     """단계 승인. 고친 칸은 문서 수정과 같은 길로 반영(이력 source: 입력은 edit, 검수는 stage:<단계>)하고 다음 단계로.
-    마지막 단계면 확정. 승인하는 동안 문서를 차지해 같은 차례를 두 번 넘기지 않는다"""
-    with audited(user, "stage_approve", vol, doc_id, stage=body.stage) as info:
+    마지막 단계면 확정. 확인·칸 반영·이동을 문서 잠금(doc_lock) 안에서 차례로 한다 — 같은 차례를 두 번 넘기거나,
+    확인 뒤 다른 요청이 단계를 바꾼 문서에 칸을 반영하지 않는다. 칸 반영이 실패하면 이동하지 않는다(다시 승인하면 된다)"""
+    with audited(user, "stage_approve", vol, doc_id, stage=body.stage) as info, store.doc_lock(vol, doc_id):
         st, pos = _stage_action(vol, doc_id, body.stage, user)
         row = store.ensure_stage(vol, doc_id, pos["stage"])
         rnd = row["round"]
-        if row["stage"] != st["name"] or not store.claim_stage(vol, doc_id, st["name"], rnd, user.id):
-            raise HTTPException(409, "다른 사람이 처리 중이거나 문서의 단계가 바뀜")
+        if row["stage"] != st["name"]:
+            raise HTTPException(409, "문서의 단계가 바뀜")
         to = workflow.next_stage(WORKFLOW, st["name"])
-        try:
-            changed = []
-            if body.fields:
-                source = "edit" if st["kind"] == "entry" else f"stage:{st['name']}"
-                _, changed = _edit_document(vol, doc_id, body.fields, user, source=source)
-            if not store.move_stage(vol, doc_id, st["name"], rnd, "approve", to, rnd, user.id, fixed=changed, claimed=True):
-                raise HTTPException(409, "문서의 단계가 바뀜")
-        except BaseException:
-            store.release_stage(vol, doc_id)
-            raise
+        changed = []
+        if body.fields:
+            source = "edit" if st["kind"] == "entry" else f"stage:{st['name']}"
+            _, changed = _edit_document(vol, doc_id, body.fields, user, source=source)
+        if not store.move_stage(vol, doc_id, st["name"], rnd, "approve", to, rnd, user.id, fixed=changed):
+            raise HTTPException(409, "문서의 단계가 바뀜")  # 잠금 안이라 DB 밖 변경이 없으면 오지 않는다
         info.update(to=to, round=rnd, recheck=rnd > 1, fields=changed)
     return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd, "fixed_fields": changed}
 
@@ -663,8 +699,8 @@ def stage_approve(vol: str, doc_id: str, body: StageApproveIn, user: StageUser):
 def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
     """단계 반려 (사유 필수): 문서만 정해진 앞 단계(reject_to)로 돌아가고 차례(round)가 하나 는다 → 다시 올라오면 재검수.
     사유는 단계 기록(stage_log)에, 감사 로그에는 단계·차례·사유 길이만"""
-    with audited(user, "stage_reject", vol, doc_id, stage=body.stage) as info:
-        reason = export.CONTROL.sub("", body.reason).strip()
+    with audited(user, "stage_reject", vol, doc_id, stage=body.stage) as info, store.doc_lock(vol, doc_id):
+        reason = clean_reason(body.reason)
         if not reason:
             raise HTTPException(422, "반려 사유를 적어야 함")
         st, pos = _stage_action(vol, doc_id, body.stage, user)
@@ -674,7 +710,7 @@ def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
         rnd, to = row["round"], st["reject_to"]
         if row["stage"] != st["name"] or not store.move_stage(vol, doc_id, st["name"], rnd, "reject", to, rnd + 1,
                                                               user.id, reason=reason):
-            raise HTTPException(409, "다른 사람이 처리 중이거나 문서의 단계가 바뀜")
+            raise HTTPException(409, "문서의 단계가 바뀜")
         info.update(to=to, round=rnd + 1, reason_chars=len(reason))
     return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd + 1}
 
@@ -898,7 +934,7 @@ def _unconfirmed(volumes, stages):
             out[v] = set(ids)
         else:
             pos = positions(v, ids)
-            out[v] = {d for d in ids if pos[d]["stage"] != CONFIRMED}
+            out[v] = {d for d in ids if pos[d]["status"] == "pending"}
     return out
 
 

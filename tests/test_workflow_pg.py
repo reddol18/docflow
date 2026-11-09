@@ -1,7 +1,10 @@
 """검토 단계 설정 — N단계 승인·반려·재검수, 작업자 ≠ 검수자, 미확정 세기, 감사 로그 (https://github.com/reddol18/docflow/issues/86).
 실제 Postgres(PGlite)에 돌린다. TEST_PG_URL이 없으면 건너뛴다. 표를 지우므로 운영 DB에 대고 돌리지 말 것.
 문서·값·사유는 모두 지어낸 것."""
+import contextlib
 import os
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +17,7 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_
 USERS = {"s": (1, "admin"), "w": (2, "reviewer"), "q": (3, "inspector"), "q2": (4, "inspector"), "w2": (6, "reviewer"),
          "s2": (7, "admin"), "v": (8, "viewer")}
 TABLES = ("inspection", "inspection_plan", "review_submitters", "audit", "events", "edits", "sessions", "review_time",
-          "doc_stage", "stage_log", "exports", "users")
+          "doc_stage", "stage_log", "stage_gen", "exports", "users")
 
 
 def h(name):
@@ -108,6 +111,7 @@ def test_three_stage_flow_end_to_end(main, monkeypatch):
     assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "몰래"}).status_code == 409  # 검수로 넘어간 문서
     assert reject(c, "q", "d01", "qc", "").status_code == 422  # 사유 필수
     assert reject(c, "q", "d01", "qc", "   \x07 ").status_code == 422  # 빈칸·제어 문자만도 안 됨
+    assert reject(c, "q", "d01", "qc", "‮​⁦﻿").status_code == 422  # 방향 제어·폭 0 문자만도 안 됨
     assert reject(c, "q", "d01", "qc", "가" * 501).status_code == 422
     r = reject(c, "q", "d01", "qc", "가상 사유: 제목 오기")
     assert r.status_code == 200 and r.json() == {"doc_id": "d01", "stage": "qc", "to": "entry", "round": 2}
@@ -124,8 +128,11 @@ def test_three_stage_flow_end_to_end(main, monkeypatch):
     assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "가상 고친 제목"}).status_code == 200
     assert approve(c, "w", "d01", "entry").json()["round"] == 2
     assert approve(c, "w2", "d01", "qc").status_code == 403  # 작업자 역할
+    assert where(c)["d01"]["last_reason"] == "가상 사유: 제목 오기"  # 재검수하는 품질관리자도 사유를 본다
     r = approve(c, "q", "d01", "qc", recipient="가상구청")
     assert r.status_code == 200 and r.json()["to"] == "supervisor" and r.json()["fixed_fields"] == ["recipient"]
+    x = where(c)["d01"]
+    assert (x["last_reason"], x["rejected_from"]) == (None, None)  # 반려한 단계가 다시 승인하면 사유 표시를 지운다
     assert approve(c, "q", "d01", "supervisor").status_code == 403  # 감독관은 admin
     assert approve(c, "s", "d01", "supervisor").json()["to"] == workflow.CONFIRMED
     x = where(c)["d01"]
@@ -141,7 +148,9 @@ def test_three_stage_flow_end_to_end(main, monkeypatch):
     assert approve(c, "s2", "d02", "entry").status_code == 200
     assert approve(c, "q2", "d02", "qc").status_code == 200
     assert approve(c, "s2", "d02", "supervisor").status_code == 403
-    assert reject(c, "s", "d02", "supervisor", "가상 사유: 쪽 순서").json()["to"] == "entry"  # 감독관 반려도 입력으로
+    # 감독관 반려도 입력으로. 사유의 방향 제어·폭 0 문자는 지우고 저장한다
+    assert reject(c, "s", "d02", "supervisor", "가상‮ 사유: 쪽​ 순서⁩").json()["to"] == "entry"
+    assert where(c)["d02"]["last_reason"] == "가상 사유: 쪽 순서"
     assert where(c)["d02"]["round"] == 2
     assert approve(c, "s2", "d02", "entry").status_code == 200
     assert approve(c, "q2", "d02", "qc").status_code == 200
@@ -175,21 +184,97 @@ def test_three_stage_flow_end_to_end(main, monkeypatch):
     assert {r["result"] for r in log} >= {"ok", "rejected_403", "rejected_409", "rejected_404"}
 
 
-def test_concurrent_claim_and_failed_fix_release(main, monkeypatch):
-    """같은 차례를 두 사람이 동시에 넘기지 못하고, 칸 반영이 실패하면 차지를 풀어 다시 할 수 있다"""
+def _race(monkeypatch, competitor):
+    """잠금을 얻기 바로 전에 다른 요청(competitor)이 먼저 끝난 상황을 만든다 — 확인이 잠금 안에서 일어나야 막힌다"""
+    real, fired = store.doc_lock, []
+
+    @contextlib.contextmanager
+    def racing(vol, doc_id):
+        if not fired:
+            fired.append(1)
+            competitor()
+        with real(vol, doc_id):
+            yield
+
+    monkeypatch.setattr(store, "doc_lock", racing)
+
+
+def edits_of(did):
+    with store.pool.connection() as conn:
+        return [r["source"] for r in conn.execute("SELECT source FROM edits WHERE doc_id = %s ORDER BY id", (did,))]
+
+
+def test_race_checks_happen_under_lock(main, monkeypatch):
+    """확인과 쓰기 사이에 다른 요청이 단계를 바꾸면: 승인·입력 수정은 409이고 고친 칸이 남지 않는다 (S2·S3·S4)"""
+    use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
+    c = TestClient(main.app)
+    assert approve(c, "w", "d03", "entry").status_code == 200
+    # 승인 경쟁: 품질관리자 q2가 먼저 넘겼다 → q의 승인(칸 함께)은 409, q의 칸은 반영되지 않는다
+    _race(monkeypatch, lambda: store.move_stage("v1", "d03", "qc", 1, "approve", "supervisor", 1, 4))
+    assert approve(c, "q", "d03", "qc", title="가상 늦은 값").status_code == 409
+    assert "stage:qc" not in edits_of("d03")
+    # 입력 수정 경쟁: 작업자 w2가 먼저 넘겼다 → w의 PATCH는 409, 칸은 반영되지 않는다
+    _race(monkeypatch, lambda: (store.ensure_stage("v1", "d02", "entry"),
+                                store.move_stage("v1", "d02", "entry", 1, "approve", "qc", 1, 6)))
+    assert c.patch("/documents/v1/d02", headers=h("w"), json={"title": "가상 늦은 값"}).status_code == 409
+    assert edits_of("d02") == []
+
+
+def test_doc_lock_serializes(main):
+    """문서 잠금은 같은 문서를 다른 요청이 동시에 쥐지 못하게 한다.
+    PGlite는 연결들이 한 세션이라 advisory lock 자체의 배타성은 여기서 재지 못한다 — 프로세스 안 잠금이 재는 범위.
+    (다른 문서는 막지 않는다는 것은 시험 서버의 연결 수 상한 때문에 시간으로 재지 않는다)"""
+    order = []
+
+    def hold():
+        with store.doc_lock("v1", "d01"):
+            order.append("a-in")
+            time.sleep(0.6)
+            order.append("a-out")
+
+    t = threading.Thread(target=hold)
+    t.start()
+    time.sleep(0.2)
+    with store.doc_lock("v1", "d01"):
+        order.append("b-in")
+    t.join()
+    assert order == ["a-in", "a-out", "b-in"]
+
+
+def test_failed_fix_does_not_move(main, monkeypatch):
+    """승인하며 고치다 실패하면(임베딩 오류) 단계는 그대로 — 다시 승인하면 된다"""
     use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
     c = TestClient(main.app, raise_server_exceptions=False)
     assert approve(c, "w", "d03", "entry").status_code == 200
-    with store.pool.connection() as conn:  # 다른 요청이 승인 중 (차지)
-        conn.execute("UPDATE doc_stage SET busy_by = 4, busy_at = now() WHERE vol = 'v1' AND doc_id = 'd03'")
-    assert approve(c, "q", "d03", "qc").status_code == 409
-    assert reject(c, "q", "d03", "qc", "가상 사유").status_code == 409
-    store.release_stage("v1", "d03")
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: (_ for _ in ()).throw(TimeoutError("embed")))
     assert approve(c, "q", "d03", "qc", title="가상").status_code == 500
-    assert store.stage_rows("v1")["d03"]["busy_at"] is None and where(c)["d03"]["stage"] == "qc"
+    assert where(c)["d03"]["stage"] == "qc"
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts: [[0.0]] * len(texts))
-    assert approve(c, "q", "d03", "qc", title="가상").status_code == 200
+    assert approve(c, "q", "d03", "qc", title="가상").json()["to"] == "supervisor"
+
+
+def test_on_index_full_stage_patch_blocked(main, monkeypatch):
+    """입력 on_index + 반려 있는 전수 검수: 검수 대기 문서는 PATCH 409, 반려로 입력에 돌아오면 고칠 수 있다 (화면 editable도 같음)"""
+    use_flow(main, monkeypatch, workflow.parse({"stages": [{"name": "entry", "role": "reviewer", "submit": "on_index"},
+                                                           {"name": "qc", "role": "inspector", "reject": True}]}))
+    c = TestClient(main.app)
+    x = where(c, "w")["d01"]
+    assert (x["stage"], x["editable"]) == ("qc", False)
+    assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "가상"}).status_code == 409
+    assert reject(c, "q", "d01", "qc", "가상 사유").status_code == 200
+    assert where(c, "w")["d01"]["editable"] is True
+    assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "가상"}).status_code == 200
+    assert approve(c, "w", "d01", "entry").json()["to"] == "qc"
+
+
+def test_stage_edits_count_in_report(main, monkeypatch):
+    """검수 단계에서 승인하며 고친 칸도 리포트의 '수정 칸'에 들어간다"""
+    use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
+    c = TestClient(main.app)
+    assert approve(c, "w", "d01", "entry", title="가상 1").status_code == 200  # 입력(edit) 1칸
+    assert approve(c, "q", "d01", "qc", recipient="가상 2", date="2001-02-03").status_code == 200  # 검수 2칸
+    daily = c.get("/report", headers=h("v")).json()["daily"]
+    assert sum(d["cells_edited"] for d in daily) == 3
 
 
 def test_sample_stage_after_full_stage_cannot_be_skipped(main, monkeypatch):
@@ -230,9 +315,16 @@ def test_default_flow_unchanged(main):
     for d in {"d02", "d03"} - listed:  # 표본 밖 문서는 지금처럼 고칠 수 있다
         assert c.patch(f"/documents/v1/{d}", headers=h("w"), json={"recipient": "가상읍"}).status_code == 200
     w = where(c)
-    assert w["d01"]["confirmed"] and all(w[d]["confirmed"] for d in {"d02", "d03"} - listed)
-    with store.pool.connection() as conn:  # 기본 흐름은 단계 위치 행을 만들지 않는다 (검사 기록만 stage_log에)
-        assert conn.execute("SELECT count(*) AS n FROM doc_stage").fetchone()["n"] == 0
+    # 표시만 바뀜(검토 지적 S5): 검사 끝난 문서는 확정, 검사 목록 밖 문서는 '검사 제외(수정 가능)' — 고칠 수 있으므로 확정과 구분
+    assert (w["d01"]["status"], w["d01"]["label"], w["d01"]["editable"]) == ("confirmed", "확정", False)
+    for d in {"d02", "d03"} - listed:
+        assert (w[d]["status"], w[d]["label"], w[d]["confirmed"], w[d]["editable"]) == (
+            "excluded", "검사 제외(수정 가능)", False, True)
+    for d in listed - {"d01"}:
+        assert (w[d]["status"], w[d]["label"]) == ("pending", "검사")
+    with store.pool.connection() as conn:  # 검사가 끝난 문서만 위치 행(확정)이 생긴다
+        assert [(r["doc_id"], r["stage"]) for r in conn.execute("SELECT doc_id, stage FROM doc_stage")] == [
+            ("d01", workflow.CONFIRMED)]
     assert [(e["stage"], e["action"]) for e in c.get("/documents/v1/d01/stages", headers=h("v")).json()] == [
         ("inspect", "approve")]
 
@@ -242,14 +334,17 @@ def test_old_database_opens(main, pg_store):
     with pg_store.pool.connection() as conn:
         conn.execute("DROP TABLE doc_stage")
         conn.execute("DROP TABLE stage_log")
+        conn.execute("DROP TABLE stage_gen")
         conn.execute("INSERT INTO inspection_plan (vol, rate, fields100, seed, flagged, unflagged, sample) "
                      "VALUES ('v1', 0.5, '{}', 1, 1, 2, 1)")
         conn.execute("INSERT INTO inspection (vol, doc_id, reason, inspected_by, inspected_at, fixed_fields) VALUES "
                      "('v1', 'd01', 'flagged', 3, now(), '{}'), ('v1', 'd02', 'sample', NULL, NULL, NULL)")
-    store.init_db()  # 앱 시작과 같은 길
+    store.init_db()  # 앱 시작과 같은 길 (lifespan: store.init → startup_migrate)
+    main.startup_migrate()
+    main.startup_migrate()  # 시작할 때마다 돌아도 같다
     c = TestClient(main.app)
     w = where(c)
-    assert (w["d01"]["confirmed"], w["d02"]["stage"], w["d03"]["confirmed"]) == (True, "inspect", True)
+    assert (w["d01"]["status"], w["d02"]["status"], w["d03"]["status"]) == ("confirmed", "pending", "excluded")
     view = c.get("/volumes/v1/inspection", headers=h("q2")).json()["docs"]
     assert [(d["doc_id"], d["can_inspect"]) for d in view] == [("d01", False), ("d02", True)]
     assert c.patch("/documents/v1/d01", headers=h("w"), json={"title": "x"}).status_code == 409
@@ -260,9 +355,22 @@ def test_old_database_opens(main, pg_store):
 def test_rerun_resets_stage_positions(main, monkeypatch):
     use_flow(main, monkeypatch, workflow.load(workflow.DIR / "three_stage.yaml"))
     c = TestClient(main.app)
+    """다시 돌리면 단계 위치를 지우고 실행 세대를 올린다: 옛 세대 기록은 작업자≠검수자·이력에 섞이지 않고 표에는 남는다.
+    감사 로그 run에 지운 위치 수"""
     assert approve(c, "w", "d02", "entry").status_code == 200
+    assert approve(c, "q", "d02", "qc", title="가상").status_code == 200
+    assert approve(c, "q", "d02", "entry").status_code == 409  # 지난 세대: q는 qc를 맡았다
     store.pages_dir("v1").mkdir(parents=True)
     (store.pages_dir("v1") / "p.jpg").write_bytes(b"\xff\xd8\xff")
     assert c.post("/volumes/v1/run", headers=h("s")).status_code == 200
+    main.runner.submit(lambda: None).result()  # 뒤에서 도는 실행이 끝날 때까지
     assert store.stage_rows("v1") == {}  # 처음부터 다시 돌리면 문서가 바뀐다 → 단계 위치도 처음으로
-    assert len(c.get("/documents/v1/d02/stages", headers=h("v")).json()) == 1  # 기록은 남는다
+    run = next(r for r in store.audit_log() if r["action"] == "run")
+    assert run["info"]["stage_reset"] == 1
+    assert c.get("/documents/v1/d02/stages", headers=h("v")).json() == []  # 지금 세대 기록만
+    with store.pool.connection() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM stage_log WHERE doc_id = 'd02'").fetchone()["n"] == 2  # 표에는 남음
+    # 새 세대: 지난 세대에 qc를 맡은(칸도 고친) q가 이번에는 입력을 맡을 수 있다
+    assert where(c, "q")["d02"]["can_approve"] is True
+    assert approve(c, "q", "d02", "entry").status_code == 200
+    assert approve(c, "q", "d02", "qc").status_code == 403  # 이번 세대 안에서는 여전히 작업자 ≠ 검수자

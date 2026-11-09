@@ -27,7 +27,7 @@ def main(pg_store, monkeypatch, tmp_path):
     from app import main
     with pg_store.pool.connection() as c:
         for t in ("inspection", "inspection_plan", "review_submitters", "audit", "events", "edits", "sessions",
-                  "review_time", "users"):
+                  "review_time", "doc_stage", "stage_log", "stage_gen", "users"):  # 단계 표: 검사가 끝나면 확정 행이 생긴다
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름
         for name, (uid, role) in USERS.items():
             c.execute("INSERT INTO users (id, username, role) VALUES (%s, %s, %s)", (uid, name, role))

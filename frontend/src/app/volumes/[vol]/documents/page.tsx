@@ -40,7 +40,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
   const [wf, setWf] = useState<Workflow | null>(null);
   const [stages, setStages] = useState<Record<string, DocStage>>({});
   const [stageTick, setStageTick] = useState(0);
-  const [reason, setReason] = useState("");
+  const [reasons, setReasons] = useState<Record<string, string>>({}); // 반려 사유는 문서마다 따로
   const reviewing = s?.stage === "review";
 
   // 칸 목록·표시명은 서버의 색인 스키마에서 (https://github.com/reddol18/docflow/issues/9)
@@ -59,10 +59,10 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
       alive = false;
     };
   }, []);
-  // 단계 승인·반려를 이 화면에서 하는 흐름일 때만 단계를 보이고 다룬다 (기본 흐름이면 화면은 지금 그대로)
+  // 단계 승인·반려는 그것을 이 화면에서 하는 흐름일 때만 (기본 흐름은 버튼 없이 단계·확정·검사 제외 표시만)
   const staged = hasStageActions(wf);
   useEffect(() => {
-    if (!staged || s?.stage !== "done") return;
+    if (s?.stage !== "done") return;
     let alive = true;
     api
       .volumeWorkflow(vol)
@@ -71,7 +71,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
     return () => {
       alive = false;
     };
-  }, [vol, staged, s?.stage, stageTick]);
+  }, [vol, s?.stage, stageTick]);
   const stageLabel = (name: string | null) => wf?.stages.find((x) => x.name === name)?.label ?? name;
   const cells = (schema?.fields ?? []).filter((f) => f.level === "document");
   const titleKey = cells.find((f) => f.isad === "title")?.name ?? cells[0]?.name;
@@ -129,10 +129,13 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
     }
   };
 
-  const cs = cur ? stages[cur.doc_id] : undefined; // 지금 문서의 검토 단계 (staged 흐름만)
-  const atEntry = !!cs && cs.stage === wf?.stages[0]?.name;
-  // 고칠 수 있나: 기본 흐름은 지금처럼, 단계 흐름은 입력 단계(저장) 또는 내가 승인할 차례(승인하며 고침). 서버가 다시 막는다
-  const canEdit = reviewing || (s?.stage === "done" && (!staged || atEntry || !!cs?.can_approve));
+  const cs = cur ? stages[cur.doc_id] : undefined; // 지금 문서의 검토 단계
+  // 입력 경로(저장)로 고칠 수 있나 — 서버가 내려준 editable (PATCH와 같은 규칙, workflow.editable_positions)
+  const entryEditable = !staged || !!cs?.editable;
+  // 고칠 수 있나: 기본 흐름은 지금처럼, 단계 흐름은 입력 경로로 고칠 수 있는 위치 또는 내가 승인할 차례(승인하며 고침)
+  const canEdit = reviewing || (s?.stage === "done" && (entryEditable || !!cs?.can_approve));
+  const reason = cur ? (reasons[cur.doc_id] ?? "") : "";
+  const setReason = (docId: string, v: string) => setReasons((prev) => ({ ...prev, [docId]: v }));
 
   const dropFixes = (docId: string) =>
     setFixes((prev) => {
@@ -161,8 +164,8 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
     setSaving(true);
     setNote(null);
     try {
-      const r = await api.rejectStage(vol, d.doc_id, st.stage, reason);
-      setReason("");
+      const r = await api.rejectStage(vol, d.doc_id, st.stage, reasons[d.doc_id] ?? "");
+      setReason(d.doc_id, "");
       setNote(`${d.doc_id} 반려 → ${stageLabel(r.to)} (차례 ${r.round})`);
       setStageTick((n) => n + 1);
     } catch (e) {
@@ -238,9 +241,9 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                     <div className="flex items-center justify-between font-mono text-xs">
                       <span>{d.doc_id.split("-").slice(-2).join("-")}</span>
                       <span className="flex gap-1">
-                        {staged && stages[d.doc_id] && (
+                        {stages[d.doc_id] && (
                           <span
-                            className={`rounded px-1 ${stages[d.doc_id].confirmed ? "bg-emerald-600 text-white" : stages[d.doc_id].recheck ? "bg-amber-500 text-white" : "bg-slate-200 text-slate-700"}`}
+                            className={`rounded px-1 ${stages[d.doc_id].confirmed ? "bg-emerald-600 text-white" : stages[d.doc_id].status === "excluded" ? "bg-sky-100 text-sky-800" : stages[d.doc_id].recheck ? "bg-amber-500 text-white" : "bg-slate-200 text-slate-700"}`}
                           >
                             {stages[d.doc_id].label ?? stages[d.doc_id].stage}
                             {stages[d.doc_id].recheck && !stages[d.doc_id].confirmed ? " 재" : ""}
@@ -336,7 +339,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                     </div>
                   );
                 })}
-                {!reviewing && s?.stage === "done" && editor && (!staged || atEntry) && (
+                {!reviewing && s?.stage === "done" && editor && entryEditable && (
                   <button
                     onClick={() => saveDoc(cur)}
                     disabled={saving || !fixes[cur.doc_id]}
@@ -345,13 +348,14 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                     이 문서 저장 (재색인)
                   </button>
                 )}
-                {staged && cs && (
+                {cs && (
                   <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
                     <div>
-                      검토 단계: <b>{cs.confirmed ? "확정" : (cs.label ?? cs.stage)}</b>
-                      {cs.round > 1 && <span className="ml-2 text-amber-700">재검수 (차례 {cs.round})</span>}
+                      검토 단계: <b>{cs.label ?? cs.stage}</b>
+                      {cs.round > 1 && !cs.confirmed && <span className="ml-2 text-amber-700">재검수 (차례 {cs.round})</span>}
                     </div>
-                    {cs.last_reason && (
+                    {/* 반려 사유는 반려된 뒤 반려한 단계가 다시 승인하기 전까지만 (서버가 그때 지운다) */}
+                    {staged && cs.last_reason && !cs.confirmed && (
                       <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-amber-900">
                         반려 사유 ({stageLabel(cs.rejected_from)}): {cs.last_reason}
                       </div>
@@ -369,7 +373,7 @@ export default function DocumentsPage({ params }: { params: Promise<{ vol: strin
                       <div className="flex flex-wrap items-center gap-2">
                         <input
                           value={reason}
-                          onChange={(e) => setReason(e.target.value)}
+                          onChange={(e) => setReason(cur.doc_id, e.target.value)}
                           maxLength={500}
                           placeholder="반려 사유 (필수)"
                           className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-1.5"

@@ -157,8 +157,11 @@ export type Workflow = {
 };
 export type DocStage = {
   doc_id: string;
-  stage: string; // 단계 이름, 확정이면 "_confirmed"
+  stage: string; // 저장된 위치: 단계 이름, 확정이면 "_confirmed"
+  // confirmed 확정 / excluded 표본 단계의 검사 목록 밖 — 검사 없이 넘어감(입력 경로로 고칠 수 있음) / pending 차례 기다림
+  status: "pending" | "excluded" | "confirmed";
   label: string | null;
+  editable: boolean; // 입력 경로(PATCH /documents)로 고칠 수 있는 위치
   round: number;
   recheck: boolean;
   confirmed: boolean;

@@ -99,8 +99,11 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 검토 흐름(단계 수·이름·맡는 역할·전수/표본·반려 규칙)도 YAML(`app/workflows/`)이 정한다. 쓰는 파일은 `WORKFLOW=경로`, 없으면 `default.yaml` — 지금까지의 입력(reviewer, 철 검토·색인 뒤 수정) → 표본 검사(inspector, `/volumes/{vol}/inspection`) 2단계와 동작·API·화면이 같다. 틀리면 앱이 시작하지 않는다. 항목은 `app/workflow.py` 머리말.
 
 - 예시: `three_stage.yaml`(작업자 → 품질관리자 → 감독관, 감독관은 지금 역할 체계에서 admin), `register_approve.yaml`(가등록 → 승인 → 자료정리 → 등록).
-- 단계 승인 `POST /workflow/{vol}/{doc_id}/approve`(고친 칸 함께, 마지막 단계면 확정), 반려 `POST /workflow/{vol}/{doc_id}/reject`(사유 필수) → 그 문서만 `reject_to` 단계로 돌아가고 차례(`round`)가 늘어 다시 올라오면 재검수. 서버가 단계 역할·문서의 지금 단계(건너뛰기·확정 문서)·작업자 ≠ 검수자(`distinct_actors`)를 확인한다. 검수로 넘어간 문서는 입력 경로(`PATCH /documents`)로 못 고친다.
-- 위치는 `doc_stage`, 승인·반려 기록(사람·단계·차례·사유·고친 칸)은 `stage_log`(`GET /documents/{vol}/{doc_id}/stages`), 감사 로그에는 `stage_approve`·`stage_reject`(단계·이동·차례·재검수 여부, 사유는 길이만). 두 표는 일괄 삭제 대상.
+- 단계 승인 `POST /workflow/{vol}/{doc_id}/approve`(고친 칸 함께, 마지막 단계면 확정), 반려 `POST /workflow/{vol}/{doc_id}/reject`(사유 필수) → 그 문서만 `reject_to` 단계로 돌아가고 차례(`round`)가 늘어 다시 올라오면 재검수. 서버가 단계 역할·문서의 지금 단계(건너뛰기·확정 문서)·작업자 ≠ 검수자(`distinct_actors`)를 확인한다. 확인과 쓰기는 문서 잠금(`store.doc_lock`: 프로세스 안 잠금 + Postgres advisory lock) 안에서 한다 — 입력 수정·검사·승인·반려 모두.
+- 입력 경로(`PATCH /documents`)로 고칠 수 있는 것은 입력 단계에 있는 문서뿐이다. 예외는 입력 `on_index` 바로 다음이 표본 단계인 흐름(기본 흐름): 검사 전·검사 목록 밖 문서를 지금처럼 고친다. 전수 검수 단계에 있는 문서는 검수자가 승인하며 고치거나 반려로 입력에 돌아와야 고친다. 화면은 `/volumes/{vol}/workflow`의 `editable`로 같은 규칙을 쓴다.
+- 문서 상태(`status`): `confirmed` 확정, `excluded` 표본 단계의 검사 목록 밖(검사 제외 — 출력 전 검증에서는 미확정이 아니고 입력 경로로 고칠 수 있다), `pending` 차례 기다림.
+- 위치는 `doc_stage`, 승인·반려 기록(사람·단계·차례·사유·고친 칸)은 `stage_log`(`GET /documents/{vol}/{doc_id}/stages`), 감사 로그에는 `stage_approve`·`stage_reject`(단계·이동·차례·재검수 여부, 사유는 길이만). 반려 사유의 제어·방향 제어·폭 0 문자는 지운다. 두 표는 일괄 삭제 대상.
+- 철을 처음부터 다시 돌리면(`/run`) 단계 위치를 지우고 실행 세대(`stage_gen`)를 올린다. 작업자 ≠ 검수자와 단계 기록 화면은 지금 세대만 본다(예전 세대 기록은 표에 남는다). 감사 로그 `run`에 지운 위치 수(`stage_reset`).
 - `count_unconfirmed: true`면 출력 전 검증(`/export/check`)이 마지막 단계 승인 전 건을 `unconfirmed`로 센다. 기본 흐름은 지금처럼 세지 않는다.
 
 ## 측정 결과

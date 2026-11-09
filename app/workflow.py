@@ -115,6 +115,8 @@ def parse(t):
             st.update(kind="review", select=sel, rate=float(rate) if rate is not None else None, reject=reject,
                       reject_to=to if reject else None)
         stages.append(st)
+    if len(stages) == 1 and stages[0]["submit"] == "on_index":
+        raise WorkflowError("입력 단계 하나뿐인 흐름은 submit: on_index일 수 없음 (색인만으로 확정되어 검토가 없다)")
     samples = [s for s in stages if s["select"] == "sample"]
     if len(samples) > 1:
         raise WorkflowError("sample 단계는 하나까지")
@@ -157,9 +159,7 @@ def sample_stage(wf):
 def initial(wf):
     """색인이 끝난 철의 문서가 처음 놓이는 단계. 입력이 on_index면 입력은 이미 끝난 것으로 본다 (지금 동작)"""
     st = wf["stages"]
-    if st[0]["submit"] == "on_index":
-        return st[1]["name"] if len(st) > 1 else CONFIRMED
-    return st[0]["name"]
+    return st[1]["name"] if st[0]["submit"] == "on_index" else st[0]["name"]  # 입력 하나뿐 + on_index는 parse가 거부
 
 
 def next_stage(wf, name):
@@ -171,9 +171,14 @@ def next_stage(wf, name):
 
 
 def editable_positions(wf):
-    """입력 경로(PATCH /documents)로 고칠 수 있는 위치: 입력 단계, 그리고 입력이 on_index면 처음 놓이는 단계.
-    검수 단계가 승인한 뒤에는 입력 경로로 못 고친다 — 반려로 돌아와야 고친다"""
-    return {wf["stages"][0]["name"], initial(wf)} - {CONFIRMED}
+    """입력 경로(PATCH /documents)로 고칠 수 있는 위치: 입력 단계. 예외로 입력이 on_index이고 처음 놓이는 단계가
+    표본(sample) 단계면 그 단계도 (기본 흐름 — 검사 전·검사 목록 밖 문서를 지금처럼 고친다).
+    전수(all) 검수 단계에 있는 문서는 입력 경로로 못 고친다 — 검수자가 승인하며 고치거나 반려로 돌아와야 고친다"""
+    st = wf["stages"]
+    out = {st[0]["name"]}
+    if st[0]["submit"] == "on_index" and st[1]["select"] == "sample":
+        out.add(st[1]["name"])
+    return out
 
 
 def actionable(wf, name):

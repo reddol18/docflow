@@ -55,6 +55,7 @@ def _flow(*stages, **top):
     ({"stages": [{"name": "Entry", "role": "reviewer"}]}, "name"),
     ({"stages": [{"name": "entry", "role": "viewer"}]}, "role"),  # 보기 역할은 단계를 맡을 수 없다
     ({"stages": [{"name": "entry", "role": "reviewer", "submit": "auto"}]}, "submit"),
+    ({"stages": [{"name": "entry", "role": "reviewer", "submit": "on_index"}]}, "on_index"),  # 색인만으로 확정 — 거부
     ({"stages": [{"name": "entry", "role": "reviewer", "reject": True}]}, "모르는 키"),  # 입력 단계는 반려 대상이 아니라 시작
     (_flow({"name": "entry", "role": "inspector"}), "중복"),
     (_flow({"name": "qc", "role": "inspector", "select": "half"}), "select"),
@@ -74,6 +75,14 @@ def _flow(*stages, **top):
 def test_bad_flows_rejected(t, msg):
     with pytest.raises(workflow.WorkflowError, match=msg):
         workflow.parse(t)
+
+
+def test_on_index_then_full_stage_not_editable_by_entry_path():
+    """입력 on_index 다음이 전수 검수 단계면 검수 대기 문서는 입력 경로로 못 고친다 (반려로 입력에 돌아오면 고친다)"""
+    wf = workflow.parse({"stages": [{"name": "entry", "role": "reviewer", "submit": "on_index"},
+                                    {"name": "qc", "role": "inspector", "reject": True}]})
+    assert workflow.initial(wf) == "qc" and workflow.editable_positions(wf) == {"entry"}
+    assert workflow.actionable(wf, "qc") and not workflow.actionable(wf, workflow.CONFIRMED)
 
 
 def test_reject_to_defaults_to_previous_stage():
