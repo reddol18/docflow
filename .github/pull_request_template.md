@@ -29,7 +29,7 @@ Closes #
 
 ## 병합
 <!-- 병합은 `scripts/merge.ps1 <PR>`로만 한다 (먼저 -DryRun). 위 로컬 검사 요약(head 커밋)·리뷰 결과 댓글이 없으면 병합하지 않는다. 실제 병합은 사용자 승인 뒤에만.
-     main 보호가 head 커밋의 commit status docflow/local-check(push 뒤 check.ps1)·docflow/review-gate(merge.ps1 판정 통과)를 요구한다 -->
+     main ruleset이 head 커밋의 commit status `docflow/local-check`(push 뒤 `scripts/check.ps1`)·`docflow/review-gate`(`scripts/merge.ps1` 승인 뒤 병합 호출)를 요구한다 -->
 
 ## 배포
 - [ ] 배포 태그: `deploy-YYYYMMDD-HHMM`

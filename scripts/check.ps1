@@ -22,7 +22,8 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
 commit status (https://github.com/reddol18/docflow/issues/85): 끝에서 `scripts/gate_status.py`가 조건을 보고 HEAD에
 docflow/local-check(success)를 올린다 — 막는 검사 모두 통과, 건너뜀 없음(코드 없는 PR만 osv·semgrep·trivy 허용),
 시작·끝 모두 커밋 안 된 변경 없음, HEAD가 그대로이고 push돼 있을 때만. 실패·건너뜀·변경 있음이면 올리지 않는다.
-main 브랜치 보호가 이 status를 병합 필수 조건으로 건다. 올리지 않으려면 -NoStatus (검사 결과·종료 코드는 같다).
+main ruleset이 이 status를 병합 필수 조건으로 건다. 올리지 않으려면 -NoStatus.
+종료 코드는 검사 결과만 따른다 (status를 올렸든 못 올렸든 같다).
 #>
 param(
     [switch]$Quick,
@@ -70,7 +71,8 @@ Push-Location $root
 try {
     $fullSha = (git rev-parse HEAD).Trim()
     $sha = $fullSha.Substring(0, 7)
-    $dirty = [bool](git status --porcelain)
+    $porcelain = git status --porcelain
+    $dirty = [bool]$porcelain -or [bool]$LASTEXITCODE  # git status가 실패하면 변경 있음으로 본다 (status 안 올림)
 
     Step "frontend" $true {
         Push-Location frontend
@@ -166,15 +168,32 @@ if ($NoStatus) {
     if ($dirty) { $stArgs += "--start-dirty" }
     foreach ($r in $results) {
         $state = if ($null -eq $r.ok) { "skip" } elseif ($r.ok) { "pass" } else { "fail" }
-        $stArgs += "--result", ("{0}:{1}:{2}" -f $r.name, [int]$r.blocking, $state)
+        $stArgs += "--result", ("{0}={1}" -f $r.name, $state)  # 막는 검사인지는 gate_status가 merge_gate.CHECKS로 정한다
     }
     foreach ($s in $Skip) { if (@($results.name) -notcontains $s) { $stArgs += "--skip-opt", $s } }  # 예: pg
     $prevEnc = [Console]::OutputEncoding
-    [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    $prevEap = $ErrorActionPreference
+    $stCode = -1
     try {
+        # stderr 한 줄·uv 오류가 검사 결과(종료 코드)를 바꾸지 않게 감싼다
+        $ErrorActionPreference = "Continue"
+        [Console]::OutputEncoding = [Text.Encoding]::UTF8
         Push-Location $root
-        uv run --quiet --no-project python -I scripts/gate_status.py local-check @stArgs | ForEach-Object { Write-Host $_ }
-    } finally { Pop-Location; [Console]::OutputEncoding = $prevEnc }
+        try {
+            uv run --quiet --no-project python -I scripts/gate_status.py local-check @stArgs | ForEach-Object { Write-Host $_ }
+            $stCode = $LASTEXITCODE
+        } finally { Pop-Location }
+    } catch {
+        Write-Host "gate_status 실행 오류: $_" -ForegroundColor Yellow
+    } finally {
+        [Console]::OutputEncoding = $prevEnc
+        $ErrorActionPreference = $prevEap
+    }
+    switch ($stCode) {
+        0 { Write-Host "commit status: 올림 (docflow/local-check = success)" -ForegroundColor Green }
+        1 { Write-Host "commit status: 올리지 않음 (이유는 바로 위 줄)" -ForegroundColor Yellow }
+        default { Write-Host "commit status: 올리기 실패 (종료 코드 $stCode) — 검사 결과는 그대로" -ForegroundColor Yellow }
+    }
 }
 if ($failed.Count) { exit 1 }
 exit 0
