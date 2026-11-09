@@ -116,7 +116,7 @@ def test_rows_only_real_errors_with_values_from_history(schema):
         "반려", "반려 · 품질관리자: =가상 사유: 수신 오기", "가상시장", "가상군청")
     r = k[("d03", "")]
     assert (r["field.label"], r["action"], uid(r), r["value.before"], r["value.after"]) == ("(문서)", "재제출", 2, "", "")
-    assert r["verdict"] == "품질관리자: 불합격(반려)"  # 재제출 뒤 아직 다시 안 봄 — 마지막 판정은 반려
+    assert r["verdict"] == "품질관리자: 재검수 전"  # 반려 뒤 재제출로 다시 올라왔고 아직 다시 안 봄
     assert {r["doc.seq"] for r in rows if r["doc.id"] == "d02"} == {2}
 
 
@@ -154,6 +154,29 @@ def test_verdict_later_stage_fix_and_return(schema):
     k = by_key(collect(schema, data=(docs, edits, logs)))
     assert k[("d01", "title")]["verdict"] == "품질관리자: 합격 · 감독관: 합격 (검수 수정)"
     assert k[("d02", "title")]["verdict"] == "품질관리자: 재검수 전 · 감독관: 불합격(반려)"
+
+
+def test_verdict_reject_to_middle_stage(schema):
+    """register_approve 흐름: 등록이 자료정리로 반려하면(reject_to = 그 단계) 자료정리는 재검수 전. 앞 단계(승인)는 그대로"""
+    wf = workflow.load(workflow.DIR / "register_approve.yaml")
+    docs = [doc("d01", "가상 제목", {"title": ["확신도"]})]
+    edits = [edit(1, "d01", "title", "가상 원래", "가상 제목", 2)]
+    logs = [log(2, "d01", "draft", 1, "approve", "approve", 2), log(3, "d01", "approve", 1, "approve", "arrange", 3),
+            log(4, "d01", "arrange", 1, "approve", "register", 2),
+            log(5, "d01", "register", 1, "reject", "arrange", 1, reason="가상")]
+    rows = collect(schema, wf, {}, (docs, edits, logs))
+    assert rows[0]["verdict"] == "승인: 합격 · 자료정리: 재검수 전 · 등록: 불합격(반려)"
+    # 자료정리가 다시 넘기면 등록 차례 — 등록은 반려 뒤 다시 올라와 재검수 전, 자료정리는 2차 합격
+    logs.append(log(6, "d01", "arrange", 2, "approve", "register", 2))
+    assert collect(schema, wf, {}, (docs, edits, logs))[0]["verdict"] == "승인: 합격 · 자료정리: 합격 (2차) · 등록: 재검수 전"
+
+
+def test_inspect_edit_without_sample_stage_uses_label(schema):
+    """흐름에 표본 단계가 없는데 지금 세대에 표본 검사 수정(source inspect)이 남아 있으면 내부 이름 대신 '표본 검사'"""
+    docs = [doc("d01", "가상 제목")]
+    edits = [edit(1, "d01", "title", "가상 원래", "가상 제목", 3, "inspect")]
+    r = collect(schema, THREE, {}, (docs, edits, []))[0]
+    assert (r["error.reason"], r["error.kind"]) == ("검수 수정 · 표본 검사", "검수 수정")
 
 
 def test_default_flow_sample_inspection(schema):

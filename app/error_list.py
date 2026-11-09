@@ -18,7 +18,8 @@
 같은 (문서, 칸)의 수정은 한 행으로 묶는다: 수정 전 값 = 첫 수정의 이전 값, 수정 후 값 = 마지막 수정의 새 값,
 담당자·조치일 = 마지막 수정. 재검수 판정 = 검수 단계마다(흐름 순서) 그 문서의 마지막 판정:
   합격 / 합격 (검수 수정)(그 단계가 이 칸을 고쳤다 — 지금 세대 수정 이력 기준) / 불합격(반려)
-  재검수 전 — 그 단계가 승인한 뒤 뒤 단계의 반려로 그 단계 앞까지 되돌아가 아직 다시 보지 않음
+  재검수 전 — 그 단계가 승인한 뒤 뒤 단계의 반려로 그 단계나 그 앞으로 되돌아갔거나, 그 단계가 반려한 문서가
+              고쳐져 다시 올라왔는데 아직 다시 보지 않음 (반려 뒤 아직 다시 올라오지 않았으면 불합격(반려))
   그 단계의 판정이 여러 번이면 '(N차)' (그 단계 판정 횟수). 판정이 하나도 없으면 '미판정'(표본 검사 목록 밖은 '검사 제외')
 
 이 모듈은 DB를 부르지 않는다 (순수 함수) — 값은 app/main.py가 store에서 읽어 넘긴다.
@@ -87,7 +88,8 @@ def _date(ts):
 
 def _verdict(wf, logs, fixed_at, field, status):
     """검수 단계마다 마지막 판정. fixed_at = {(칸, 단계)} 그 단계가 고친 칸 (지금 세대 수정 이력).
-    승인 뒤에 뒤 단계가 반려해 그 단계 앞으로 되돌아갔으면(아직 다시 안 봄) '재검수 전'"""
+    '재검수 전': 승인 뒤에 뒤 단계가 반려해 그 단계나 그 앞으로 되돌아갔거나, 그 단계가 반려한 문서가 고쳐져 다시
+    올라왔는데 아직 다시 판정하지 않음. 반려 뒤 아직 다시 올라오지 않았으면 '불합격(반려)'"""
     idx = {s["name"]: s["index"] for s in wf["stages"]}
     rejects = [x for x in logs if x["action"] == "reject"]
     parts = []
@@ -97,8 +99,12 @@ def _verdict(wf, logs, fixed_at, field, status):
             continue
         last = ds[-1]
         if last["action"] == "reject":
+            back = any(x["id"] > last["id"] and x["action"] == "approve" and x["to_stage"] == st["name"] for x in logs)
+            if back:
+                parts.append(f"{st['label']}: 재검수 전")
+                continue
             word = "불합격(반려)"
-        elif any(r["id"] > last["id"] and idx.get(r["to_stage"], -1) < st["index"] for r in rejects):
+        elif any(r["id"] > last["id"] and idx.get(r["to_stage"], -1) <= st["index"] for r in rejects):
             parts.append(f"{st['label']}: 재검수 전")
             continue
         else:
@@ -141,6 +147,7 @@ def collect(vol, docs, edits, logs, schema, wf, status):
     by = fields.by_name(schema)
     order = {f["name"]: i for i, f in enumerate(schema["fields"])}
     labels = {s["name"]: s["label"] for s in wf["stages"]}
+    labels.setdefault("inspect", "표본 검사")  # 흐름에 표본 단계가 없는데 남은 표본 검사 수정 (내부 이름 대신 표시명)
     ed = {}  # doc_id -> 칸 -> [수정]
     for e in edits:
         ed.setdefault(e["doc_id"], {}).setdefault(e["field"], []).append(e)
@@ -192,9 +199,7 @@ def collect(vol, docs, edits, logs, schema, wf, status):
             text = f"반려 · {labels.get(x['stage'], x['stage'])}" + (f": {x['reason']}" if x.get("reason") else "")
             touched = [n for n, es in mine.items()
                        if any(e["ts"] > x["ts"] and (nxt is None or e["ts"] < nxt["ts"]) for e in es)]
-            for n in touched:
-                for r, machine in flagged.get(n, ()):
-                    add(n, r, "규칙" if machine else "표시")
+            for n in touched:  # 고친 칸의 표시는 (가)가 이미 넣었다
                 add(n, text, "반려")
             if not touched:
                 doc_rows.append((x, nxt, text))
@@ -205,10 +210,7 @@ def collect(vol, docs, edits, logs, schema, wf, status):
                 st = _edit_stage(wf, e["source"])
                 if st:
                     fixed_at.add((name, st))
-                    if not errs.get(name):
-                        for r, machine in flagged.get(name, ()):
-                            add(name, r, "규칙" if machine else "표시")
-                    if not errs.get(name):
+                    if not errs.get(name):  # 고친 칸의 표시는 (가)가 이미 넣었다
                         add(name, f"검수 수정 · {labels.get(st, st)}", "검수 수정")
 
         base = {"vol": vol, "doc.seq": seq, "doc.id": did, "doc.first_page": d["pages"][0], "doc.last_page": d["pages"][-1]}
