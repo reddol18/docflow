@@ -29,17 +29,12 @@ if ($LASTEXITCODE) { throw "복사 실패 (tls_secrets.sh)" }
 
 $lines = foreach ($k in $files.Keys) { "$k " + [Convert]::ToBase64String([IO.File]::ReadAllBytes($files[$k])) }
 $prevEnc = $OutputEncoding
-$prevIn = [Console]::InputEncoding
 try {
-    # 5.1은 [Console]::InputEncoding의 BOM을 네이티브 표준 입력 앞에 붙인다($OutputEncoding만으로는 안 됨) — 둘 다 BOM 없이.
-    # 맥 쪽(tls_secrets.sh)도 첫 줄 BOM을 뗀다.
-    $noBom = New-Object Text.UTF8Encoding $false
-    [Console]::InputEncoding = $noBom
-    $OutputEncoding = $noBom
+    # base64 글자뿐. 5.1은 이것과 상관없이 [Console]::InputEncoding의 BOM을 표준 입력 앞에 붙일 수 있어 맥 쪽(tls_secrets.sh)이 뗀다
+    $OutputEncoding = [Text.Encoding]::ASCII
     ($lines -join "`n") | ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/tls_secrets.sh"
     if ($LASTEXITCODE) { throw "Secret 넣기 실패 (위 메시지)" }
 } finally {
-    [Console]::InputEncoding = $prevIn
     $OutputEncoding = $prevEnc
     $lines = $null
 }
