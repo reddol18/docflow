@@ -678,3 +678,71 @@ def test_review_submit_records_edits_and_user(db, monkeypatch):
     db.add_review_times("v2", [{"doc_id": "v2-0001", "mode": "review", "active_ms": 5000}], uid)
     with db.pool.connection() as c:
         assert c.execute("SELECT user_id FROM review_time WHERE vol = 'v2'").fetchone()["user_id"] == uid
+
+
+def _review_post(db, monkeypatch, via, snaps, fixes=None):
+    """iris(검토자)가 v3 검토를 폼·JSON으로 제출. G.get_state는 snaps를 차례로 돌려주고(마지막은 계속), submit은 대신 받는다
+    → (응답, 받은 submit 인자, iris id)"""
+    from types import SimpleNamespace
+
+    from app import main
+    add_user(monkeypatch, "iris", "reviewer")
+    with db.pool.connection() as c:
+        uid = c.execute("SELECT id FROM users WHERE username = 'iris'").fetchone()["id"]
+        c.execute("DELETE FROM review_submitters WHERE vol = 'v3'")
+    user = auth.User(uid, "iris", "iris", "reviewer")
+    monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
+    monkeypatch.setattr(auth, "session_user", lambda t: user if t == "iris-token" else None)
+    left = list(snaps)
+    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: left.pop(0) if len(left) > 1 else left[0]))
+    sent = []
+    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: sent.append(arg))
+    c = TestClient(main.app)
+    h = {"authorization": "Bearer iris-token", **CSRF}
+    try:
+        if via == "form":
+            data = {f"v3-0001__{k}": v for k, v in (fixes or {"title": "가상 제목"}).items()}
+            r = c.post("/review/v3", data=data, headers=h, follow_redirects=False)
+        else:
+            r = c.post("/review/v3/json", json={"v3-0001": fixes} if fixes else {}, headers=h)
+    finally:
+        main.running.pop("v3", None)  # submit을 대신 받아 실행 표시가 남는다
+    return r, sent, uid
+
+
+def _v3_waiting(intr_id):
+    from types import SimpleNamespace
+    doc = {"doc_id": "v3-0001", "pages": ["v3-0001"], "flags": {"title": ["확신도"]},
+           "fields": {"docno": "가상 1-1", "date": "", "recipient": "가상 수신", "title": "가상 제목"}, "hw": {}}
+    return SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": [doc]}, id=intr_id)])
+
+
+@pytest.mark.parametrize("via", ["form", "json"])
+def test_empty_review_submit_still_records(db, monkeypatch, via):
+    """고친 칸 없는 검토 제출도 review_submitters 행과 감사 ok(fixed_cells=0)를 남긴다 — 교차검사 근거를 잃지 않게
+    (https://github.com/reddol18/docflow/issues/120). 흐름(그래프)은 대신 받아 둔다"""
+    r, sent, uid = _review_post(db, monkeypatch, via, [_v3_waiting("1" * 32)])
+    assert r.status_code == (303 if via == "form" else 200), r.text
+    assert [s.resume for s in sent] == [{"1" * 32: {}}]
+    with db.pool.connection() as cn:
+        assert [r["user_id"] for r in cn.execute("SELECT user_id FROM review_submitters WHERE vol = 'v3'")] == [uid]
+    rows = [r for r in audit_rows(db) if r["action"] == "review" and r["vol"] == "v3"]
+    assert [(r["result"], r["info"]["fixed_cells"], r["info"]["via"]) for r in rows] == [("ok", 0, via)]
+    assert db.edit_history("v3", "v3-0001") == []
+
+
+@pytest.mark.parametrize("via", ["form", "json"])
+@pytest.mark.parametrize("now", ["ended", "changed"])
+def test_review_submit_stale_interrupt_409(db, monkeypatch, via, now):
+    """화면(경로)이 대기를 읽은 뒤 철이 다시 돌아 대기가 끝났거나 다른 대기로 바뀌었으면 409 — 고친 값·이력·
+    review_submitters를 남기지 않고 흐름도 잇지 않는다. 감사는 기존 규칙대로 rejected_409"""
+    from types import SimpleNamespace
+    after = SimpleNamespace(interrupts=[]) if now == "ended" else _v3_waiting("f" * 32)
+    r, sent, _ = _review_post(db, monkeypatch, via, [_v3_waiting("1" * 32), after], fixes={"title": "가상 새 제목"})
+    assert r.status_code == 409, r.text
+    assert sent == []
+    with db.pool.connection() as cn:
+        assert cn.execute("SELECT count(*) AS n FROM review_submitters WHERE vol = 'v3'").fetchone()["n"] == 0
+    assert db.edit_history("v3", "v3-0001") == []
+    rows = [r for r in audit_rows(db) if r["action"] == "review" and r["vol"] == "v3"]
+    assert [r["result"] for r in rows] == ["rejected_409"]

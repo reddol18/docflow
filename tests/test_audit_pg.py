@@ -96,7 +96,7 @@ def test_audit_four_actions_and_no_leak(main, monkeypatch, capsys):
     wait_idle(main, "v1")
 
     # 3) 검토 저장 — 고친 값에 가상 실명
-    monkeypatch.setattr(main, "G", fake_graph(interrupts=[SimpleNamespace(value={"flagged": [doc]})]))
+    monkeypatch.setattr(main, "G", fake_graph(interrupts=[SimpleNamespace(value={"flagged": [doc]}, id="2" * 32)]))
     r = c.post("/review/v1/json", headers=ADMIN, json={"d1": {"title": f"{FAKE_NAME} 민원 회신"}})
     assert r.status_code == 200, r.text
     wait_idle(main, "v1")

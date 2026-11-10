@@ -313,7 +313,9 @@ def test_off_runs_whole_flow_without_openai(tmp_path, monkeypatch, fake_openai, 
         assert d["fields"]["title"] == "" and d["fields"]["docno"] == "" and d["fields"]["date"] == ""  # 가짜 값 없이 빈 칸
         assert d["hw"] == {"docno": {"text": "", "conf": 0.0}, "date": {"text": "", "conf": 0.0}}
 
-    g.invoke(Command(resume={"v1-0001": {"title": "사람이 쓴 가상 제목"}}), c)  # 사람이 채우고 이어 간다
+    # 사람이 채우고 이어 간다 — 운영(main.resume_review)과 같이 interrupt id 지도로 (https://github.com/reddol18/docflow/issues/120)
+    intr_id = state.tasks[0].interrupts[0].id
+    g.invoke(Command(resume={intr_id: {"v1-0001": {"title": "사람이 쓴 가상 제목"}}}), c)
     state = g.get_state(c)
     assert fake_openai.made == [] and fake_openai.calls == []  # OpenAI 클라이언트를 만들지도 부르지도 않음
     assert not state.next and state.values["indexed"] == 2 and state.values["embedded"] == 0  # 끝까지 돎
@@ -323,6 +325,70 @@ def test_off_runs_whole_flow_without_openai(tmp_path, monkeypatch, fake_openai, 
     for node in ("extract", "read"):  # 진행 화면(events)에 건너뜀이 드러난다
         assert sum(n == node and s == "end" and k.get("skipped") == "llm_off" for n, s, k in rec.events) == 2
     assert any(n == "index" and k.get("embedded") == 0 and k.get("indexed") == 2 for n, _, k in rec.events)
+
+
+def _waiting_review(tmp_path, monkeypatch):
+    """main.G(MemorySaver) 위에서 철을 review 대기까지 돌린다 → (rec, 기다리기, 대기 snapshot)"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app import graph, main, store
+    use(monkeypatch, {"LLM_PROVIDER": "off"})
+    rec = _fake_volume(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "G", graph.build(MemorySaver()))
+    monkeypatch.setattr(main, "audit_safe", lambda *a, **k: None)
+    monkeypatch.setattr(main, "record_review", lambda vol, fl, fx, user: None)  # 이력 저장은 test_auth_pg에서
+    monkeypatch.setattr(store, "set_run_stop", lambda vol, reason: None)
+    monkeypatch.setattr(store, "run_stop", lambda vol: None)
+
+    def settle():  # 일꾼이 하나라 앞선 실행이 끝날 때까지 기다린 뒤 상태
+        main.runner.submit(lambda: None).result()
+        return main.G.get_state(main.cfg("v1"))
+    main.submit("v1", {"vol": "v1", "review_mode": "human"})
+    snap = settle()
+    assert snap.next == ("review",)
+    return rec, settle, snap
+
+
+def _resume_via_main(snap, fixes):
+    from app import main
+    main.resume_review("v1", snap.interrupts[0].value["flagged"], fixes, None, snap.interrupts[0].id)
+
+
+def test_empty_review_submit_reaches_index(tmp_path, monkeypatch, fake_openai):
+    """고친 칸 없이 검토 제출(fixes == {}) → 흐름이 index를 지나 끝까지 간다 (https://github.com/reddol18/docflow/issues/120).
+    빈 dict를 그대로 resume에 넣으면 LangGraph가 '인터럽트 id → 값' 지도로 보고 버려 review에서 다시 멈췄다"""
+    rec, settle, snap = _waiting_review(tmp_path, monkeypatch)
+    _resume_via_main(snap, {})  # 고친 칸 없음
+    snap = settle()
+    assert not snap.next and snap.values["indexed"] == 2  # review에서 다시 멈추지 않고 끝까지
+    assert [d["doc_id"] for d in rec.saved] == ["v1-0001", "v1-0003"] and all(d["reviewed"] for d in rec.saved)
+    assert rec.saved[0]["fields"]["title"] == ""  # 고친 값이 없으니 그대로
+    assert sum(n == "review" and s == "waiting" for n, s, _ in rec.events) == 1  # 처음 한 번만 멈춤
+
+
+def test_review_submit_with_fixes_reaches_index(tmp_path, monkeypatch, fake_openai):
+    """고친 칸 있음 → main.resume_review → 그래프 → 저장된 문서에 고친 값 반영 (끝까지)"""
+    rec, settle, snap = _waiting_review(tmp_path, monkeypatch)
+    _resume_via_main(snap, {"v1-0003": {"title": "가상 검토 제목"}})
+    snap = settle()
+    assert not snap.next and snap.values["indexed"] == 2
+    saved = {d["doc_id"]: d for d in rec.saved}
+    assert saved["v1-0003"]["fields"]["title"] == "가상 검토 제목" and saved["v1-0001"]["fields"]["title"] == ""
+    assert sum(n == "review" and s == "waiting" for n, s, _ in rec.events) == 1
+
+
+@pytest.mark.parametrize("bad", [None, "가상 문자열", ["목록"],
+                                 {"v1-0001": "가상 문자열", "v1-0003": ["목록"]}])  # 문서별 값이 dict가 아닌 것도
+def test_review_node_non_dict_resume_is_no_fixes(tmp_path, monkeypatch, fake_openai, bad):
+    """resume 값(또는 문서별 값)이 dict가 아니면(None·문자열·목록) 고친 값 없음으로 보고 끝까지 간다"""
+    from langgraph.types import Command
+
+    from app import main
+    rec, settle, snap = _waiting_review(tmp_path, monkeypatch)
+    main.G.invoke(Command(resume={snap.interrupts[0].id: bad}), main.cfg("v1"))
+    snap = settle()
+    assert not snap.next and snap.values["indexed"] == 2
+    assert all(d["reviewed"] and d["fields"]["title"] == "" for d in rec.saved)
 
 
 def test_budget_stop_is_not_error(tmp_path, monkeypatch, fake_openai):

@@ -268,15 +268,20 @@ def route_review(s: VolState):
 
 def review(s: VolState):
     """사람 검토. interrupt()에서 멈추고 상태가 체크포인트(Postgres)에 남는다.
-    검토 화면에서 고친 값이 Command(resume={doc_id: {칸: 값}})로 들어오면 여기서부터 이어 간다.
+    검토 화면에서 고친 값이 Command(resume={<interrupt id>: {doc_id: {칸: 값}}})로 들어오면 여기서부터 이어 간다
+    (id로 집어 넘기므로 고친 칸이 없는 {}도 버려지지 않는다 — https://github.com/reddol18/docflow/issues/120).
     (이어 갈 때 이 노드는 처음부터 다시 실행되므로 interrupt 앞에는 부수효과를 두지 않는다.)"""
     flagged = [{"doc_id": d["doc_id"], "pages": d["pages"], "fields": d["fields"], "flags": d["flags"], "hw": d["hw"]}
                for d in s["docs"] if d["flags"]]
-    fixes = interrupt({"vol": s["vol"], "flagged": flagged}) or {}
+    fixes = interrupt({"vol": s["vol"], "flagged": flagged})
+    if not isinstance(fixes, dict):  # None·문자열·목록 등 — 고친 값 없음으로 본다
+        fixes = {}
     docs = []
     for d in s["docs"]:
         if d["flags"]:
             fix = fixes.get(d["doc_id"], {})
+            if not isinstance(fix, dict):  # 문서별 값도 dict가 아니면 고친 값 없음
+                fix = {}
             d = dict(d, fields=rederive({**d["fields"], **fix}, fix), reviewed=True)
         docs.append(d)
     # 고친 값으로 기계 검수(칸 검증 규칙)를 다시 본다 — 철 안 중복은 다른 문서에도 걸리므로 철 전체. 규칙 없는 스키마는 그대로

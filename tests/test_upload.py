@@ -344,26 +344,45 @@ def test_extension_and_name_bytes(main, tmp_path):
 
 def test_review_resume_reserves_first(main, monkeypatch):
     """검토 제출은 이력을 쓰기 전에 실행 표시를 세우고, 실패하면 자기 표시를 푼다"""
-    seen, submitted = [], []
+    seen, submitted, args = [], [], []
+    waiting = SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": []}, id="0" * 32)])
+    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: waiting))
     monkeypatch.setattr(main, "record_review", lambda vol, fl, fx, user: seen.append(main.running.get(vol)))
-    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: submitted.append(reserved))
-    main.resume_review("v1", [], {}, None)
+    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: (submitted.append(reserved),
+                                                                                    args.append(arg)))
+    main.resume_review("v1", [], {}, None, "0" * 32)
     assert seen == ["queued"] and submitted == [True]
+    # 빈 fixes도 interrupt id로 집어 넘긴다 (https://github.com/reddol18/docflow/issues/120)
+    assert isinstance(args[0], main.Command) and args[0].resume == {"0" * 32: {}}
     main.running.pop("v1", None)
 
     def boom(vol, fl, fx, user):
         raise RuntimeError("가상 저장 실패")
     monkeypatch.setattr(main, "record_review", boom)
     with pytest.raises(RuntimeError):
-        main.resume_review("v1", [], {}, None)
+        main.resume_review("v1", [], {}, None, "0" * 32)
     assert "v1" not in main.running
     main.running["v1"] = "running"
     try:
         with pytest.raises(main.HTTPException):
-            main.resume_review("v1", [], {}, None)
+            main.resume_review("v1", [], {}, None, "0" * 32)
         assert main.running["v1"] == "running"
     finally:
         main.running.pop("v1", None)
+
+
+@pytest.mark.parametrize("now", ["ended", "changed"])
+def test_review_resume_rejects_stale_interrupt(main, monkeypatch, now):
+    """화면이 읽은 뒤 대기가 끝났거나(다시 돌아 끝남) 다른 대기로 바뀌었으면, 실행 표시 아래에서 다시 보고 409 —
+    이력을 남기지 않고 흐름도 잇지 않으며 자기 표시를 푼다 (https://github.com/reddol18/docflow/issues/120)"""
+    snaps = {"ended": SimpleNamespace(interrupts=[]),
+             "changed": SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": []}, id="f" * 32)])}
+    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snaps[now]))
+    monkeypatch.setattr(main, "record_review", lambda *a: pytest.fail("이력을 남기면 안 됨"))
+    monkeypatch.setattr(main, "submit", lambda *a, **k: pytest.fail("흐름을 이으면 안 됨"))
+    with pytest.raises(main.HTTPException) as e:
+        main.resume_review("v1", [], {}, None, "0" * 32)
+    assert e.value.status_code == 409 and "v1" not in main.running
 
 
 def test_jpeg_info():
