@@ -7,7 +7,7 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
   .\scripts\check.ps1 -Skip frontend,pg
 
 검사                                   막음(실패 시 종료 코드 1)
-  frontend   next typegen → tsc → eslint      예
+  frontend   next typegen → tsc → eslint → node --test(tls-proxy)  예
   ruff       보안 규칙(S) 포함                 예
   lock       requirements.txt 판이 lock과 같은지·해시 있는지  예
   pytest     실제 Postgres(PGlite) 시험 포함  예
@@ -121,7 +121,8 @@ try {
             if (-not (Test-Path node_modules)) { npm ci; if ($LASTEXITCODE) { return } }
             npx next typegen | Out-Null; if ($LASTEXITCODE) { return }
             npx tsc --noEmit; if ($LASTEXITCODE) { return }
-            npx eslint src
+            npx eslint src; if ($LASTEXITCODE) { return }
+            node --test tls-proxy.test.mjs  # web 파드 TLS 종단 (https://github.com/reddol18/docflow/issues/48)
         } finally { Pop-Location }
     }
 

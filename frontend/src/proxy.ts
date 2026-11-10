@@ -8,7 +8,8 @@ const DEV = process.env.NODE_ENV === "development";
 // 응답 보안 헤더 (https://github.com/reddol18/docflow/issues/47, ASVS V14.4.3·V14.4.4·V14.4.7·V8.2.1)
 // 스크립트는 요청마다 새 nonce로만 (Next가 자기 스크립트에 붙인다 — 그래서 레이아웃은 매 요청 렌더링).
 // 스타일은 'unsafe-inline': 진행 막대 등 React style 속성이 서버 HTML의 style="…"로 나가기 때문 (스크립트 실행은 못 함).
-// upgrade-insecure-requests는 넣지 않는다 — 아직 http로 쓴다 (https는 https://github.com/reddol18/docflow/issues/48).
+// 'unsafe-eval'은 개발 서버(next dev)에만 — k8s web 파드는 운영 빌드(next start, NODE_ENV=production)라 없다 (https://github.com/reddol18/docflow/issues/48).
+// upgrade-insecure-requests는 넣지 않는다 — 이 PC의 개발 서버는 http다. https 쪽은 TLS 종단(frontend/tls-proxy.mjs)이 HSTS를 붙인다.
 function csp(nonce: string, dev = DEV): string {
   return [
     "default-src 'self'",

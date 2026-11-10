@@ -1,5 +1,5 @@
 ﻿<#
-백엔드(docflow API)를 맥 k3s에 배포하고 배포 태그를 남긴다 (https://github.com/reddol18/docflow/issues/24).
+백엔드(docflow API)·프런트(web, 운영 빌드)를 맥 k3s에 배포하고 배포 태그를 남긴다 (https://github.com/reddol18/docflow/issues/24).
 
   $env:DOCFLOW_MAC = "user@host"       # 맥 ssh 주소 (저장소에 적지 않는다)
   .\scripts\deploy.ps1
@@ -12,7 +12,10 @@
 순서: 커밋 안 된 변경 확인 → 로컬 검사(scripts/check.ps1) → 맥 디스크 여유 확인(scripts/mac/disk_check.sh, 모자라면 중단) → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기)
       → 태그 deploy-YYYYMMDD-HHMM push
 (맥에는 git 저장소가 없어서 태그는 이 스크립트가 남긴다)
-프런트엔드는 k3s가 아니라 이 PC에서 next로 돈다(배포 대상 아님).
+프런트엔드 (https://github.com/reddol18/docflow/issues/48): k3s web 파드 = 운영 빌드. 맥 build_image.sh가 frontend/Dockerfile로
+next build 하고 파드는 next start + TLS 종단(https://docflow.localhost:8443, ssh 터널). frontend는 HEAD 커밋 그대로(git archive) 복사한다.
+이 PC의 localhost:3000 개발 서버(npm run dev, DOCFLOW_URL)는 화면 확인용으로 그대로 — 배포 대상 아님.
+처음 한 번(그리고 인증서 갱신 때): .\scripts\ca.ps1 init·issue → .\scripts\tls_secrets.ps1 (없으면 맥 deploy.sh가 apply 전에 멈춘다)
 #>
 param(
     [string]$Mac = $env:DOCFLOW_MAC,
@@ -53,6 +56,16 @@ try {
     if ($LASTEXITCODE) { throw "복사 실패 (app)" }
     scp -q k8s/docs.yaml "${Mac}:doc_platform/k8s/"
     if ($LASTEXITCODE) { throw "복사 실패 (k8s)" }
+    # 프런트 소스: 커밋된 HEAD 그대로 (node_modules·.next·.env 없이). 파이프로 넘기면 PowerShell 5.1이 바이너리를 깨므로 파일로
+    $webTar = Join-Path ([IO.Path]::GetTempPath()) "docflow-frontend.tar"
+    try {
+        git archive --format=tar -o $webTar HEAD frontend
+        if ($LASTEXITCODE) { throw "git archive 실패 (frontend)" }
+        scp -q $webTar "${Mac}:doc_platform/frontend.tar"
+        if ($LASTEXITCODE) { throw "복사 실패 (frontend)" }
+    } finally { Remove-Item $webTar -ErrorAction SilentlyContinue }
+    ssh -o BatchMode=yes $Mac "cd ~/doc_platform && rm -rf frontend && tar -xf frontend.tar && rm -f frontend.tar && chmod -R a+rX frontend"
+    if ($LASTEXITCODE) { throw "풀기 실패 (frontend)" }
     # tool_pins.txt: scan_image.sh가 읽는 trivy 버전·고정 해시 (https://github.com/reddol18/docflow/issues/46)
     scp -q (Get-ChildItem scripts/mac/*.sh).FullName scripts/tool_pins.txt "${Mac}:doc_platform/scripts/"
     if ($LASTEXITCODE) { throw "복사 실패 (scripts)" }

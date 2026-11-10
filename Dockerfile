@@ -56,4 +56,6 @@ RUN chmod -R a+rX app
 USER app
 ENV DATA_DIR=/data
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --no-proxy-headers: X-Forwarded-For·Proto를 믿지 않는다 → request.client는 늘 소켓 상대. app/auth.py의 루프백(port-forward) 쿠키 분기가
+# 이것에 기댄다 (uvicorn 기본은 127.0.0.1의 XFF를 믿어 port-forward 경로에서 보낸 XFF로 client가 바뀐다, issues/48). tests/test_auth.py가 확인
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

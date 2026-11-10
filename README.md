@@ -24,11 +24,11 @@
 ## 구조
 
 ```
-Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + PaddleOCR)   ── k8s namespace: docs
+브라우저 ─https─▶ web (TLS 종단 + next start) ──/api/*──▶ docflow (FastAPI + LangGraph + PaddleOCR)   ── k8s namespace: docs
                                 ├─ Postgres  문서 색인 · 비용 장부 · 노드 이벤트 · LangGraph 체크포인트
                                 ├─ Qdrant    문서 벡터 (text-embedding-3-small, 연도 필터)
                                 └─ OpenAI    4칸 추출 · 손글씨 칸 판독 (gpt-4.1-mini), 임베딩
-네트워크: 기본 차단, docflow → Postgres/Qdrant/OpenAI(443)만 허용
+네트워크: 기본 차단, web → docflow, docflow → Postgres(TLS)/Qdrant(TLS+키)/OpenAI(443)만 허용
 ```
 
 ### LangGraph 흐름
@@ -313,17 +313,43 @@ Next.js 대시보드 ──/api/*──▶ docflow (FastAPI + LangGraph + Paddle
 ## 실행
 
 ```bash
-# 백엔드 (k8s)
+# 이 PC(Windows)에서 한 번: 내부 데모 CA·서버 인증서 → k8s Secret (아래 'https')
+.\scripts\ca.ps1 init; .\scripts\ca.ps1 issue; .\scripts\tls_secrets.ps1 -Mac user@mac
+
+# 백엔드·프런트 (k8s) — 보통은 .\scripts\deploy.ps1 (복사 → 맥 deploy.sh)
 kubectl apply -f k8s/docs.yaml
 sh scripts/mac/make_secrets.sh < openai_key      # 키는 표준 입력으로만, 화면에 찍지 않음
-sh scripts/mac/build_image.sh                    # PaddleOCR 모델을 이미지에 포함 (2.0GB)
-kubectl port-forward -n docs svc/docflow 8000:8000
+sh scripts/mac/build_image.sh                    # docflow:dev(PaddleOCR 모델 포함 2.0GB) + docflow-web:dev(next build)
+kubectl port-forward -n docs svc/web 8443:8443   # https://docflow.localhost:8443 (이 PC: ssh -L 8443:127.0.0.1:8443 user@mac)
 
-# 대시보드
+# 화면 확인용 개발 서버 (이 PC) — 그대로 쓴다
+kubectl port-forward -n docs svc/docflow 8000:8000
 cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFLOW_URL 기본 http://127.0.0.1:8000)
 ```
 
-컨테이너 최소 권한 (https://github.com/reddol18/docflow/issues/29): 세 컨테이너 모두 root 아님(postgres 70, qdrant·docflow 1000)·읽기 전용 루트 파일시스템·capability 전부 버림·SA 토큰 없음. 쓰는 곳만 PVC·emptyDir(`k8s/docs.yaml` 주석).
+### https·내부 암호화 (https://github.com/reddol18/docflow/issues/48)
+
+| 구간 | 지금 |
+|---|---|
+| 브라우저 → web 파드 | https `docflow.localhost:8443` — `frontend/tls-proxy.mjs`(TLS 1.2+, 모든 응답에 HSTS `max-age=31536000`) → 같은 파드 `next start`(127.0.0.1:3000). 운영 빌드라 개발 오버레이·HMR·CSP `'unsafe-eval'` 없음 |
+| web → docflow | http `docflow:8000` (클러스터 안, NetworkPolicy `docflow-from-web`로 web 파드만) — 남은 평문 |
+| docflow → Postgres | TLS 필수: 서버는 `hostssl`만(ConfigMap `pg-hba`), 클라이언트는 `sslmode=verify-full`(이름 `postgres.docs.svc.cluster.local`, 내부 CA) |
+| docflow → Qdrant | https(`qdrant.docs.svc.cluster.local`) + API 키(Secret `qdrant-api-key`). 키 없이 부르면 401 (`/readyz` 등 상태 확인만 열림) |
+
+- **배포 표시:** `k8s/docs.yaml`의 `DOCFLOW_REQUIRE_TLS=1`이 있으면 PG `sslmode`(require 이상)·Qdrant https·키 파일이 없을 때 docflow가 시작하지 않는다(`store.check_transport`). 이 PC 시험(PGlite)·개발은 표시가 없어 평문 그대로.
+- **받는 이름:** TLS 종단은 Host가 `docflow.localhost:8443`일 때만 받고 그 밖은 421 — 터널의 이 PC 쪽 포트도 8443으로 연다. 웹소켓 업그레이드는 받지 않는다(운영 빌드엔 HMR 없음). 요청 하나 300초(뒤의 `next start` 기본과 같음, 210MB 업로드면 초당 약 0.7MB 이상), 헤더 30초, 동시 연결 256.
+
+- **인증서:** 이 PC의 내부 데모 CA(`scripts/ca.ps1` → `scripts/ca.py`). CA 키는 `%LOCALAPPDATA%\docflow-ca`에만(암호화, 암호는 DPAPI로 이 Windows 사용자에게 묶임, 폴더는 이 사용자만). 서버 인증서는 서비스마다 따로(web·postgres·qdrant, 이름 하나씩, 397일), CA 인증서에 이름 제약(그 세 이름만, IP 금지, 메일·URI는 `.invalid`만)과 확장 키 용도 serverAuth가 있어 CA 키가 새도 다른 사이트를 흉내 내지 못한다. 출력은 경로·지문·만료뿐.
+- **브라우저가 CA를 믿게 하기 (사용자가 직접):** `.\scripts\ca.ps1 trust-command`가 명령만 보여 준다 — `Import-Certificate … -CertStoreLocation Cert:\CurrentUser\Root`(현재 사용자 저장소, 관리자 권한 불필요, Windows 확인 창에서 지문 확인), 지우는 명령도 함께. Firefox는 `security.enterprise_roots.enabled`.
+- **쿠키:** `__Host-docflow_session`(Secure·Path=/·Domain 없음). `kubectl port-forward`로 파드 안 루프백에서 온 요청만 http 이름 `docflow_session`(Secure 없음) — 이 PC의 localhost:3000 개발 서버가 계속 로그인되는 길. 두 이름은 섞어 읽지 않는다 (`app/auth.py` 머리말). 루프백 판단은 소켓 상대만 본다 — 이미지가 uvicorn을 `--no-proxy-headers`로 띄워 `X-Forwarded-For`로 꾸밀 수 없다.
+- **OIDC:** discovery 문서의 `jwks_uri`·`token_endpoint`·`authorization_endpoint`는 scheme·호스트·포트가 issuer와 같아야 한다(`auth.check_discovery`) — 다른 호스트에 JWKS를 두는 제공자(구글 등)는 받지 않는다. docflow 바깥 443에서 사설 대역에 더해 169.254/16·127/8·100.64/10·0/8·192.0.0/24·198.18/15·224/4·240/4도 뺐다.
+- **배포 순서 (처음):** ① 백업 — `kubectl exec -n docs deploy/postgres -- pg_dump -U docflow docflow > 백업.sql`(맥, 저장소 밖), Qdrant 스냅숏 ② 이 PC: `.\scripts\ca.ps1 init` → `issue` → `.\scripts\tls_secrets.ps1` (Secret `tls-web`·`tls-postgres`·`tls-qdrant`·`qdrant-api-key`, ConfigMap `docflow-ca`. 없으면 맥 `deploy.sh`가 apply 전에 멈춘다) ③ `.\scripts\deploy.ps1` (빌드 → apply → postgres·qdrant 재시작 → docflow·web 재시작) ④ 확인 아래.
+  - 위험: apply가 postgres를 TLS·새 접속 규칙으로 다시 띄운다(Recreate, 몇 초 끊김). 돌고 있는 실행이 있으면 끝난 뒤에. 데이터·PVC는 그대로이고 PGDATA 안 파일은 바꾸지 않는다.
+- **확인 (배포 뒤, 맥):** `kubectl exec -n docs deploy/postgres -- psql -U docflow -tAc "select ssl, count(*) from pg_stat_ssl join pg_stat_activity using (pid) where client_addr is not null group by ssl"` → `t|N`만. Qdrant 키 없이(docflow 파드에서 — NetworkPolicy가 qdrant를 docflow에만 연다): `kubectl exec -n docs deploy/docflow -- python -c "import httpx;print(httpx.get('https://qdrant.docs.svc.cluster.local:6333/collections',verify='/etc/docflow-ca/ca.crt').status_code)"` → 401. 이 PC: `curl.exe -sI https://docflow.localhost:8443/login`(CA를 믿은 뒤)에 `strict-transport-security`, CSP에 `unsafe-eval` 없음, 로그인 응답 `Set-Cookie: __Host-docflow_session=…; …; Path=/; …; Secure`.
+- **되돌리기:** 이전 배포 태그의 매니페스트를 apply한다 (`git show deploy-<태그>:k8s/docs.yaml` → 맥에서 `kubectl apply -f`, 그 태그로 `deploy.ps1` 다시) → postgres가 TLS 없이·PGDATA의 원래 `pg_hba.conf`로 뜨고 qdrant는 http·키 없이. web Deployment·Service·새 NetworkPolicy·ConfigMap·Secret은 apply로 지워지지 않으니 `kubectl delete deploy/web svc/web netpol/web-egress netpol/docflow-from-web configmap/pg-hba -n docs`. 예전 docflow 이미지는 `COOKIE_SECURE=0` 줄이 있는 매니페스트와 함께 쓴다.
+- **인증서 갱신(397일):** `.\scripts\ca.ps1 issue` → `.\scripts\tls_secrets.ps1` → postgres·web 다시 띄우기(`deploy.ps1`). qdrant는 1시간 안에 다시 읽는다.
+
+컨테이너 최소 권한 (https://github.com/reddol18/docflow/issues/29): 모든 컨테이너 root 아님(postgres 70, qdrant·docflow·web 1000)·읽기 전용 루트 파일시스템·capability 전부 버림·SA 토큰 없음. 쓰는 곳만 PVC·emptyDir(`k8s/docs.yaml` 주석).
 - k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
 - emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi(업로드 본문을 Starlette가 흘려 쓰는 곳). 넘으면 kubelet이 docflow 파드를 내쫓으므로 앱이 업로드를 묶는다(`app/upload.py`, https://github.com/reddol18/docflow/issues/26): 파일 하나 `UPLOAD_MAX_MB`(기본 20, 넘으면 413), 요청 하나 `UPLOAD_MAX_FILES`장(기본 50, 넘으면 400), 픽셀 수 `UPLOAD_MAX_MPX`(기본 100MP — A3 600dpi ≈ 70MP, 넘으면 400), 스캔 수 `UPLOAD_MAX_SCANS`(기본 64, 넘으면 400), 요청 본문 `UPLOAD_MAX_BODY_MB`(기본 210 — 화면이 10장씩 보냄, 받은 바이트로 세어 413), 동시에 받는 본문 합계 `UPLOAD_TMP_MB`(기본 1536, 넘으면 429), 동시 디코드 검사 `UPLOAD_DECODE_SLOTS`(기본 2). 본문은 로그인·역할·CSRF 확인 뒤에 읽는다. 같은 이름의 다른 내용은 409, `?replace=true`면 바꾸고 그 쪽 OCR을 지운다. 새 쪽·교체는 처음·끝난 철만(실행 중·검토 대기·멈춤은 409), 끝난 철은 `/run`으로 다시.
 
@@ -368,7 +394,7 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 | | |
 |---|---|
 | `app/` | FastAPI · LangGraph 흐름(`graph.py`) · OCR · 규칙(`layout.py`) · GPT 호출(`llm.py`) · 저장소 |
-| `frontend/` | Next.js 16 대시보드 (업로드 · 진행 단계 · 검토 에디터 · 검색) |
+| `frontend/` | Next.js 16 대시보드 (업로드 · 진행 단계 · 검토 에디터 · 검색). 운영 이미지 `Dockerfile`(next build → next start)·TLS 종단 `tls-proxy.mjs` |
 | `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow |
 | `eval/` | 정답 채점(`score.py`), 모델·지시문 비교 하네스(`promptfoo/`, 예전 일회성 `cell_variants.py`, `extract_variants.py`). 정답 데이터와 채점 규칙은 이전 PoC 폴더에 있어 이 레포만으로는 돌지 않음 |
 | `sim/` | breakscale_wrap 부하 시나리오 (지금 구성 / 클라우드)와 실행기 |

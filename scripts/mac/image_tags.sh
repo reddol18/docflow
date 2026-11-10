@@ -18,9 +18,10 @@ echo "-- 최근 태그"
 tags qdrant/qdrant "page_size=40&ordering=last_updated" '"name":"v[0-9.]*"' 6
 tags library/postgres "page_size=60&name=17" '"name":"17\.[0-9]*-alpine"' 4
 tags library/python "page_size=60&name=3.11" '"name":"3\.11\.[0-9]*-slim-bookworm"' 4
+tags library/node "page_size=60&name=-alpine3&ordering=last_updated" '"name":"24\.[0-9.]*-alpine3\.[0-9]*"' 4  # 프런트 (frontend/Dockerfile, issues/48)
 
 echo "-- 고정한 태그의 지금 다이제스트"
-PINNED=$( { sed -n 's/^FROM[[:space:]]*\([^[:space:]]*@sha256:[0-9a-f]*\).*/\1/p' "$ROOT/Dockerfile"
+PINNED=$( { sed -n 's/^FROM[[:space:]]*\([^[:space:]]*@sha256:[0-9a-f]*\).*/\1/p' "$ROOT/Dockerfile" "$ROOT/frontend/Dockerfile"
             sed -n 's/^[[:space:]]*image:[[:space:]]*\([^[:space:]]*@sha256:[0-9a-f]*\).*/\1/p' "$ROOT/k8s/docs.yaml"; } | sort -u)
 for IMG in $PINNED; do
   NAME=${IMG%@*}; WANT=${IMG#*@}

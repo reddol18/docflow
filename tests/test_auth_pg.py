@@ -37,7 +37,6 @@ def db(pg_store):
 @pytest.fixture
 def client(db, monkeypatch):
     monkeypatch.setattr(auth, "MODES", frozenset({"local", "oidc"}))
-    monkeypatch.setattr(auth, "COOKIE_SECURE", False)  # 시험 클라이언트는 http → Secure 쿠키를 다시 보내지 않는다
     monkeypatch.setattr(auth, "_hits", {})  # 시험마다 IP 제한 창을 비운다
     monkeypatch.setattr(auth, "_anon", collections.deque())  # 감사 로그 계정 없는 행 상한 창도
     monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
@@ -52,7 +51,8 @@ def client(db, monkeypatch):
     def w(u: auth.Reviewer):
         return {"ok": u.username}
 
-    return TestClient(app, follow_redirects=False)
+    # https 주소 — 운영과 같이 __Host-·Secure 쿠키를 받아 다시 보낸다 (https://github.com/reddol18/docflow/issues/48)
+    return TestClient(app, base_url="https://docflow.test", follow_redirects=False)
 
 
 def add_user(monkeypatch, name, role, pw=PW):
@@ -75,8 +75,11 @@ def test_local_login_session_logout(client, db, monkeypatch):
     assert login(client, "alice", headers={}).status_code == 403  # CSRF 표시 없는 로그인
     r = login(client, "alice")
     assert r.status_code == 200 and r.json()["user"]["role"] == "reviewer"
-    sc = r.headers["set-cookie"].lower()
-    assert "httponly" in sc and "samesite=lax" in sc
+    sc = r.headers["set-cookie"]
+    assert sc.startswith(auth.COOKIE + "=") and auth.COOKIE == "__Host-docflow_session"
+    attrs = {a.strip().split("=")[0].lower() for a in sc.split(";")[1:]}
+    assert {"httponly", "secure", "path"} <= attrs and "domain" not in attrs and "; Path=/" in sc  # __Host- 조건
+    assert "samesite=lax" in sc.lower()
     token = client.cookies.get(auth.COOKIE)
     with db.pool.connection() as c:
         stored = c.execute("SELECT token_hash FROM sessions").fetchall()
@@ -579,6 +582,65 @@ def test_last_seen_updated_at_most_every_5_minutes(client, db, monkeypatch):
     client.get("/p")
     with db.pool.connection() as c:
         assert c.execute("SELECT last_seen > now() - interval '1 minute' AS fresh FROM sessions").fetchone()["fresh"]
+
+
+def test_loopback_gets_http_cookie_and_names_do_not_mix(client, db, monkeypatch):
+    """port-forward(파드 안 루프백)로 온 요청만 http 이름·Secure 없음 — 이 PC의 localhost:3000 개발 서버가 로그인하는 길.
+    파드 IP에서 온 요청(https 프런트)은 http 이름 쿠키를 읽지 않고, 루프백 요청은 __Host- 쿠키를 읽지 않는다 (https://github.com/reddol18/docflow/issues/48)"""
+    add_user(monkeypatch, "lia", "viewer")
+    dev = TestClient(client.app, base_url="http://localhost:3000", client=("127.0.0.1", 50000))
+    r = login(dev, "lia")
+    sc = r.headers["set-cookie"]
+    assert r.status_code == 200 and sc.startswith(auth.HTTP_COOKIE + "=") and "secure" not in sc.lower()
+    assert dev.get("/p").status_code == 200  # http에서 쿠키가 다시 온다
+    token = dev.cookies.get(auth.HTTP_COOKIE)
+    for host in ("::1", "::ffff:127.0.0.1"):
+        assert auth.cookie_mode(type("R", (), {"client": type("C", (), {"host": host})()})())[2] is False
+    pod = TestClient(client.app, base_url="https://docflow.test", client=("10.42.0.9", 50000))
+    assert pod.get("/p", headers={"cookie": f"{auth.HTTP_COOKIE}={token}"}).status_code == 401  # 다른 이름은 무시
+    assert pod.get("/p", headers={"cookie": f"{auth.COOKIE}={token}"}).status_code == 200
+    assert dev.get("/p", headers={"cookie": f"{auth.COOKIE}={token}"}).status_code == 401
+    r = dev.post("/auth/logout", headers=CSRF)
+    assert auth.HTTP_COOKIE in r.headers["set-cookie"] and "secure" not in r.headers["set-cookie"].lower()
+
+
+def test_logout_clears_host_cookie_with_secure(client, db, monkeypatch):
+    add_user(monkeypatch, "kai", "viewer")
+    login(client, "kai")
+    sc = client.post("/auth/logout", headers=CSRF).headers["set-cookie"]
+    assert sc.startswith(auth.COOKIE + "=") and "secure" in sc.lower() and "; Path=/" in sc  # __Host- 지우기도 Secure·Path=/
+
+
+@pytest.mark.parametrize("key,url", [
+    ("jwks_uri", "https://evil.test/certs"),
+    ("token_endpoint", "https://evil.test/token"),
+    ("authorization_endpoint", "https://evil.test/auth"),
+    ("token_endpoint", "http://169.254.169.254/latest/meta-data/"),
+    ("jwks_uri", "https://idp.test:8443/realms/x/certs"),  # 포트가 다름
+    ("token_endpoint", "https://idp.test@evil.test/token"),  # 사용자 정보로 호스트 숨기기
+    ("authorization_endpoint", "http://idp.test/realms/x/auth"),  # https → http
+])
+def test_oidc_discovery_host_must_match_issuer(client, db, idp, monkeypatch, key, url):
+    """discovery 문서의 주소 호스트가 issuer와 다르면 로그인 시작·콜백 모두 거절, 그 주소로 아무것도 보내지 않는다 (API7)"""
+    seen, _ = idp
+    state = start(client, seen)  # 처음엔 맞는 문서
+    disc = {"issuer": ISS, "jwks_uri": ISS + "/certs", "authorization_endpoint": ISS + "/auth", "token_endpoint": ISS + "/token"}
+    bad = {**disc, key: url}
+    fetched = []
+
+    def get_json(u):
+        fetched.append(u)
+        return bad
+
+    monkeypatch.setattr(auth, "_get_json", get_json)
+    auth._cache.clear()  # 문서가 바뀐 뒤 (캐시 만료·가로채기)
+    r = client.get("/auth/oidc/callback", params={"code": "c", "state": state})
+    assert r.status_code == 303 and r.headers["location"] == "/login?error=oidc"
+    assert "data" not in seen  # 토큰 교환을 부르지 않았다
+    r = client.get("/auth/oidc/login")
+    assert r.status_code == 502 and "evil" not in r.headers.get("location", "")
+    assert all("evil" not in u and "169.254" not in u for u in fetched)  # discovery 주소 말고는 받지 않았다
+    assert client.get("/p").status_code == 401
 
 
 def test_oidc_off(client, monkeypatch):
