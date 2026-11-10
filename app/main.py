@@ -1174,6 +1174,11 @@ def resume_review(vol, flagged, fixes, user, interrupt_id):
     if tok is None:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     try:
+        # 화면이 읽은 대기와 지금 대기가 같은지 실행 표시 아래에서 다시 본다 — 그 사이 철이 다시 돌아 대기가 끝났거나
+        # 바뀌었으면 이력을 남기지 않고 409 (옛 id로 이어 가면 지도에서 집히지 않아 제출이 조용히 버려진다)
+        snap = G.get_state(cfg(vol))
+        if not snap.interrupts or snap.interrupts[0].id != interrupt_id:
+            raise HTTPException(409, "검토 대기가 바뀜 — 검토 화면을 다시 열어 주세요")
         record_review(vol, flagged, fixes, user)
         submit(vol, Command(resume={interrupt_id: fixes}), user, reserved=True)
     except BaseException:

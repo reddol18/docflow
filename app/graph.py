@@ -280,6 +280,8 @@ def review(s: VolState):
     for d in s["docs"]:
         if d["flags"]:
             fix = fixes.get(d["doc_id"], {})
+            if not isinstance(fix, dict):  # 문서별 값도 dict가 아니면 고친 값 없음
+                fix = {}
             d = dict(d, fields=rederive({**d["fields"], **fix}, fix), reviewed=True)
         docs.append(d)
     # 고친 값으로 기계 검수(칸 검증 규칙)를 다시 본다 — 철 안 중복은 다른 문서에도 걸리므로 철 전체. 규칙 없는 스키마는 그대로

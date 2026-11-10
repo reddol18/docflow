@@ -313,7 +313,9 @@ def test_off_runs_whole_flow_without_openai(tmp_path, monkeypatch, fake_openai, 
         assert d["fields"]["title"] == "" and d["fields"]["docno"] == "" and d["fields"]["date"] == ""  # 가짜 값 없이 빈 칸
         assert d["hw"] == {"docno": {"text": "", "conf": 0.0}, "date": {"text": "", "conf": 0.0}}
 
-    g.invoke(Command(resume={"v1-0001": {"title": "사람이 쓴 가상 제목"}}), c)  # 사람이 채우고 이어 간다
+    # 사람이 채우고 이어 간다 — 운영(main.resume_review)과 같이 interrupt id 지도로 (https://github.com/reddol18/docflow/issues/120)
+    intr_id = state.tasks[0].interrupts[0].id
+    g.invoke(Command(resume={intr_id: {"v1-0001": {"title": "사람이 쓴 가상 제목"}}}), c)
     state = g.get_state(c)
     assert fake_openai.made == [] and fake_openai.calls == []  # OpenAI 클라이언트를 만들지도 부르지도 않음
     assert not state.next and state.values["indexed"] == 2 and state.values["embedded"] == 0  # 끝까지 돎
@@ -375,9 +377,10 @@ def test_review_submit_with_fixes_reaches_index(tmp_path, monkeypatch, fake_open
     assert sum(n == "review" and s == "waiting" for n, s, _ in rec.events) == 1
 
 
-@pytest.mark.parametrize("bad", [None, "가상 문자열", ["목록"]])
+@pytest.mark.parametrize("bad", [None, "가상 문자열", ["목록"],
+                                 {"v1-0001": "가상 문자열", "v1-0003": ["목록"]}])  # 문서별 값이 dict가 아닌 것도
 def test_review_node_non_dict_resume_is_no_fixes(tmp_path, monkeypatch, fake_openai, bad):
-    """resume 값이 dict가 아니면(None·문자열·목록) 고친 값 없음으로 보고 끝까지 간다"""
+    """resume 값(또는 문서별 값)이 dict가 아니면(None·문자열·목록) 고친 값 없음으로 보고 끝까지 간다"""
     from langgraph.types import Command
 
     from app import main
