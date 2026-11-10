@@ -7,7 +7,7 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
   .\scripts\check.ps1 -Skip frontend,pg
 
 검사                                   막음(실패 시 종료 코드 1)
-  frontend   next typegen → tsc → eslint → node --test(tls-proxy)  예
+  frontend   이미지 npm으로 lock 확인 → next typegen → tsc → eslint → node --test(tls-proxy)  예
   ruff       보안 규칙(S) 포함                 예
   lock       requirements.txt 판이 lock과 같은지·해시 있는지  예
   pytest     실제 Postgres(PGlite) 시험 포함  예
@@ -36,7 +36,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $env:LOCALAPPDATA "docflow-tools"
 $V = @{ semgrep = "1.180.0"; ruff = "0.14.3"  # gitleaks·osv·trivy는 scripts/tool_pins.txt (버전·해시)
-        pglite = "0.5.14"; pgliteSocket = "0.2.17" }
+        pglite = "0.5.14"; pgliteSocket = "0.2.17"
+        npmImage = "11.19.1" }  # frontend/Dockerfile 기반 이미지(node 24.22.2-alpine3.24)에 든 npm — 기반 이미지를 올리면 함께
 $Skip = @($Skip | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File로 부르면 "a,b"가 한 문자열로 온다
 if ($Quick) { $Skip += "osv", "semgrep", "trivy" }
 $env:PYTHONUTF8 = "1"
@@ -119,6 +120,18 @@ try {
         Push-Location frontend
         try {
             if (-not (Test-Path node_modules)) { npm ci; if ($LASTEXITCODE) { return } }
+            # 프런트 이미지(frontend/Dockerfile node 기반)의 npm으로 'npm ci'가 lock을 받는지 — npm 판마다 lock 검사가 달라
+            # 이 PC의 npm은 통과하고 이미지 빌드만 실패한 적이 있다 (https://github.com/reddol18/docflow/issues/48, npm 11.6.2 vs 11.19.1).
+            # 설치하지 않고(--dry-run) 임시 폴더에서 lock 일치만 본다
+            $lockDir = Join-Path ([IO.Path]::GetTempPath()) ("docflow-lockcheck-" + [IO.Path]::GetRandomFileName())
+            New-Item -ItemType Directory $lockDir | Out-Null
+            try {
+                Copy-Item package.json, package-lock.json $lockDir
+                Push-Location $lockDir
+                try { npx -y "npm@$($V.npmImage)" ci --dry-run --ignore-scripts --no-audit --no-fund | Out-Null; $lockCode = $LASTEXITCODE }
+                finally { Pop-Location }
+            } finally { Remove-Item -Recurse -Force $lockDir -ErrorAction SilentlyContinue }
+            if ($lockCode) { Write-Host "frontend/package-lock.json이 이미지의 npm $($V.npmImage) 'npm ci'와 맞지 않음 — npx npm@$($V.npmImage) install --package-lock-only" -ForegroundColor Red; $global:LASTEXITCODE = $lockCode; return }
             npx next typegen | Out-Null; if ($LASTEXITCODE) { return }
             npx tsc --noEmit; if ($LASTEXITCODE) { return }
             npx eslint src; if ($LASTEXITCODE) { return }

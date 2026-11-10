@@ -7,7 +7,8 @@
 FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS build
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
-# package-lock.json 그대로 (판·무결성 해시 고정)
+# package-lock.json 그대로 (판·무결성 해시 고정). 이 이미지의 npm(11.19.1)이 lock을 받는지는 scripts/check.ps1 frontend 단계가
+# 같은 판 npm으로 미리 본다($V.npmImage) — 기반 이미지를 올리면 그 값도 함께 (https://github.com/reddol18/docflow/issues/48)
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
