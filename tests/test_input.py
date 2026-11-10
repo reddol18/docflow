@@ -75,6 +75,17 @@ def test_review_form_value_limit(main, monkeypatch):
     assert res.status_code == 303 and got == [{"d1": {"title": "가" * 500}}]
 
 
+def test_review_empty_submit_both_routes(main, monkeypatch):
+    """고친 칸 없는 제출(폼 '그대로 승인'·JSON {})도 두 경로 모두 resume_review로 간다 — 빈 fixes로 흐름이
+    끝까지 가는지는 test_llm_provider.test_empty_review_submit_reaches_index (https://github.com/reddol18/docflow/issues/120)"""
+    got = _review_ready(main, monkeypatch)
+    c = TestClient(main.app)
+    res = c.post("/review/v1", data={"d1__title": "옛 제목"}, headers=ADMIN, follow_redirects=False)
+    assert res.status_code == 303
+    assert c.post("/review/v1/json", json={}, headers=ADMIN).status_code == 200
+    assert got == [{}, {}]
+
+
 def test_search_ask_limits(main, monkeypatch):
     monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k, user=None: [])
     monkeypatch.setattr(main.llm, "answer", lambda q, hits, user_id=None: "답")

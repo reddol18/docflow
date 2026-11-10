@@ -1173,7 +1173,8 @@ def resume_review(vol, flagged, fixes, user):
         raise HTTPException(409, f"{vol} 이미 실행 중")
     try:
         record_review(vol, flagged, fixes, user)
-        submit(vol, Command(resume=fixes), user, reserved=True)
+        # 봉투로 감싸 빈 fixes도 이어 가게 (https://github.com/reddol18/docflow/issues/120)
+        submit(vol, Command(resume=flow.review_resume(fixes)), user, reserved=True)
     except BaseException:
         release(vol, tok)
         raise
