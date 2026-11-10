@@ -33,7 +33,8 @@ put() {
   fi
   rm -f "$D/obj.yaml"
 }
-tr -d '\r' | while read -r n b; do
+# Windows PowerShell 5.1은 콘솔 입력 인코딩이 BOM 있는 UTF-8이면 표준 입력 앞에 BOM을 붙인다 — 첫 줄에서 뗀다(zap_scan.ps1과 같은 방식)
+perl -pe 's/^\xEF\xBB\xBF// if $. == 1; s/\r//g' | while read -r n b; do
   [ -n "$n" ] || continue
   case "$n" in
     ca.crt|web.crt|web.key|postgres.crt|postgres.key|qdrant.crt|qdrant.key) ;;
