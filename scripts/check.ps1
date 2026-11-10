@@ -7,7 +7,7 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
   .\scripts\check.ps1 -Skip frontend,pg
 
 검사                                   막음(실패 시 종료 코드 1)
-  frontend   next typegen → tsc → eslint → node --test(tls-proxy)  예
+  frontend   이미지 npm(Dockerfile ARG NPM_VERSION)으로 lock 확인 → npm ci(없을 때) → next typegen → tsc → eslint → node --test(tls-proxy)  예
   ruff       보안 규칙(S) 포함                 예
   lock       requirements.txt 판이 lock과 같은지·해시 있는지  예
   pytest     실제 Postgres(PGlite) 시험 포함  예
@@ -36,7 +36,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $tools = Join-Path $env:LOCALAPPDATA "docflow-tools"
 $V = @{ semgrep = "1.180.0"; ruff = "0.14.3"  # gitleaks·osv·trivy는 scripts/tool_pins.txt (버전·해시)
-        pglite = "0.5.14"; pgliteSocket = "0.2.17" }
+        pglite = "0.5.14"; pgliteSocket = "0.2.17" }  # 프런트 이미지의 npm 판은 frontend/Dockerfile ARG NPM_VERSION 한 곳 (frontend 단계가 읽는다)
 $Skip = @($Skip | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File로 부르면 "a,b"가 한 문자열로 온다
 if ($Quick) { $Skip += "osv", "semgrep", "trivy" }
 $env:PYTHONUTF8 = "1"
@@ -118,6 +118,26 @@ try {
     Step "frontend" $true {
         Push-Location frontend
         try {
+            # 맨 먼저: 프런트 이미지의 npm 판으로 'npm ci'가 lock을 받는지 — npm 판마다 lock 검사가 달라 이 PC의 npm(11.6.2)은
+            # 통과하고 이미지 빌드만 실패한 적이 있다 (https://github.com/reddol18/docflow/issues/48). 판은 frontend/Dockerfile의
+            # ARG NPM_VERSION 한 곳(빌드가 이미지 npm과 같은지 확인한다), package.json devEngines도 같아야 한다.
+            # --dry-run: node_modules·lock을 건드리지 않는다(2026-11-10 확인). 이미지와 같은 플랫폼(linux x64 musl)으로 푼다
+            $npmVer = [regex]::Match((Get-Content -Raw -Encoding UTF8 Dockerfile), '(?m)^ARG NPM_VERSION=([0-9]+\.[0-9]+\.[0-9]+)\s*$').Groups[1].Value
+            if (-not $npmVer) { Write-Host "frontend/Dockerfile에서 ARG NPM_VERSION=<판>을 읽지 못함" -ForegroundColor Red; $global:LASTEXITCODE = 1; return }
+            $devEng = (Get-Content -Raw -Encoding UTF8 package.json | ConvertFrom-Json).devEngines.packageManager
+            if (-not $devEng -or $devEng.name -ne "npm" -or $devEng.version -ne $npmVer) {
+                Write-Host "frontend/package.json devEngines.packageManager가 npm $npmVer(Dockerfile)과 다름" -ForegroundColor Red; $global:LASTEXITCODE = 1; return
+            }
+            $out = cmd /c "npx -y npm@$npmVer ci --dry-run --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/ --os=linux --cpu=x64 --libc=musl 2>&1"
+            $lockCode = $LASTEXITCODE
+            if ($lockCode) {
+                $out | Select-Object -Last 15 | ForEach-Object { Write-Host $_ }
+                if ($out -match 'EUSAGE|in sync') {
+                    Write-Host "lock 불일치 — frontend 폴더에서 npx npm@$npmVer install --package-lock-only" -ForegroundColor Red
+                } else { Write-Host "npm 실행 실패(네트워크?) — 위 출력 확인" -ForegroundColor Red }
+                $global:LASTEXITCODE = $lockCode; return
+            }
+            Write-Host "lock 확인: npm $npmVer ci (linux x64 musl) 통과"
             if (-not (Test-Path node_modules)) { npm ci; if ($LASTEXITCODE) { return } }
             npx next typegen | Out-Null; if ($LASTEXITCODE) { return }
             npx tsc --noEmit; if ($LASTEXITCODE) { return }

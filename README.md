@@ -365,6 +365,7 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
   재현되는 것은 기반 층까지다: docflow 이미지의 apt upgrade 층은 주마다 새로 받는다(`APT_REFRESH`).
 - 파이썬 의존성: 이미지는 `requirements.lock`(전이 의존성까지 판·해시 고정)으로 `pip install --require-hashes --no-deps --only-binary :all:` 설치한다 — 같은 커밋이면 몇 번 빌드해도 같은 패키지 (https://github.com/reddol18/docflow/issues/33).
   `requirements.txt`를 바꿨을 때만 `.\scripts\lock_refresh.ps1`로 lock을 다시 만든다(맥 컨테이너에서 linux/amd64로 풀어 freeze 파일만 꺼내고 — 이미지 태그 없음 — `scripts/lock_hashes.py`가 PyPI 휠 해시를 붙임, 배포 없음) → 바뀐 판을 확인하고 함께 커밋. 안 맞으면 로컬 검사 `lock` 단계가 막는다.
+- 프런트 의존성 (https://github.com/reddol18/docflow/issues/48): `frontend/package-lock.json`은 프런트 이미지의 npm 판(`frontend/Dockerfile` `ARG NPM_VERSION`, `package.json` `devEngines`와 같게)으로 만든다 — **frontend 폴더에서** `npx npm@<판> install --package-lock-only`. 이 PC의 npm 판으로 만들면 이미지의 `npm ci`가 거절할 수 있다(실제로 배포가 멈춤). 로컬 검사 frontend 단계가 맨 먼저 같은 판으로 `npm ci --dry-run`(linux x64 musl)을 돌려 막는다. 기반 이미지를 올려 npm 판이 바뀌면 이미지 빌드가 판 확인에서 멈춘다 → 세 곳을 함께 바꾸고 lock을 다시 만든다.
 - **병합은 `scripts/merge.ps1`로만** 한다 (https://github.com/reddol18/docflow/issues/83). `.\scripts\merge.ps1 <PR> -DryRun`으로 먼저 확인한다.
   PR head 커밋의 로컬 검사 요약(막는 검사 모두 통과, 건너뜀 거부)·계약 리뷰·버그 리뷰 결과 댓글(댓글·리뷰 한 글 안에 이름과
   '| 지적 | 반영 |' 표)·보안 영향 칸에 체크가 있으면 보안 리뷰 결과 댓글이 있어야, 확인한 head 그대로 squash 병합(제목 끝 `(#N)`)한다.
