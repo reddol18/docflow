@@ -266,29 +266,16 @@ def route_review(s: VolState):
     return "index"
 
 
-RESUME_KEY = "fixes"
-
-
-def review_resume(fixes):
-    """검토 결과를 resume 값으로 감싼다. 빈 dict를 그대로 넣으면 LangGraph가 '인터럽트 id → 값' 지도로 보고
-    버려 review가 다시 멈춘다 (https://github.com/reddol18/docflow/issues/120) — hex id일 수 없는 키로 감싼다"""
-    return {RESUME_KEY: fixes}
-
-
-def unwrap_resume(v):
-    """봉투 {"fixes": {...}}를 푼다. 봉투가 아닌 {doc_id: {칸: 값}}(옛 형식)도 그대로 받는다"""
-    if isinstance(v, dict) and set(v) == {RESUME_KEY} and isinstance(v[RESUME_KEY], dict):
-        return v[RESUME_KEY]
-    return v or {}
-
-
 def review(s: VolState):
     """사람 검토. interrupt()에서 멈추고 상태가 체크포인트(Postgres)에 남는다.
-    검토 화면에서 고친 값이 Command(resume=review_resume({doc_id: {칸: 값}}))로 들어오면 여기서부터 이어 간다.
+    검토 화면에서 고친 값이 Command(resume={<interrupt id>: {doc_id: {칸: 값}}})로 들어오면 여기서부터 이어 간다
+    (id로 집어 넘기므로 고친 칸이 없는 {}도 버려지지 않는다 — https://github.com/reddol18/docflow/issues/120).
     (이어 갈 때 이 노드는 처음부터 다시 실행되므로 interrupt 앞에는 부수효과를 두지 않는다.)"""
     flagged = [{"doc_id": d["doc_id"], "pages": d["pages"], "fields": d["fields"], "flags": d["flags"], "hw": d["hw"]}
                for d in s["docs"] if d["flags"]]
-    fixes = unwrap_resume(interrupt({"vol": s["vol"], "flagged": flagged}))
+    fixes = interrupt({"vol": s["vol"], "flagged": flagged})
+    if not isinstance(fixes, dict):  # None·문자열·목록 등 — 고친 값 없음으로 본다
+        fixes = {}
     docs = []
     for d in s["docs"]:
         if d["flags"]:

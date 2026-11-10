@@ -678,3 +678,41 @@ def test_review_submit_records_edits_and_user(db, monkeypatch):
     db.add_review_times("v2", [{"doc_id": "v2-0001", "mode": "review", "active_ms": 5000}], uid)
     with db.pool.connection() as c:
         assert c.execute("SELECT user_id FROM review_time WHERE vol = 'v2'").fetchone()["user_id"] == uid
+
+
+@pytest.mark.parametrize("via", ["form", "json"])
+def test_empty_review_submit_still_records(db, monkeypatch, via):
+    """고친 칸 없는 검토 제출도 review_submitters 행과 감사 ok(fixed_cells=0)를 남긴다 — 교차검사 근거를 잃지 않게
+    (https://github.com/reddol18/docflow/issues/120). 흐름(그래프)은 대신 받아 둔다"""
+    from types import SimpleNamespace
+
+    from app import main
+    add_user(monkeypatch, "iris", "reviewer")
+    with db.pool.connection() as c:
+        uid = c.execute("SELECT id FROM users WHERE username = 'iris'").fetchone()["id"]
+        c.execute("DELETE FROM review_submitters WHERE vol = 'v3'")
+    user = auth.User(uid, "iris", "iris", "reviewer")
+    monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
+    monkeypatch.setattr(auth, "session_user", lambda t: user if t == "iris-token" else None)
+    doc = {"doc_id": "v3-0001", "pages": ["v3-0001"], "flags": {"title": ["확신도"]},
+           "fields": {"docno": "가상 1-1", "date": "", "recipient": "가상 수신", "title": "가상 제목"}, "hw": {}}
+    intr = SimpleNamespace(value={"flagged": [doc]}, id="1" * 32)
+    monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: SimpleNamespace(interrupts=[intr])))
+    sent = []
+    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: sent.append(arg))
+    c = TestClient(main.app)
+    h = {"authorization": "Bearer iris-token", **CSRF}
+    try:
+        if via == "form":
+            r = c.post("/review/v3", data={"v3-0001__title": "가상 제목"}, headers=h, follow_redirects=False)
+            assert r.status_code == 303
+        else:
+            assert c.post("/review/v3/json", json={}, headers=h).status_code == 200
+    finally:
+        main.running.pop("v3", None)  # submit을 대신 받아 실행 표시가 남는다
+    assert [s.resume for s in sent] == [{"1" * 32: {}}]
+    with db.pool.connection() as cn:
+        assert [r["user_id"] for r in cn.execute("SELECT user_id FROM review_submitters WHERE vol = 'v3'")] == [uid]
+    rows = [r for r in audit_rows(db) if r["action"] == "review" and r["vol"] == "v3"]
+    assert [(r["result"], r["info"]["fixed_cells"], r["info"]["via"]) for r in rows] == [("ok", 0, via)]
+    assert db.edit_history("v3", "v3-0001") == []

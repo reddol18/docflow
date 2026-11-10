@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app import auth, store
 
 ADMIN = {"authorization": "Bearer a", "x-docflow-csrf": "1"}
+INTR_ID = "0" * 32  # 지어낸 interrupt id (xxh3 128 hex 형식)
 
 
 @pytest.fixture
@@ -57,15 +58,16 @@ def test_volume_names_skips_bad_dirs(main, tmp_path):
 def _review_ready(main, monkeypatch):
     doc = {"doc_id": "d1", "pages": ["p1"], "flags": {"title": ["확신도"]},
            "fields": {"docno": "가-1", "date": "", "recipient": "긴" * 600, "title": "옛 제목"}, "hw": {}}
-    snap = SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": [doc]})])
+    snap = SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": [doc]}, id=INTR_ID)])
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snap))
-    got = []
-    monkeypatch.setattr(main, "resume_review", lambda vol, flagged, fixes, user: got.append(fixes))
-    return got
+    got, ids = [], []
+    monkeypatch.setattr(main, "resume_review",
+                        lambda vol, flagged, fixes, user, interrupt_id: (got.append(fixes), ids.append(interrupt_id)))
+    return got, ids
 
 
 def test_review_form_value_limit(main, monkeypatch):
-    got = _review_ready(main, monkeypatch)
+    got, _ = _review_ready(main, monkeypatch)
     c = TestClient(main.app)
     res = c.post("/review/v1", data={"d1__title": "가" * 501}, headers=ADMIN, follow_redirects=False)
     assert res.status_code == 422 and not got
@@ -76,14 +78,15 @@ def test_review_form_value_limit(main, monkeypatch):
 
 
 def test_review_empty_submit_both_routes(main, monkeypatch):
-    """고친 칸 없는 제출(폼 '그대로 승인'·JSON {})도 두 경로 모두 resume_review로 간다 — 빈 fixes로 흐름이
-    끝까지 가는지는 test_llm_provider.test_empty_review_submit_reaches_index (https://github.com/reddol18/docflow/issues/120)"""
-    got = _review_ready(main, monkeypatch)
+    """고친 칸 없는 제출(폼 '그대로 승인'·JSON {})도 두 경로 모두 대기 중인 interrupt id와 함께 resume_review로 간다.
+    빈 fixes로 흐름이 끝까지 가는지는 test_llm_provider.test_empty_review_submit_reaches_index
+    (https://github.com/reddol18/docflow/issues/120)"""
+    got, ids = _review_ready(main, monkeypatch)
     c = TestClient(main.app)
     res = c.post("/review/v1", data={"d1__title": "옛 제목"}, headers=ADMIN, follow_redirects=False)
     assert res.status_code == 303
     assert c.post("/review/v1/json", json={}, headers=ADMIN).status_code == 200
-    assert got == [{}, {}]
+    assert got == [{}, {}] and ids == [INTR_ID, INTR_ID]
 
 
 def test_search_ask_limits(main, monkeypatch):

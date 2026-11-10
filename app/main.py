@@ -1166,15 +1166,16 @@ def record_review(vol, flagged, fixes, user):
                 fixed_docs=len(fixes), fixed_cells=sum(len(v) for v in fixes.values()), user=user.username)
 
 
-def resume_review(vol, flagged, fixes, user):
-    """이력을 먼저 남기고 흐름을 잇는다 — 이력 저장이 실패하면 고친 값도 반영되지 않는다 (누가 바꿨는지 잃지 않게)."""
+def resume_review(vol, flagged, fixes, user, interrupt_id):
+    """이력을 먼저 남기고 흐름을 잇는다 — 이력 저장이 실패하면 고친 값도 반영되지 않는다 (누가 바꿨는지 잃지 않게).
+    resume 값은 {interrupt id: fixes}로 넘긴다 — fixes를 그대로 넣으면 빈 {}를 LangGraph가 'id → 값' 지도로 보고
+    버려 review가 다시 멈춘다 (https://github.com/reddol18/docflow/issues/120)."""
     tok = reserve(vol, "queued")  # 이력 쓰기 전에 실행 표시를 세운다 — 쓰는 사이 업로드·/run이 끼지 못하게
     if tok is None:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     try:
         record_review(vol, flagged, fixes, user)
-        # 봉투로 감싸 빈 fixes도 이어 가게 (https://github.com/reddol18/docflow/issues/120)
-        submit(vol, Command(resume=flow.review_resume(fixes)), user, reserved=True)
+        submit(vol, Command(resume={interrupt_id: fixes}), user, reserved=True)
     except BaseException:
         release(vol, tok)
         raise
@@ -1193,7 +1194,7 @@ async def review_submit(vol: str, request: Request, user: Reviewer):
         # 바뀐 값만 본다 — 고치지 않은 칸은 기존 값(OCR·GPT가 낸 긴 값일 수 있음)이 그대로 다시 오므로 막지 않는다
         if any(len(v) > CELL_MAX for f in fixes.values() for v in f.values()):  # JSON 경로(CellValue)와 같은 상한
             raise HTTPException(422, f"칸 값은 {CELL_MAX}자까지")
-        resume_review(vol, flagged, fixes, user)
+        resume_review(vol, flagged, fixes, user, snap.interrupts[0].id)
         info.update(docs=len(flagged), fixed_cells=sum(len(v) for v in fixes.values()))
     return RedirectResponse(f"/volumes/{vol}", status_code=303)
 
@@ -1208,7 +1209,7 @@ def review_json(vol: str, body: Annotated[dict[str, dict[str, CellValue]], Field
             raise HTTPException(409, "검토 대기 없음")
         flagged = snap.interrupts[0].value["flagged"]
         fixes = clean_fixes(flagged, [(did, k, v) for did, f in body.items() for k, v in f.items()])
-        resume_review(vol, flagged, fixes, user)
+        resume_review(vol, flagged, fixes, user, snap.interrupts[0].id)
         info.update(docs=len(flagged), fixed_cells=sum(len(v) for v in fixes.values()))
     return {"vol": vol, "fixed": {k: list(v) for k, v in fixes.items()}}
 
