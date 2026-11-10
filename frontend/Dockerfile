@@ -7,8 +7,12 @@
 FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS build
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
-# package-lock.json 그대로 (판·무결성 해시 고정). 이 이미지의 npm(11.19.1)이 lock을 받는지는 scripts/check.ps1 frontend 단계가
-# 같은 판 npm으로 미리 본다($V.npmImage) — 기반 이미지를 올리면 그 값도 함께 (https://github.com/reddol18/docflow/issues/48)
+# 이 이미지의 npm 판 — 한 곳 (https://github.com/reddol18/docflow/issues/48). scripts/check.ps1 frontend 단계가 이 값을 읽어 같은 판
+# npm으로 lock을 미리 보고, frontend/package.json devEngines도 같아야 한다. 기반 이미지를 올려 npm이 바뀌면 빌드가 아래에서 멈춘다 →
+# 이 값·devEngines를 함께 바꾸고 frontend 폴더에서 npx npm@<판> install --package-lock-only
+ARG NPM_VERSION=11.19.1
+RUN test "$(npm -v)" = "$NPM_VERSION" || { echo "이미지 npm $(npm -v) != NPM_VERSION $NPM_VERSION — frontend/Dockerfile·package.json devEngines·lock을 함께 맞출 것" >&2; exit 1; }
+# package-lock.json 그대로 (판·무결성 해시 고정)
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
