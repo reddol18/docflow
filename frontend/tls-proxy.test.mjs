@@ -6,11 +6,16 @@ import { after, before, test } from "node:test";
 import { HSTS, LIMITS, PUBLIC_HOST, createServer, makeHandler } from "./tls-proxy.mjs";
 
 let upstream, proxy, upPort, port;
+let slowClosed = false;
 const seen = [];
 
 before(async () => {
   upstream = http.createServer((req, res) => {
     seen.push(req.headers);
+    if (req.url === "/slow") { // 응답을 늦게 — 그 사이 클라이언트가 끊는다
+      req.socket.on("close", () => { slowClosed = true; });
+      return;
+    }
     if (req.url === "/cut") { // 헤더를 보내고 본문 중간에 끊긴 뒤(Next가 죽음)
       res.writeHead(200, { "content-type": "text/plain" });
       res.write("part");
@@ -27,7 +32,10 @@ before(async () => {
   await new Promise((r) => proxy.listen(0, "127.0.0.1", r));
   port = proxy.address().port;
 });
-after(() => { proxy.close(); upstream.close(); });
+after(() => { // 실패해 남은 연결이 있어도 시험이 끝나게
+  proxy.closeAllConnections(); upstream.closeAllConnections();
+  proxy.close(); upstream.close();
+});
 
 function get(path, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -98,6 +106,17 @@ test("뒤가 죽어 있으면 502, 응답 도중 끊기면 연결을 끊는다(�
     assert.equal(r.status, 502);
     assert.equal(r.headers["strict-transport-security"], HSTS);
   } finally { port = p; dead.close(); }
+});
+
+test("응답 전에 클라이언트가 끊으면 뒤(upstream) 연결도 닫는다", async () => {
+  slowClosed = false;
+  const r = http.request({ host: "127.0.0.1", port, path: "/slow", headers: { host: PUBLIC_HOST } });
+  r.on("error", () => {});
+  r.end();
+  await new Promise((ok) => setTimeout(ok, 50)); // 뒤가 요청을 받을 때까지
+  r.destroy();
+  for (let i = 0; i < 50 && !slowClosed; i++) await new Promise((ok) => setTimeout(ok, 20));
+  assert.equal(slowClosed, true);
 });
 
 test("서버 시간 제한·연결 수", () => {

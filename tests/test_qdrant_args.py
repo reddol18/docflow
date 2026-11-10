@@ -67,6 +67,9 @@ def test_check_transport_deployed():
             {"PG_URL": "postgresql://docflow@h/db?sslmode=prefer"},
             {"PG_URL": "postgresql://docflow:fake-pw@h/db?sslmode=disable"},
             {"PG_URL": "not a url ==="},
+            {"PG_URL": "postgresql://docflow@%2Fvar%2Frun%2Fpostgresql/docflow?sslmode=verify-full"},  # 유닉스 소켓
+            {"PG_URL": "postgresql:///docflow?host=/var/run/postgresql&sslmode=require"},
+            {"PG_URL": "postgresql:///docflow?sslmode=require"},  # 호스트 없음 = 기본 소켓
             {"QDRANT_URL": "http://qdrant:6333"},
             {"QDRANT_API_KEY_FILE": ""}]
     for b in bads:

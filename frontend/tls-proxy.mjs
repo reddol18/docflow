@@ -73,6 +73,9 @@ export function makeHandler({ upstream = UPSTREAM, publicHost = PUBLIC_HOST } = 
         res.end("bad gateway");
       }
     });
+    // 응답을 다 보내기 전에 클라이언트가 끊으면(응답 헤더 전 포함) 뒤 연결도 닫는다
+    res.on("close", () => { if (!res.writableFinished) up.destroy(); });
+
     pipeline(req, up, (err) => { if (err) up.destroy(); });
   };
 }

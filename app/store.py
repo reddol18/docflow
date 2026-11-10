@@ -34,12 +34,17 @@ def check_transport(env=os.environ):
     from psycopg import Error as PgError
     from psycopg.conninfo import conninfo_to_dict
     try:
-        mode = conninfo_to_dict(env.get("PG_URL", PG_URL)).get("sslmode") or env.get("PGSSLMODE")
+        info = conninfo_to_dict(env.get("PG_URL", PG_URL))
     except (ValueError, PgError):  # 형식 오류도 멈춤 (값은 비밀번호가 있을 수 있어 싣지 않음)
         raise RuntimeError("DOCFLOW_REQUIRE_TLS: PG_URL을 읽지 못함") from None
+    mode = info.get("sslmode") or env.get("PGSSLMODE")
+    hosts = [h.strip() for h in str(info.get("host") or env.get("PGHOST") or "").split(",")]
     bad = []
     if mode not in PG_TLS_MODES:
         bad.append("PG_URL sslmode가 require·verify-ca·verify-full이 아님")
+    # 유닉스 소켓(호스트가 '/'로 시작하거나 없음 = libpq 기본 소켓)에는 sslmode가 듣지 않는다 — TLS 없이 붙는다
+    if any(not h or h.startswith("/") or h.startswith("@") for h in hosts):
+        bad.append("PG_URL 호스트가 유닉스 소켓(TLS 아님)")
     if not env.get("QDRANT_URL", QDRANT_URL).startswith("https://"):
         bad.append("QDRANT_URL이 https가 아님")
     if not env.get("QDRANT_API_KEY_FILE"):
