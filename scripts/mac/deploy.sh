@@ -4,21 +4,26 @@
 # 보통은 Windows에서 scripts/deploy.ps1로 부른다(복사 + 이 스크립트 + 배포 태그).
 set -e
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
-# 디스크 확인의 시험 값은 배포에서 늘 지운다 (실제 측정·실제 문턱만) — scripts/mac/disk_check.sh 머리말
-unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY
+URL119=https://github.com/reddol18/docflow/issues/119
+# 디스크 확인의 시험 값·바꾼 기준은 배포에서 늘 지운다 (실제 측정·실제 문턱·저장소의 기준만) — scripts/mac/disk_check.sh 머리말.
+# scripts/deploy.ps1의 사전 확인도 같은 목록 (tests/test_disk_check.py가 둘이 disk_check.sh의 변수를 모두 지우는지 본다)
+unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB
 
-# 롤아웃 전에 이미지가 containerd(k8s.io)에 있는지 (https://github.com/reddol18/docflow/issues/119).
-# imagePullPolicy: Never라 없으면 새 파드가 ErrImageNeverPull로 뜨지 못한다. 빌드한 뒤 롤아웃 전까지 그 이미지는 어떤 컨테이너도
-# 쓰지 않으므로, 이미지 디스크가 GC 문턱을 넘으면 kubelet이 지울 수 있다(2026-11-10 약 10분 중단).
-# 없으면 빌드 캐시로 그 이미지만 다시 빌드하고(build_image.sh api|web, 디스크 확인 포함), 그래도 없으면 롤아웃하지 않고 멈춘다.
+# 이미지를 kubelet 이미지 GC에서 지키는 것 (https://github.com/reddol18/docflow/issues/119):
+#   주: build_image.sh가 빌드 직후 우리 두 이미지를 고정(pin)한다 — '== 이미지 고정' 줄.
+#   보조: 재시작 바로 전에 이미지가 containerd(k8s.io)에 있는지·고정됐는지 본다 — '== 이미지 확인' 줄. imagePullPolicy: Never라
+#   없으면 새 파드가 ErrImageNeverPull로 뜨지 못한다(2026-11-10 약 10분 중단). 없으면 빌드 캐시로 그 이미지만 다시 만들고
+#   (build_image.sh api|web rebuild — 디스크 확인을 그 이미지 크기로), 그래도 없으면 롤아웃하지 않고 멈춘다.
 has_image() { colima nerdctl -- --namespace k8s.io image inspect "$1" >/dev/null 2>&1 </dev/null; }
+pinned() { colima ssh -- sudo crictl inspecti "docker.io/library/$1" </dev/null 2>/dev/null | grep -q '"pinned": true'; }
 ensure_image() {  # $1 이미지, $2 build_image.sh 대상(api|web), $3 언제
-  if has_image "$1"; then echo "== 이미지 확인($3): $1 있음 (containerd k8s.io)"; return 0; fi
-  echo "!! 이미지 확인($3): $1 없음 — kubelet 이미지 GC가 지웠을 수 있다. 빌드 캐시로 다시 빌드한다" >&2
-  sh ~/doc_platform/scripts/build_image.sh "$2" </dev/null || { echo "!! $1 다시 빌드 실패 — 롤아웃하지 않음" >&2; return 1; }
-  if has_image "$1"; then echo "== 이미지 확인($3): $1 다시 빌드해 있음"; return 0; fi
-  echo "!! 이미지 확인($3): $1 다시 빌드해도 없음 — 롤아웃하지 않음. sh ~/doc_platform/scripts/image_list.sh로 디스크·이미지 확인" >&2
-  return 1
+  if ! has_image "$1"; then
+    echo "!! 이미지 확인($3): $1 없음 — kubelet 이미지 GC가 지웠을 수 있다. 빌드 캐시로 다시 빌드한다" >&2
+    sh ~/doc_platform/scripts/build_image.sh "$2" rebuild </dev/null || { echo "!! $1 다시 빌드 실패 — 롤아웃하지 않음" >&2; return 1; }
+    has_image "$1" || { echo "!! 이미지 확인($3): $1 다시 빌드해도 없음 — 롤아웃하지 않음. sh ~/doc_platform/scripts/image_list.sh로 디스크·이미지 확인" >&2; return 1; }
+  fi
+  if pinned "$1"; then echo "== 이미지 확인($3): $1 있음, 고정(pinned: true)"
+  else echo "!! 이미지 확인($3): $1 있음, 고정 안 됨 — GC에서 빠지지 않는다 (build_image.sh '이미지 고정' 줄 확인)" >&2; fi
 }
 # 롤아웃이 실패하면: 파드가 ErrImageNeverPull이면 원인을 크게 알린다 → 로그 → 실패
 rollout_failed() {  # $1 Deployment, $2 logs 인자
@@ -27,7 +32,7 @@ rollout_failed() {  # $1 Deployment, $2 logs 인자
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
     echo "!! ErrImageNeverPull — 노드에 이미지가 없어 파드가 뜨지 못함 (imagePullPolicy: Never)" >&2
     printf '%s\n' "$bad" >&2
-    echo "!! 원인: 빌드 뒤 kubelet 이미지 GC가 지웠을 가능성이 크다 (이미지 디스크가 GC 문턱 이상, issues/119)" >&2
+    echo "!! 원인: 빌드 뒤 kubelet 이미지 GC가 지웠을 가능성이 크다 (이미지 디스크가 GC 문턱 이상, $URL119)" >&2
     echo "!! 확인: sh ~/doc_platform/scripts/disk_check.sh · sh ~/doc_platform/scripts/image_list.sh (읽기만)" >&2
     echo "!! 되살리기: 디스크 정리(사용자 판단) → sh ~/doc_platform/scripts/build_image.sh → kubectl rollout restart deploy/$1 -n docs" >&2
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
@@ -36,8 +41,7 @@ rollout_failed() {  # $1 Deployment, $2 logs 인자
   exit 1
 }
 
-# 빌드 전 디스크 확인 (반드시) — 여유 GB와 이미지 디스크 사용률(kubelet GC 문턱). 걸리면 여기서 멈춘다 — scripts/mac/disk_check.sh
-sh ~/doc_platform/scripts/disk_check.sh </dev/null
+# 디스크 확인은 build_image.sh가 빌드 직전에 한다(더 쓸 2GB 포함). Windows deploy.ps1도 복사 전에 한 번 본다
 # 데이터 소유자가 매니페스트의 runAsUser와 맞는지 (https://github.com/reddol18/docflow/issues/29). 다르면 apply 전에 멈춘다
 sh ~/doc_platform/scripts/owner_migrate.sh check
 # TLS 인증서·Qdrant API 키·CA가 있어야 한다 (https://github.com/reddol18/docflow/issues/48). 없이 apply하면 postgres·qdrant가
@@ -45,20 +49,18 @@ sh ~/doc_platform/scripts/owner_migrate.sh check
 kubectl get secret tls-web tls-postgres tls-qdrant qdrant-api-key -n docs >/dev/null </dev/null \
   && kubectl get configmap docflow-ca -n docs >/dev/null </dev/null \
   || { echo "TLS Secret(tls-web·tls-postgres·tls-qdrant·qdrant-api-key)·ConfigMap docflow-ca가 없음 — Windows에서 scripts/tls_secrets.ps1 먼저. 배포하지 않음" >&2; exit 1; }
+# 빌드 → 바로 고정('== 이미지 고정' 줄). 그 직후의 apply 전 확인은 따로 두지 않는다(고정 줄이 같은 것을 방금 본다)
 sh ~/doc_platform/scripts/build_image.sh </dev/null
-# apply가 docflow·web 정의를 바꾸면 그 자리에서 다시 띄우므로 apply 전에 둘 다 본다
-ensure_image docflow:dev api "apply 전"
-ensure_image docflow-web:dev web "apply 전"
 kubectl apply -f ~/doc_platform/k8s/docs.yaml >/dev/null
 # postgres·qdrant 이미지를 바꾸면 apply가 둘을 다시 띄운다(Recreate) — docflow는 시작할 때 DB에 붙으므로 먼저 기다린다
 for d in postgres qdrant; do
   kubectl rollout status deploy/$d -n docs --timeout=300s || rollout_failed $d --tail=40
 done
-# 위 기다림 동안에도 GC가 돌 수 있어 재시작 바로 전에 다시 본다
+# 위 기다림 동안에도 GC가 돌 수 있어 재시작 바로 전에 본다 (고정이 됐으면 지워지지 않는다 — 보조 확인)
 ensure_image docflow:dev api "docflow 재시작 전"
 kubectl rollout restart deploy/docflow -n docs >/dev/null
 kubectl rollout status deploy/docflow -n docs --timeout=300s || rollout_failed docflow --tail=40
-# 프런트 운영 서버 (next start + TLS 종단, issues/48). 이미지 태그가 같아(docflow-web:dev) apply만으로는 다시 뜨지 않는다
+# 프런트 운영 서버 (next start + TLS 종단, https://github.com/reddol18/docflow/issues/48). 이미지 태그가 같아(docflow-web:dev) apply만으로는 다시 뜨지 않는다
 ensure_image docflow-web:dev web "web 재시작 전"
 kubectl rollout restart deploy/web -n docs >/dev/null
 kubectl rollout status deploy/web -n docs --timeout=180s || rollout_failed web "--all-containers=true --tail=40"

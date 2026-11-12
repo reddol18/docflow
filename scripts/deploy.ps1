@@ -48,7 +48,8 @@ try {
     ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s"
     if ($LASTEXITCODE) { throw "맥 접속 실패" }
     scp -q scripts/mac/disk_check.sh "${Mac}:doc_platform/scripts/"
-    ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/disk_check.sh"
+    # 시험 값·바꾼 기준은 지우고 부른다 — 맥 deploy.sh의 unset과 같은 목록 (https://github.com/reddol18/docflow/issues/119)
+    ssh -o BatchMode=yes $Mac "unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB; sh ~/doc_platform/scripts/disk_check.sh </dev/null"
     if ($LASTEXITCODE) { throw "디스크 여유가 모자랍니다. 정리한 뒤 배포하세요 (위 메시지)." }
 
     Write-Host "== 복사 ($sha → $Mac)"
