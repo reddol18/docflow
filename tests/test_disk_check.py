@@ -35,7 +35,8 @@ pytestmark = pytest.mark.skipif(RUNNER is None, reason="sh도 WSL도 없음 — 
 
 
 def run(script, *args, **env):
-    """환경 변수는 env 명령으로 넘긴다 (WSL은 Windows 환경 변수를 그대로 넘기지 않는다). PATH는 그대로 — colima·kubectl을 부르면 실패해야 한다."""
+    """환경 변수는 env 명령으로 넘긴다 (WSL은 Windows 환경 변수를 그대로 넘기지 않는다).
+    PATH는 그대로 — colima·kubectl을 부르면 실패해야 한다."""
     if VIA_WSL:
         cmd, penv = ["wsl", "-e", "env", *(f"{k}={v}" for k, v in env.items()), "sh", script, *args], None
     else:
