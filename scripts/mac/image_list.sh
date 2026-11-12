@@ -91,8 +91,13 @@ echo "== containerd(k8s.io) 이미지 ID별 쓰는 곳과 판단 (지우지 않�
 if [ -z "${IMAGE_LIST_TEST_IMAGES:-}" ]; then
   echo
   echo "== 고정(pin)된 이미지 — kubelet GC가 지우지 않는다 (우리 것은 docflow:dev·docflow-web:dev만이어야 함, build_image.sh)"
-  colima ssh -- sudo ctr -n k8s.io images ls </dev/null 2>/dev/null | awk '/io\.cri-containerd\.pinned=pinned/ {print "  " $1}' \
-    || echo "(ctr images ls를 부르지 못함)"
+  # ctr 실패와 '고정 없음'을 구분한다 (파이프 끝 awk는 늘 성공하므로 출력을 먼저 받는다)
+  if refs=$(colima ssh -- sudo ctr -n k8s.io images ls </dev/null 2>/dev/null); then
+    pinned=$(printf '%s\n' "$refs" | awk '/io\.cri-containerd\.pinned=pinned/ {print "  " $1}')
+    if [ -n "$pinned" ]; then printf '%s\n' "$pinned"; else echo "  (고정된 이미지 없음 — 우리 이미지도 고정 안 됨: 빌드 뒤 '== 이미지 고정' 줄 확인)"; fi
+  else
+    echo "!! ctr images ls 실패 — 고정 목록을 모른다 (colima ssh -- sudo ctr -n k8s.io images ls 로 확인)" >&2
+  fi
   echo
   echo "== 빌드 캐시 (buildkit — 이미지 목록에 안 보이지만 같은 디스크를 쓴다. 이 VM에서 빌드하는 모든 프로젝트가 함께 쓴다)"
   colima ssh -- sudo buildctl du </dev/null 2>/dev/null | tail -2 || echo "(buildctl du를 부르지 못함)"

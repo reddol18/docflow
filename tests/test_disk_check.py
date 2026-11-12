@@ -35,6 +35,16 @@ RUNNER, VIA_WSL = _runner()
 pytestmark = pytest.mark.skipif(RUNNER is None, reason="sh도 WSL도 없음 — 맥에서 손으로 확인 (PR 수동 확인 칸)")
 
 
+def run_code(code, **env):
+    """sh -c 코드 (저장소 폴더에서)."""
+    if VIA_WSL:
+        cmd, penv = ["wsl", "-e", "env", *(f"{k}={v}" for k, v in env.items()), "sh", "-c", code], None
+    else:
+        cmd, penv = [RUNNER[0], "-c", code], {**os.environ, **env}
+    p = subprocess.run(cmd, cwd=ROOT, env=penv, capture_output=True, timeout=120)
+    return p.returncode, p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")
+
+
 def run(script, *args, **env):
     """환경 변수는 env 명령으로 넘긴다 (WSL은 Windows 환경 변수를 그대로 넘기지 않는다).
     PATH는 그대로 — colima·kubectl을 부르면 실패해야 한다."""
@@ -86,14 +96,15 @@ def test_boundary_is_stop():
 
 
 def test_megabytes_and_rebuild_mode():
-    # 다시 빌드 경로: 이미지 하나 크기(MB)만큼, 여유 없이 GC high 문턱 자체로
-    code, out = disk("1400M", "rebuild", DISK_TEST_IMG_PCT="79")  # 여유 6.3GB - 1.37 = 16.4% → 84%
+    # 다시 빌드 경로: 이미지 하나 크기(MB)만큼, 여유 1%p (high 85 → 84% 이상이면 멈춤)
+    code, out = disk("1400M", "rebuild", DISK_TEST_IMG_PCT="78")  # 여유 6.6GB - 1.37 = 17.4% → 83%
     assert code == 0, out
-    assert "1400M 더 쓰면 84% — 85% 이상이면 멈춤 (GC high 85% - 여유 0%p [rebuild]" in out
-    code, out = disk("1400M", "rebuild", DISK_TEST_IMG_PCT="80")  # → 85%: kubelet이 GC를 시작할 값
-    assert code == 1 and "85%가 멈춤 기준 85% 이상" in out
+    assert "1400M 더 쓰면 83% — 84% 이상이면 멈춤 (GC high 85% - 여유 1%p [rebuild]" in out
+    code, out = disk("1400M", "rebuild", DISK_TEST_IMG_PCT="79")  # → 84%: high 바로 아래까지 채우지 않는다
+    assert code == 1 and "84%가 멈춤 기준 84% 이상" in out
     assert disk("0", "rebuild", DISK_TEST_IMG_PCT="83")[0] == 0
     assert disk("0", DISK_TEST_IMG_PCT="83")[0] == 1  # 보통 경로는 여유 3%p
+    assert disk("0", "rebuild", DISK_TEST_IMG_PCT="83", DISK_GC_REBUILD_MARGIN_PCT="2")[0] == 1
 
 
 def test_threshold_and_margin_from_env():
@@ -104,14 +115,21 @@ def test_threshold_and_margin_from_env():
     assert disk(DISK_TEST_IMG_PCT="80", DISK_GC_MARGIN_PCT="10")[0] == 1
 
 
+def run_fake(code, **env):
+    """PATH 앞에 가짜 colima·kubectl(tests/fixtures/fakebin을 임시 폴더로 복사해 실행 권한)을 두고 sh 코드를 돌린다."""
+    pre = ('B=$(mktemp -d); cp tests/fixtures/fakebin/* "$B/"; chmod +x "$B"/*; export PATH="$B:$PATH" FAKE="$B/state";'
+           ' mkdir "$FAKE"; echo sha256:new > "$FAKE/new_id";\n')
+    return run_code(pre + code + '\nrc=$?; rm -rf "$B"; exit $rc', **env)
+
+
 def test_unreadable_threshold_is_conservative():
-    # 문턱을 읽을 수 없으면(여기는 kubectl 없음) 멈추지 않고 보수적으로 high 80%
+    # 문턱을 못 읽으면(가짜 kubectl이 실패. 진짜 kubectl이 PATH 앞에 있어도 KUBECONFIG=/dev/null) 멈추지 않고 보수적으로 high 80%
     env = {k: v for k, v in BASE.items() if k != "DISK_GC_QUERY"}
-    code, out = run(DISK, DISK_TEST_IMG_PCT="76", **env)
+    code, out = run_fake(f"sh {DISK}", DISK_TEST_IMG_PCT="76", KUBECONFIG="/dev/null", **env)
     assert code == 0, out
     assert f"!! kubelet GC 문턱을 노드 configz에서 읽지 못함 — 보수적으로 high 80%로 판단 ({URL119})" in out
     assert "77% 이상이면 멈춤 (GC high 80% - 여유 3%p, low ?%; 문턱 출처: !! 실제 설정을 읽지 못해 보수적 값)" in out
-    code, out = run(DISK, DISK_TEST_IMG_PCT="77", **env)
+    code, out = run_fake(f"sh {DISK}", DISK_TEST_IMG_PCT="77", KUBECONFIG="/dev/null", **env)
     assert code == 1 and "77%가 멈춤 기준 77% 이상" in out
 
 
@@ -184,17 +202,66 @@ def test_deploy_checks_images_before_each_restart_and_build_pins():
         before = [line for line in lines[max(0, i - 3):i] if line.startswith("ensure_image")]
         assert before and before[-1].startswith(f"ensure_image {img} {what} "), marker
     assert 'build_image.sh "$2" rebuild' in text  # 다시 빌드는 rebuild 경로(이미지 하나 크기로 디스크 확인)
-    assert not any(line.startswith("sh ~/doc_platform/scripts/disk_check.sh") for line in lines)  # 중복 확인 없음 (build_image.sh가 한다)
+    assert "sh ~/doc_platform/scripts/build_image.sh all deploy" in text  # 배포 빌드는 고정 실패면 멈춤(apply 전)
+    assert 'pin_image "$1" "$(image_id "$1")" strict ||' in text  # 재시작 전 고정 안 됨 → 다시 고정, 안 되면 멈춤
+    assert not any(line.startswith("sh ~/doc_platform/scripts/disk_check.sh") for line in lines)  # 중복 확인 없음
     build = (ROOT / "scripts/mac/build_image.sh").read_text(encoding="utf-8")
-    assert 'pin_image docflow:dev "$old_api"' in build and 'pin_image docflow-web:dev "$old_web"' in build
-    assert "io.cri-containerd.pinned=pinned" in build and "io.cri-containerd.pinned= " in build  # 붙이기·옛 판 풀기
-    assert "disk_check.sh 1400M rebuild" in build and "disk_check.sh 450M rebuild" in build and "disk_check.sh 2 " in build
+    assert 'pin_image docflow:dev "$old_api" $PIN_MODE' in build and 'pin_image docflow-web:dev "$old_web" $PIN_MODE' in build
+    assert 'PIN_MODE=""; [ -z "$MODE" ] || PIN_MODE=strict' in build  # deploy·rebuild = strict, 손 빌드 = 경고만
+    assert 'size=450M; [ "$WHAT" != api ] || size=1400M' in build and 'disk_check.sh "$size" rebuild' in build
+    assert "build_image.sh $WHAT rebuild" in build  # 막히면 정리 뒤 다시 빌드 안내
+    assert "disk_check.sh 2 " in build
+
+
+# ---- pin_image.sh: 가짜 colima로 분기 ----
+PIN = "PIN_SLEEP=0; . scripts/mac/pin_image.sh; "
+
+
+def test_pin_waits_until_cri_sees_image():
+    code, out = run_fake('echo 3 > "$FAKE/hidden"; ' + PIN + 'pin_image docflow:dev "" strict; echo "rc=$?"; '
+                         'grep -c "crictl inspecti -o" "$FAKE/calls"; head -1 "$FAKE/calls"')
+    assert code == 0, out
+    assert "== 이미지 고정: docflow:dev new (pinned: true — kubelet 이미지 GC 대상 아님)" in out and "rc=0" in out
+    assert "첫 시도 실패" not in out
+    assert "\n4\n" in out  # 안 보인 3번 + 보인 1번
+    assert "ctr -n k8s.io images label docker.io/library/docflow:dev io.cri-containerd.pinned=pinned" in out  # 라벨이 먼저
+    assert "== 옛 판 확인 생략: docflow:dev 빌드 전 ID 없음" in out and "image_list.sh '고정된 이미지'" in out
+
+
+def test_pin_second_try_then_success():
+    code, out = run_fake('echo 15 > "$FAKE/hidden"; ' + PIN + 'pin_image docflow:dev "" strict; echo "rc=$?"')
+    assert "!! 이미지 고정: docflow:dev 첫 시도 실패 — 한 번 더" in out
+    assert "== 이미지 고정: docflow:dev new" in out and "rc=0" in out
+
+
+@pytest.mark.parametrize("state", ["label_fail", "never_pinned", "hidden_forever"])
+def test_pin_failure_stops_deploy_path_and_warns_manual(state):
+    setup = 'echo 99 > "$FAKE/hidden"; ' if state == "hidden_forever" else f'touch "$FAKE/{state}"; '
+    code, out = run_fake(setup + PIN + 'pin_image docflow:dev "" strict; echo "rc=$?"')
+    assert "!! 이미지 고정 실패: docflow:dev — 두 번 시도해도 pinned: true가 아님. 배포 경로라 멈춘다 (롤아웃하지 않음)" in out
+    assert "rc=1" in out and "== 이미지 고정:" not in out
+    code, out = run_fake(setup + PIN + 'pin_image docflow:dev ""; echo "rc=$?"')
+    assert "!! 이미지 고정 실패: docflow:dev — GC에서 빠지지 않는다 (수동 빌드라 경고만" in out and "rc=0" in out
+
+
+def test_pin_checks_old_image_released():
+    code, out = run_fake('touch "$FAKE/old_exists" "$FAKE/old_pinned"; ' + PIN
+                         + 'pin_image docflow:dev sha256:old strict; echo "rc=$?"')
+    assert "!! 옛 판 고정이 남음: docflow:dev old — GC되지 않아 디스크를 잡는다" in out and "rc=0" in out
+    code, out = run_fake('touch "$FAKE/old_exists"; ' + PIN + 'pin_image docflow:dev sha256:old strict; echo "rc=$?"')
+    assert "== 옛 판 고정 없음: docflow:dev old (안 쓰이면 GC 대상)" in out
+    code, out = run_fake(PIN + 'pin_image docflow:dev sha256:new strict; echo "rc=$?"')  # 같은 ID(캐시 빌드) → 옛 판 확인 없음
+    assert "옛 판" not in out and "rc=0" in out
 
 
 def test_user_messages_use_full_issue_url():
-    for f in (DISK, "scripts/mac/deploy.sh", "scripts/mac/build_image.sh", LIST):
+    # 이슈 번호는 늘 전체 URL로 (issues/<번호>·#<번호> 줄임 금지)
+    for f in (DISK, "scripts/mac/deploy.sh", "scripts/mac/build_image.sh", "scripts/mac/pin_image.sh", LIST):
         text = (ROOT / f).read_text(encoding="utf-8")
-        assert not re.search(r"(?<!docflow/)issues/1[0-9][0-9]\b", text), f
+        for m in re.finditer(r"issues/\d+", text):
+            assert text[:m.start()].endswith("https://github.com/reddol18/docflow/"), (f, text[max(0, m.start() - 40):m.end()])
+        assert not re.search(r"(?<![\w&])#\d{2,}\b", text), f
+
 
 WORKLOADS = "\n".join([
     "docs\tdocflow:dev ",

@@ -7,3 +7,5 @@ scripts/tool_pins.txt text eol=lf
 requirements.lock text eol=lf
 # 평가 세트 diff: CRLF로 바뀌면 git apply가 깨진다
 evals/**/*.patch text eol=lf
+# 시험용 가짜 colima·kubectl (sh 스크립트, 확장자 없음): WSL·sh가 읽도록 LF
+tests/fixtures/fakebin/* text eol=lf

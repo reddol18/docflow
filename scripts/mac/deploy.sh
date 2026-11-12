@@ -7,23 +7,27 @@ export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 URL119=https://github.com/reddol18/docflow/issues/119
 # 디스크 확인의 시험 값·바꾼 기준은 배포에서 늘 지운다 (실제 측정·실제 문턱·저장소의 기준만) — scripts/mac/disk_check.sh 머리말.
 # scripts/deploy.ps1의 사전 확인도 같은 목록 (tests/test_disk_check.py가 둘이 disk_check.sh의 변수를 모두 지우는지 본다)
-unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB
+unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_GC_REBUILD_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB PIN_TRIES PIN_SLEEP
+. ~/doc_platform/scripts/pin_image.sh
 
 # 이미지를 kubelet 이미지 GC에서 지키는 것 (https://github.com/reddol18/docflow/issues/119):
-#   주: build_image.sh가 빌드 직후 우리 두 이미지를 고정(pin)한다 — '== 이미지 고정' 줄.
+#   주: build_image.sh가 빌드 직후 우리 두 이미지를 고정(pin)한다 — '== 이미지 고정' 줄. 배포 경로(deploy·rebuild)에서는
+#   두 번 시도해도 안 되면 빌드가 실패로 멈춰 apply·롤아웃까지 가지 않는다 (scripts/mac/pin_image.sh).
 #   보조: 재시작 바로 전에 이미지가 containerd(k8s.io)에 있는지·고정됐는지 본다 — '== 이미지 확인' 줄. imagePullPolicy: Never라
 #   없으면 새 파드가 ErrImageNeverPull로 뜨지 못한다(2026-11-10 약 10분 중단). 없으면 빌드 캐시로 그 이미지만 다시 만들고
 #   (build_image.sh api|web rebuild — 디스크 확인을 그 이미지 크기로), 그래도 없으면 롤아웃하지 않고 멈춘다.
 has_image() { colima nerdctl -- --namespace k8s.io image inspect "$1" >/dev/null 2>&1 </dev/null; }
-pinned() { colima ssh -- sudo crictl inspecti "docker.io/library/$1" </dev/null 2>/dev/null | grep -q '"pinned": true'; }
 ensure_image() {  # $1 이미지, $2 build_image.sh 대상(api|web), $3 언제
   if ! has_image "$1"; then
     echo "!! 이미지 확인($3): $1 없음 — kubelet 이미지 GC가 지웠을 수 있다. 빌드 캐시로 다시 빌드한다" >&2
     sh ~/doc_platform/scripts/build_image.sh "$2" rebuild </dev/null || { echo "!! $1 다시 빌드 실패 — 롤아웃하지 않음" >&2; return 1; }
     has_image "$1" || { echo "!! 이미지 확인($3): $1 다시 빌드해도 없음 — 롤아웃하지 않음. sh ~/doc_platform/scripts/image_list.sh로 디스크·이미지 확인" >&2; return 1; }
   fi
-  if pinned "$1"; then echo "== 이미지 확인($3): $1 있음, 고정(pinned: true)"
-  else echo "!! 이미지 확인($3): $1 있음, 고정 안 됨 — GC에서 빠지지 않는다 (build_image.sh '이미지 고정' 줄 확인)" >&2; fi
+  if is_pinned "docker.io/library/$1"; then echo "== 이미지 확인($3): $1 있음, 고정(pinned: true)"; return 0; fi
+  # 고정이 빠졌으면 다시 고정한다(두 번 시도). 안 되면 롤아웃하지 않는다
+  echo "!! 이미지 확인($3): $1 있음, 고정 안 됨 — 다시 고정한다" >&2
+  pin_image "$1" "$(image_id "$1")" strict || { echo "!! 이미지 확인($3): $1 고정 실패 — 롤아웃하지 않음" >&2; return 1; }
+  echo "== 이미지 확인($3): $1 있음, 다시 고정(pinned: true)"
 }
 # 롤아웃이 실패하면: 파드가 ErrImageNeverPull이면 원인을 크게 알린다 → 로그 → 실패
 rollout_failed() {  # $1 Deployment, $2 logs 인자
@@ -49,8 +53,9 @@ sh ~/doc_platform/scripts/owner_migrate.sh check
 kubectl get secret tls-web tls-postgres tls-qdrant qdrant-api-key -n docs >/dev/null </dev/null \
   && kubectl get configmap docflow-ca -n docs >/dev/null </dev/null \
   || { echo "TLS Secret(tls-web·tls-postgres·tls-qdrant·qdrant-api-key)·ConfigMap docflow-ca가 없음 — Windows에서 scripts/tls_secrets.ps1 먼저. 배포하지 않음" >&2; exit 1; }
-# 빌드 → 바로 고정('== 이미지 고정' 줄). 그 직후의 apply 전 확인은 따로 두지 않는다(고정 줄이 같은 것을 방금 본다)
-sh ~/doc_platform/scripts/build_image.sh </dev/null
+# 빌드 → 바로 고정('== 이미지 고정' 줄). 고정이 확인되지 않으면 build_image.sh가 실패로 멈춰 apply에 가지 않는다 —
+# 그래서 apply 전 확인은 따로 두지 않는다(고정 줄이 같은 것을 방금 확인했다)
+sh ~/doc_platform/scripts/build_image.sh all deploy </dev/null
 kubectl apply -f ~/doc_platform/k8s/docs.yaml >/dev/null
 # postgres·qdrant 이미지를 바꾸면 apply가 둘을 다시 띄운다(Recreate) — docflow는 시작할 때 DB에 붙으므로 먼저 기다린다
 for d in postgres qdrant; do

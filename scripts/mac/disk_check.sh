@@ -2,7 +2,7 @@
 # 디스크 확인 — 배포·이미지 빌드/받기·파드 늘리기 같은, 디스크를 쓰는 일 전에 반드시 부른다. 걸리면 종료 코드 1.
 #   sh disk_check.sh                 지금 상태로
 #   sh disk_check.sh 8               이번 일에 colima에서 8GB를 더 쓸 예정 (정수 GB)
-#   sh disk_check.sh 1400M rebuild   이미지 하나를 빌드 캐시로 다시 만들 때 (MB 단위, 여유 없이 GC high 문턱 자체로 판단 — 아래)
+#   sh disk_check.sh 1400M rebuild   이미지 하나를 빌드 캐시로 다시 만들 때 (MB 단위, 여유 1%p로 판단 — 아래)
 # 보는 것 세 가지 (하나라도 걸리면 멈춤):
 #   1) 이미지 디스크 사용률(%) — 이번에 더 쓴 뒤의 사용률이 kubelet 이미지 GC 문턱 - 여유 미만이어야 한다
 #   2) colima 데이터 디스크 여유 GB (MIN_VM + 더 쓸 양)
@@ -25,6 +25,7 @@ URL119=https://github.com/reddol18/docflow/issues/119
 MIN_VM=${DISK_MIN_VM_GB:-4}              # colima 데이터 디스크 최소 여유 GB (+ 더 쓸 양)
 MIN_HOST=${DISK_MIN_HOST_GB:-10}         # 맥 호스트 최소 여유 GB
 GC_MARGIN=${DISK_GC_MARGIN_PCT:-3}       # high 문턱보다 이만큼(%p) 아래에서 멈춘다 — 빌드 추정 오차·롤아웃 중 로그 몫
+GC_REBUILD_MARGIN=${DISK_GC_REBUILD_MARGIN_PCT:-1}   # rebuild 경로의 여유(%p) — 아래 인자 설명
 GC_HIGH_DEFAULT=85                       # kubelet imageGCHighThresholdPercent 기본값 (2026-11-13 이 노드 configz 실측도 85)
 GC_LOW_DEFAULT=80                        # kubelet imageGCLowThresholdPercent 기본값 (실측 80)
 GC_HIGH_UNKNOWN=80                       # configz를 못 읽었을 때 쓰는 보수적 high 문턱
@@ -49,12 +50,13 @@ case "$NEED_RAW" in
 esac
 case "$MODE" in
   "") ;;
-  # 다시 빌드: 캐시로 이미지 하나의 층(압축 blob + 풀린 스냅숏)만 다시 쓴다 — 양을 알고 있으므로 추정 여유를 두지 않는다.
-  # GC가 방금 그 이미지를 지웠다면 사용률은 low 문턱(80%) 근처라, 여유(82%)로 재면 늘 막혀 되살릴 수 없다
-  rebuild) GC_MARGIN=0 ;;
+  # 다시 빌드: 캐시로 이미지 하나의 층(압축 blob + 풀린 스냅숏)만 다시 쓴다 — 양을 실측으로 알고(올려 잡음) 있으므로 여유를 1%p로.
+  # 보통 여유(3%p, 82%)로 재면 GC 직후(low 80% 근처) 늘 막혀 되살릴 수 없다. 0%p면 high 바로 아래(84%)까지 채워 롤아웃 중
+  # 로그·작은 쓰기로 high에 닿아 GC가 남의 이미지를 지울 수 있어 1%p(이 디스크 약 300MB)를 둔다. 여유 값은 DISK_GC_REBUILD_MARGIN_PCT
+  rebuild) GC_MARGIN=$GC_REBUILD_MARGIN ;;
   *) die "두 번째 인자는 rebuild만 받는다: '$MODE'" ;;
 esac
-num DISK_MIN_VM_GB "$MIN_VM"; num DISK_MIN_HOST_GB "$MIN_HOST"; num DISK_GC_MARGIN_PCT "$GC_MARGIN"
+num DISK_MIN_VM_GB "$MIN_VM"; num DISK_MIN_HOST_GB "$MIN_HOST"; num DISK_GC_MARGIN_PCT "$GC_MARGIN"; num DISK_GC_REBUILD_MARGIN_PCT "$GC_REBUILD_MARGIN"
 printf '%s\n' "$IMAGE_FS" | grep -Eq '^/[A-Za-z0-9/_.-]+$' || die "DISK_IMAGE_FS 경로 형식이 틀림: '$IMAGE_FS'"
 
 n_test=0

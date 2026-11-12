@@ -1,0 +1,42 @@
+#!/bin/sh
+# 시험용 가짜 colima (tests/test_disk_check.py). 'colima ssh -- [sudo] crictl|ctr …'만 흉내 낸다. 상태는 $FAKE 폴더의 파일:
+#   new_id       이름 ref(docker.io/library/…)의 이미지 ID
+#   hidden       이름 ref가 CRI에 안 보이는 남은 횟수 (inspecti 부를 때마다 1씩 줄어든다)
+#   label_fail   있으면 ctr images label 실패
+#   never_pinned 있으면 라벨을 붙여도 CRI가 pinned: false
+#   pinned       ctr 라벨로 붙은 고정 (이 파일이 상태)
+#   old_exists·old_pinned   sha256:<옛 ID> ref가 있는지·CRI가 고정으로 보는지
+#   calls        부른 명령 기록
+[ -n "${FAKE:-}" ] && [ -d "$FAKE" ] || { echo "fake colima: FAKE 폴더가 없음" >&2; exit 2; }
+[ "${1:-}" = ssh ] && [ "${2:-}" = -- ] || { echo "fake colima: ssh -- 만 흉내 냄" >&2; exit 2; }
+shift 2
+[ "${1:-}" != sudo ] || shift
+echo "$*" >> "$FAKE/calls"
+pinned_line() { if [ "$1" = 1 ]; then echo '    "pinned": true,'; else echo '    "pinned": false,'; fi; }
+case "$1 ${2:-}" in
+  "crictl inspecti")
+    shift 2
+    tpl=0
+    if [ "${1:-}" = -o ]; then tpl=1; shift 4; fi
+    ref=${1:-}
+    case "$ref" in
+      sha256:*)
+        [ -f "$FAKE/old_exists" ] || { echo "no such image \"$ref\"" >&2; exit 1; }
+        if [ "$tpl" = 1 ]; then echo "$ref"; else p=0; [ ! -f "$FAKE/old_pinned" ] || p=1; pinned_line "$p"; fi
+        exit 0 ;;
+    esac
+    n=$(cat "$FAKE/hidden" 2>/dev/null || echo 0)
+    if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$FAKE/hidden"; echo "no such image \"$ref\"" >&2; exit 1; fi
+    if [ "$tpl" = 1 ]; then cat "$FAKE/new_id"; exit 0; fi
+    p=0; if [ -f "$FAKE/pinned" ] && [ ! -f "$FAKE/never_pinned" ]; then p=1; fi
+    pinned_line "$p" ;;
+  "ctr -n")
+    # ctr -n k8s.io images label <ref> <키=값>
+    if [ "${4:-}" = images ] && [ "${5:-}" = label ]; then
+      [ ! -f "$FAKE/label_fail" ] || { echo "ctr: label 실패(흉내)" >&2; exit 1; }
+      case "${7:-}" in *=pinned) touch "$FAKE/pinned" ;; *) rm -f "$FAKE/pinned" ;; esac
+      exit 0
+    fi
+    echo "fake colima: 모르는 ctr 명령: $*" >&2; exit 2 ;;
+  *) echo "fake colima: 모르는 명령: $*" >&2; exit 2 ;;
+esac
