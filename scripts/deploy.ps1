@@ -9,7 +9,7 @@
 
 이미지는 requirements.lock(해시 고정)으로 설치한다. requirements.txt를 바꿨으면 배포 전에 .\scripts\lock_refresh.ps1로 lock을 다시 만들어 커밋한다.
 
-순서: 커밋 안 된 변경 확인 → 로컬 검사(scripts/check.ps1) → 맥 디스크 여유 확인(scripts/mac/disk_check.sh, 모자라면 중단) → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기)
+순서: 커밋 안 된 변경 확인 → 로컬 검사(scripts/check.ps1) → 맥 디스크 확인(scripts/mac/disk_check.sh — 여유 GB와 이미지 디스크 사용률·kubelet GC 문턱, 걸리면 중단) → 맥으로 복사 → scripts/mac/deploy.sh(빌드·재시작·준비 대기)
       → 태그 deploy-YYYYMMDD-HHMM push
 (맥에는 git 저장소가 없어서 태그는 이 스크립트가 남긴다)
 프런트엔드 (https://github.com/reddol18/docflow/issues/48): k3s web 파드 = 운영 빌드. 맥 build_image.sh가 frontend/Dockerfile로

@@ -353,6 +353,27 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 - k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
 - emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi(업로드 본문을 Starlette가 흘려 쓰는 곳). 넘으면 kubelet이 docflow 파드를 내쫓으므로 앱이 업로드를 묶는다(`app/upload.py`, https://github.com/reddol18/docflow/issues/26): 파일 하나 `UPLOAD_MAX_MB`(기본 20, 넘으면 413), 요청 하나 `UPLOAD_MAX_FILES`장(기본 50, 넘으면 400), 픽셀 수 `UPLOAD_MAX_MPX`(기본 100MP — A3 600dpi ≈ 70MP, 넘으면 400), 스캔 수 `UPLOAD_MAX_SCANS`(기본 64, 넘으면 400), 요청 본문 `UPLOAD_MAX_BODY_MB`(기본 210 — 화면이 10장씩 보냄, 받은 바이트로 세어 413), 동시에 받는 본문 합계 `UPLOAD_TMP_MB`(기본 1536, 넘으면 429), 동시 디코드 검사 `UPLOAD_DECODE_SLOTS`(기본 2). 본문은 로그인·역할·CSRF 확인 뒤에 읽는다. 같은 이름의 다른 내용은 409, `?replace=true`면 바꾸고 그 쪽 OCR을 지운다. 새 쪽·교체는 처음·끝난 철만(실행 중·검토 대기·멈춤은 409), 끝난 철은 `/run`으로 다시.
 
+### colima 디스크 정리 기준 (https://github.com/reddol18/docflow/issues/119)
+
+맥 colima VM의 이미지 디스크(`/var/lib/containerd`·`/var/lib/rancher`, 같은 `/dev/vdb1` 30GB)가 kubelet 이미지 GC 문턱(high 85%)을 넘으면 kubelet이 **돌고 있는 컨테이너가 쓰지 않는 이미지**를 오래된 것부터 low 80%까지 지운다. 배포 중(빌드 뒤~새 파드 전, Recreate로 옛 파드가 내려간 사이) `docflow:dev`가 여기에 걸려 지워지면 `imagePullPolicy: Never`라 새 파드가 `ErrImageNeverPull`로 멈춘다(2026-11-10 약 10분 중단).
+
+- **막는 곳:** `scripts/mac/disk_check.sh`가 여유 GB와 함께 이미지 디스크 사용률을 본다 — `지금 사용 + 이번에 더 쓸 GB`의 사용률(올림)이 `GC high - 여유`(기본 85 - 3 = 82%) 이상이면 멈춘다. 문턱은 노드의 실제 kubelet 설정(`kubectl get --raw /api/v1/nodes/<노드>/proxy/configz`의 `imageGCHighThresholdPercent`)에서 읽고, 못 읽으면 기본값 85/80(출력에 출처가 찍힌다). 값은 그 파일 머리 한 곳: `DISK_GC_MARGIN_PCT`·`DISK_GC_HIGH_PCT`·`DISK_GC_LOW_PCT`·`DISK_MIN_VM_GB`·`DISK_MIN_HOST_GB`. 시험 값 `DISK_TEST_IMG_PCT` 등으로 멈추는 것을 볼 수 있다(예: `DISK_TEST_IMG_PCT=84 sh ~/doc_platform/scripts/disk_check.sh` → 종료 코드 1). 배포(`scripts/mac/deploy.sh`)는 시험 값을 지우고 부른다.
+- **배포 중:** `scripts/mac/deploy.sh`가 apply 전·docflow 재시작 전·web 재시작 전에 이미지가 containerd(k8s.io)에 있는지 보고(`== 이미지 확인(…)` 줄), 없으면 빌드 캐시로 그 이미지만 다시 빌드(`build_image.sh api|web`), 그래도 없으면 롤아웃하지 않고 멈춘다. 롤아웃이 실패하고 파드가 `ErrImageNeverPull`이면 원인과 되살리는 순서를 크게 찍는다.
+- **목록 보기 (읽기만, 지우지 않음):** 맥에서 `sh ~/doc_platform/scripts/image_list.sh` — 사용률·문턱, containerd 이미지마다 쓰는 네임스페이스와 판단, 빌드 캐시 크기. 손으로 볼 때는:
+
+  | 무엇 | 명령 (맥) |
+  |---|---|
+  | 사용률 | `colima ssh -- df -h /var/lib/containerd /mnt/lima-colima` |
+  | 이미지 (크기·태그 없음 포함) | `colima nerdctl -- --namespace k8s.io images` 또는 `colima ssh -- sudo crictl images` |
+  | 워크로드가 쓰는 이미지 | `kubectl get deploy,statefulset,daemonset -A -o wide` (0개로 줄인 것도 정의가 남아 있으면 그 이미지는 그 프로젝트 것) |
+  | 빌드 캐시 | `colima ssh -- sudo buildctl du` |
+  | GC 문턱 | `kubectl get --raw /api/v1/nodes/<노드>/proxy/configz` 의 `imageGC*` |
+
+- **판단 (사용자가 한다):** 지울지는 사용자가 정하고, 지우는 명령도 사용자가 직접 친다 — 스크립트는 지우지 않는다.
+  - 후보: `docs` 네임스페이스의 예전 판·태그 없는(dangling) docflow 빌드, 쌓인 빌드 캐시(지우면 다음 빌드가 느려진다).
+  - **대상 아님:** 다른 프로젝트 네임스페이스(bank-a·bank-b·gateway·ocr·queue·keda·sllm)가 쓰거나 같은 이름을 쓰는 이미지(0개로 줄였어도), `kube-system`·pause 같은 시스템 이미지, 지금 `docs`가 쓰는 이미지. 주인을 모르는 이미지는 확인 전엔 두기.
+  - 목표: 다음 배포의 빌드 몫(2GB)을 더해도 멈춤 기준(82%) 아래. 맥 호스트(`df -g /Users`)도 10GB 이상.
+
 ## 개발 절차
 
 - 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).
