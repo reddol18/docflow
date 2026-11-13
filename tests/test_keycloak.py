@@ -249,6 +249,30 @@ def test_keycloak_image_pinned_and_limited():
     assert quota["limits.memory"] == "1Gi" and quota["persistentvolumeclaims"] == "1"
 
 
+def test_keycloak_built_by_init_containers():
+    """공식 이미지는 미리 빌드돼 있지 않다 — 첫 시작에 --optimized가 거부된다(2026-11-13 맥 실측). 초기화 컨테이너가 lib/quarkus를
+    emptyDir로 복사(cp -R)하고 kc.sh build, 본 컨테이너가 그 결과로 start --optimized. 모두 같은 고정 이미지·루트 FS 읽기 전용"""
+    spec = _get(KC, "Deployment", "keycloak")["spec"]["template"]["spec"]
+    inits = {c["name"]: c for c in spec["initContainers"]}
+    assert list(inits) == ["copy-quarkus", "build"]  # 순서: 복사 → 빌드
+    assert "cp -R /opt/keycloak/lib/quarkus/. /qk/" in inits["copy-quarkus"]["command"][-1]
+    assert inits["build"]["args"][0] == "build" and "--db=dev-file" in inits["build"]["args"]
+    vols = {v["name"]: v for v in spec["volumes"]}
+    assert "emptyDir" in vols["quarkus"]
+    for c in [*inits.values(), KC_C]:
+        assert c["image"] == KC_C["image"]
+        sc = c["securityContext"]
+        assert sc["readOnlyRootFilesystem"] is True and sc["capabilities"]["drop"] == ["ALL"] and sc["allowPrivilegeEscalation"] is False
+        assert c["resources"]["limits"]["memory"]
+        assert "env" not in c or not any("valueFrom" in e for e in c["env"]) or c is KC_C  # Secret은 본 컨테이너에만
+    mounts = lambda c: {m["name"]: m for m in c["volumeMounts"]}  # noqa: E731
+    assert mounts(inits["copy-quarkus"])["quarkus"]["mountPath"] == "/qk"
+    assert set(mounts(inits["build"])) == {"quarkus", "tmp"}  # 빌드는 H2 PVC(data)를 붙이지 않는다
+    assert mounts(inits["build"])["quarkus"]["mountPath"] == mounts(KC_C)["quarkus"]["mountPath"] == "/opt/keycloak/lib/quarkus"
+    assert mounts(KC_C)["quarkus"].get("readOnly") is True  # 본 컨테이너는 빌드 결과를 바꿀 수 없다
+    assert "--cache=local" in KC_C["args"]  # 복제본 하나 — 클러스터 캐시 없이 (cache는 실행 옵션)
+
+
 def test_keycloak_image_scanned_and_tag_checked():
     """배포 때 이미지 스캔·고정 다이제스트 확인이 keycloak.yaml도 읽는다 (https://github.com/reddol18/docflow/issues/46)"""
     scan = (ROOT / "scripts/mac/scan_image.sh").read_text(encoding="utf-8")
@@ -267,7 +291,8 @@ def test_keycloak_pod_security():
     sc = KC_C["securityContext"]
     assert sc["allowPrivilegeEscalation"] is False and sc["readOnlyRootFilesystem"] is True and sc["capabilities"]["drop"] == ["ALL"]
     mounts = {m["mountPath"] for m in KC_C["volumeMounts"]}
-    assert mounts == {"/opt/keycloak/data", "/opt/keycloak/data/import", "/tmp"}
+    # 쓰는 곳: PVC·realm(읽기 전용)·/tmp·초기화 컨테이너가 만든 빌드 결과(emptyDir)
+    assert mounts == {"/opt/keycloak/data", "/opt/keycloak/data/import", "/tmp", "/opt/keycloak/lib/quarkus"}
 
 
 def test_keycloak_network_policies():
@@ -440,7 +465,7 @@ def test_script_first_run_creates_secrets_once_and_syncs_docs_after_rollout():
     assert "secret docs/oidc: Keycloak client secret과 같게 바꿈" in out
     assert "docflow는 아직 Secret oidc를 마운트하지 않음" in out and "patch" not in calls
     assert "== clusterIP 10.43.0.39: 서비스 대역 10.43.0.0/16 안, 비어 있음" in out
-    assert out.index("DISK_CHECK 1") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인
+    assert out.index("DISK_CHECK 2") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인 (이미지 + emptyDir 몫)
     assert _idx(calls, "get servicecidrs") < _idx(calls, "get svc") < _idx(calls, "apply")
     # docs/oidc는 Keycloak이 준비된 뒤에만
     assert _idx(calls, "rollout status deploy/keycloak") < _idx(calls, "STORED create secret docs/oidc")

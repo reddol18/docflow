@@ -64,8 +64,8 @@ if [ "${1:-}" = verify ]; then
   exit 0
 fi
 
-echo "== 디스크 여유 확인 (이미지 처음 받기 몫 1GB)"
-sh "$HERE/disk_check.sh" 1 </dev/null || { echo "디스크 여유가 모자람 — Keycloak을 올리지 않음 (위 메시지)" >&2; exit 1; }
+echo "== 디스크 여유 확인 (이미지 처음 받기 + 빌드 결과 emptyDir 512Mi·/tmp 256Mi 몫 2GB)"
+sh "$HERE/disk_check.sh" 2 </dev/null || { echo "디스크 여유가 모자람 — Keycloak을 올리지 않음 (위 메시지)" >&2; exit 1; }
 
 D=$(mktemp -d "${TMPDIR:-/tmp}/docflow-kc.XXXXXX")
 trap 'rm -rf "$D"' EXIT
@@ -135,7 +135,8 @@ kubectl apply -f "$K/keycloak.yaml" </dev/null
 # 처음엔 이미지 받기 + 첫 시작(H2 만들기·realm 가져오기)으로 몇 분 걸린다
 if ! kubectl rollout status deploy/keycloak -n $NS --timeout=600s </dev/null; then
   kubectl get pods -n $NS </dev/null || true
-  kubectl logs deploy/keycloak -n $NS --tail=60 </dev/null || true
+  # 초기화 컨테이너(copy-quarkus·build)에서 멈췄을 수도 있어 모든 컨테이너 로그 (본 컨테이너만 보면 PodInitializing뿐)
+  kubectl logs deploy/keycloak -n $NS --all-containers=true --tail=40 </dev/null || true
   echo "!! Keycloak이 준비되지 않음 — docs/oidc·docflow는 건드리지 않았다. 고친 뒤 이 스크립트를 다시" >&2
   exit 1
 fi

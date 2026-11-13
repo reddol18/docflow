@@ -384,7 +384,7 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 | 무엇 | 값 |
 |---|---|
 | 매니페스트 | `k8s/keycloak.yaml` — 네임스페이스 `keycloak`(docs 쿼터·PVC를 쓰지 않음, 자체 쿼터 요청 메모리 640Mi·한도 1Gi·PVC 1), 기본 차단 NetworkPolicy, 들어오는 것은 docs의 docflow API 파드 8080만 |
-| 이미지 | `quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e…` (amd64 압축 약 253MB). `start --optimized` — 이미지에 미리 된 빌드를 그대로 써서 루트 파일시스템 읽기 전용. 배포 때 스캔(`scan_image.sh`, k3s에 없으면 건너뜀)·고정 다이제스트 확인(`image_tags.sh`)에 들어간다 |
+| 이미지 | `quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e…` (amd64 압축 약 253MB). 이미지는 미리 빌드돼 있지 않아(첫 시작에 `--optimized` 거부, 맥 실측) 초기화 컨테이너가 `lib/quarkus`를 emptyDir로 복사해 `kc.sh build --db=dev-file`(약 10초) → 본 컨테이너 `start --optimized`. 세 컨테이너 모두 루트 파일시스템 읽기 전용. 배포 때 스캔(`scan_image.sh`, k3s에 없으면 건너뜀)·고정 다이제스트 확인(`image_tags.sh`)에 들어간다 |
 | 저장소 | Keycloak 자체 H2 파일(dev-file)을 PVC `keycloak-data`(512Mi)에. 별도 Postgres 없음 — realm은 저장소 JSON에서 언제든 다시 만든다 |
 | 메모리 | 요청 512Mi · 한도 1Gi, 힙은 한도의 50%(`JAVA_OPTS_KC_HEAP`) |
 | realm | `k8s/keycloak/docflow-realm.json` — realm `docflow`(비밀번호 정책 `length(12)`, 무차별 대입 보호), 기밀 클라이언트 `docflow`(PKCE S256 필수, 콜백 `http://localhost:3000/api/auth/oidc/callback` 하나), 그룹 `/docflow-admin`·`/docflow-reviewer`, 가상 사용자 `hangaram`(두 그룹)·`seonuri`(reviewer). 비밀값 칸은 `${…}` 자리표시자뿐 — 가져올 때 Secret에서 채운다 |
