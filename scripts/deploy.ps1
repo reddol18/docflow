@@ -47,7 +47,7 @@ try {
     Write-Host "== 디스크 여유 확인"
     # 반드시: 모자란 채로 빌드하면 kubelet이 운영 파드를 내쫓는다 (2026-11-07). 맥 쪽 deploy.sh도 빌드 전에 한 번 더 본다
     Invoke-Mac -Mac $Mac -Script "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s" -Stream -FailMessage "맥 접속 실패"
-    Copy-ToMac -Mac $Mac -Path scripts/mac/disk_check.sh -Destination "doc_platform/scripts/" -AllowFail
+    Copy-ToMac -Mac $Mac -Path scripts/mac/disk_check.sh -Destination "doc_platform/scripts/" -FailMessage "디스크 확인 스크립트(disk_check.sh) 복사 실패 — 디스크 확인은 필수라 배포하지 않습니다."
     # 시험 값·바꾼 기준은 지우고 부른다 — 맥 deploy.sh의 unset과 같은 목록 (https://github.com/reddol18/docflow/issues/119)
     Invoke-Mac -Mac $Mac -Script "unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_GC_REBUILD_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB; sh ~/doc_platform/scripts/disk_check.sh </dev/null" -Stream -TimeoutSec 180 -FailMessage "디스크 여유가 모자랍니다. 정리한 뒤 배포하세요 (위 메시지)."
 
@@ -78,11 +78,9 @@ try {
     $freeze = Join-Path ([IO.Path]::GetTempPath()) "docflow-requirements.freeze"
     Remove-Item $freeze -ErrorAction SilentlyContinue
     $copied = $false
-    try {  # 시간 제한(throw)이어도 경고만 — 롤아웃은 이미 끝났다
-        Copy-FromMac -Mac $Mac -Path "doc_platform/requirements.freeze" -Destination $freeze -TimeoutSec 120 -AllowFail
-        $copied = -not $LASTEXITCODE
-    } catch { Write-Warning $_ }
-    if (-not $copied -or -not (Test-Path $freeze) -or -not (Get-Item $freeze).Length) {
+    try { Copy-FromMac -Mac $Mac -Path "doc_platform/requirements.freeze" -Destination $freeze -TimeoutSec 120; $copied = $true }
+    catch { Write-Host $_ }  # 실패·시간 제한 모두 경고만 — 롤아웃은 이미 끝났다
+    if (-not $copied -or -not (Get-Item $freeze).Length) {
         Write-Warning "이미지 패키지 목록(requirements.freeze)을 받지 못해 lock 비교를 건너뜁니다. 빌드 출력의 'lock 일치' 줄을 확인하세요."
     } else {
         $pins = { param($p) Get-Content $p | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { ($_.Trim() -split '\s+')[0] } }

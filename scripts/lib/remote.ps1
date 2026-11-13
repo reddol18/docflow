@@ -1,34 +1,58 @@
 ﻿<#
 맥 원격 명령은 여기 함수로만 한다 (W46 회고 규칙 B, https://github.com/reddol18/docflow/issues/117).
-스크립트에서 ssh·scp를 직접 부르지 않는다 — tests/test_remote_helper.py가 막는다.
+스크립트에서 ssh·scp를 직접 부르지 않는다 — tests/test_remote_helper.py가 PowerShell AST로 막는다.
 
   . (Join-Path $PSScriptRoot "lib/remote.ps1")
   Invoke-Mac -Mac $Mac -Script "sh ~/doc_platform/scripts/deploy.sh" -Stream -TimeoutSec 3600 -FailMessage "배포 실패"
-  $rows = Invoke-Mac -Mac $Mac -Script "kubectl get pods -n docs </dev/null"          # 출력 줄을 돌려받음
+  $rows = Invoke-Mac -Mac $Mac -Script "kubectl get pods -n docs"                   # 출력 줄을 돌려받음
   Invoke-Mac -Mac $Mac -Script "sh ~/doc_platform/scripts/tls_secrets.sh" -Stdin $text  # 표준 입력 (BOM 없음)
   Copy-ToMac -Mac $Mac -Path a.sh, b.sh -Destination "doc_platform/scripts/"
   Copy-FromMac -Mac $Mac -Path "doc_platform/requirements.freeze" -Destination $local
 
 왜 (2026-W46):
 - PowerShell 5.1은 네이티브 명령 인자 안의 큰따옴표를 지운다 → 맥 zsh가 'command not found'를 냈고 맥 고장으로 오해했다.
-  그래서 스크립트는 base64로 넘긴다. 맥에 가는 명령줄은 늘 아래 한 줄이고 큰따옴표가 없다:
-    sh -c 'exec 4<&0; echo <base64> | base64 -D | sh /dev/fd/3 3<&0 0<&4 4<&-'
-  (안쪽 sh는 스크립트를 fd 3에서 읽고, 표준 입력은 ssh 표준 입력 그대로 — 스크립트 안 명령이 스크립트 나머지를 먹지 않는다.
-   바깥 sh -c: 맥 로그인 셸 zsh는 MULTIOS 때문에 파이프와 0<&4를 이어 붙여 스크립트가 비었다 — 2026-11-14 맥에서 확인)
-- 맥이 먹통일 때 시간 제한이 없어 하염없이 기다렸다 → ssh 옵션(접속 5초, 살아 있음 10초×3) + 전체 시간 제한(넘으면 ssh를 끊고 throw).
+  여기서는 ssh를 PowerShell 네이티브 호출이 아니라 Process로 띄우고 인자를 Windows 규칙대로 직접 감싼다. 스크립트 본문은 base64로 넘긴다.
+  맥에 가는 명령줄은 늘 아래 꼴이다 (바깥 sh -c: 맥 로그인 셸 zsh의 MULTIOS 같은 차이를 피한다):
+    sh -c 'b=$(echo <부트스트랩 b64> | /usr/bin/base64 -D) && [ -n "$b" ] && exec /bin/sh -c "$b" invoke-mac <스크립트 b64> <pidfile>; ...; exit 97'
+  부트스트랩(아래 $RemoteBootstrap): 스크립트를 풀고(실패하거나 비면 종료 코드 97), 새 프로세스 그룹에서 돌리고,
+  그 그룹 번호를 pidfile(/tmp/invoke-mac.<무작위>.pid, 600, O_EXCL)에 남긴다. 스크립트의 표준 입력은 ssh 표준 입력 그대로.
+- 맥이 먹통일 때 시간 제한이 없어 하염없이 기다렸다 → ssh 옵션(접속 5초, 살아 있음 10초×3) + 전체 시간 제한.
+  넘으면 ssh를 끊고, 짧은 두 번째 호출로 맥 쪽 프로세스 그룹에 TERM(5초 뒤 남으면 KILL)을 보낸 뒤 결과를 담아 throw한다
+  (ssh만 끊으면 tty가 없어 맥 쪽 작업은 계속 돈다).
 - 5.1은 네이티브 표준 입력 앞에 [Console]::InputEncoding의 BOM을 붙인다 (Process.Start가 만드는 StreamWriter가 머리말을 쓴다).
-  Process를 띄우는 동안만 그 인코딩을 머리말 없는 것으로 바꾸고 바이트를 그대로 쓴다. 콘솔 없는 호스트에서도 예외가 나지 않는다
-  (SetConsoleCP를 부르는 공개 setter 대신 캐시 필드를 바꾼다).
+  -Stdin이 있을 때만: 띄우는 동안 그 인코딩을 머리말 없는 UTF-8로 바꾼다 — 먼저 공개 setter, 콘솔 없는 호스트에서 setter가
+  예외를 내면 캐시 필드(Console._inputEncoding)로. -Stdin이 없으면 표준 입력을 리디렉션하지 않고 ssh -n.
 - 출력: -Stream이면 줄마다 바로 화면(Write-Host)에 — 배포처럼 긴 일은 사용자가 보고 있다. 아니면 표준 출력 줄을 돌려준다.
   표준 오류는 늘 바로 화면에. 어느 쪽이든 리디렉션 없이 콘솔에 보이므로 check.ps1·deploy.ps1 출력을 리디렉션하지 않는 관행과 맞다.
-- 종료 코드가 0이 아니면 throw (-FailMessage가 있으면 그 문구). -AllowFail이면 throw하지 않고 $LASTEXITCODE만 남긴다.
+- 종료 코드가 0이 아니면 throw (-FailMessage가 있으면 그 문구, '{code}'는 종료 코드로). -AllowFail이면 $LASTEXITCODE만 남긴다.
+- PATH: 맥 ssh 비대화 셸의 PATH는 /usr/bin:/bin:/usr/sbin:/sbin뿐(kubectl·colima 없음, 2026-11-14 확인).
+  맥 스크립트 대부분과 같은 순서로 앞에 붙인다 — kubectl은 /usr/local/bin(1.15)이 ~/.local/bin(1.37)보다 먼저. sh·base64·perl은 시스템 것 그대로.
 #>
 
+# ssh.exe·scp.exe는 PATH에서 한 번 찾아 전체 경로로 — Process.Start는 현재 폴더를 먼저 뒤지므로 이름만 주지 않는다.
 # 시험만 바꾼다 (tests/test_remote_helper.py가 가짜 ssh로 바꿔 끼운다). 첫 칸이 실행 파일, 나머지는 앞에 붙는 인자
-$RemoteSshExe = @("ssh.exe")
-$RemoteScpExe = @("scp.exe")
+$RemoteSshExe = @(Get-Command ssh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object Source)
+$RemoteScpExe = @(Get-Command scp.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object Source)
 $RemoteSshOpts = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3")
-$RemotePathLine = 'export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH'
+$RemotePathLine = 'export PATH=/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH'
+$RemoteDecodeFailed = "invoke-mac: decode-failed"
+$RemoteBootstrap = @'
+# invoke-mac 부트스트랩 ($1 = 스크립트 base64, $2 = pidfile). scripts/lib/remote.ps1이 만든다
+p=$(printf '%s' "$1" | /usr/bin/base64 -D 2>/dev/null) || p=
+if [ -z "$p" ]; then echo 'invoke-mac: decode-failed (스크립트 base64 -D 실패 또는 빈 스크립트)' >&2; exit 97; fi
+# 새 프로세스 그룹(번호 = 이 perl의 pid)에서 스크립트를 돌리고 그 번호를 pidfile에 — 시간 제한 때 그룹째 멈춘다
+/usr/bin/perl -e 'use Fcntl; setpgrp(0, 0) or die "setpgrp: $!\n"; my $pf = shift;
+  sysopen(my $f, $pf, O_WRONLY | O_CREAT | O_EXCL, 0600) or die "invoke-mac: pidfile $pf: $!\n"; print $f "$$\n"; close $f;
+  exec @ARGV or die "exec: $!\n"' "$2" /bin/sh -c "$p" invoke-mac
+rc=$?
+rm -f "$2"
+exit $rc
+'@
+
+function Assert-MacHost([string]$Mac) {
+    # ssh·scp 옵션으로 읽히지 않게 (예: -oProxyCommand=…)
+    if (-not $Mac -or $Mac.StartsWith("-") -or $Mac -match '\s') { throw "맥 주소가 이상합니다: '$Mac' (user@host 꼴, '-'로 시작하거나 공백이 있으면 안 됨)" }
+}
 
 function ConvertTo-RemoteArg([string]$Arg) {
     # Windows 명령줄 규칙(MSVCRT)대로 한 인자를 감싼다 — 공백·큰따옴표가 있어도 그대로 전달
@@ -38,23 +62,27 @@ function ConvertTo-RemoteArg([string]$Arg) {
     return '"' + $s + '"'
 }
 
-function ConvertTo-MacCommand([string]$Script) {
-    # 맥 쪽 명령줄 한 줄 (큰따옴표 없음). 스크립트는 CR을 빼고 PATH 줄을 앞에 붙여 UTF-8(BOM 없음) base64로
-    $body = $RemotePathLine + "`n" + $Script.Replace("`r", "")
-    $b64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($body))
-    return "sh -c 'exec 4<&0; echo $b64 | base64 -D | sh /dev/fd/3 3<&0 0<&4 4<&-'"
+function ConvertTo-B64([string]$Text) { [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($Text.Replace("`r", ""))) }
+
+function ConvertTo-MacCommand([string]$Script, [string]$PidFile) {
+    # 맥 쪽 명령줄 한 줄. 스크립트는 PATH 줄을 앞에 붙여 base64로, 부트스트랩도 base64로 (부트스트랩이 안 풀리면 97)
+    $boot = ConvertTo-B64 $RemoteBootstrap
+    $body = ConvertTo-B64 ($RemotePathLine + "`n" + $Script)
+    return "sh -c 'b=`$(echo $boot | /usr/bin/base64 -D) && [ -n `"`$b`" ] && exec /bin/sh -c `"`$b`" invoke-mac $body $PidFile; echo $RemoteDecodeFailed >&2; exit 97'"
 }
 
+function New-MacPidFile { "/tmp/invoke-mac." + [guid]::NewGuid().ToString("N") + ".pid" }
+
 function Invoke-RemoteProcess {
-    # ssh·scp 한 번 실행: 시간 제한, BOM 없는 표준 입력, 줄 단위 출력. 반환: @{ Code; Out }
+    # ssh·scp 한 번 실행: 시간 제한, BOM 없는 표준 입력, 줄 단위 출력. 반환: @{ Code; Out; Err; TimedOut }
     param(
-        [Parameter(Mandatory)][string[]]$Exe,
+        [string[]]$Exe,
         [Parameter(Mandatory)][string[]]$Arguments,
         [byte[]]$StdinBytes,
         [int]$TimeoutSec,
-        [switch]$Stream,
-        [string]$Label
+        [switch]$Stream
     )
+    if (-not $Exe -or -not $Exe[0]) { throw "ssh.exe·scp.exe를 찾지 못했습니다 (Windows OpenSSH 클라이언트가 PATH에 있어야 함)" }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe[0]
     $psi.Arguments = (@($Exe | Select-Object -Skip 1) + $Arguments | ForEach-Object { ConvertTo-RemoteArg $_ }) -join " "
@@ -62,37 +90,45 @@ function Invoke-RemoteProcess {
     $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
-    $psi.RedirectStandardInput = $true
+    $hasStdin = [bool]($StdinBytes -and $StdinBytes.Length)
+    $psi.RedirectStandardInput = $hasStdin
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $utf8 = [Text.UTF8Encoding]::new($false)
     $psi.StandardOutputEncoding = $utf8
     $psi.StandardErrorEncoding = $utf8
 
-    # BOM 막기: Process.Start는 [Console]::InputEncoding으로 표준 입력 StreamWriter를 만들고 머리말(BOM)을 바로 쓴다.
-    # 그 동안만 머리말 없는 인코딩으로 바꾼다. 공개 setter는 SetConsoleCP를 불러 콘솔 없는 호스트에서 예외가 나므로 캐시 필드를 쓴다.
-    $field = $null; $saved = $null
-    if ($psi.GetType().GetProperty("StandardInputEncoding")) {
-        $psi.GetType().GetProperty("StandardInputEncoding").SetValue($psi, $utf8)  # PowerShell 7(.NET Core)은 정식 속성이 있다
-    } else {
-        $enc = $null
-        try { $enc = [Console]::InputEncoding } catch { $enc = $null }
-        if ($enc -and $enc.GetPreamble().Length) {
-            $field = [Console].GetField("_inputEncoding", [Reflection.BindingFlags]"NonPublic,Static")
-            if (-not $field) { throw "표준 입력을 BOM 없이 넘길 방법이 없습니다 (Console._inputEncoding 없음, 인코딩 $($enc.WebName))" }
-            $saved = $field.GetValue($null)
-            $field.SetValue($null, $utf8)
+    # BOM 막기 (-Stdin이 있을 때만): Process.Start는 [Console]::InputEncoding으로 표준 입력 StreamWriter를 만들고 머리말을 바로 쓴다
+    $restore = $null
+    if ($hasStdin) {
+        if ($psi.GetType().GetProperty("StandardInputEncoding")) {
+            $psi.GetType().GetProperty("StandardInputEncoding").SetValue($psi, $utf8)  # PowerShell 7(.NET Core)은 정식 속성이 있다
+        } else {
+            $enc = $null
+            try { $enc = [Console]::InputEncoding } catch { $enc = $null }
+            if ($enc -and $enc.GetPreamble().Length) {
+                try {
+                    [Console]::InputEncoding = $utf8  # 공개 setter 먼저 (콘솔이 있으면 된다)
+                    $restore = { try { [Console]::InputEncoding = $enc } catch { } }.GetNewClosure()
+                } catch {
+                    # 콘솔 없는 호스트: setter가 SetConsoleCP 실패로 예외 → 캐시 필드만 바꾼다
+                    $field = [Console].GetField("_inputEncoding", [Reflection.BindingFlags]"NonPublic,Static")
+                    if (-not $field) { throw "표준 입력을 BOM 없이 넘길 방법이 없습니다 (Console._inputEncoding 없음, 인코딩 $($enc.WebName))" }
+                    $saved = $field.GetValue($null)
+                    $field.SetValue($null, $utf8)
+                    $restore = { $field.SetValue($null, $saved) }.GetNewClosure()
+                }
+            }
         }
     }
     try { $p = [Diagnostics.Process]::Start($psi) }
-    finally { if ($field) { $field.SetValue($null, $saved) } }
+    finally { if ($restore) { & $restore } }
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
     $out = [Collections.Generic.List[string]]::new()
-    $stdin = $p.StandardInput.BaseStream
-    $writeTask = $null
-    if ($StdinBytes -and $StdinBytes.Length) { $writeTask = $stdin.WriteAsync($StdinBytes, 0, $StdinBytes.Length) }
-    else { $stdin.Close(); $stdin = $null }
+    $err = [Collections.Generic.List[string]]::new()
+    $stdin = $null; $writeTask = $null
+    if ($hasStdin) { $stdin = $p.StandardInput.BaseStream; $writeTask = $stdin.WriteAsync($StdinBytes, 0, $StdinBytes.Length) }
     $outTask = $p.StandardOutput.ReadLineAsync()
     $errTask = $p.StandardError.ReadLineAsync()
     try {
@@ -100,7 +136,7 @@ function Invoke-RemoteProcess {
             if ([DateTime]::UtcNow -gt $deadline) {
                 try { $p.Kill() } catch { }
                 [void]$p.WaitForExit(5000)
-                throw "맥 명령이 ${TimeoutSec}초 안에 끝나지 않아 ssh를 끊었습니다 (시간 제한): $Label — 맥이 답하는지 먼저 확인 (colima list, kubectl get pods -n docs)"
+                return @{ Code = $null; Out = $out.ToArray(); Err = $err.ToArray(); TimedOut = $true }
             }
             if ($stdin -and $writeTask.IsCompleted) {
                 if ($writeTask.IsFaulted) { Write-Host "표준 입력 쓰기 실패: $($writeTask.Exception.InnerException.Message)" }
@@ -120,24 +156,48 @@ function Invoke-RemoteProcess {
             if ($errTask -and $errTask.IsCompleted) {
                 $line = $errTask.Result
                 if ($null -eq $line) { $errTask = $null }
-                else { Write-Host $line; $errTask = $p.StandardError.ReadLineAsync() }
+                else { Write-Host $line; $err.Add($line); $errTask = $p.StandardError.ReadLineAsync() }
             }
         }
         $p.WaitForExit()
-        return @{ Code = $p.ExitCode; Out = $out.ToArray() }
+        return @{ Code = $p.ExitCode; Out = $out.ToArray(); Err = $err.ToArray(); TimedOut = $false }
     } finally {
         if (-not $p.HasExited) { try { $p.Kill() } catch { } }
         $p.Dispose()
     }
 }
 
-function Complete-Remote($r, [string]$FailMessage, [string]$Label, [switch]$AllowFail, [switch]$Stream) {
+function Complete-Remote($r, [string]$FailMessage, [string]$Default, [switch]$AllowFail, [switch]$Stream) {
     $global:LASTEXITCODE = $r.Code
     if ($r.Code -and -not $AllowFail) {
-        if ($FailMessage) { throw $FailMessage }
-        throw "맥 명령 실패 (종료 코드 $($r.Code)): $Label"
+        if ($FailMessage) { throw $FailMessage.Replace("{code}", "$($r.Code)") }
+        throw $Default
     }
     if (-not $Stream) { $r.Out }
+}
+
+function Stop-MacJob([string]$Mac, [string]$PidFile) {
+    # 시간 제한 뒤: pidfile의 프로세스 그룹에 TERM, 5초 뒤 남으면 KILL. 결과 한 줄을 돌려준다 (실패해도 throw하지 않음)
+    $kill = @"
+pf=$PidFile
+[ -s "`$pf" ] || { echo '작업 없음 (pidfile 없음 — 이미 끝났거나 시작 전)'; exit 0; }
+g=`$(cat "`$pf")
+case "`$g" in ''|*[!0-9]*) echo "pidfile 내용이 이상함: `$g"; exit 1;; esac
+if ! kill -TERM -- "-`$g" 2>/dev/null; then rm -f "`$pf"; echo "작업 없음 (그룹 `$g 이미 끝남)"; exit 0; fi
+i=0; how=TERM
+while kill -0 -- "-`$g" 2>/dev/null && [ `$i -lt 5 ]; do sleep 1; i=`$((i + 1)); done
+if kill -0 -- "-`$g" 2>/dev/null; then kill -KILL -- "-`$g" 2>/dev/null; how='TERM 뒤 KILL'; sleep 1; fi
+if kill -0 -- "-`$g" 2>/dev/null; then echo "프로세스 그룹 `$g 가 아직 남아 있음"; exit 1; fi
+rm -f "`$pf"
+echo "프로세스 그룹 `$g 멈춤 (`$how)"
+"@
+    try {
+        $r = Invoke-RemoteProcess -Exe $RemoteSshExe -Arguments ($RemoteSshOpts + @("-n", $Mac, (ConvertTo-MacCommand $kill (New-MacPidFile)))) -TimeoutSec 20
+        if ($r.TimedOut) { return "멈추기 호출도 시간 제한(20초)" }
+        $msg = ($r.Out | Where-Object { $_ }) -join " "
+        if ($r.Code) { return "실패 (종료 코드 $($r.Code)): $msg" }
+        return $msg
+    } catch { return "실패: $($_.Exception.Message)" }
 }
 
 function Invoke-Mac {
@@ -151,13 +211,35 @@ function Invoke-Mac {
         [switch]$AllowFail,
         [string]$FailMessage
     )
+    Assert-MacHost $Mac
     $bytes = $null
     if ($Stdin -is [byte[]]) { $bytes = $Stdin }
     elseif ($null -ne $Stdin) { $bytes = [Text.UTF8Encoding]::new($false).GetBytes([string]$Stdin) }
     $label = ($Script.Trim() -split "`n")[0].Trim()
-    $r = Invoke-RemoteProcess -Exe $RemoteSshExe -Arguments ($RemoteSshOpts + @($Mac, (ConvertTo-MacCommand $Script))) `
-        -StdinBytes $bytes -TimeoutSec $TimeoutSec -Stream:$Stream -Label $label
-    Complete-Remote $r $FailMessage $label -AllowFail:$AllowFail -Stream:$Stream
+    $pidFile = New-MacPidFile
+    $n = if ($bytes -and $bytes.Length) { @() } else { @("-n") }  # 표준 입력 없음 → ssh -n (리디렉션도 BOM 손질도 하지 않음)
+    $r = Invoke-RemoteProcess -Exe $RemoteSshExe -Arguments ($RemoteSshOpts + $n + @($Mac, (ConvertTo-MacCommand $Script $pidFile))) `
+        -StdinBytes $bytes -TimeoutSec $TimeoutSec -Stream:$Stream
+    if ($r.TimedOut) {
+        $res = Stop-MacJob $Mac $pidFile
+        $global:LASTEXITCODE = 124
+        throw "시간 제한(${TimeoutSec}초)으로 끊음: $label — 맥 쪽 작업을 멈추려 했다(결과: $res). 배포 상태를 확인한 뒤 다시"
+    }
+    if ($r.Code -eq 97 -and ($r.Err | Where-Object { $_ -like "$RemoteDecodeFailed*" })) {
+        $global:LASTEXITCODE = 97
+        $why = "맥에서 스크립트를 풀지 못함 (base64 -D 실패 또는 빈 스크립트, 종료 코드 97): $label"
+        throw $(if ($FailMessage) { "$($FailMessage.Replace('{code}', '97')) — $why" } else { $why })
+    }
+    Complete-Remote $r $FailMessage "맥 명령 실패 (종료 코드 $($r.Code)): $label" -AllowFail:$AllowFail -Stream:$Stream
+}
+
+function Invoke-Scp([string[]]$Arguments, [int]$TimeoutSec, [string]$Label, [string]$FailMessage, [switch]$AllowFail) {
+    $r = Invoke-RemoteProcess -Exe $RemoteScpExe -Arguments $Arguments -TimeoutSec $TimeoutSec -Stream
+    if ($r.TimedOut) {
+        $global:LASTEXITCODE = 124
+        throw "scp 전송이 ${TimeoutSec}초 안에 끝나지 않아 끊었습니다 (시간 제한): $Label — 맥·네트워크 상태를 확인한 뒤 다시"
+    }
+    Complete-Remote $r $FailMessage "scp 전송 실패 (종료 코드 $($r.Code)): $Label" -AllowFail:$AllowFail -Stream
 }
 
 function Copy-ToMac {
@@ -171,10 +253,9 @@ function Copy-ToMac {
         [switch]$AllowFail,
         [string]$FailMessage
     )
-    $args_ = @("-q") + $RemoteSshOpts + $(if ($Recurse) { @("-r") } else { @() }) + $Path + @("${Mac}:$Destination")
-    $label = "scp → ${Mac}:$Destination"
-    $r = Invoke-RemoteProcess -Exe $RemoteScpExe -Arguments $args_ -TimeoutSec $TimeoutSec -Stream -Label $label
-    Complete-Remote $r $FailMessage $label -AllowFail:$AllowFail -Stream
+    Assert-MacHost $Mac
+    $a = @("-q") + $RemoteSshOpts + $(if ($Recurse) { @("-r") } else { @() }) + $Path + @("${Mac}:$Destination")
+    Invoke-Scp $a $TimeoutSec "$($Path -join ', ') → ${Mac}:$Destination" $FailMessage -AllowFail:$AllowFail
 }
 
 function Copy-FromMac {
@@ -187,8 +268,6 @@ function Copy-FromMac {
         [switch]$AllowFail,
         [string]$FailMessage
     )
-    $label = "scp ${Mac}:$Path →"
-    $r = Invoke-RemoteProcess -Exe $RemoteScpExe -Arguments (@("-q") + $RemoteSshOpts + @("${Mac}:$Path", $Destination)) `
-        -TimeoutSec $TimeoutSec -Stream -Label $label
-    Complete-Remote $r $FailMessage $label -AllowFail:$AllowFail -Stream
+    Assert-MacHost $Mac
+    Invoke-Scp (@("-q") + $RemoteSshOpts + @("${Mac}:$Path", $Destination)) $TimeoutSec "${Mac}:$Path → $Destination" $FailMessage -AllowFail:$AllowFail
 }

@@ -63,9 +63,8 @@ open(r'$spec', 'w', encoding='utf-8').write(json.dumps(d))
 $hdr = Join-Path $out "auth.hdr"  # curl에 토큰을 명령줄이 아니라 파일로 넘긴다 (프로세스 목록·감사 로그에 남지 않게). finally에서 지운다
 $failed = $false
 function Remote([string]$cmd, [string]$stdin) {
-    $r = if ($stdin) { Invoke-Mac -Mac $Mac -Script $cmd -Stdin "$stdin`n" -TimeoutSec 120 -AllowFail } else { Invoke-Mac -Mac $Mac -Script $cmd -TimeoutSec 120 -AllowFail }
-    if ($LASTEXITCODE) { throw "맥 명령 실패 ($LASTEXITCODE): $($cmd.Split('|')[-1].Trim())" }
-    $r
+    $in = @{}; if ($stdin) { $in.Stdin = "$stdin`n" }
+    Invoke-Mac -Mac $Mac -Script $cmd -TimeoutSec 120 -FailMessage "맥 명령 실패 ({code}): $($cmd.Split('|')[-1].Trim())" @in
 }
 try {
     # 3. 임시 viewer (있으면 비밀번호를 바꾸고 역할을 viewer로 되돌리고 켠다)
@@ -190,7 +189,7 @@ $check
     $disabled = $false
     try { Invoke-Mac -Mac $Mac -Script "$kubectl disable $user" -TimeoutSec 120 | Out-Null; $disabled = $true } catch { Write-Host $_ -ForegroundColor Red }
     if (-not $disabled) {
-        Write-Warning "임시 계정 $user 를 끄지 못함 — 직접: ssh $Mac `"$kubectl disable $user`""  # remote-ok: 사용자에게 보이는 안내 문구 (실행 아님)
+        Write-Warning "임시 계정 $user 를 끄지 못함 — 직접: ssh $Mac `"$kubectl disable $user`""
         $failed = $true
     }
     $zh = Join-Path $out "zaphome"

@@ -18,7 +18,7 @@ NS=docs
 HERE=$(cd "$(dirname "$0")" && pwd)
 D=$(mktemp -d "${TMPDIR:-/tmp}/docflow-tls.XXXXXX")
 trap 'rm -rf "$D"' EXIT
-trap 'exit 1' HUP INT TERM   # ssh가 끊겨도(HUP) EXIT 트랩으로 임시 폴더를 지운다
+trap 'exit 1' HUP INT TERM PIPE   # ssh가 끊겨도(HUP, 출력이 막히면 PIPE) EXIT 트랩으로 임시 폴더를 지운다
 if ! kubectl get ns $NS >/dev/null 2>&1 </dev/null; then
   kubectl create namespace $NS >/dev/null </dev/null
   echo "namespace $NS: 새로 만듦"
