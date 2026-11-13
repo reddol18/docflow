@@ -120,8 +120,9 @@ def run_ps(tmp_path: Path, body: str, env: dict | None = None, flags: int = 0, t
         f"$RemoteSshExe = @('{sys.executable}', '{FAKE}')\n"
         "$RemoteScpExe = $RemoteSshExe\n"
         f"$T = '{tmp_path}'\n"
-        "function Save($name, $lines) { [IO.File]::WriteAllLines((Join-Path $T $name), [string[]]@($lines), [Text.UTF8Encoding]::new($false)) }\n"
-        "function Load($name) { [IO.File]::ReadAllText((Join-Path $T $name), [Text.UTF8Encoding]::new($false)) }\n"
+        "$U8 = [Text.UTF8Encoding]::new($false)\n"
+        "function Save($name, $lines) { [IO.File]::WriteAllLines((Join-Path $T $name), [string[]]@($lines), $U8) }\n"
+        "function Load($name) { [IO.File]::ReadAllText((Join-Path $T $name), $U8) }\n"
     )
     drv.write_text(pre + body, encoding="ascii")
     e = {**__import__("os").environ, "FAKE_SSH_DIR": str(tmp_path), **(env or {})}
