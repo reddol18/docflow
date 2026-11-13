@@ -232,7 +232,8 @@ def test_timeout_stops_remote_job_and_throws(tmp_path):
 
 def test_decode_failure_is_not_success(tmp_path):
     body = (
-        "try { Invoke-Mac -Mac 'u@h' -Script 'true' -AllowFail | Out-Null; Save 'a.txt' 'NO_THROW' } catch { Save 'a.txt' $_.Exception.Message }\n"
+        "try { Invoke-Mac -Mac 'u@h' -Script 'true' -AllowFail | Out-Null; Save 'a.txt' 'NO_THROW' }\n"
+        "catch { Save 'a.txt' $_.Exception.Message }\n"
         "try { Invoke-Mac -Mac 'u@h' -Script 'true' -FailMessage 'copy failed' | Out-Null; Save 'b.txt' 'NO_THROW' }\n"
         "catch { Save 'b.txt' $_.Exception.Message }\n"
         "Save 'code.txt' $LASTEXITCODE\n"
@@ -289,7 +290,8 @@ def test_copy_args_and_messages(tmp_path):
         "$env:FAKE_SSH_EXIT = '1'\n"
         "try { Copy-ToMac -Mac 'u@h' -Path 'k.sh' -Destination 'd/' 6>$null } catch { Save 'fail.txt' $_.Exception.Message }\n"
         "$env:FAKE_SSH_EXIT = '0'; $RemoteScpExe = @('" + sys.executable + "', '-I', '-c', 'import time; time.sleep(30)')\n"
-        "try { Copy-FromMac -Mac 'u@h' -Path 'big' -Destination 'x' -TimeoutSec 2 6>$null } catch { Save 'slow.txt' $_.Exception.Message }\n"
+        "try { Copy-FromMac -Mac 'u@h' -Path 'big' -Destination 'x' -TimeoutSec 2 6>$null }\n"
+        "catch { Save 'slow.txt' $_.Exception.Message }\n"
     )
     r = run_ps(tmp_path, body)
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
