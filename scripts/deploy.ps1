@@ -55,7 +55,8 @@ try {
     Write-Host "== 복사 ($sha → $Mac)"
     scp -q -r Dockerfile requirements.txt requirements.lock app "${Mac}:doc_platform/"
     if ($LASTEXITCODE) { throw "복사 실패 (app)" }
-    scp -q k8s/docs.yaml "${Mac}:doc_platform/k8s/"
+    # keycloak.yaml: 맥 scan_image.sh·image_tags.sh가 데모 Keycloak 이미지도 읽는다 (apply는 scripts/keycloak.ps1만, https://github.com/reddol18/docflow/issues/39)
+    scp -q k8s/docs.yaml k8s/keycloak.yaml "${Mac}:doc_platform/k8s/"
     if ($LASTEXITCODE) { throw "복사 실패 (k8s)" }
     # 프런트 소스: 커밋된 HEAD 그대로 (node_modules·.next·.env 없이). 파이프로 넘기면 PowerShell 5.1이 바이너리를 깨므로 파일로
     $webTar = Join-Path ([IO.Path]::GetTempPath()) "docflow-frontend.tar"

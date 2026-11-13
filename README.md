@@ -379,29 +379,31 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 
 ### 데모 Keycloak — OIDC 실연결 (https://github.com/reddol18/docflow/issues/39)
 
-시험·시연용 OIDC 제공자. 기관 SSO가 아니다. `AUTH_MODES=local,oidc` — 로컬 로그인은 그대로 있고 로그인 화면에 'Keycloak(데모)로 로그인' 버튼이 더해진다.
+시험·시연용 OIDC 제공자. 기관 SSO가 아니다. `AUTH_MODES=local,oidc` — 로컬 로그인은 그대로 있고, 등록한 콜백과 같은 출처(`http://localhost:3000`)의 로그인 화면에만 'Keycloak(데모)로 로그인' 버튼이 더해진다.
 
 | 무엇 | 값 |
 |---|---|
 | 매니페스트 | `k8s/keycloak.yaml` — 네임스페이스 `keycloak`(docs 쿼터·PVC를 쓰지 않음, 자체 쿼터 요청 메모리 640Mi·한도 1Gi·PVC 1), 기본 차단 NetworkPolicy, 들어오는 것은 docs의 docflow API 파드 8080만 |
-| 이미지 | `quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e…` (amd64 압축 약 253MB). `start --optimized` — 이미지에 미리 된 빌드를 그대로 써서 루트 파일시스템 읽기 전용 |
+| 이미지 | `quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e…` (amd64 압축 약 253MB). `start --optimized` — 이미지에 미리 된 빌드를 그대로 써서 루트 파일시스템 읽기 전용. 배포 때 스캔(`scan_image.sh`, k3s에 없으면 건너뜀)·고정 다이제스트 확인(`image_tags.sh`)에 들어간다 |
 | 저장소 | Keycloak 자체 H2 파일(dev-file)을 PVC `keycloak-data`(512Mi)에. 별도 Postgres 없음 — realm은 저장소 JSON에서 언제든 다시 만든다 |
 | 메모리 | 요청 512Mi · 한도 1Gi, 힙은 한도의 50%(`JAVA_OPTS_KC_HEAP`) |
-| realm | `k8s/keycloak/docflow-realm.json` — realm `docflow`, 기밀 클라이언트 `docflow`(PKCE S256 필수, 콜백 `http://localhost:3000/api/auth/oidc/callback` 하나), 그룹 `docflow-admin`·`docflow-reviewer`, 가상 사용자 `hangaram`(두 그룹)·`seonuri`(reviewer). 비밀값 칸은 `${…}` 자리표시자뿐 — 가져올 때 Secret에서 채운다 |
+| realm | `k8s/keycloak/docflow-realm.json` — realm `docflow`(비밀번호 정책 `length(12)`, 무차별 대입 보호), 기밀 클라이언트 `docflow`(PKCE S256 필수, 콜백 `http://localhost:3000/api/auth/oidc/callback` 하나), 그룹 `/docflow-admin`·`/docflow-reviewer`, 가상 사용자 `hangaram`(두 그룹)·`seonuri`(reviewer). 비밀값 칸은 `${…}` 자리표시자뿐 — 가져올 때 Secret에서 채운다 |
 | issuer | `http://keycloak.localhost:8180/realms/docflow` — 브라우저와 docflow 파드가 같은 글자 |
-| docflow 설정 | `k8s/docs.yaml` `OIDC_*`, client secret은 Secret `oidc`(`/etc/oidc/client-secret`), `docflow-egress`에 keycloak 8080 규칙, `hostAliases` keycloak.localhost → Keycloak Service 고정 IP `10.43.0.39` |
+| docflow 설정 | `k8s/docs.yaml` `OIDC_*`, client secret은 Secret `oidc`(`/etc/oidc/client-secret`, optional 마운트), NetworkPolicy `docflow-to-keycloak`(API 파드만 → keycloak 8080, 워커는 아님), `hostAliases` keycloak.localhost → Keycloak Service 고정 IP `10.43.0.39` |
 
-- **주소가 하나로 맞는 길:** 브라우저는 `*.localhost`를 늘 127.0.0.1로 푼다(`docflow.localhost:8443`과 같은 방식) → ssh 터널 8180 → 맥 `kubectl port-forward svc/keycloak 8180:8180` → 파드 8080. docflow 파드는 `hostAliases`로 같은 이름을 Keycloak Service(고정 clusterIP, 서비스 대역 아래쪽 정적 몫)로 보낸다. 그래서 discovery 문서의 issuer·토큰·JWKS 주소가 docflow 설정과 같아 `auth.check_discovery`를 통과한다.
-- **http인 까닭:** 내부 데모 CA(`scripts/ca.py`)는 이름 제약에 keycloak 이름이 없어 https로 하려면 CA를 다시 만들어야 한다. 그래서 이 설치만 `OIDC_ALLOW_HTTP=1`(클러스터 안 시험 제공자 전용 값), realm은 `sslRequired=external`(사설·루프백 주소만 http). 바깥에 열지 않는다(port-forward·ssh 터널뿐).
-- **역할 = 그룹:** 클라이언트의 그룹 매퍼가 ID 토큰에 `groups`(경로 없는 이름)를 넣고 docflow가 `OIDC_ROLE_CLAIM=groups`·`OIDC_ROLE_MAP`으로 옮긴다. 로그인할 때마다 다시 맞추므로 그룹을 빼면 **다음 로그인 때** 남은 그룹 중 가장 넓은 역할로 내려가고, 지도에 있는 그룹이 없으면 로그인이 거절된다(`OIDC_DEFAULT_ROLE=none`, 감사 사유 `oidc_role`). 이미 열린 docflow 세션은 로그아웃·만료까지 그 역할 그대로다.
-- **SSO는 `localhost:3000`(이 PC 개발 서버)에서만:** 콜백을 그 주소 하나로 등록했다. `https://docflow.localhost:8443`(web 파드)에서 SSO 버튼을 누르면 콜백이 달라 로그인되지 않는다 — 그쪽은 로컬 로그인. Keycloak 쪽 로그아웃 연동(RP-initiated logout)은 범위 밖이라 docflow 로그아웃 뒤에도 Keycloak 세션이 남아 다음 SSO 로그인은 비밀번호 없이 된다(다른 사용자로 시험하려면 Keycloak 계정 화면에서 로그아웃하거나 시크릿 창).
+- **주소가 하나로 맞는 길:** 브라우저는 `*.localhost`를 늘 127.0.0.1로 푼다(`docflow.localhost:8443`과 같은 방식) → ssh 터널 8180 → 맥 `kubectl port-forward svc/keycloak 8180:8180` → 파드 8080. docflow 파드는 `hostAliases`로 같은 이름을 Keycloak Service(고정 clusterIP, 서비스 대역 아래쪽 정적 몫)로 보낸다. 그래서 discovery 문서의 issuer·토큰·JWKS 주소가 docflow 설정과 같아 `auth.check_discovery`를 통과한다. 가정: 그 IP가 클러스터 서비스 대역(맥 k3s `10.43.0.0/16`) 안이고 비어 있다 — `scripts/mac/keycloak.sh`가 apply 전에 ServiceCIDR·Service 목록으로 확인하고 아니면 멈춘다.
+- **http인 까닭:** 내부 데모 CA(`scripts/ca.py`)는 이름 제약에 keycloak 이름이 없어 https로 하려면 CA를 다시 만들어야 한다. 그래서 이 설치만 `OIDC_ALLOW_HTTP=1`, realm은 `sslRequired=external`(사설·루프백 주소만 http). 바깥에 열지 않는다(port-forward·ssh 터널뿐). `OIDC_ALLOW_HTTP=1`이면 docflow는 발급자 호스트가 `localhost`·`*.localhost`·`*.svc`·`*.svc.cluster.local`·루프백·사설 IP일 때만 시작한다(`auth.internal_issuer_host`) — 배포 표시 `DOCFLOW_REQUIRE_TLS=1`에서 http 발급자도 같은 규칙.
+- **역할 = 그룹:** 클라이언트의 그룹 매퍼가 ID 토큰에 `groups`(전체 경로 `/docflow-admin` — 다른 부모 밑 같은 이름 하위 그룹이 역할을 얻지 않게)를 넣고 docflow가 `OIDC_ROLE_CLAIM=groups`·`OIDC_ROLE_MAP`으로 옮긴다. 로그인할 때마다 다시 맞추므로 그룹을 빼면 **다음 로그인 때** 남은 그룹 중 가장 넓은 역할로 내려가고, 지도에 있는 그룹이 없으면 로그인이 거절된다(`OIDC_DEFAULT_ROLE=none`, 감사 사유 `oidc_role`). 이미 열린 docflow 세션은 로그아웃·만료까지 그 역할 그대로다.
+- **SSO는 `localhost:3000`(이 PC 개발 서버)에서만:** 콜백을 그 주소 하나로 등록했다. 다른 출처에서 시작하면 state 쿠키가 콜백 쪽에 없어 늘 실패하므로, 로그인 화면은 `/auth/config`의 `oidc_origin`(콜백의 출처)이 자기 출처와 같을 때만 SSO 버튼을 보이고 아니면 "SSO 로그인은 … 에서만" 안내만 낸다(`https://docflow.localhost:8443` web 파드는 로컬 로그인). Keycloak 쪽 로그아웃 연동(RP-initiated logout)은 범위 밖이라 docflow 로그아웃 뒤에도 Keycloak 세션이 남아 다음 SSO 로그인은 비밀번호 없이 된다(다른 사용자로 시험하려면 Keycloak 계정 화면에서 로그아웃하거나 시크릿 창).
+- **데모 없이도 배포된다:** Secret `oidc` 마운트는 optional이다. 없으면 맥 `deploy.sh`가 "OIDC(SSO) 꺼짐"을 알리고, docflow는 경고를 남기고 OIDC만 끈 채 로컬 로그인으로 뜬다(`auth.oidc_startup`). `AUTH_MODES=oidc`만인 설치는 끌 수 없어 시작을 거부한다.
+- **비밀값의 정본:** Secret `keycloak/keycloak-realm-secrets` 하나. `keycloak.sh`는 값을 돌리지 않는다 — Secret은 realm이 든 PVC가 없을 때(처음)만 만들고, PVC가 있는데 Secret이 없으면 새 값을 만들지 않고 멈춘다(전부 새로 `kubectl delete namespace keycloak`, 또는 옛 값으로 Secret을 다시 만드는 명령을 찍는다). `docs/oidc`는 정본과 다를 때만 바꾸고, docflow가 그 Secret을 마운트하고 있으면 docflow를 다시 띄운다(시작할 때 한 번 읽음).
 
 **올리기 (처음, 이 PC에서):**
 
 ```powershell
-.\scripts\keycloak.ps1        # 맥: 디스크 확인(1GB) → Secret 3개(없을 때만 무작위, docs/oidc 포함) → realm ConfigMap → apply → 준비 대기
-.\scripts\deploy.ps1          # docflow를 AUTH_MODES=local,oidc로 (Secret oidc가 없으면 맥 deploy.sh가 apply 전에 멈춘다)
-.\scripts\keycloak.ps1 -Verify  # docflow 파드에서 discovery 문서 → "issuer 같음: True"
+.\scripts\keycloak.ps1        # 맥: 디스크 확인(1GB) → clusterIP 확인 → Secret(처음만 무작위) → docs/oidc 맞추기 → realm ConfigMap → apply → 준비 대기
+.\scripts\deploy.ps1          # docflow가 아직 옛 매니페스트면 (AUTH_MODES=local,oidc). 이미 새 매니페스트면 keycloak.ps1이 docflow를 다시 띄웠다
+.\scripts\keycloak.ps1 -Verify  # docflow 파드에서 discovery — issuer·authorization/token/jwks 주소 출처가 다르면 실패(throw)
 ```
 
 **데모 로그인:**
@@ -419,7 +421,7 @@ ssh user@mac "PATH=/usr/local/bin:`$PATH kubectl get secret keycloak-realm-secre
 
 - 관리 화면: `http://keycloak.localhost:8180/admin/` — 사용자 `kcadmin`, 비밀번호는 Secret `keycloak-admin`(`password`)을 위와 같이 클립보드로. realm `docflow` → Clients·Groups·Users에서 확인하고, 그룹 빼기 시험은 Users → `hangaram` → Groups → `docflow-admin` Leave → docflow 로그아웃 → 다시 SSO 로그인 → 검토자 화면.
 - **realm을 바꿀 때:** Keycloak은 같은 이름의 realm이 있으면 가져오기를 건너뛴다. JSON을 고쳐 다시 넣으려면 관리 화면에서 realm을 지우고 파드를 다시 띄우거나 `kubectl delete namespace keycloak` 뒤 `keycloak.ps1`(Secret도 새로 만들어지고 docs/oidc도 맞춰진다 → docflow 재시작).
-- **지우기:** `kubectl delete namespace keycloak`, 그리고 docflow를 `AUTH_MODES=local`로 되돌려 배포(`OIDC_*`·`hostAliases`·`oidc` 볼륨·egress 규칙은 그 커밋에서 함께 뺀다).
+- **지우기:** `kubectl delete namespace keycloak`, 그리고 docflow를 `AUTH_MODES=local`로 되돌려 배포(`OIDC_*`·`hostAliases`·`oidc` 볼륨·NetworkPolicy `docflow-to-keycloak`은 그 커밋에서 함께 뺀다). Keycloak만 지우고 docflow를 그대로 두면 SSO 시작이 discovery 실패(502)로 끝나고 로컬 로그인은 그대로다.
 
 ### colima 디스크 정리 기준 (https://github.com/reddol18/docflow/issues/119)
 

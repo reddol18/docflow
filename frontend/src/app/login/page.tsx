@@ -47,7 +47,11 @@ function LoginForm() {
   };
 
   const local = cfg?.modes.includes("local");
-  const oidc = cfg?.modes.includes("oidc");
+  // SSO는 등록한 콜백과 같은 출처에서만 — 다른 출처(예: web 파드 https)에서 시작하면 state 쿠키가 콜백 쪽에 없어 늘 실패한다
+  // (https://github.com/reddol18/docflow/issues/39). cfg는 브라우저에서만 채워지므로 window를 써도 된다
+  const oidcHere = !!cfg?.modes.includes("oidc") && cfg.oidc_origin === window.location.origin;
+  const oidcElsewhere = !!cfg?.modes.includes("oidc") && !oidcHere && cfg.oidc_origin;
+  const oidc = oidcHere;
   return (
     <div className="mx-auto mt-16 w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
       <h1 className="mb-5 text-lg font-semibold">로그인</h1>
@@ -61,6 +65,9 @@ function LoginForm() {
         </a>
       )}
       {oidc && local && <div className="my-4 text-center text-xs text-slate-400">또는</div>}
+      {oidcElsewhere && (
+        <div className="mb-4 text-center text-xs text-slate-400">SSO 로그인은 {oidcElsewhere}에서만 됩니다.</div>
+      )}
       {local && (
         <form onSubmit={submit} className="space-y-3">
           <input

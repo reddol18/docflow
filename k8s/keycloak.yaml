@@ -12,7 +12,8 @@
 #     → 맥 kubectl port-forward -n keycloak svc/keycloak 8180:8180 → 파드 8080. port-forward는 NetworkPolicy를 거치지 않는다.
 #   docflow 파드: k8s/docs.yaml hostAliases가 keycloak.localhost를 아래 Service의 고정 clusterIP(10.43.0.39)로 → 8180 → 파드 8080.
 #     고정 IP는 서비스 대역 아래쪽 정적 몫(10.43.0.0–10.43.0.255, 자동 배정이 피하는 칸)에서 골랐다 — 바꾸면 docs.yaml hostAliases도
-#     (tests/test_keycloak.py가 둘이 같은지 본다).
+#     (tests/test_keycloak.py가 둘이 같은지 본다). 가정: 맥 k3s 서비스 대역이 10.43.0.0/16이고 이 IP를 다른 Service가 쓰지 않는다 —
+#     scripts/mac/keycloak.sh가 apply 전에 ServiceCIDR·Service 목록으로 확인하고, 아니면 멈춘다(다른 클러스터면 IP를 그 대역으로 바꾼다).
 #   http인 까닭: 내부 CA(scripts/ca.py)의 이름 제약에 keycloak 이름이 없어 https면 CA를 다시 만들어야 한다. docflow는 이 설치에서만
 #     OIDC_ALLOW_HTTP=1 (그 값의 원래 용도 — 클러스터 안 시험 제공자). realm sslRequired=external: 사설·루프백 주소만 http 허용.
 #
@@ -91,7 +92,7 @@ spec:
       enableServiceLinks: false  # 서비스 이름(keycloak)으로 KEYCLOAK_* 환경 변수가 들어가지 않게
       containers:
       - name: keycloak
-        image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332  # 다이제스트 고정 (issues/46). 판을 올리면 다이제스트도
+        image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332  # 다이제스트 고정 (https://github.com/reddol18/docflow/issues/46). 판을 올리면 다이제스트도 (sh scripts/mac/image_tags.sh)
         args: [start, --optimized, --import-realm]
         env:
         - {name: KC_HOSTNAME, value: "http://keycloak.localhost:8180"}  # issuer의 앞부분 — docs.yaml OIDC_ISSUER와 같게

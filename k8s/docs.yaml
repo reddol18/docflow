@@ -2,7 +2,7 @@
 # Postgres, Qdrant. 대기열·워커는 https://github.com/reddol18/docflow/issues/5 — 맥은 워커 1개(taint·KEDA 없음),
 # 클라우드용 노드 그룹 B·KEDA는 k8s/cloud/ (맥 deploy.sh는 이 파일만 apply한다).
 # 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → 공인 IP 443만 (LLM_PROVIDER=openai일 때 OpenAI API용)과
-# 데모 Keycloak(keycloak 네임스페이스 8080, k8s/keycloak.yaml — https://github.com/reddol18/docflow/issues/39).
+# docflow API → 데모 Keycloak(keycloak 네임스페이스 8080, NetworkPolicy docflow-to-keycloak, k8s/keycloak.yaml — https://github.com/reddol18/docflow/issues/39).
 # LLM_PROVIDER=local(현장 내부 서버)·off면 이 443 규칙은 쓰지 않는다 — 외부 송신 0을 막는 정책은 https://github.com/reddol18/docflow/issues/13 마지막 완료 조건.
 # 컨테이너는 최소 권한 (https://github.com/reddol18/docflow/issues/29): root 아님·권한 상승 없음·capability 전부 버림·seccomp RuntimeDefault·SA 토큰 없음,
 # 루트 파일시스템 읽기 전용 — 쓰는 곳만 PVC·emptyDir로 연다. 막는 검사: scripts/check.ps1의 trivy config·semgrep.
@@ -55,10 +55,6 @@ spec:
     ports: [{protocol: TCP, port: 6333}]
   - to: [{podSelector: {matchLabels: {app: redis}}}]
     ports: [{protocol: TCP, port: 6379}]
-  # 데모 Keycloak (https://github.com/reddol18/docflow/issues/39, k8s/keycloak.yaml): discovery·JWKS·토큰 교환. 포트는 파드 쪽(8080) —
-  # 서비스 8180으로 보내도 정책은 DNAT 뒤 파드 포트로 본다. 워커도 이 정책에 걸리지만 Keycloak 쪽 ingress가 docflow API 파드만 받는다
-  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keycloak}}, podSelector: {matchLabels: {app: keycloak}}}]
-    ports: [{protocol: TCP, port: 8080}]
   # 공인 IP 443만: 사설 대역 + 링크 로컬(169.254 — 클라우드 메타데이터)·루프백·CGNAT(100.64, 일부 클라우드 내부망)은 뺀다 (issues/48)
   - to:
     - ipBlock:
@@ -67,6 +63,18 @@ spec:
         except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8, 100.64.0.0/10,
                  0.0.0.0/8, 192.0.0.0/24, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4]
     ports: [{protocol: TCP, port: 443}]
+---
+# 데모 Keycloak으로는 docflow API 파드만 (워커는 로그인 경로를 쓰지 않는다) — discovery·JWKS·토큰 교환
+# (https://github.com/reddol18/docflow/issues/39, k8s/keycloak.yaml). 포트는 파드 쪽(8080): 서비스 8180으로 보내도 정책은 DNAT 뒤 파드 포트로 본다
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: docflow-to-keycloak, namespace: docs}
+spec:
+  podSelector: {matchLabels: {app: docflow}}
+  policyTypes: [Egress]
+  egress:
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keycloak}}, podSelector: {matchLabels: {app: keycloak}}}]
+    ports: [{protocol: TCP, port: 8080}]
 ---
 # docflow API(8000)는 web 파드(Next)에서만. 이 PC 개발 서버는 kubectl port-forward라 NetworkPolicy를 거치지 않는다
 apiVersion: networking.k8s.io/v1
@@ -358,7 +366,9 @@ spec:
       securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
       automountServiceAccountToken: false  # k8s API를 쓰지 않는다
       # 데모 Keycloak issuer 호스트(keycloak.localhost)를 그 Service의 고정 clusterIP로 — 브라우저(이 PC, ssh 터널)와 같은 issuer 글자를
-      # 파드 안에서도 쓰려고 (https://github.com/reddol18/docflow/issues/39, k8s/keycloak.yaml '주소'). IP를 바꾸면 두 파일 함께
+      # 파드 안에서도 쓰려고 (https://github.com/reddol18/docflow/issues/39, k8s/keycloak.yaml '주소'). IP를 바꾸면 두 파일 함께.
+      # 가정: 이 IP가 클러스터 서비스 대역(맥 k3s 10.43.0.0/16) 안이고 다른 Service가 쓰지 않는다 — scripts/mac/keycloak.sh가 apply 전에 확인.
+      # Keycloak이 없으면 이 이름은 아무 데도 닿지 않는다(OIDC만 실패, NetworkPolicy docflow-to-keycloak 밖으로는 못 나감)
       hostAliases:
       - {ip: 10.43.0.39, hostnames: [keycloak.localhost]}
       containers:
@@ -408,19 +418,21 @@ spec:
         - {name: SESSION_HOURS, value: "12"}
         # 세션 쿠키는 코드 기본값 __Host-docflow_session(Secure). port-forward(루프백)로 온 요청만 http 이름 — app/auth.py 머리말 (issues/48)
         # OIDC = 데모 Keycloak (https://github.com/reddol18/docflow/issues/39, k8s/keycloak.yaml). client secret은 Secret oidc(client-secret)
-        #   — scripts/mac/keycloak.sh가 Keycloak 쪽 Secret과 같은 값으로 넣는다(값은 이 파일에 없다). 없으면 맥 deploy.sh가 apply 전에 멈춘다.
+        #   — scripts/mac/keycloak.sh가 Keycloak 쪽 Secret과 같은 값으로 넣는다(값은 이 파일에 없다). 마운트는 optional: Secret이 없으면
+        #   docflow는 경고를 남기고 OIDC만 끈 채 로컬 로그인으로 뜬다(app/auth.py oidc_startup) — 데모 없이도 배포가 막히지 않는다.
         # 콜백은 이 PC의 개발 서버(localhost:3000 → ssh 터널·port-forward → 파드 루프백, http 쿠키 이름)만 등록했다 —
-        #   https://docflow.localhost:8443(web 파드)에서 SSO 버튼을 누르면 콜백 주소가 달라 로그인되지 않는다(로컬 로그인은 그대로).
-        # 기관 SSO로 바꿀 때: https issuer, OIDC_ALLOW_HTTP 줄 빼기, 콜백 https, 아래 hostAliases·docflow-egress Keycloak 규칙을 그 SSO로.
+        #   다른 출처(https://docflow.localhost:8443, web 파드)의 로그인 화면은 SSO 버튼을 숨긴다(/auth/config oidc_origin). 로컬 로그인은 그대로.
+        # 기관 SSO로 바꿀 때: https issuer, OIDC_ALLOW_HTTP 줄 빼기, 콜백 https, 아래 hostAliases·NetworkPolicy docflow-to-keycloak을 그 SSO로.
         - {name: OIDC_ISSUER, value: "http://keycloak.localhost:8180/realms/docflow"}  # 브라우저·파드가 같은 글자 (keycloak.yaml '주소')
         - {name: OIDC_ALLOW_HTTP, value: "1"}  # 클러스터 안 데모 제공자 전용 (app/auth.py). 내부 CA에 keycloak 이름이 없어 http
         - {name: OIDC_CLIENT_ID, value: "docflow"}
         - {name: OIDC_CLIENT_SECRET_FILE, value: /etc/oidc/client-secret}
         - {name: OIDC_REDIRECT_URI, value: "http://localhost:3000/api/auth/oidc/callback"}
-        # 역할 = Keycloak 그룹 (realm 클라이언트의 그룹 매퍼 → ID 토큰 groups, 경로 없이 이름만). 로그인할 때마다 다시 맞춘다:
-        # 그룹을 빼면 다음 로그인 때 남은 그룹 중 가장 넓은 역할로 내려가고, 지도에 있는 그룹이 하나도 없으면 로그인 거절(기본 none)
+        # 역할 = Keycloak 그룹 (realm 클라이언트의 그룹 매퍼 → ID 토큰 groups, 전체 경로 — 하위 그룹 /x/docflow-admin이 같은 이름으로
+        # 섞이지 않게). 로그인할 때마다 다시 맞춘다: 그룹을 빼면 다음 로그인 때 남은 그룹 중 가장 넓은 역할로 내려가고,
+        # 지도에 있는 그룹이 하나도 없으면 로그인 거절(기본 none)
         - {name: OIDC_ROLE_CLAIM, value: "groups"}
-        - {name: OIDC_ROLE_MAP, value: '{"docflow-admin":"admin","docflow-reviewer":"reviewer"}'}
+        - {name: OIDC_ROLE_MAP, value: '{"/docflow-admin":"admin","/docflow-reviewer":"reviewer"}'}
         - {name: OIDC_DEFAULT_ROLE, value: "none"}
         - {name: OIDC_LABEL, value: "Keycloak(데모)"}
         # 세션 서명 비밀값은 없다: 세션은 서버가 만든 무작위 토큰이고 DB(sessions)에 해시로만 둔다.
@@ -453,7 +465,7 @@ spec:
       - {name: ca, configMap: {name: docflow-ca}}
       - {name: qdrant-key, secret: {secretName: qdrant-api-key, defaultMode: 0440}}  # fsGroup 1000이 읽는다
       - {name: redis-auth, secret: {secretName: redis-auth, defaultMode: 0440}}
-      - {name: oidc, secret: {secretName: oidc, defaultMode: 0440}}  # OIDC client secret (scripts/mac/keycloak.sh)
+      - {name: oidc, secret: {secretName: oidc, defaultMode: 0440, optional: true}}  # OIDC client secret (scripts/mac/keycloak.sh). 없으면 OIDC 꺼짐
       # 업로드 임시 파일(Starlette가 1MB 넘는 파일 조각을 /tmp에 흘려 씀). 넘으면 kubelet이 docflow 파드를 내쫓는다 →
       # 앱이 동시에 받는 업로드 본문 합계를 UPLOAD_TMP_MB(기본 1536MB)로, 요청 본문 하나를 UPLOAD_MAX_BODY_MB(기본 210MB)로 묶는다 (app/upload.py, https://github.com/reddol18/docflow/issues/26)
       - {name: tmp, emptyDir: {sizeLimit: 2Gi}}
