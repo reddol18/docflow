@@ -17,6 +17,8 @@ python-multipart==0.0.32
 argon2-cffi==25.1.0
 PyJWT[crypto]==2.15.1
 httpx==0.28.1
+# 실행 대기열 Redis Streams (https://github.com/reddol18/docflow/issues/5). QUEUE_BACKEND=redis일 때만 불러온다
+redis==8.1.0
 # 납품 양식 엑셀 쓰기 (https://github.com/reddol18/docflow/issues/12)
 openpyxl==3.1.5
 # 색인 칸 스키마·납품 양식 YAML 읽기 — 시작할 때 필수라 간접 의존(lock)에 기대지 않고 직접 고정 (https://github.com/reddol18/docflow/issues/9)
