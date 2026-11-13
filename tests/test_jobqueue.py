@@ -5,6 +5,7 @@
 fakeredis가 없으면 건너뛰지 않고 실패한다 (두 구현 모두 돌았다는 근거).
 """
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -604,7 +605,13 @@ def test_manifest_redis_acl_matches_code():
 
     from app.jobqueue_redis import ACL_COMMANDS, acl_rules
     text = (Path(__file__).resolve().parents[1] / "k8s" / "docs.yaml").read_text(encoding="utf-8")
-    assert "user default off" in text
     assert "user docflow on >%s " + " ".join(acl_rules()) in text
+    # default 줄: 꺼져 있고(비밀번호 없음), 권한은 +@all — 리셋 권한(-@all)이면 재시작 때 AOF 적재기가 Lua 효과의 MULTI/EXEC를
+    # NOPERM으로 버린다 (https://github.com/reddol18/docflow/issues/5, scripts/redis_aof_check.sh)
+    default = re.findall(r'printf "user default ([^"\\]*)\\n', text)
+    assert len(default) == 1, default
+    words = default[0].split()
+    assert words[0] == "off" and "on" not in words and not any(w.startswith((">", "#", "<", "!")) for w in words)
+    assert {"~*", "&*", "+@all"} <= set(words) and not any(w.startswith("-") or w in ("reset", "nocommands") for w in words)
     assert "requirepass" not in text
     assert all(c in ("ping", "client|setinfo", "time") or c.startswith(("x", "eval", "script")) for c in ACL_COMMANDS)
