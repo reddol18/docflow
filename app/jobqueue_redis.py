@@ -51,12 +51,15 @@ def acl_rules(prefix: str = "docflow:q") -> list[str]:
 def aof_loader_rules(prefix: str = "docflow:q") -> list[str]:
     """default 사용자 규칙 (설정의 "user default ..." 뒤): 꺼 두고(비밀번호 없음 → 누구도 default로 인증 못 함) 권한은 AOF 적재기 몫만.
     설정의 user default 줄은 default를 먼저 리셋(-@all)하는데, 재시작 때 AOF 적재기는 Lua 효과의 MULTI/EXEC 묶음을 default
-    권한으로 다시 검사해 NOPERM이면 버린다 (https://github.com/reddol18/docflow/issues/5, XLEN 3 → 0). 그래서 대기열 Lua 효과가
-    전파하는 것만 연다 — 스트림 명령(XADD·XACK·XDEL·XCLAIM·XGROUP SETID·XTRIM 등) + MULTI·EXEC·SELECT, 키는 {prefix}:*.
-    +@all이 아닌 까닭: 실수로 on이 되어도 비밀번호 없는 전권 사용자가 되지 않게 (tests/test_jobqueue.py AOF 재시작 시험)"""
-    return ["off", "resetchannels", f"~{{{prefix}}}:*", "+multi", "+exec", "+select", "+@stream"]
+    권한으로 다시 검사해 NOPERM이면 버린다 (https://github.com/reddol18/docflow/issues/5, XLEN 3 → 0). 그래서 대기열 명령·Lua 효과가
+    AOF에 남기는 명령(AOF_LOADER_COMMANDS — 실제 Redis 7.4 AOF에서 확인) + MULTI·EXEC·SELECT만 연다, 키는 {prefix}:*.
+    +@all이 아닌 까닭: 실수로 on이 되어도 비밀번호 없는 전권 사용자가 되지 않게 (tests/test_jobqueue.py AOF 재시작 시험).
+    QUEUE_PREFIX를 바꾸면 그 접두사로 aof_loader_rules(QUEUE_PREFIX)를 쓴다 (AOF_LOADER_ACL은 기본 접두사 docflow:q 몫)"""
+    return ["off", "resetchannels", f"~{{{prefix}}}:*", *(f"+{c}" for c in AOF_LOADER_COMMANDS)]
 
 
+# AOF에 남는 명령 (MULTI/EXEC 안의 것을 AOF 적재기가 default 권한으로 다시 검사한다). 늘리거나 줄일 때는 AOF 재시작 시험으로 확인
+AOF_LOADER_COMMANDS = ("multi", "exec", "select", "xadd", "xack", "xdel", "xclaim", "xgroup|setid", "xtrim")
 AOF_LOADER_ACL = " ".join(aof_loader_rules())  # k8s/docs.yaml redis 초기화 컨테이너의 "user default " 뒤와 같다 (시험이 본다)
 PREFIX_RX = re.compile(r"[A-Za-z0-9:_-]{1,64}")
 T = TypeVar("T")

@@ -297,7 +297,7 @@ spec:
         # AOF_LOADER_ACL과 같은 글자 — 시험이 본다). "user default off"만 두면 -@all로 리셋되고, 재시작 때 AOF 적재기가 Lua 효과의
         # MULTI/EXEC를 default 권한으로 다시 검사해 NOPERM으로 버린다 (XLEN 3 → 0, https://github.com/reddol18/docflow/issues/5).
         # 실제 Redis 시험: tests/test_jobqueue.py test_redis_aof_restart_keeps_queue (TEST_REDIS_SERVER)
-        command: [sh, -c, 'p="$(cat /auth/password)" && case "$p" in "" | *[!A-Za-z0-9]*) echo "redis-auth password는 [A-Za-z0-9]+ 이어야 함" >&2; exit 1;; esac && umask 077 && printf "user default off resetchannels ~{docflow:q}:* +multi +exec +select +@stream\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$p" > /conf/auth.conf']
+        command: [sh, -c, 'p="$(cat /auth/password)" && case "$p" in "" | *[!A-Za-z0-9]*) echo "redis-auth password는 [A-Za-z0-9]+ 이어야 함" >&2; exit 1;; esac && umask 077 && printf "user default off resetchannels ~{docflow:q}:* +multi +exec +select +xadd +xack +xdel +xclaim +xgroup|setid +xtrim\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$p" > /conf/auth.conf']
         resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
