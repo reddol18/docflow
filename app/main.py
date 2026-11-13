@@ -81,6 +81,10 @@ from app import upload as uploads  # 경로 함수 이름 upload와 겹치지 �
 from app.auth import Admin, Reviewer, Viewer, audit_as
 from app.review_input import EDITABLE, changes, clean_fixes
 
+# uvicorn 접근 로그에서 질의 문자열(/search·/ask의 q — 실명 등이 들어갈 수 있음)을 뗀다. 접근 로그는 남긴다
+# (https://github.com/reddol18/docflow/issues/27, app/errors.py AccessLogNoQuery)
+errors.install_access_log_filter()
+
 # 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부. fullmatch + \Z — '$'는 끝 줄바꿈 앞에서도 맞아 'v1\n'이 지나간다
 VOL_RX = re.compile(r"(?!\.+\Z)[\w.-]{1,80}")
 Q_MAX = 200  # 검색어 길이 상한: 질의는 문서 제목(색인 칸 500자 안)보다 짧고, 임베딩·답변 입력 토큰을 묶는다

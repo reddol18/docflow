@@ -137,7 +137,8 @@ def rebuild(results, data):
         try:
             if out is None:
                 raise ValueError("응답 없음")
-            return fields.parse_extract(SCHEMA, out)
+            # 운영과 같은 판정 (https://github.com/reddol18/docflow/issues/27): 틀린 칸은 빈 값, JSON 객체가 아니면 읽기 실패
+            return dict(fields.validate_extract(SCHEMA, out))
         except (ValueError, TypeError):
             errors += 1
             return json.loads(json.dumps(EMPTY))

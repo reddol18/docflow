@@ -77,31 +77,64 @@ BAD = {
 }
 
 
-@pytest.mark.parametrize("content, why", [
-    *[(json.dumps(v, ensure_ascii=False), k) for k, v in BAD.items()],
-    ("JSON 아님 " + NAME, "JSON이 아님"),
-    (json.dumps([NAME]), "JSON 객체가 아님"),
-    (json.dumps({**json.loads(GOOD_EXTRACT), "title": {"value": NAME, "confidence": 85}}), "less_than_equal"),
-    (json.dumps({**json.loads(GOOD_EXTRACT), "title": {"value": NAME, "confidence": True}}), "float_type"),
-    (json.dumps({**json.loads(GOOD_EXTRACT), "title": {"value": 1997, "confidence": 0.5}}), "string_type"),
+BAD_PROBLEM = {"칸 값이 문자열": "recipient: model_type", "confidence가 문자열": "recipient.confidence: float_type",
+               "칸 누락": "recipient: 칸 없음"}
+BAD_TITLE = {k: v["title"]["value"] for k, v in BAD.items()}  # 틀린 칸이 아닌 제목은 그대로 남아야 한다
+
+
+def _good_with(**cells):
+    return json.dumps({**json.loads(GOOD_EXTRACT), **cells}, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("content, failed, problem", [
+    *[(json.dumps(v, ensure_ascii=False), ("recipient",), BAD_PROBLEM[k]) for k, v in BAD.items()],
+    (_good_with(title=None), ("title",), "title: null"),
+    (_good_with(title={"value": NAME, "confidence": 85}), ("title",), "title.confidence: less_than_equal"),
+    (_good_with(title={"value": NAME, "confidence": -0.1}), ("title",), "title.confidence: greater_than_equal"),
+    (_good_with(title={"value": NAME, "confidence": True}), ("title",), "title.confidence: float_type"),
+    (_good_with(title={"value": NAME}), ("title",), "title.confidence: missing"),
+    (_good_with(title={"value": [NAME], "confidence": 0.5}), ("title",), None),
+    (_good_with(title=[NAME], date=NAME), ("date", "title"), "date: model_type; title: model_type"),
 ])
-def test_validate_extract_rejects_bad_shapes(content, why):
+def test_validate_extract_marks_only_bad_cells(content, failed, problem):
+    """칸마다 따로 본다: 틀린 칸만 빈 값·확신도 0과 failed, 나머지 칸은 값 그대로. 오류 분류에 응답 값은 없다"""
+    out = fields.validate_extract(GIMHAE, content)
+    assert out.failed == failed and list(out) == ["docno", "date", "recipient", "title"]
+    for n in failed:
+        assert out[n] == {"value": "", "confidence": 0.0}
+    for n in set(out) - set(failed):
+        assert out[n]["confidence"] > 0  # 맞는 칸은 응답의 확신도 그대로 (빈 값으로 바뀌지 않음)
+    if problem:
+        assert "; ".join(out.problems) == problem
+    assert NAME not in repr(out.problems)
+
+
+def test_validate_extract_one_bad_three_good_keep_values():
+    """틀린 칸 1개 + 맞는 칸 3개 → 맞는 3칸의 값은 그대로 쓴다 (예전 '문서 전체 실패'가 아님)"""
+    out = fields.validate_extract(GIMHAE, json.dumps({
+        "docno": {"value": "가상 12345-1", "confidence": 0.8}, "date": {"value": "1997-03-02", "confidence": 0.7},
+        "recipient": {"value": "가상시장", "confidence": "높음"}, "title": {"value": "가상 제목", "confidence": 0.9}},
+        ensure_ascii=False))
+    assert out.failed == ("recipient",)
+    assert {k: v["value"] for k, v in out.items()} == {"docno": "가상 12345-1", "date": "1997-03-02", "recipient": "",
+                                                       "title": "가상 제목"}
+
+
+@pytest.mark.parametrize("content, why", [("JSON 아님 " + NAME, "JSON이 아님"), (json.dumps([NAME]), "JSON 객체가 아님")])
+def test_validate_extract_not_object_fails_whole(content, why):
+    """응답 전체가 JSON 객체가 아닐 때만 ExtractInvalid (문서의 추출 칸 모두 실패). 메시지에 응답 값 없음"""
     with pytest.raises(llm.ExtractInvalid) as e:
         fields.validate_extract(GIMHAE, content)
-    msg = str(e.value)
-    assert NAME not in msg and e.value.__cause__ is None  # 칸 이름·오류 종류만 — 응답 값(원문)은 싣지 않는다
-    if why in BAD:
-        assert {"칸 값이 문자열": "recipient: model_type", "confidence가 문자열": "recipient.confidence: float_type",
-                "칸 누락": "recipient: 칸 없음"}[why] == msg
-    else:
-        assert why in msg
+    assert why in str(e.value) and NAME not in str(e.value) and e.value.__cause__ is None
 
 
-def test_validate_extract_accepts_good_shape():
-    body = {**json.loads(GOOD_EXTRACT), "docno": {"value": None, "confidence": 0}, "끼어든 칸": "버림"}
-    out = fields.validate_extract(GIMHAE, json.dumps(body))
-    assert list(out) == ["docno", "date", "recipient", "title"]
-    assert out["docno"] == {"value": "", "confidence": 0.0} and out["title"] == {"value": "가상 제목", "confidence": 0.9}
+def test_validate_extract_number_value_and_extra_keys():
+    """value가 숫자면 글자로 바꿔 쓴다(예전 parse_extract도 받던 것), null은 빈 값, 모르는 칸은 버림"""
+    out = fields.validate_extract(GIMHAE, _good_with(docno={"value": None, "confidence": 0},
+                                                     date={"value": 1997, "confidence": 0.5}, **{"끼어든 칸": "버림"}))
+    assert out.failed == () and list(out) == ["docno", "date", "recipient", "title"]
+    assert out["docno"] == {"value": "", "confidence": 0.0} and out["date"] == {"value": "1997", "confidence": 0.5}
+    assert out["title"] == {"value": "가상 제목", "confidence": 0.9}
 
 
 def _fake_client(sent, extract_reply, answer_reply=None):
@@ -160,18 +193,27 @@ def _run(monkeypatch, rec, mode):
     return worker.execute(main, "v1", {"vol": "v1", "review_mode": mode}, None)
 
 
-def _bad_for_0002(bad):
-    """문서 v1-0002의 추출에만 틀린 응답, 나머지는 정상"""
-    return lambda a: json.dumps(bad, ensure_ascii=False) if "가상 줄 v1-0002" in a["messages"][1]["content"] else GOOD_EXTRACT
+def _bad_for_0002(content):
+    """문서 v1-0002의 추출에만 틀린 응답(글자 그대로), 나머지는 정상"""
+    return lambda a: content if "가상 줄 v1-0002" in a["messages"][1]["content"] else GOOD_EXTRACT
 
 
-@pytest.mark.parametrize("bad", list(BAD), ids=list(BAD))
-def test_one_bad_extract_marks_only_that_doc(tmp_path, monkeypatch, capsys, bad):
-    """문서 3건 중 1건만 틀린 응답 → 예외 없이 그 문서만 '추출 실패'(검토 표시), 나머지는 정상 추출, 실행은 run end (run error 없음)"""
+ALL_KEYS = {"serial", "date", "recipient", "title"}  # 김해 prompt 칸의 표시 키 (docno는 serial에 표시)
+GRAPH_CASES = {  # 이름: (응답 글자, 실패 칸, 실패 표시 키, 남는 제목)
+    **{k: (json.dumps(v, ensure_ascii=False), ["recipient"], {"recipient"}, BAD_TITLE[k]) for k, v in BAD.items()},
+    "JSON 객체 아님": ("[1, 2]", ["docno", "date", "recipient", "title"], ALL_KEYS, ""),
+}
+
+
+@pytest.mark.parametrize("case", list(GRAPH_CASES), ids=list(GRAPH_CASES))
+def test_one_bad_extract_marks_only_that_doc(tmp_path, monkeypatch, capsys, case):
+    """문서 3건 중 1건만 틀린 응답 → 예외 없이 그 문서의 틀린 칸만 '추출 실패'(검토 표시), 그 문서의 맞는 칸과 다른 문서는
+    정상 값, 실행은 run end (run error 없음). auto라 실패 칸을 빈 값·표시로 둔 채 색인까지 간다"""
     from app import graph
+    content, failed_cells, failed_keys, title = GRAPH_CASES[case]
     use(monkeypatch, LOCAL)
     rec = _volume(tmp_path, monkeypatch, lambda p: [f"가상 줄 {p}"])
-    monkeypatch.setattr(llm, "client", lambda: _fake_client([], _bad_for_0002(BAD[bad])))
+    monkeypatch.setattr(llm, "client", lambda: _fake_client([], _bad_for_0002(content)))
     assert _run(monkeypatch, rec, "auto") == "ok"
 
     runs = [s for n, s, _, _ in rec.events if n == "run"]
@@ -180,28 +222,29 @@ def test_one_bad_extract_marks_only_that_doc(tmp_path, monkeypatch, capsys, bad)
     docs = {d["doc_id"]: d for d in rec.saved}
     assert list(docs) == PAGES  # 세 문서 모두 색인까지
     bad_doc = docs["v1-0002"]
-    assert bad_doc["info"]["llm_failed"] == ["extract"] and bad_doc["fields"]["title"] == ""
-    failed = {k for k, v in bad_doc["flags"].items() if graph.FAIL_FLAG in v}
-    assert failed == {"serial", "date", "recipient", "title"}  # 추출 칸(김해 prompt 칸)의 표시 키마다
-    assert not any("LLM" in v for v in bad_doc["flags"].values())  # 확신도 0은 '낮은 확신도'가 아니라 실패
+    assert bad_doc["info"]["llm_failed"] == failed_cells
+    assert bad_doc["fields"]["recipient"] == "" and bad_doc["fields"]["title"] == title  # 맞는 칸(제목)은 값 그대로
+    assert {k for k, v in bad_doc["flags"].items() if graph.FAIL_FLAG in v} == failed_keys  # 틀린 칸에만
+    for k in failed_keys:
+        assert "LLM" not in bad_doc["flags"][k]  # 확신도 0은 '낮은 확신도'가 아니라 실패
     for k in ("v1-0001", "v1-0003"):
         assert docs[k]["info"]["llm_failed"] == [] and docs[k]["fields"]["title"] == "가상 제목"
         assert not any(graph.FAIL_FLAG in v for v in docs[k]["flags"].values())
-    # 진행 화면에는 분류 코드만
-    assert [(d, k["failed"]) for n, s, d, k in rec.events if n == "extract" and s == "end" and k.get("failed")] == \
-           [("v1-0002", "extract_invalid")]
+    # 진행 화면에는 분류 코드·칸 이름만
+    assert [(d, k["failed"], k["failed_fields"]) for n, s, d, k in rec.events
+            if n == "extract" and s == "end" and k.get("failed")] == [("v1-0002", "extract_invalid", failed_cells)]
     assert "[graph] extract 응답 형식 오류 v1/v1-0002" in capsys.readouterr().err
 
 
 def test_bad_extract_goes_to_human_review(tmp_path, monkeypatch):
-    """human이면 '추출 실패' 문서가 사람 검토(review)의 검토 대상 목록에 들어간다 (기존 검토 표시 흐름 그대로)"""
+    """human이면 '추출 실패' 칸이 있는 문서가 사람 검토(review)의 검토 대상 목록에 들어간다 (기존 검토 표시 흐름 그대로)"""
     from app import graph, main
     use(monkeypatch, LOCAL)
     rec = _volume(tmp_path, monkeypatch, lambda p: [f"가상 줄 {p}"])
-    monkeypatch.setattr(llm, "client", lambda: _fake_client([], _bad_for_0002(BAD["칸 누락"])))
+    monkeypatch.setattr(llm, "client", lambda: _fake_client([], _bad_for_0002(json.dumps(BAD["칸 누락"]))))
     assert _run(monkeypatch, rec, "human") == "review"
     flagged = {d["doc_id"]: d for d in main.G.get_state(main.cfg("v1")).interrupts[0].value["flagged"]}
-    assert graph.FAIL_FLAG in flagged["v1-0002"]["flags"]["title"]
+    assert graph.FAIL_FLAG in flagged["v1-0002"]["flags"]["recipient"]
     assert not [e for e in rec.events if e[1] == "error"]
 
 
@@ -258,7 +301,104 @@ def test_ask_answer_returns_warnings(monkeypatch):
     assert out == {"answer": "가상 답 [va/p-0001]", "sources": hits, "warnings": ["근거 없는 인용 1건 제거"]}
 
 
+def test_citation_lookalikes_survive():
+    """[x/y]라도 우리 문서 id 꼴이 아니고 넘긴 철도 아니면 본문 글로 둔다 — 날짜·부서 표기는 지우지 않는다"""
+    text = "1997년 5월 [1997/05] [총무과/서무계] 문서 [va/p-0001] 참고"
+    assert llm.drop_unknown_citations(text, DOCS) == (text, 0)
+    # 넘긴 철이면 뒤쪽이 id 꼴이 아니어도 근거 표시로 본다 (철 이름을 빌린 조작)
+    assert llm.drop_unknown_citations("가상 [va/서무계] 끝", DOCS) == ("가상 끝", 1)
+
+
+@pytest.mark.parametrize("variant", ["[ va / p-0001 ]", "［va/p-0001］", "【va/p-0001】", "〔va/p-0001〕", "[va /p-0001]"])
+def test_citation_variants_normalized(variant):
+    """괄호 변형·안쪽 빈칸도 근거 표시로 본다: 넘긴 문서면 표준 꼴로 남기고, 아니면 지운다"""
+    assert llm.drop_unknown_citations(f"가상 답 {variant}.", DOCS) == ("가상 답 [va/p-0001].", 0)
+    bad = variant.replace("p-0001", "p-9999")
+    assert llm.drop_unknown_citations(f"가상 답 {bad}.", DOCS) == ("가상 답.", 1)
+
+
+def test_citation_removal_cleans_only_the_spot():
+    """지운 자리에서만 빈칸을 정리한다 — 답의 다른 곳의 겹친 빈칸·들여쓰기·줄바꿈은 그대로"""
+    text = "표:  가상  값\n    들여쓴 줄 [vz/p-9999] 끝\n[vz/p-1]  줄 맨 앞\n둘 [va/p-0001][vz/p-2] 붙음"
+    out, n = llm.drop_unknown_citations(text, DOCS)
+    assert n == 3
+    assert out == "표:  가상  값\n    들여쓴 줄 끝\n줄 맨 앞\n둘 [va/p-0001] 붙음"
+
+
 # ---------- 조건 5: 로그·추적에 실명 0건 ----------
+
+def test_mask_hangul_hanja_and_number_values():
+    """예외 repr의 따옴표 글자: 한글·한자·주민등록번호·전화번호 꼴은 가리고, 경로·영문 글자는 둔다"""
+    s = errors.mask("KeyError: '남궁가온'\nValueError: input_value='李明博士' a=\"010-1234-5678\" b='900101-1234567' "
+                    "c='/data/pages/v1/v1-0001.jpg' d='C:\\data\\v1' e='v1-0001' f='plain'")
+    for bad in ("남궁가온", "李明博士", "010-1234-5678", "900101-1234567"):
+        assert bad not in s
+    for keep in ("'/data/pages/v1/v1-0001.jpg'", "'C:\\data\\v1'", "'v1-0001'", "'plain'"):
+        assert keep in s  # 경로(철·문서 id)·영문은 그대로
+
+
+def test_mask_keeps_traceback_source_lines():
+    """traceback의 소스 위치 줄과 그 다음 코드 줄은 가리지 않는다 (예외 메시지 줄만)"""
+    tb = ('Traceback (most recent call last):\n  File "E:\\app\\가상.py", line 3, in f\n'
+          '    raise KeyError("한글 소스 글자")\nKeyError: \'남궁가온\'')
+    s = errors.mask(tb)
+    assert 'File "E:\\app\\가상.py", line 3' in s and 'raise KeyError("한글 소스 글자")' in s
+    assert "남궁가온" not in s and "KeyError: '***'" in s
+
+
+def test_mask_linear_time_on_unclosed_quote():
+    """닫히지 않은 따옴표 뒤에 한글 50,000자 — 따옴표 길이를 묶어 되짚기가 제곱으로 늘지 않는다"""
+    import time
+    for s in ("x = '" + "가" * 50_000, 'x = "' + "一" * 50_000, "가" * 50_000 + "password=1"):
+        t = time.perf_counter()
+        errors.mask(s)
+        assert time.perf_counter() - t < 0.5
+
+
+def test_access_log_drops_query():
+    """실제 uvicorn으로 앱에 /ask?q=<가상 실명>·/search?q=… 요청 → 접근 로그 줄은 남고 질의 글은 없다"""
+    import logging
+    import socket
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+
+    import uvicorn
+
+    from app import main
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    records = []
+    grab = logging.Handler()
+    grab.emit = records.append  # 접근 로거에 직접 붙인다 (다른 시험이 propagate를 꺼 두었어도 받게)
+    access = logging.getLogger("uvicorn.access")
+    access.addHandler(grab)
+    server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=port, lifespan="off", log_config=None,
+                                           access_log=True, log_level="info"))
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.05)
+        assert server.started
+        for path in (f"/ask?q={NAME}", f"/search?q={NAME}&k=3"):
+            url = f"http://127.0.0.1:{port}" + urllib.request.quote(path, safe="/?=&")
+            try:
+                urllib.request.urlopen(url, timeout=5)  # noqa: S310 — 시험이 띄운 루프백 서버
+            except urllib.error.HTTPError:
+                pass  # 로그인 없음(401) — 접근 로그는 상태와 상관없이 남는다
+    finally:
+        server.should_exit = True
+        t.join(5)
+        access.removeHandler(grab)
+    lines = [r.getMessage() for r in records]
+    assert any('"GET /ask?… HTTP/1.1"' in x for x in lines) and any('"GET /search?… HTTP/1.1"' in x for x in lines)
+    quoted = urllib.request.quote(NAME)
+    assert not any(NAME in x or quoted in x for x in lines)
 
 def test_fictional_name_not_in_logs(tmp_path, monkeypatch, capsys):
     """가상 실명이 든 문서 3건을 처리(정상 추출 1·실명이 든 틀린 응답 1·정상 1) + 그 문서로 답변 + 실명이 든 예외를 서버 로그로

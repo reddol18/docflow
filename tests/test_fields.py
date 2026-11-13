@@ -154,11 +154,13 @@ def test_llm_extract_keys_and_prompt_from_schema(monkeypatch):
     assert list(out) == ["subject", "kind", "made"]  # 스키마의 prompt 칸만, 스키마 순서. 모르는 칸(docno)은 버림
     assert out["kind"] == {"value": "신고", "confidence": 1.0} and out["made"] == {"value": "", "confidence": 0.0}
     assert "아래 3칸을 뽑는다." in seen["prompt"] and "- kind: 문서 종류 (다음 중 하나: 허가, 신고)" in seen["prompt"]
-    # 모양이 틀린 응답(confidence가 글자, 칸 누락)은 예전처럼 빈 값으로 고쳐 쓰지 않고 추출 실패
+    assert out.failed == ()  # value null은 빈 값 (틀린 칸 아님)
+    # 모양이 틀린 칸(confidence가 글자, 칸 누락)은 그 칸만 빈 값·추출 실패, 맞는 칸은 그대로
     # (https://github.com/reddol18/docflow/issues/27 — tests/test_llm_boundary.py)
     body = {"subject": {"value": "가상 건명", "confidence": 0.9}, "kind": {"value": "신고", "confidence": "x"}}
-    with pytest.raises(llm.ExtractInvalid, match="kind.confidence: float_type; made: 칸 없음"):
-        llm.extract("v", ["줄"], other())
+    out = llm.extract("v", ["줄"], other())
+    assert out.failed == ("kind", "made") and out.problems == ("kind.confidence: float_type", "made: 칸 없음")
+    assert out["subject"] == {"value": "가상 건명", "confidence": 0.9} and out["kind"] == {"value": "", "confidence": 0.0}
     no_llm = copy.deepcopy(OTHER)
     no_llm["fields"] = [f for f in no_llm["fields"] if "prompt" not in f]
     no_llm.pop("extract")

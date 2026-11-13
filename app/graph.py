@@ -15,9 +15,11 @@ LLM_PROVIDER=off (app/llm.py)면 추출·판독·임베딩을 부르지 않고 �
 events(extract·read의 skipped, index의 embedded)로 드러난다. 건너뛴 문서는 스키마와 상관없이(app/flags.py 규칙과 별도로)
 LLM이 채울 칸에 'LLM 꺼짐' 검토 표시가 붙고, review_mode가 auto여도 사람 검토(review)에서 멈춘다.
 
-추출 응답의 모양이 틀리면(app/fields.py validate_extract, https://github.com/reddol18/docflow/issues/27) 그 문서만
-'추출 실패': 추출 칸은 빈 값·확신도 0, 문서 info.llm_failed와 events(extract의 failed)에 드러나고 추출 칸마다 '추출 실패'
-검토 표시가 붙는다. 철 실행은 멈추지 않는다 — 표시가 있으니 human이면 사람 검토에서, auto(평가용)면 표시를 단 채 색인까지 간다.
+추출 응답은 칸마다 확인한다(app/fields.py validate_extract, https://github.com/reddol18/docflow/issues/27). 모양이 틀린 칸만
+'추출 실패': 그 칸은 빈 값·확신도 0, 문서 info.llm_failed(칸 이름)와 events(extract의 failed: extract_invalid, failed_fields)에
+드러나고 그 칸에 '추출 실패' 검토 표시가 붙는다. 맞는 칸은 값을 그대로 쓴다. 응답이 JSON 객체가 아니면 추출 칸 모두가 실패.
+철 실행은 멈추지 않는다 — 표시가 있으니 human이면 사람 검토에서 멈추고, auto(평가용)면 실패 칸을 빈 값·표시로 둔 채 색인까지
+간다(내보내기 전 검증 /export/check의 '검토 안 끝난 건'과 검토 목록이 잡는다).
 """
 import json
 import operator
@@ -111,7 +113,7 @@ FAIL_FLAG = "추출 실패"  # 추출 응답 모양이 틀림 (https://github.co
 def off_flags(d, schema=None):
     """LLM을 건너뛰었거나 추출 응답이 틀린 문서의 검토 표시 {flag_key: [사유]}.
     건너뜀(info.llm_skipped): 추출 칸(스키마 prompt 칸)·손글씨 규칙 칸(판독)마다 'LLM 꺼짐'.
-    추출 실패(info.llm_failed, 응답이 fields.validate_extract에 맞지 않음): 추출 칸마다 '추출 실패'"""
+    추출 실패(info.llm_failed = 응답 모양이 틀린 추출 칸 이름, fields.validate_extract): 그 칸에만 '추출 실패'"""
     schema = schema or SCHEMA
     info = d.get("info") or {}
     skipped = set(info.get("llm_skipped") or ())
@@ -119,7 +121,7 @@ def off_flags(d, schema=None):
     names = set(prompt_names) if "extract" in skipped else set()
     if "read" in skipped:
         names |= {f["name"] for f in schema["fields"] if f.get("rule") in HW_RULES}
-    failed = prompt_names if "extract" in (info.get("llm_failed") or ()) else set()
+    failed = prompt_names & set(info.get("llm_failed") or ())
     out = {}
     for why, ns in ((OFF_FLAG, names), (FAIL_FLAG, failed)):
         for k in sorted({fields.flag_key(f) for f in schema["fields"] if f["name"] in ns}):
@@ -165,8 +167,8 @@ def _brief(name, out):
         return {"missing": [k for k, b in out["boxes"].items() if b is None]}
     if name in ("extract", "read") and out.get("skipped"):
         return {"skipped": "llm_off"}
-    if name == "extract" and out.get("failed"):  # 진행 화면에 분류 코드만 (응답 값 없이)
-        return {"failed": "extract_invalid"}
+    if name == "extract" and out.get("failed"):  # 진행 화면에 분류 코드·칸 이름만 (응답 값 없이)
+        return {"failed": "extract_invalid", "failed_fields": list(out["failed"])}
     if name == "read":
         return {k: v["text"] for k, v in out["hw"].items()}
     if name == "index":
@@ -198,7 +200,8 @@ class DocState(TypedDict, total=False):
     doc_id: str
     pages: list[str]
     skipped: Annotated[list[str], operator.add]  # LLM_PROVIDER=off로 건너뛴 단계 (extract·read)
-    failed: Annotated[list[str], operator.add]  # 응답 모양이 틀려 쓰지 못한 단계 (extract, #27)
+    # 응답 모양이 틀려 빈 값으로 둔 추출 칸 이름 (https://github.com/reddol18/docflow/issues/27)
+    failed: Annotated[list[str], operator.add]
     b: dict  # GPT 텍스트 추출 (PoC의 B 갈래)
     recipient: str
     recipient_fix: str
@@ -275,7 +278,8 @@ def validate(s: VolState):
         # LLM을 건너뛴 문서는 스키마와 상관없이 표시. 그 칸의 'LLM'(낮은 확신도) 사유는 뺀다 — 건너뛴 추출의 확신도 0은
         # LLM이 낮게 본 값이 아니라 부르지 않은 것이라, 'LLM 꺼짐' 하나가 사람에게 맞는 이유다 (손글씨 판독 확신도 0이
         # 확신도 표시를 내지 않는 것과 같게). 다른 사유(일자 형식 등 — 빈 값이라 실제로 틀림)는 그대로 둔다.
-        # 추출 실패(응답 모양이 틀림, #27)도 같다 — 빈 값·확신도 0은 LLM이 낮게 본 값이 아니라 쓸 수 없던 응답이다
+        # 추출 실패 칸(응답 모양이 틀림, https://github.com/reddol18/docflow/issues/27)도 같다 — 빈 값·확신도 0은 LLM이 낮게 본
+        # 값이 아니라 쓸 수 없던 응답이다
         for k, v in off_flags(d).items():
             rest = [x for x in fl.get(k, []) if x != "LLM"]
             fl[k] = [*rest, *v]
@@ -345,13 +349,18 @@ def extract(s: DocState):
     skipped, failed = [], []
     try:
         b = llm.extract(s["vol"], d["lines"], SCHEMA)
+        # 칸마다 확인한 결과: 모양이 틀린 칸(칸 없음·null·문자열·confidence가 문자열 등)만 빈 값, 그 칸 이름
+        failed, why = list(getattr(b, "failed", ())), "; ".join(getattr(b, "problems", ()))
+        b = dict(b)  # 상태(체크포인트)에는 보통 dict로
     except llm.LLMOff:  # 추출 칸은 빈 값·확신도 0 (가짜 값 없음) → 검토 표시로 사람에게
         b, skipped = fields.parse_extract(SCHEMA, "{}"), ["extract"]  # LLMOff는 prompt 칸이 있을 때만 난다
-    except llm.ExtractInvalid as e:
-        # 응답 모양이 틀림(칸 값이 문자열·confidence가 문자열·칸 누락·JSON 아님) → 이 문서만 '추출 실패'(빈 값, 검토 표시),
-        # 철 실행은 이어 간다 (https://github.com/reddol18/docflow/issues/27). 서버 로그에는 칸 이름·오류 종류만 (e에 원문 값 없음)
-        print(f"[graph] extract 응답 형식 오류 {s['vol']}/{s['doc_id']}: {e}", file=sys.stderr, flush=True)
-        b, failed = fields.parse_extract(SCHEMA, "{}"), ["extract"]
+    except llm.ExtractInvalid as e:  # 응답이 JSON 객체가 아님 → 추출 칸 모두 실패
+        b = fields.parse_extract(SCHEMA, "{}")
+        failed, why = list(b), str(e)
+    if failed:
+        # 그 칸만 '추출 실패'(빈 값, 검토 표시), 철 실행은 이어 간다 (https://github.com/reddol18/docflow/issues/27).
+        # 서버 로그에는 칸 이름·오류 종류만 (응답 값·원문 없음)
+        print(f"[graph] extract 응답 형식 오류 {s['vol']}/{s['doc_id']}: {why}", file=sys.stderr, flush=True)
     rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
     return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped, "failed": failed}
 
