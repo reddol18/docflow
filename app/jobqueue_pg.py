@@ -185,6 +185,11 @@ class PgQueue:
                               FROM job_queue, t WHERE kind = %(kind)s""", {"kind": kind, "idle": idle}).fetchone()
         return QueueStats(r["waiting"], r["running"], r["dead"])
 
+    def count_for(self, vol: str) -> int:
+        with self.pool.connection() as c:
+            return c.execute("SELECT count(*) AS n FROM job_queue WHERE NOT dead AND body->>'vol' = %s",
+                             (vol,)).fetchone()["n"]
+
     def position(self, kind: str, job_id: str) -> int | None:
         idle = self.cfg.spec(kind).idle
         if (i := _int(job_id)) is None:

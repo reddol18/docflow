@@ -242,8 +242,11 @@ spec: {selector: {app: qdrant}, ports: [{port: 6333}]}
 ---
 # 실행 대기열 Redis (https://github.com/reddol18/docflow/issues/5). 쪽 OCR·그래프·/ask 작업 (본문은 철·쪽 이름·요청 id뿐).
 # AOF(appendonly, 1초마다 fsync) — 재시작해도 작업이 남는다. 대기열은 지워지면 안 되므로 maxmemory-policy noeviction(가득 차면 쓰기 거절
-# → 앱은 넣기 실패). TLS만(port 0, tls-port 6379, 인증서 tls-redis — 내부 CA, scripts/ca.py redis), 비밀번호(Secret redis-auth)는
-# 명령줄·환경 변수에 두지 않고 초기화 컨테이너가 메모리 emptyDir의 설정 조각으로 옮긴다. 같은 이미지·같은 uid.
+# → 앱은 넣기 실패). TLS만(port 0, tls-port 6379, 인증서 tls-redis — 내부 CA, scripts/ca.py redis).
+# ACL: default 사용자는 끈다. 앱 전용 사용자 docflow만 — 키 {docflow:q}:*, 명령은 app/jobqueue_redis.py ACL_COMMANDS(대기열·Lua가
+# 쓰는 것)뿐 (-@all 뒤 하나씩. 관리 명령·KEYS·CONFIG·FLUSH·SELECT 없음 — tests/test_jobqueue.py가 규칙이 코드와 같은지 본다).
+# 비밀번호(Secret redis-auth)는 명령줄·환경 변수에 두지 않고 초기화 컨테이너가 메모리 emptyDir의 설정 조각(ACL 줄)으로 옮긴다.
+# 관리(측정·점검)는 파드 안 redis-cli로 같은 사용자 — PR https://github.com/reddol18/docflow/pull/128 배포 칸의 명령.
 apiVersion: v1
 kind: ConfigMap
 metadata: {name: redis-conf, namespace: docs}
@@ -287,7 +290,7 @@ spec:
       initContainers:
       - name: auth-conf
         image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
-        command: [sh, -c, 'umask 077 && printf "requirepass %s\n" "$(cat /auth/password)" > /conf/auth.conf']
+        command: [sh, -c, 'umask 077 && printf "user default off\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$(cat /auth/password)" > /conf/auth.conf']
         resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
@@ -357,6 +360,7 @@ spec:
         # 실행 대기열 (https://github.com/reddol18/docflow/issues/5, app/jobqueue.py 머리말 — 값은 결정 댓글의 기본값)
         - {name: QUEUE_BACKEND, value: redis}
         - {name: REDIS_URL, value: "rediss://redis.docs.svc.cluster.local:6379/0"}  # 비밀번호는 URL에 두지 않는다
+        - {name: REDIS_USERNAME, value: docflow}  # Redis ACL 앱 전용 사용자 (default는 꺼 둠)
         - {name: REDIS_PASSWORD_FILE, value: /etc/redis-auth/password}
         - {name: REDIS_CA_FILE, value: /etc/docflow-ca/ca.crt}
         - {name: DAILY_BUDGET_USD, value: "3.0"}  # 색인·수정 하루 예산 (KST)
@@ -470,6 +474,7 @@ spec:
         # 실행 대기열 (https://github.com/reddol18/docflow/issues/5, app/jobqueue.py 머리말 — 값은 결정 댓글의 기본값)
         - {name: QUEUE_BACKEND, value: redis}
         - {name: REDIS_URL, value: "rediss://redis.docs.svc.cluster.local:6379/0"}  # 비밀번호는 URL에 두지 않는다
+        - {name: REDIS_USERNAME, value: docflow}  # Redis ACL 앱 전용 사용자 (default는 꺼 둠)
         - {name: REDIS_PASSWORD_FILE, value: /etc/redis-auth/password}
         - {name: REDIS_CA_FILE, value: /etc/docflow-ca/ca.crt}
         - {name: DAILY_BUDGET_USD, value: "3.0"}  # 예산은 DB(budget_day)에서 API와 함께 센다 — 값은 API와 같게

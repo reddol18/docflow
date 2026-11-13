@@ -60,6 +60,7 @@ import threading
 import time
 import unicodedata
 from contextlib import asynccontextmanager, contextmanager
+from types import SimpleNamespace
 from typing import Annotated, Literal
 
 import cv2
@@ -305,39 +306,46 @@ def unaudited_routes(application):
             if set(r.methods) - set(auth.SAFE_METHODS) and not getattr(r.endpoint, "audit_action", None)]
 
 
-def busy(vol):
-    """실행 중인가: 이 프로세스의 짧은 일 표시 또는 철 실행(대기열) 상태. 값은 상태 글자 ('queued'·'running'·'uploading' …)"""
-    return running.get(vol) or runs.active(vol)
+def busy(vol, act=None):
+    """실행 중인가: 이 프로세스의 짧은 일 표시 또는 철 실행(대기열) 상태. 값은 상태 글자 ('queued'·'running'·'uploading' …).
+    act: 미리 읽은 {철: 실행 상태} (runs.active_all — 철 목록이 철마다 DB를 다시 읽지 않게)"""
+    if vol in running:
+        return running[vol]
+    return act.get(vol) if act is not None else runs.active(vol)
 
 
 def start_run(vol, kind, arg, user, before=None):
-    """철 실행을 대기열에 넣는다 (app/runs.py 머리말 순서): 작업 넣기 → before()(리셋·검토 기록) → 행 확정 → 진행 이벤트.
-    대기열이 가득 차면 429 + Retry-After, 상한 잠금을 못 얻으면 503 + Retry-After — 그때는 아무것도 바뀌지 않는다.
+    """철 실행을 대기열에 넣는다 (app/runs.py 머리말 순서): 행 확정(preparing, 끝난 행일 때만 — 아니면 409) → 작업 넣기 →
+    before()(리셋·검토 기록) → 준비 끝(queued) → 진행 이벤트. 넣기·before가 실패하면 행을 앞선 것으로 되돌린다:
+    대기열이 가득 차면 429, 상한 잠금을 못 얻으면 503 (둘 다 대기열이 준 Retry-After) — 그때는 아무것도 바뀌지 않는다.
+    넣기는 한 번(put 하나)뿐이고 before보다 앞이라, 리셋한 뒤에 429가 나는 일은 없다.
     kind: start(처음부터, arg {review_mode}) / resume(멈춘 곳부터) / review(검토 값으로 이어 감, arg {resume: {interrupt id: 값}})"""
     run = runs.next_run()
     if kind == "start":
-        jobs, graph_put = runs.start_jobs(vol, run, flow.vol_pages(vol))
+        jobs, left = runs.start_jobs(vol, run, flow.vol_pages(vol))
     else:
-        jobs, graph_put = [jobqueue.NewJob(jobqueue.GRAPH, vol=vol, ref=str(run))], True
+        jobs, left = [jobqueue.NewJob(jobqueue.GRAPH, vol=vol, ref=str(run))], 0
+    try:
+        prev = runs.prepare(vol, run, kind, arg, user, pages_left=left, graph_put=left == 0)
+    except runs.Busy:
+        raise HTTPException(409, f"{vol} 이미 실행 중") from None
     try:
         runs.put(jobs)
+        if before is not None:
+            before()
     except jobqueue.QueueFull as e:
+        runs.rollback(vol, run, prev)
         print(f"[queue] {vol} 넣기 거절: {e}", file=sys.stderr, flush=True)
         raise HTTPException(429, "처리 대기열이 가득 찼습니다 — 잠시 뒤 다시 실행하세요", headers=e.headers()) from None
     except jobqueue.QueueBusy as e:
+        runs.rollback(vol, run, prev)
         raise HTTPException(503, "처리 대기열이 바쁩니다 — 잠시 뒤 다시 실행하세요", headers=e.headers()) from None
-    if before is not None:
-        before()
-    runs.commit(vol, run, kind, arg, user, graph_put)
+    except BaseException:
+        runs.rollback(vol, run, prev)  # 넣은 작업은 실행 번호가 행과 달라져 워커가 버린다
+        raise
+    runs.ready(vol, run)
     store.set_run_stop(vol, None)  # 다시 돌리면 앞선 멈춤 이유는 없어진다
     store.event(vol, "run", "start", None, resume=kind != "start", jobs=len(jobs))
-    if not graph_put:
-        try:
-            runs.maybe_put_graph(vol, run)  # 행을 확정하기 전에 워커가 쪽을 다 읽었으면 여기서 graph를 넣는다
-        except (jobqueue.QueueFull, jobqueue.QueueBusy):
-            runs.end(vol, run, "error")
-            store.event(vol, "run", "error", None, code="queue_full")
-            raise HTTPException(429, "처리 대기열이 가득 찼습니다 — 잠시 뒤 /resume", headers={"Retry-After": "30"}) from None
     return run
 
 
@@ -535,7 +543,7 @@ def resume(vol: str, user: Admin):
 
 def _stage(vol, snap, act=None):
     act = act if act is not None else busy(vol)
-    if act == "queued":
+    if act in ("queued", "preparing"):
         return "queued"
     if snap.interrupts:
         return "review"
@@ -565,11 +573,11 @@ def day_totals():
             "budget": store.budget_today(llm.LIMITS)}  # 오늘 예산 {index·query: {used, held, limit}}
 
 
-def summary(vol, totals=None):
+def summary(vol, totals=None, active=None):
     snap = G.get_state(cfg(vol))
     v = snap.values or {}
     docs = v.get("docs", [])
-    act = busy(vol) or None
+    act = busy(vol, active) or None
     return {
         "vol": vol,
         "stage": _stage(vol, snap, act or ""),
@@ -598,7 +606,8 @@ def volume_names():
 def volumes(_: Viewer):
     vols = volume_names()
     totals = day_totals() if vols else None
-    return [summary(v, totals) for v in vols]
+    act = runs.active_all() if vols else {}  # 실행 상태를 한 번에 (철마다 읽지 않게)
+    return [summary(v, totals, act) for v in vols]
 
 
 @app.get("/volumes/{vol}")
@@ -1540,13 +1549,18 @@ def rate_limited(route, user):
         raise HTTPException(429, f"{route} 오늘 호출 한도 {RATE[route]['day']}회를 다 썼습니다",
                             headers={"Retry-After": str(_until_tomorrow())})
     try:
-        yield
+        yield SimpleNamespace(key=key, wins=wins)
     except (llm.BudgetExceeded, llm.LLMOff):  # 둘 다 503 — 설치·예산 쪽 거절
-        try:
-            store.refund_quota(key, route, wins)
-        except Exception:
-            errors.log_exception(f"[rate] {route} 되돌리기 실패")
+        refund_quota(key, route, wins)
         raise
+
+
+def refund_quota(key, route, wins):
+    """사용자 탓이 아닌 거절(예산·LLM 꺼짐 503)로 쓴 호출 1회를 되돌린다 — /ask 동기 경로와 결과 조회 경로가 같이 쓴다"""
+    try:
+        store.refund_quota(key, route, wins)
+    except Exception:
+        errors.log_exception(f"[rate] {route} 되돌리기 실패")
 
 
 @app.get("/search")
@@ -1565,12 +1579,20 @@ def ask_answer(q, year_from, year_to, user):
             "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
 
 
-ASK_WAIT = float(os.environ.get("ASK_WAIT_SECONDS", "30"))  # /ask가 워커의 답을 기다리는 최대 초 — 넘으면 202 {id}
-ASK_POLL = 0.2
+# /ask가 워커의 답을 기다리는 최대 초 — 넘으면 202 {id}, 화면은 GET /ask/{id}를 1초마다 (frontend/src/lib/api.ts).
+# 짧게 둔다: 기다리는 동안 API 스레드 하나(기본 40개)를 쥔다 — 30초면 분당 상한(사용자당 10회)만으로도 스레드가 빠르게 묶인다.
+# 5초면 검색 + 짧은 답(대부분)은 한 번에 오고, 긴 답만 폴링으로 간다
+ASK_WAIT = float(os.environ.get("ASK_WAIT_SECONDS", "5"))
+ASK_POLL = 0.5
 ASK_ID_RX = re.compile(r"[A-Za-z0-9_-]{16,64}")
 
 
-def _ask_result(req_id, user, wait):
+def _wins_of(raw):
+    """ask_request.quota_wins(JSON) → 호출 제한 창 [(이름, 시작, 상한)] (store.take_quota와 같은 모양)"""
+    return [(kind, dt.datetime.fromisoformat(start), cap) for kind, start, cap in (raw or [])]
+
+
+def _ask_result(req_id, user, wait, refund=False):
     """요청 행이 끝날 때까지(최대 wait초) 본다. 끝났으면 답(행은 지운다), 오류면 예외, 아직이면 None"""
     end = time.monotonic() + wait
     while True:
@@ -1578,11 +1600,15 @@ def _ask_result(req_id, user, wait):
         if r is None or (r["user_id"] != getattr(user, "id", None)
                          or (r["user_id"] is None and r["username"] != getattr(user, "username", None))):
             raise HTTPException(404)
-        if r["state"] != "queued":
+        if r["state"] in ("done", "error"):
             runs.ask_forget(req_id)
-            if r["code"] == "budget":
-                raise llm.BudgetExceeded("검색·질문 예산")  # 503 (budget_exceeded 처리기) + 호출 1회 되돌림
-            if r["code"] == "llm_off":
+            if r["code"] in ("budget", "llm_off"):
+                # 503 (budget_exceeded·llm_off 처리기). 결과 조회 경로는 rate_limited 밖이라 여기서 1회 되돌린다
+                # (동기 경로는 rate_limited가 같은 예외로 되돌린다 — 두 번 되돌리지 않게 refund 인자로 고른다)
+                if refund and r["quota_key"]:
+                    refund_quota(r["quota_key"], "ask", _wins_of(r["quota_wins"]))
+                if r["code"] == "budget":
+                    raise llm.BudgetExceeded("검색·질문 예산")
                 raise llm.LLMOff("LLM 꺼짐")
             if r["code"]:
                 raise HTTPException(500, "질문을 처리하지 못했습니다")
@@ -1595,9 +1621,9 @@ def _ask_result(req_id, user, wait):
 @app.get("/ask")
 def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewer, year_from: int | None = None,
         year_to: int | None = None):
-    with rate_limited("ask", user):
+    with rate_limited("ask", user) as quota:
         req_id = secrets.token_urlsafe(18)
-        runs.ask_new(req_id, user, q, year_from, year_to)  # 질문 본문은 DB에, 대기열에는 id만
+        runs.ask_new(req_id, user, q, year_from, year_to, quota.key, quota.wins)  # 질문 본문은 DB에, 대기열에는 id만
         try:
             runs.put([jobqueue.NewJob(jobqueue.ASK, ref=req_id)])
         except (jobqueue.QueueFull, jobqueue.QueueBusy) as e:
@@ -1616,7 +1642,7 @@ def ask_poll(req_id: str, user: Viewer):
     """202로 받은 /ask 결과 — 요청한 사람만 (남의 id는 404). 끝났으면 답을 한 번 돌려주고 지운다"""
     if not ASK_ID_RX.fullmatch(req_id):
         raise HTTPException(404)
-    out = _ask_result(req_id, user, 0)
+    out = _ask_result(req_id, user, 0, refund=True)
     if out is None:
         return JSONResponse({"id": req_id, "status": "queued"}, status_code=202)
     return out

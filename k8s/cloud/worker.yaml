@@ -3,7 +3,10 @@
 # k8s/docs.yaml의 docflow-worker를 이것으로 바꿔 쓴다 (같은 이름) — 다른 점만:
 #   - 노드 그룹 B(워커 전용, taint docflow/worker=true:NoSchedule)에만: nodeSelector + toleration
 #   - replicas는 KEDA가 정한다 (1~4개, 대기열 쪽 OCR 작업 50개당 1개)
-#   - Redis는 관리형(Valkey/Redis, TLS) — 주소·CA는 설치 환경마다. 비밀번호는 Secret redis-auth(password)
+#   - Redis는 관리형(Valkey/Redis, TLS) — 주소는 설치 환경마다. CA는 Secret redis-ca(ca.crt) 하나를 앱(REDIS_CA_FILE)과 KEDA가 같이 쓴다.
+#     ACL: 앱 사용자 docflow(Secret redis-auth password, 규칙은 k8s/docs.yaml·app/jobqueue_redis.py acl_rules와 같게),
+#     KEDA 읽기 전용 사용자 keda(Secret redis-keda password): ~{docflow:q}:* resetchannels -@all +ping +xlen +xinfo|groups +xinfo|stream +xpending
+#     — 관리형 Redis의 ACL·보안 그룹(워커·API·KEDA에서만 6379)은 https://github.com/reddol18/docflow/issues/16 에서 정한다
 #   - 쪽 이미지·OCR 결과 공유: 여러 노드의 워커가 같은 파일을 봐야 한다 → RWO PVC가 아니라 RWX(파일 스토리지) 또는
 #     오브젝트 스토리지가 필요하다. 아래는 RWX PVC 이름(docflow-data-rwx) 자리만 둔다 — 정하는 것은 https://github.com/reddol18/docflow/issues/16
 # 이미지는 레지스트리 이름·다이제스트로 (맥의 docflow:dev·imagePullPolicy: Never는 단일 노드 전용)
@@ -38,8 +41,9 @@ spec:
         - {name: OCR_THREADS, value: "4"}
         - {name: QUEUE_BACKEND, value: redis}
         - {name: REDIS_URL, value: "rediss://REDIS_HOST:6379/0"}
+        - {name: REDIS_USERNAME, value: docflow}
         - {name: REDIS_PASSWORD_FILE, value: /etc/redis-auth/password}
-        - {name: REDIS_CA_FILE, value: /etc/docflow-ca/ca.crt}
+        - {name: REDIS_CA_FILE, value: /etc/redis-ca/ca.crt}  # KEDA TriggerAuthentication의 ca와 같은 Secret
         - {name: DAILY_BUDGET_USD, value: "3.0"}
         - {name: DAILY_QUERY_BUDGET_USD, value: "0.6"}
         - {name: LLM_PROVIDER, value: "openai"}
@@ -54,6 +58,7 @@ spec:
         - {name: ca, mountPath: /etc/docflow-ca, readOnly: true}
         - {name: qdrant-key, mountPath: /etc/qdrant, readOnly: true}
         - {name: redis-auth, mountPath: /etc/redis-auth, readOnly: true}
+        - {name: redis-ca, mountPath: /etc/redis-ca, readOnly: true}
         - {name: tmp, mountPath: /tmp}
         - {name: pdx-temp, mountPath: /opt/paddlex/temp}
         - {name: pdx-locks, mountPath: /opt/paddlex/locks}
@@ -65,6 +70,7 @@ spec:
       - {name: ca, configMap: {name: docflow-ca}}
       - {name: qdrant-key, secret: {secretName: qdrant-api-key, defaultMode: 0440}}
       - {name: redis-auth, secret: {secretName: redis-auth, defaultMode: 0440}}
+      - {name: redis-ca, secret: {secretName: redis-ca, defaultMode: 0440}}
       - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
       - {name: pdx-temp, emptyDir: {sizeLimit: 256Mi}}
       - {name: pdx-locks, emptyDir: {sizeLimit: 1Mi}}
@@ -97,5 +103,6 @@ kind: TriggerAuthentication
 metadata: {name: docflow-redis, namespace: docs}
 spec:
   secretTargetRef:
-  - {parameter: password, name: redis-auth, key: password}
-  - {parameter: ca, name: redis-ca, key: ca.crt}  # 관리형 Redis CA (설치 환경마다)
+  - {parameter: username, name: redis-keda, key: username}  # 읽기 전용 사용자 (머리말)
+  - {parameter: password, name: redis-keda, key: password}
+  - {parameter: ca, name: redis-ca, key: ca.crt}  # 앱 REDIS_CA_FILE과 같은 Secret

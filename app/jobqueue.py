@@ -82,7 +82,9 @@ class QueueConfig:
             GRAPH: KindSpec(idle=_num(env, "QUEUE_IDLE_GRAPH", 180.0),
                             limit=_num(env, "QUEUE_LIMIT_GRAPH", 200, int),
                             heartbeat=_num(env, "QUEUE_HEARTBEAT_GRAPH", 30.0)),
-            ASK: KindSpec(idle=_num(env, "QUEUE_IDLE_ASK", 60.0), limit=_num(env, "QUEUE_LIMIT_ASK", 100, int)),
+            # ask도 살아 있음 표시(20초): 답변 LLM이 늦어도(최악 시간 > 유휴 60초) 다른 워커가 같은 요청을 되찾지 않게
+            ASK: KindSpec(idle=_num(env, "QUEUE_IDLE_ASK", 60.0), limit=_num(env, "QUEUE_LIMIT_ASK", 100, int),
+                          heartbeat=_num(env, "QUEUE_HEARTBEAT_ASK", 20.0)),
         }
         for name, k in kinds.items():
             if k.idle <= 0:
@@ -247,6 +249,7 @@ class JobQueue(Protocol):
     def heartbeat(self, job: Job) -> bool: ...
     def stats(self, kind: str) -> QueueStats: ...
     def position(self, kind: str, job_id: str) -> int | None: ...
+    def count_for(self, vol: str) -> int: ...  # 그 철의 작업 수 (죽은 것 빼고, 모든 종류) — 감시(app/runs.py sweep)용
 
 
 def open_queue(env=os.environ) -> JobQueue:

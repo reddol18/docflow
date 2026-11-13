@@ -26,7 +26,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import errors, fields, flags, layout, line_crops, llm, ocr, store
+from app import cancel, errors, fields, flags, layout, line_crops, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -123,6 +123,7 @@ def traced(name, fn):
     """노드 시작·끝·오류를 events 표에 남긴다 (대시보드 진행 화면용)."""
     def run(s):
         vol, doc = s.get("vol"), s.get("doc_id")
+        cancel.check(vol)  # 워커가 그래프 임대를 잃었으면 노드 경계에서 끊는다 (app/cancel.py)
         store.event(vol, name, "start", doc)
         t0 = time.time()
         try:

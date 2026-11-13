@@ -75,8 +75,12 @@ def env(pg_store, monkeypatch, tmp_path):
         store.add_stage_log(vol, pages[0], "qc", 1, "reject", "entry", 1, reason="가상 사유")
         # 끝난 실행 행 (https://github.com/reddol18/docflow/issues/5) — 일괄 삭제 대상
         from app import runs
-        runs.commit(vol, runs.next_run(), "start", {"review_mode": "human"})
-        runs.end(vol, runs.row(vol)["run"], "ok")
+        run = runs.next_run()
+        runs.prepare(vol, run, "start", {"review_mode": "human"})
+        runs.ready(vol, run)
+        runs.end(vol, run, "ok")
+        with store.pool.connection() as conn:
+            conn.execute("INSERT INTO run_page (vol, run, page) VALUES (%s, %s, 'p')", (vol, run))
         q.upsert(store.COLLECTION, [PointStruct(id=i * 10 + j, vector=[1.0, float(j)], payload={"vol": vol, "doc_id": d})
                                     for j, d in enumerate((pages[0], pages[2]))])
         graph.invoke({"x": 0}, {"configurable": {"thread_id": vol}})

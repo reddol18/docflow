@@ -297,7 +297,19 @@ export const api = {
     if (yearTo) p.set("year_to", yearTo);
     return call<SearchHit[]>(`/search?${p}`);
   },
-  ask: (q: string) => call<{ answer: string; sources: SearchHit[] }>(`/ask?q=${enc(q)}`),
+  // 질문은 대기열 워커가 답한다 (https://github.com/reddol18/docflow/issues/5): 몇 초 안에 끝나면 바로 답, 아니면 202 {id} →
+  // 1초마다 GET /ask/{id} (최대 2분). 서버는 기다리는 동안 스레드를 쥐지 않게 처음 기다림을 짧게 둔다(ASK_WAIT_SECONDS)
+  ask: async (q: string) => {
+    type Done = { answer: string; sources: SearchHit[] };
+    type Pending = { id: string; status: "queued" };
+    let r = await call<Done | Pending>(`/ask?q=${enc(q)}`);
+    for (let i = 0; "status" in r && i < 120; i++) {
+      await new Promise((ok) => setTimeout(ok, 1000));
+      r = await call<Done | Pending>(`/ask/${enc(r.id)}`);
+    }
+    if ("status" in r) throw new ApiError("답변이 늦어지고 있습니다 — 잠시 뒤 다시 물어보세요", 504);
+    return r;
+  },
   timings: (vol: string, rows: Timing[]) =>
     call<{ saved: number; dropped: number }>(`/volumes/${enc(vol)}/timings`, {
       method: "POST",

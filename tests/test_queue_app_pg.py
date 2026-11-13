@@ -138,9 +138,10 @@ def test_run_over_limit_429_changes_nothing(app, monkeypatch):
 
 def test_queue_busy_is_503(app, monkeypatch):
     upload(app, "v3", 1)
-    monkeypatch.setattr(runs, "put", lambda jobs: (_ for _ in ()).throw(jobqueue.QueueBusy(OCR_PAGE, 30)))
+    monkeypatch.setattr(runs, "put", lambda jobs: (_ for _ in ()).throw(jobqueue.QueueBusy(OCR_PAGE, 17)))
     r = app.c.post("/volumes/v3/run", headers=ADMIN)
-    assert r.status_code == 503 and r.headers["retry-after"] == "30" and runs.row("v3") is None
+    assert r.status_code == 503 and r.headers["retry-after"] == "17"  # 대기열이 준 값 그대로
+    assert runs.row("v3") is None  # 확정한 행도 되돌린다
 
 
 def test_run_while_running_409_and_upload_blocked(app):
@@ -175,8 +176,9 @@ def test_dead_graph_worker_reclaimed_resumes_from_checkpoint(app):
     w = worker.Worker(q=app.q, name="w1")
     assert w.run_once(OCR_PAGE)
     job = app.q.take(GRAPH, "dead-worker")
-    claim = w._claim_graph(job, int(job.ref))
-    w._input(job, int(job.ref), claim)  # 시작 표시까지 하고 죽음
+    run = int(job.ref)
+    _, claim = runs.claim_graph("v6", run, job.id, job.lease, stale=IDLE)
+    w._input(job, run, claim, (job.id, job.lease))  # 시작 표시까지 하고 죽음
     app.g.state.next = ("doc",)
     time.sleep(IDLE + 0.3)
     assert w.run_once(GRAPH)
@@ -240,7 +242,7 @@ def test_duplicate_graph_job_runs_once(app):
     run = runs.row("va")["run"]
     app.q.put([NewJob(GRAPH, vol="va", ref=str(run))])  # 넣기 재시도로 생긴 겹침
     first = app.q.take(GRAPH, "w1")
-    assert w._claim_graph(first, run) is not None
+    assert runs.claim_graph("va", run, first.id, first.lease, stale=IDLE)[0] == "ok"
     worker.drain(w)  # 두 번째 graph 작업은 버려진다
     assert app.g.calls == []
     w.handle(first)
@@ -325,13 +327,214 @@ def test_resume_unfinished_on_worker_start(app):
     for v in ("s1", "s2", "s3", "s4"):
         (store.pages_dir(v)).mkdir(parents=True)
     app.g.state.next = ("doc",)
-    runs.commit("s2", runs.next_run(), "start", {})
+    runs.prepare("s2", runs.next_run(), "start", {})
     runs.end("s2", runs.row("s2")["run"], "error")  # 마지막 실행이 오류 — 사람이 /resume
     store.set_run_stop("s3", "budget")
-    runs.commit("s4", runs.next_run(), "start", {})  # 실행 중 — 대기열 작업이 잇는다
+    run4 = runs.next_run()
+    runs.prepare("s4", run4, "start", {})  # 실행 중 — 대기열 작업이 잇는다
+    runs.ready("s4", run4)
     assert worker.resume_unfinished(app.main) == ["s1"]
     assert worker.resume_unfinished(app.main) == []  # 두 번째 워커
     assert app.q.stats(GRAPH).length == 1
     worker.drain(worker.Worker(q=app.q), kinds=(GRAPH,))
     assert app.g.calls == [None] and runs.row("s1")["outcome"] in ("ok", "error")
     assert ("run", "start") in events("s1")
+
+
+def _graph_job(app, vol, pages=1):
+    upload(app, vol, pages)
+    assert app.c.post(f"/volumes/{vol}/run", headers=ADMIN).status_code == 200
+    w = worker.Worker(q=app.q, name="w0")
+    while w.run_once(OCR_PAGE):
+        pass
+    return runs.row(vol)["run"]
+
+
+def test_heartbeat_failure_cancels_graph_and_only_reclaimer_records(app, monkeypatch):
+    """살아 있음 표시가 계속 실패하면(대기열 오류) 워커는 (유휴 - 표시 간격)초 뒤 임대를 잃은 것으로 보고 그래프를 끊는다
+    (노드·LLM 예약 직전의 취소 표시). 되찾은 워커만 결과를 남기고, 두 워커의 그래프가 겹쳐 돌지 않는다"""
+    import threading
+
+    from app import cancel
+    run = _graph_job(app, "vh")
+    spans, lock = [], threading.Lock()
+
+    class SlowGraph(FakeGraph):
+        def invoke(self, arg, cfg):
+            vol = cfg["configurable"]["thread_id"]
+            t0 = time.monotonic()
+            try:
+                for _ in range(200):  # 노드 여러 개 — 노드 경계마다 취소 표시를 본다
+                    cancel.check(vol)
+                    time.sleep(0.02)
+                    if threading.current_thread().name == "B":
+                        break
+            finally:
+                with lock:
+                    spans.append((threading.current_thread().name, t0, time.monotonic()))
+            self.state.next, self.state.values = (), {"docs": [], "indexed": 0}
+    g = SlowGraph(nxt=("doc",))  # 끊긴 그래프는 멈춘 곳이 남는다 → 되찾은 워커가 체크포인트에서 이어 감
+    monkeypatch.setattr(app.main, "G", g)
+    real_hb = app.q.heartbeat
+    broken = {"A"}
+
+    def hb(job):
+        if threading.current_thread().name.startswith("keeper") and job.consumer == "A":
+            raise ConnectionError("가상 대기열 끊김")
+        return real_hb(job)
+    monkeypatch.setattr(app.q, "heartbeat", hb)
+    wa = worker.Worker(q=app.q, name="A")
+    ta = threading.Thread(target=wa.run_once, args=(GRAPH,), name="A")
+    ta.start()
+    ta.join(10)
+    assert not ta.is_alive() and spans and spans[0][0] == "A"
+    assert runs.row("vh")["state"] == "running"  # A는 결과를 남기지 않았다
+    time.sleep(IDLE + 0.3)  # A의 행 표시도 멈췄다 → 넘겨받을 수 있다
+    broken.clear()
+    wb = worker.Worker(q=app.q, name="B")
+    tb = threading.Thread(target=wb.run_once, args=(GRAPH,), name="B")
+    tb.start()
+    tb.join(10)
+    assert runs.row("vh")["outcome"] == "ok" and runs.row("vh")["run"] == run
+    (na, a0, a1), (nb, b0, b1) = sorted(spans, key=lambda s: s[1])
+    assert (na, nb) == ("A", "B") and a1 <= b0  # 겹치지 않음
+    assert app.q.stats(GRAPH).length == 0
+
+
+def test_claim_waits_while_previous_lease_alive(app):
+    """같은 graph 작업을 되찾았어도 앞선 임대의 행 표시가 살아 있으면 쥐지 않고(시도 안 셈) 되돌린다 — 표시가 멈추면 넘겨받는다"""
+    run = _graph_job(app, "vw")
+    old = app.q.take(GRAPH, "old")
+    assert runs.claim_graph("vw", run, old.id, old.lease, stale=IDLE)[0] == "ok"
+    time.sleep(IDLE + 0.2)
+    keep = True
+    while keep:  # 옛 워커가 행 표시만 계속한다 (대기열 표시는 끊김 → 대기열은 되찾게 해 줌)
+        assert runs.beat_graph("vw", run, (old.id, old.lease))
+        keep = False
+    w = worker.Worker(q=app.q, name="new")
+    assert w.run_once(GRAPH)  # 되찾았지만 'wait' → release
+    assert app.g.calls == [] and runs.row("vw")["graph_lease"] == old.lease
+    job = app.q.take(GRAPH, "peek")
+    assert job.attempts == old.attempts + 1  # 되돌리기는 시도로 세지 않았다 (되찾기만 셈)
+    app.q.release(job)
+    time.sleep(IDLE + 0.2)  # 옛 임대 표시가 멈춤
+    worker.drain(w)
+    assert len(app.g.calls) == 1 and runs.row("vw")["outcome"] == "ok"
+    assert not runs.end("vw", run, "error", (old.id, old.lease))  # 옛 임대로는 결과를 못 남긴다
+
+
+def test_preparing_row_job_released_not_counted(app):
+    """행이 준비 중(preparing)일 때 꺼낸 작업은 시도로 세지 않고 되돌린다. 준비가 끝나면 처리한다"""
+    upload(app, "vp", 1)
+    run = runs.next_run()
+    runs.prepare("vp", run, "start", {"review_mode": "human"}, pages_left=1)
+    app.q.put([NewJob(OCR_PAGE, vol="vp", page="p01", ref=str(run))])
+    w = worker.Worker(q=app.q, name="w")
+    for _ in range(4):  # max_attempts(3)보다 많이 — 죽은 작업이 되지 않는다
+        assert w.run_once(OCR_PAGE)
+    assert app.q.stats(OCR_PAGE).dead == 0 and app.q.stats(OCR_PAGE).length == 1
+    runs.ready("vp", run)
+    worker.drain(w)
+    assert runs.row("vp")["outcome"] == "ok"
+
+
+def test_commit_is_conditional_and_races_with_resume(app):
+    """행 확정은 끝난 행일 때만 — 실행 중이면 Busy(409). 자동 재개와 /run이 겹쳐도 하나만 이긴다"""
+    upload(app, "vr", 1)
+    app.g.state.next = ("doc",)  # 그래프가 중간에 멈춘 철
+    assert worker.resume_unfinished(app.main) == ["vr"]
+    assert app.c.post("/volumes/vr/run", headers=ADMIN).status_code == 409  # 자동 재개가 먼저
+    with pytest.raises(runs.Busy):
+        runs.prepare("vr", runs.next_run(), "start", {})
+    worker.drain(worker.Worker(q=app.q))
+    app.g.state.next = ("doc",)
+    assert app.c.post("/volumes/vr/run", headers=ADMIN).status_code == 200  # /run이 먼저면
+    assert worker.resume_unfinished(app.main) == []  # 재개는 건너뛴다
+
+
+def test_before_failure_rolls_back(app, monkeypatch):
+    """검토 기록(before)이 실패하면 행을 되돌리고, 이미 넣은 작업은 실행 번호가 달라 워커가 버린다 (검토 값이 반영되지 않음)"""
+    intr = SimpleNamespace(value={"flagged": []}, id="9" * 32)
+    app.g.state.interrupts = [intr]
+    monkeypatch.setattr(app.main, "record_review", lambda *a: (_ for _ in ()).throw(RuntimeError("가상 저장 실패")))
+    r = app.c.post("/review/vc/json", headers=ADMIN, json={})
+    assert r.status_code == 500 and runs.row("vc") is None
+    worker.drain(worker.Worker(q=app.q))
+    assert app.g.calls == [] and app.q.stats(GRAPH).length == 0
+
+
+def test_sweep_closes_orphan_active_runs(app):
+    """작업이 유실된 실행(활성인데 대기열에 그 철 작업이 없음)은 감시가 오류로 닫는다 — 작업이 남아 있으면 그대로"""
+    upload(app, "vs", 1)
+    assert app.c.post("/volumes/vs/run", headers=ADMIN).status_code == 200
+    upload(app, "vt", 1)
+    assert app.c.post("/volumes/vt/run", headers=ADMIN).status_code == 200
+    with store.pool.connection() as c:  # vs의 작업이 유실됨 (Redis 초기화 등)
+        c.execute("DELETE FROM job_queue WHERE body->>'vol' = 'vs'")
+    assert runs.sweep(app.q, stale=3600) == []  # 아직 오래되지 않음
+    time.sleep(0.3)
+    assert runs.sweep(app.q, stale=0.1) == ["vs"]  # vt는 작업이 있어 그대로
+    assert runs.row("vs")["outcome"] == "error" and runs.row("vt")["state"] == "queued"
+    assert ("run", "error") in events("vs")
+    assert app.c.post("/volumes/vs/run", headers=ADMIN).status_code == 200  # 다시 돌릴 수 있다
+
+
+def test_bad_page_name_closes_run(app):
+    """쪽 이름이 규칙에 맞지 않는 작업은 버리고, 그 실행을 오류로 닫는다 (영원히 실행 중으로 남지 않게)"""
+    upload(app, "vx", 1)
+    assert app.c.post("/volumes/vx/run", headers=ADMIN).status_code == 200
+    run = runs.row("vx")["run"]
+    with store.pool.connection() as c:
+        c.execute("UPDATE job_queue SET body = jsonb_set(body, '{page}', '\"a/b\"') WHERE body->>'vol' = 'vx'")
+    worker.drain(worker.Worker(q=app.q))
+    r = runs.row("vx")
+    assert (r["run"], r["outcome"]) == (run, "error")
+
+
+def test_ask_runs_once_even_if_reclaimed(app, monkeypatch):
+    """ask 작업을 되찾아도(앞선 워커가 살아 있음 표시 중) 같은 요청을 두 번 처리하지 않는다. 앞선 워커가 사라지면 넘겨받는다"""
+    calls = []
+    monkeypatch.setattr(app.main, "ask_answer", lambda q, yf, yt, user: calls.append(q) or {"answer": "가상", "sources": []})
+    monkeypatch.setattr(app.main, "ASK_WAIT", 0)
+    req = app.c.get("/ask", params={"q": "가상 질문"}, headers=ADMIN).json()["id"]
+    first = app.q.take(ASK, "old")
+    assert runs.ask_claim(req, f"{first.id}:{first.lease}", stale=IDLE) is not None  # 옛 워커가 쥠
+    assert runs.ask_beat(req, f"{first.id}:{first.lease}")
+    time.sleep(IDLE + 0.2)
+    runs.ask_beat(req, f"{first.id}:{first.lease}")  # 아직 살아 있다 (행 표시)
+    w = worker.Worker(q=app.q, name="new")
+    assert w.run_once(ASK)  # 되찾았지만 처리하지 않는다
+    assert calls == []
+    assert runs.ask_done(req, {"answer": "옛 워커", "sources": []}, None, f"{first.id}:{first.lease}")
+    assert app.c.get(f"/ask/{req}", headers=ADMIN).json()["answer"] == "옛 워커"
+    # 앞선 워커가 사라진 경우: 표시가 멈추면 넘겨받아 한 번 처리
+    req = app.c.get("/ask", params={"q": "가상 둘"}, headers=ADMIN).json()["id"]
+    gone = app.q.take(ASK, "gone")
+    assert runs.ask_claim(req, f"{gone.id}:{gone.lease}", stale=IDLE)
+    time.sleep(IDLE + 0.3)
+    worker.drain(w)
+    assert calls == ["가상 둘"] and app.c.get(f"/ask/{req}", headers=ADMIN).status_code == 200
+
+
+def test_ask_poll_refunds_quota_on_budget(app, monkeypatch):
+    """결과 조회 경로(202 뒤 GET /ask/{id})의 예산 503도 호출 1회를 되돌린다 (동기 경로와 같은 함수)"""
+    refunds = []
+    monkeypatch.setattr(app.main, "ASK_WAIT", 0)
+    monkeypatch.setattr(app.main, "hybrid", lambda *a, **k: (_ for _ in ()).throw(app.main.llm.BudgetExceeded("가상")))
+    real = store.refund_quota
+    monkeypatch.setattr(store, "refund_quota", lambda key, route, wins: (refunds.append((key, route, [w[0] for w in wins])),
+                                                                          real(key, route, wins)))
+    req = app.c.get("/ask", params={"q": "가상"}, headers=ADMIN).json()["id"]
+    worker.drain(worker.Worker(q=app.q))
+    assert app.c.get(f"/ask/{req}", headers=ADMIN).status_code == 503
+    assert refunds == [("1", "ask", ["min", "day"])]
+    with store.pool.connection() as c:
+        assert c.execute("SELECT coalesce(sum(n), 0) AS n FROM api_quota WHERE route = 'ask' AND kind = 'min'").fetchone()["n"] == 0
+
+
+def test_summary_reads_run_states_once(app, monkeypatch):
+    """철 목록은 실행 상태를 한 번에 읽는다 (철마다 runs.active를 부르지 않음)"""
+    for v in ("l1", "l2", "l3"):
+        upload(app, v, 1)
+    monkeypatch.setattr(runs, "active", lambda vol: pytest.fail("철마다 읽음"))
+    assert len(app.c.get("/volumes", headers=ADMIN).json()) >= 3

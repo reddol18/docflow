@@ -235,8 +235,19 @@ CREATE TABLE IF NOT EXISTS ask_request (
   id text PRIMARY KEY, user_id bigint, username text, q text NOT NULL, year_from int, year_to int,
   state text NOT NULL DEFAULT 'queued', result jsonb, code text,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(), done_at timestamptz);
-CREATE INDEX IF NOT EXISTS ask_request_created ON ask_request (created_at)
+CREATE INDEX IF NOT EXISTS ask_request_created ON ask_request (created_at);
+ALTER TABLE vol_run ADD COLUMN IF NOT EXISTS graph_lease text;
+ALTER TABLE vol_run ADD COLUMN IF NOT EXISTS graph_beat timestamptz;
+ALTER TABLE vol_run ADD COLUMN IF NOT EXISTS pages_left int NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS run_page (vol text NOT NULL, run bigint NOT NULL, page text NOT NULL, PRIMARY KEY (vol, run, page));
+ALTER TABLE ask_request ADD COLUMN IF NOT EXISTS claimed_by text;
+ALTER TABLE ask_request ADD COLUMN IF NOT EXISTS beat timestamptz;
+ALTER TABLE ask_request ADD COLUMN IF NOT EXISTS quota_key text;
+ALTER TABLE ask_request ADD COLUMN IF NOT EXISTS quota_wins jsonb
 """
+# ↑ vol_run.graph_job·graph_lease·graph_beat = 그래프를 쥔 대기열 작업 id·임대(펜싱 토큰)·마지막 살아 있음 (DB 시계).
+#   다른 임대는 graph_beat가 유휴 시간보다 오래됐을 때만 넘겨받는다. pages_left = 남은 쪽 OCR 수, run_page = 끝낸 쪽 (같은 쪽을
+#   두 번 세지 않게). ask_request.claimed_by·beat = 처리 중인 워커 임대(한 번만 처리), quota_* = 호출 제한 되돌리기용 창
 # ↑ vol_run (https://github.com/reddol18/docflow/issues/5 2단계): 철마다 마지막 실행 한 행 (app/runs.py). 예전 프로세스 안
 #   running 표시를 대신한다 — API와 워커(다른 Pod)가 같이 본다. run = vol_run_seq 번호(대기열 작업 ref), state queued/running/ended,
 #   arg = 그래프 입력(처음 실행·이어 가기·검토 값). 검토 값이 들어 있어 끝나면 지우고, 철 일괄 삭제도 행을 지운다.
@@ -1039,7 +1050,7 @@ def reset_stages(vol):
 # 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간)·exports(출력 기록) — 개수·시각만 있고 값은 없다
 PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters",
                 "doc_stage", "stage_log",  # 단계 기록에는 반려 사유(사람이 쓴 글)가 있다
-                "vol_run")  # 실행 행(검토 값이 남을 수 있음) — https://github.com/reddol18/docflow/issues/5
+                "vol_run", "run_page")  # 실행 행(검토 값이 남을 수 있음) — https://github.com/reddol18/docflow/issues/5
 
 
 def purge_volume(vol, delete_thread):

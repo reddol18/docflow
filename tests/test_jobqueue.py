@@ -34,7 +34,10 @@ def clean_pg(store):
         c.execute("DELETE FROM job_queue_kind")
 
 
-REAL_REDIS = os.environ.get("TEST_REDIS_URL")  # 선택: 실제 Redis 7.4 (예: WSL redis-server, redis://:pw@127.0.0.1:56379/15)
+# 선택: 실제 Redis 7.4 관리자 연결 (예: WSL redis-server, redis://:pw@127.0.0.1:56379/0). 시험은 이 연결로 시험마다 앱 전용 ACL 사용자
+# (app/jobqueue_redis.py acl_rules — 운영 k8s/docs.yaml과 같은 규칙)를 만들고, 대기열은 그 사용자로 붙는다 — Lua가 부르는 명령까지
+# ACL에 다 들어 있는지 공통 시험 전체로 확인한다
+REAL_REDIS = os.environ.get("TEST_REDIS_URL")
 
 
 @pytest.fixture(params=["postgres", "redis", "redis-real"])
@@ -50,10 +53,27 @@ def q(request):
                           prefix="t:q", poll=0.05)
     if not REAL_REDIS:
         pytest.skip("TEST_REDIS_URL 없음 — 실제 Redis 시험은 선택 (fakeredis 시험은 늘 돈다)")
+    return acl_queue(request)
+
+
+def acl_queue(request):
+    import secrets
+
     import redis
-    client = redis.Redis.from_url(REAL_REDIS, decode_responses=True)  # 시험 전용: URL 비밀번호 허용
+
+    from app.jobqueue_redis import RedisQueue, acl_rules
+    admin = redis.Redis.from_url(REAL_REDIS, decode_responses=True, db=0)  # 시험 전용: URL 비밀번호 허용
     prefix = f"t:{os.getpid()}:{time.monotonic_ns()}"  # 시험마다 새 키
-    request.addfinalizer(lambda: [client.delete(k) for k in client.scan_iter(f"{{{prefix}}}:*")])
+    user, pw = f"t-docflow-{os.getpid()}-{time.monotonic_ns()}", secrets.token_hex(16)
+    admin.execute_command("ACL", "SETUSER", user, "reset", "on", f">{pw}", *acl_rules(prefix))
+
+    def cleanup():
+        for k in admin.scan_iter(f"{{{prefix}}}:*"):
+            admin.delete(k)
+        admin.execute_command("ACL", "DELUSER", user)
+    request.addfinalizer(cleanup)
+    kw = admin.connection_pool.connection_kwargs
+    client = redis.Redis(host=kw["host"], port=kw["port"], db=0, username=user, password=pw, decode_responses=True)
     return RedisQueue(client, CFG, prefix=prefix, poll=0.05)
 
 
@@ -461,7 +481,7 @@ def test_config_defaults_match_decision():
     cfg = QueueConfig.from_env({})
     assert cfg.spec(OCR_PAGE) == KindSpec(idle=120.0, limit=2000)
     assert cfg.spec(GRAPH) == KindSpec(idle=180.0, limit=200, heartbeat=30.0)
-    assert cfg.spec(ASK) == KindSpec(idle=60.0, limit=100)
+    assert cfg.spec(ASK) == KindSpec(idle=60.0, limit=100, heartbeat=20.0)  # 살아 있음 표시는 2차 리뷰 반영(결정값 60은 그대로)
     assert cfg.retry_after == 30 and cfg.max_attempts == 3  # 2단계 전 결정 (2026-11-13)
     assert (cfg.dead_keep, cfg.dead_days, cfg.lock_timeout) == (1000, 14.0, 5.0)
 
@@ -560,3 +580,29 @@ except ModuleNotFoundError:
     r = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, r.stderr[-3000:]
     assert "redis-blocked-ok" in r.stdout
+
+
+def test_real_redis_acl_user_is_narrow(request):
+    """실제 Redis: 앱 전용 ACL 사용자는 대기열 키(접두어) 밖·위험 명령을 못 한다 (선택 시험)"""
+    if not REAL_REDIS:
+        pytest.skip("TEST_REDIS_URL 없음")
+    import redis
+    q = acl_queue(request)
+    q.put(pages(1))
+    for bad in (lambda: q.r.set("other-key", "x"), lambda: q.r.flushall(), lambda: q.r.keys("*"),
+                lambda: q.r.config_get("*"), lambda: q.r.xadd("{other:q}:ocr_page", {"a": "1"}),
+                lambda: q.r.execute_command("ACL", "LIST"), lambda: q.r.execute_command("SELECT", 1)):
+        with pytest.raises(redis.exceptions.NoPermissionError):
+            bad()
+
+
+def test_manifest_redis_acl_matches_code():
+    """맥 Redis 매니페스트가 코드와 같은 ACL 규칙을 쓰고 default 사용자를 끈다 (k8s/docs.yaml redis 초기화 컨테이너)"""
+    from pathlib import Path
+
+    from app.jobqueue_redis import ACL_COMMANDS, acl_rules
+    text = (Path(__file__).resolve().parents[1] / "k8s" / "docs.yaml").read_text(encoding="utf-8")
+    assert "user default off" in text
+    assert "user docflow on >%s " + " ".join(acl_rules()) in text
+    assert "requirepass" not in text
+    assert all(c in ("ping", "client|setinfo", "time") or c.startswith(("x", "eval", "script")) for c in ACL_COMMANDS)

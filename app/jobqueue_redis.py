@@ -18,11 +18,14 @@ redis 클라이언트는 이 모듈만 불러온다. 앱은 QUEUE_BACKEND=redis�
   길이·순번 XPENDING IDLE로 되찾을 차례를 세고, 개수만 돌려준다 (본문은 Redis 밖으로 나오지 않음)
 스트림이 사라지면(Redis 초기화 등) NOGROUP — 어느 경로든 그룹을 다시 만들고 한 번 더 한다.
 시간은 Redis 서버 시계만 쓴다 (유휴 시간 판단).
-연결: REDIS_URL(호스트만, 비밀번호 없이) + REDIS_PASSWORD_FILE(Secret 마운트) + REDIS_CA_FILE(rediss일 때 CA).
+연결: REDIS_URL(호스트만, 비밀번호 없이) + REDIS_USERNAME(ACL 사용자) + REDIS_PASSWORD_FILE(Secret 마운트) + REDIS_CA_FILE(rediss일 때 CA,
+  호스트 이름까지 확인). Redis 쪽은 default 사용자를 끄고 앱 전용 ACL 사용자만 둔다 — 허용 명령은 ACL_COMMANDS(아래, Lua 스크립트가
+  부르는 명령 포함)뿐, 키는 {prefix}:* 만 (acl_rules, k8s/docs.yaml이 같은 규칙을 쓰는지 시험이 본다).
 """
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -34,6 +37,15 @@ import redis
 from app.jobqueue import BODY_MAX, Job, NewJob, QueueConfig, QueueFull, QueueStats, group_by_kind, notify_dead, parse_job
 
 GROUP = "workers"
+# 앱 전용 ACL 사용자에 여는 명령 — 이 모듈과 Lua 스크립트가 부르는 것만 (실제 Redis 7.4 시험이 이 규칙의 사용자로 공통 시험을 돈다).
+# client|setinfo: redis-py가 연결할 때 라이브러리 이름을 알린다. time: 죽은 작업 정리(Lua). script|load: EVALSHA가 NOSCRIPT일 때
+ACL_COMMANDS = ("ping", "client|setinfo", "xadd", "xlen", "xrange", "xpending", "xautoclaim", "xclaim", "xack", "xdel",
+                "xtrim", "xreadgroup", "xgroup|create", "evalsha", "eval", "script|load", "time")
+
+
+def acl_rules(prefix: str = "docflow:q") -> list[str]:
+    """ACL SETUSER 규칙 (켜기·비밀번호는 따로): 키 {prefix}:*만, 채널 없음, 명령은 ACL_COMMANDS만"""
+    return [f"~{{{prefix}}}:*", "resetchannels", "-@all", *(f"+{c}" for c in ACL_COMMANDS)]
 PREFIX_RX = re.compile(r"[A-Za-z0-9:_-]{1,64}")
 T = TypeVar("T")
 
@@ -203,13 +215,17 @@ class RedisQueue:
         kw: dict = {"decode_responses": True, "socket_connect_timeout": 5,
                     "socket_timeout": 10,  # XREADGROUP BLOCK(poll, 1초)보다 길게
                     "health_check_interval": 30}
+        if env.get("REDIS_USERNAME"):
+            kw["username"] = env["REDIS_USERNAME"]
         if env.get("REDIS_PASSWORD_FILE"):
             kw["password"] = Path(env["REDIS_PASSWORD_FILE"]).read_text(encoding="utf-8").strip()
         if env.get("REDIS_CA_FILE"):
             if parts.scheme != "rediss":
                 raise ValueError("REDIS_CA_FILE은 rediss://일 때만")
             kw["ssl_ca_certs"] = env["REDIS_CA_FILE"]
+        if parts.scheme == "rediss":
             kw["ssl_cert_reqs"] = "required"
+            kw["ssl_check_hostname"] = True  # 인증서 이름(SAN)이 REDIS_URL 호스트와 같아야 한다
         # urlsplit이 소문자로 바꾼 scheme으로 다시 짠다 — redis-py는 'REDISS://'를 거절하고, check_transport는 대소문자를 무시한다
         return cls(redis.Redis.from_url(urlunsplit(parts), **kw), cfg, prefix=env.get("QUEUE_PREFIX", "docflow:q"))
 
@@ -333,6 +349,25 @@ class RedisQueue:
         total, pend, due, dead = (int(x) for x in self._grouped([kind], lambda: self._stats(keys=[k, f"{k}:dead"],
                                                                                               args=[GROUP, idle_ms])))
         return QueueStats(waiting=total - pend + due, running=pend - due, dead=dead)
+
+    def count_for(self, vol: str) -> int:
+        """그 철의 작업 수 — 스트림을 훑는다 (종류마다 상한 안이라 작다, 감시가 몇 분마다만 부른다)"""
+        n = 0
+        for kind in self.cfg.kinds:
+            k = self.key(kind)
+            last = "-"
+            while True:
+                rows = self.r.xrange(k, min=last, max="+", count=500)
+                for _, fields in rows:
+                    try:
+                        if json.loads((fields or {}).get("body") or "{}").get("vol") == vol:
+                            n += 1
+                    except (ValueError, AttributeError):
+                        pass
+                if len(rows) < 500:
+                    break
+                last = "(" + rows[-1][0]
+        return n
 
     def position(self, kind: str, job_id: str) -> int | None:
         k = self.key(kind)

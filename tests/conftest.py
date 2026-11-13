@@ -35,6 +35,7 @@ def queue_isolated(monkeypatch):
         with store.pool.connection() as c:
             c.execute("DELETE FROM job_queue")
             c.execute("DELETE FROM vol_run")
+            c.execute("DELETE FROM run_page")
     runs = sys.modules.get("app.runs")
     if runs is not None:
         runs.set_queue(None)
@@ -49,15 +50,27 @@ def ask_inline(monkeypatch):
     from app import jobqueue, runs, worker
     rows = {}
 
-    def new(req_id, user, q, yf, yt):
+    def new(req_id, user, q, yf, yt, quota_key=None, quota_wins=None):
         rows[req_id] = {"id": req_id, "user_id": getattr(user, "id", None), "username": getattr(user, "username", None),
-                        "q": q, "year_from": yf, "year_to": yt, "state": "queued", "result": None, "code": None}
+                        "q": q, "year_from": yf, "year_to": yt, "state": "queued", "result": None, "code": None,
+                        "quota_key": quota_key, "quota_wins": None, "claimed_by": None}
 
-    def done(req_id, result, code=None):
-        if req_id in rows and rows[req_id]["state"] == "queued":
-            rows[req_id].update(state="error" if code else "done", result=result, code=code, q="")
+    def claim(req_id, token, stale):
+        r = rows.get(req_id)
+        if r is None or r["state"] != "queued":
+            return None
+        r.update(state="running", claimed_by=token)
+        return dict(r)
 
-    fake_q = SimpleNamespace(ack=lambda job: True, fail=lambda job: None, cfg=jobqueue.QueueConfig.from_env({}))
+    def done(req_id, result, code=None, token=None):
+        r = rows.get(req_id)
+        if r and r["state"] in ("queued", "running") and (token is None or r["claimed_by"] == token):
+            r.update(state="error" if code else "done", result=result, code=code, q="")
+            return True
+        return False
+
+    fake_q = SimpleNamespace(ack=lambda job: True, fail=lambda job: None, heartbeat=lambda job: True,
+                             cfg=jobqueue.QueueConfig.from_env({}))
 
     def put(jobs):
         for j in jobs:
@@ -66,6 +79,8 @@ def ask_inline(monkeypatch):
     monkeypatch.setattr(runs, "ask_new", new)
     monkeypatch.setattr(runs, "ask_get", lambda req_id: dict(rows[req_id]) if req_id in rows else None)
     monkeypatch.setattr(runs, "ask_done", done)
+    monkeypatch.setattr(runs, "ask_claim", claim)
+    monkeypatch.setattr(runs, "ask_beat", lambda req_id, token: True)
     monkeypatch.setattr(runs, "ask_forget", lambda req_id: rows.pop(req_id, None))
     monkeypatch.setattr(runs, "put", put)
     return rows

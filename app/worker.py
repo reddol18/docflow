@@ -1,16 +1,21 @@
 """대기열 워커 (https://github.com/reddol18/docflow/issues/5 2단계). API와 같은 이미지에서 `python -m app.worker`로 띄운다.
 
 종류마다 스레드 하나(WORKER_KINDS, 기본 ocr_page,graph,ask)가 대기열에서 꺼내 처리한다:
-  ocr_page  쪽 하나 OCR(app/graph.py ocr_one) → 철의 쪽이 다 읽혔으면 graph 작업을 한 번 넣는다 (app/runs.py maybe_put_graph)
-  graph     철 그래프를 돌린다 (QUEUE_HEARTBEAT_GRAPH마다 살아 있음 표시). 끝·검토 대기·한도 멈춤·오류를 예전 runner와 같게
-            이벤트·감사 로그·run_stop에 남긴다
+  ocr_page  쪽 하나 OCR(app/graph.py ocr_one) → 남은 쪽이 0이면 graph 작업을 한 번 넣는다 (app/runs.py page_done·maybe_put_graph)
+  graph     철 그래프를 돌린다. 끝·검토 대기·한도 멈춤·오류를 예전 runner와 같게 이벤트·감사 로그·run_stop에 남긴다
   ask       /ask 요청 하나 (질문은 DB ask_request, 대기열에는 id만) — 검색 + 답변을 행에 남긴다. API가 행을 읽어 돌려준다
+임대 지키기 (Keeper): graph·ask는 살아 있음 표시(QUEUE_HEARTBEAT_GRAPH 30초·QUEUE_HEARTBEAT_ASK 20초)를 대기열과 DB 행에 함께 한다.
+  표시가 거절되면(다른 워커가 되찾음) 또는 오류로 (유휴 시간 - 표시 간격)초 넘게 못 하면 임대를 잃은 것으로 보고, 그래프는
+  취소 표시(app/cancel.py)로 다음 노드·LLM 예약 직전에 끊는다. 그래프·질문 행은 (작업 id, 임대) 토큰으로 쥐고(vol_run.graph_lease,
+  ask_request.claimed_by) 결과도 그 토큰으로만 남긴다 — 되찾은 워커와 옛 워커가 같은 철 그래프를 함께 돌리거나 결과를 덮지 않게.
 실패는 fail(시도로 셈, QUEUE_MAX_ATTEMPTS 3번이면 죽은 작업 → app/runs.py on_dead가 실행을 오류로 닫는다). 비용 한도 멈춤은
-실패가 아니다(ack, 예전처럼 /resume으로 이어 감). 작업 본문은 믿지 않는다 — 철·쪽 이름을 경로에 쓰기 전에 API와 같은 규칙
-(main.VOL_RX, upload.page_of)과 store.under(저장 폴더 밖 차단)로 다시 본다.
+실패가 아니다(ack, 예전처럼 /resume으로 이어 감). 행이 아직 준비 중(preparing)인 작업은 시도로 세지 않고 되돌린다(release).
+작업 본문은 믿지 않는다 — 철·쪽 이름을 경로에 쓰기 전에 API와 같은 규칙(main.VOL_RX, upload.page_of)과 store.under로 다시 본다.
+  규칙에 안 맞는 작업은 버리고, 실행 번호를 알면 그 실행을 오류로 닫는다.
+감시 (SWEEP_SECONDS마다): 활성인데 작업 없이 오래 그대로인 실행을 오류로 닫는다 (app/runs.py sweep).
 기동할 때: 끝나지 않은 철 자동 재개 (resume_unfinished) — 그래프가 중간에 멈춰 있고(next 있음·검토 대기 아님) 실행 중이 아니며
-마지막 실행이 오류·한도 멈춤이 아닌 철에 graph 이어 가기 작업을 넣는다 (예전 판에서 Pod 재시작으로 끊긴 철). 실행 중(queued·
-running)인 철은 대기열에 작업이 남아 있으므로(Postgres 표·Redis AOF) 되찾기가 잇는다.
+마지막 실행이 오류·한도 멈춤이 아닌 철에 graph 이어 가기 작업을 넣는다 (예전 판에서 Pod 재시작으로 끊긴 철). 실행 중인 철은
+대기열에 작업이 남아 있으므로(Postgres 표·Redis AOF) 되찾기가 잇는다.
 """
 
 from __future__ import annotations
@@ -24,12 +29,13 @@ from types import SimpleNamespace
 
 from langgraph.types import Command
 
-from app import errors, jobqueue, llm, runs, store
+from app import cancel, errors, jobqueue, llm, runs, store
 from app import upload as uploads
 from app.jobqueue import ASK, GRAPH, OCR_PAGE, NewJob
 
 KINDS = (OCR_PAGE, GRAPH, ASK)
-NOT_YET_WAIT = 1.0  # 실행 행이 아직 확정되지 않은 작업을 되돌리기 전 기다림 (API가 넣은 뒤 행을 쓰는 사이)
+NOT_YET_WAIT = 1.0  # 행이 준비 중(preparing)이거나 앞선 임대가 아직 살아 있는 작업을 되돌리기 전 기다림
+SWEEP_SECONDS = float(os.environ.get("SWEEP_SECONDS", "120"))
 
 
 def first_input(vol, kind, arg):
@@ -74,7 +80,47 @@ def execute(main, vol, inp, user, invoke=True, claim=lambda outcome: True):
 
 
 class BadJob(ValueError):
-    """본문의 철·쪽 이름이 규칙에 맞지 않음 — 다시 해도 같으므로 버린다"""
+    """본문의 철·쪽 이름·실행 번호가 규칙에 맞지 않음 — 다시 해도 같으므로 버린다"""
+
+
+class Keeper:
+    """작업 임대 지키기: beat초마다 대기열 heartbeat + 행 표시(row_beat). 거절되면 바로, 오류가 (idle - beat)초 넘게 이어지면
+    임대를 잃은 것으로 본다 (그때쯤 다른 워커가 되찾을 수 있다) → lost, on_lost()"""
+
+    def __init__(self, q, job, beat, idle, row_beat=None, on_lost=None):
+        self.q, self.job, self.beat, self.idle = q, job, beat, idle
+        self.row_beat, self.on_lost = row_beat, on_lost
+        self.lost, self._stop = threading.Event(), threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True, name=f"keeper-{job.kind}")
+
+    def __enter__(self):
+        if self.beat:
+            self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        return False
+
+    def _lose(self, why):
+        self.lost.set()
+        print(f"[worker] {self.job.kind} 작업 임대를 잃음 ({why})", flush=True)
+        if self.on_lost:
+            self.on_lost()
+
+    def _run(self):
+        last_ok = time.monotonic()
+        while not self._stop.wait(self.beat):
+            try:
+                ok = self.q.heartbeat(self.job) and (self.row_beat() if self.row_beat else True)
+            except Exception as e:  # noqa: BLE001 — 대기열·DB가 잠깐 안 될 때: 다시 해 보다가 늦으면 잃은 것으로
+                print(f"[worker] 살아 있음 표시 실패: {type(e).__name__}", flush=True)
+                if time.monotonic() - last_ok > self.idle - self.beat:
+                    return self._lose("표시 실패가 이어짐")
+                continue
+            if not ok:
+                return self._lose("다른 워커가 되찾음")
+            last_ok = time.monotonic()
 
 
 def _main():
@@ -116,17 +162,15 @@ class Worker:
     # ---------- 공통 ----------
 
     def _row_for(self, job, run):
-        """이 작업의 실행 행. 아직 확정 전이면 'later', 옛 실행이면 None"""
+        """이 작업의 실행 행. 준비 중이면 'later', 다른 실행(옛 것·되돌린 것)이거나 끝났으면 None"""
         r = runs.row(job.vol)
-        if r is None or r["run"] < run:
-            return "later"
-        if r["run"] > run or r["state"] == "ended":
+        if r is None or r["run"] != run or r["state"] == "ended":
             return None
-        return r
+        return "later" if r["state"] == "preparing" else r
 
     def _later(self, job):
         time.sleep(NOT_YET_WAIT)
-        self.q.fail(job)
+        self.q.release(job)  # 시도로 세지 않는다
 
     def handle(self, job):
         try:
@@ -140,6 +184,11 @@ class Worker:
         except BadJob as e:
             print(f"[worker] {job.kind} 작업 버림: {e}", flush=True)  # 이름 값은 싣지 않는다
             self.q.ack(job)
+            if job.kind != ASK and str(e) != "실행 번호" and job.vol and _main().VOL_RX.fullmatch(job.vol):
+                try:  # 철·실행을 알면 그 실행을 닫는다 (영원히 '실행 중'으로 남지 않게) — 쪽 이름만 틀린 경우
+                    runs.close_error(job.vol, int(job.ref), "bad_job", job=job.kind)
+                except (TypeError, ValueError):
+                    pass
 
     # ---------- 쪽 OCR ----------
 
@@ -154,7 +203,8 @@ class Worker:
         try:
             if store.page_path(job.vol, job.page).exists():  # 그 사이 지워진 쪽(일괄 삭제)은 읽지 않는다
                 flow.ocr_one(job.vol, job.page)
-            runs.maybe_put_graph(job.vol, run, force=job.attempts > 1)
+            if runs.page_done(job.vol, run, job.page) == 0:
+                runs.maybe_put_graph(job.vol, run, force=job.attempts > 1)
         except Exception as e:
             errors.log_exception(f"ocr {job.vol}")
             store.event(job.vol, "ocr_page", "error", None, page=job.page, **errors.public(e))
@@ -164,26 +214,17 @@ class Worker:
 
     # ---------- 그래프 ----------
 
-    def _claim_graph(self, job, run):
-        with store.pool.connection() as c:
-            return c.execute("""UPDATE vol_run SET state = 'running', graph_job = %(j)s, updated_at = clock_timestamp()
-                                WHERE vol = %(v)s AND run = %(r)s AND state <> 'ended' AND (graph_job IS NULL OR graph_job = %(j)s)
-                                RETURNING kind, arg, started, user_id, username""",
-                             {"j": job.id, "v": job.vol, "r": run}).fetchone()
-
-    def _input(self, job, run, claim):
+    def _input(self, job, run, claim, token):
         """이번에 그래프에 넣을 입력. 첫 시도면 실행 종류대로, 앞선 시도가 시작했으면 체크포인트에서 이어 간다.
         ('done', None)이면 그래프가 이미 끝까지 갔다 (앞선 시도가 결과를 남기기 전에 죽음)"""
         main = _main()
         arg = claim["arg"] or {}
         if not claim["started"]:
-            with store.pool.connection() as c:
-                c.execute("UPDATE vol_run SET started = true WHERE vol = %s AND run = %s", (job.vol, run))
+            runs.mark_started(job.vol, run, token)
             return "go", first_input(job.vol, claim["kind"], arg)
         snap = main.G.get_state(main.cfg(job.vol))
         if snap.interrupts and claim["kind"] == "review":
-            ids = set((arg.get("resume") or {}).keys())
-            if snap.interrupts[0].id in ids:  # 검토 값을 넣기 전에 끊겼다
+            if snap.interrupts[0].id in set((arg.get("resume") or {}).keys()):  # 검토 값을 넣기 전에 끊겼다
                 return "go", Command(resume=arg.get("resume") or {})
         if snap.next and not snap.interrupts:
             return "go", None
@@ -191,73 +232,75 @@ class Worker:
 
     def graph(self, job, run):
         main = _main()
+        vol = job.vol
         r = self._row_for(job, run)
         if r == "later":
             return self._later(job)
         if r is None:
             return self.q.ack(job)
-        claim = self._claim_graph(job, run)
-        if claim is None:  # 같은 실행의 graph 작업을 다른 작업이 돌리는 중 (넣기 재시도로 생긴 겹침) — 이것은 버린다
+        spec = self.q.cfg.spec(GRAPH)
+        token = (job.id, job.lease)
+        status, claim = runs.claim_graph(vol, run, job.id, job.lease, stale=spec.idle)
+        if status == "wait":  # 같은 작업의 앞선 임대가 아직 살아 있다 — 그쪽이 잃으면(표시가 멈추면) 넘겨받는다
+            return self._later(job)
+        if status == "dup":  # 같은 실행을 다른 graph 작업이 쥐고 있다 (넣기 재시도로 생긴 겹침) — 이것은 버린다
             return self.q.ack(job)
-        vol, user = job.vol, _user(claim)
-        lost = threading.Event()
-        stop = threading.Event()
-        beat = self.q.cfg.spec(GRAPH).heartbeat
-
-        def heartbeat():
-            while beat and not stop.wait(beat):
-                if not self.q.heartbeat(job):
-                    lost.set()  # 다른 워커가 되찾았다 — 끝나도 결과를 남기지 않는다
-                    print(f"[worker] {vol} graph 작업을 잃음 (되찾김)", flush=True)
-                    return
-        hb = threading.Thread(target=heartbeat, daemon=True)
-        hb.start()
+        user = _user(claim)
+        ev = cancel.arm(vol)
         try:
-            what, inp = self._input(job, run, claim)
-            execute(main, vol, inp, user, invoke=what == "go",
-                    claim=lambda outcome: not lost.is_set() and runs.end(vol, run, outcome, graph_job=job.id))
-            if not lost.is_set():
-                self.q.ack(job)
-        except Exception as e:
-            errors.log_exception(f"run {vol}")  # 상세는 서버 로그에만
-            if lost.is_set():
-                return
-            last = job.attempts >= self.q.cfg.max_attempts
-            if last and runs.end(vol, run, "error", graph_job=job.id):
-                store.event(vol, "run", "error", None, **errors.public(e))
-                main.audit_safe(user, "run_done", vol, None, "error", code=errors.code_of(e))
-                self.q.ack(job)
-                return
-            store.event(vol, "run", "error", None, retry=job.attempts, **errors.public(e))  # 다시 해 본다 (시도 수)
-            with store.pool.connection() as c:  # 다음 시도(새 항목 id일 수 있음)가 쥘 수 있게
-                c.execute("UPDATE vol_run SET graph_job = NULL WHERE vol = %s AND run = %s AND graph_job = %s",
-                          (vol, run, job.id))
-            self.q.fail(job)
+            with Keeper(self.q, job, spec.heartbeat, spec.idle, row_beat=lambda: runs.beat_graph(vol, run, token),
+                        on_lost=ev.set) as keep:
+                try:
+                    what, inp = self._input(job, run, claim, token)
+                    execute(main, vol, inp, user, invoke=what == "go",
+                            claim=lambda outcome: not keep.lost.is_set() and runs.end(vol, run, outcome, token))
+                    if not keep.lost.is_set():
+                        self.q.ack(job)
+                except cancel.Cancelled:
+                    print(f"[worker] {vol} 그래프를 끊음 — 임대를 잃음 (되찾은 워커가 잇는다)", flush=True)
+                except Exception as e:
+                    errors.log_exception(f"run {vol}")  # 상세는 서버 로그에만
+                    if keep.lost.is_set():
+                        return
+                    if job.attempts >= self.q.cfg.max_attempts and runs.end(vol, run, "error", token):
+                        store.event(vol, "run", "error", None, **errors.public(e))
+                        main.audit_safe(user, "run_done", vol, None, "error", code=errors.code_of(e))
+                        self.q.ack(job)
+                        return
+                    store.event(vol, "run", "error", None, retry=job.attempts, **errors.public(e))  # 다시 해 본다
+                    runs.release_graph(vol, run, token)  # 다음 시도(새 항목 id일 수 있음)가 쥘 수 있게
+                    self.q.fail(job)
         finally:
-            stop.set()
+            cancel.disarm(vol, ev)
 
     # ---------- /ask ----------
 
     def ask(self, job):
         main = _main()
-        r = runs.ask_get(job.ref)
-        if r is None or r["state"] != "queued":
+        spec = self.q.cfg.spec(ASK)
+        token = f"{job.id}:{job.lease}"
+        r = runs.ask_claim(job.ref, token, stale=spec.idle)
+        if r is None:  # 이미 끝났거나 다른 워커가 처리 중 (한 번만)
             return self.q.ack(job)
         user = SimpleNamespace(id=r["user_id"], username=r["username"] or "dev")
-        try:
-            out = main.ask_answer(r["q"], r["year_from"], r["year_to"], user)
-        except llm.BudgetExceeded:
-            runs.ask_done(job.ref, None, "budget")
-        except llm.LLMOff:
-            runs.ask_done(job.ref, None, "llm_off")
-        except Exception:
-            errors.log_exception("ask")
-            if job.attempts < self.q.cfg.max_attempts:
-                self.q.fail(job)
-                return
-            runs.ask_done(job.ref, None, "internal")
-        else:
-            runs.ask_done(job.ref, out)
+        with Keeper(self.q, job, spec.heartbeat, spec.idle, row_beat=lambda: runs.ask_beat(job.ref, token)):
+            try:
+                out = main.ask_answer(r["q"], r["year_from"], r["year_to"], user)
+            except llm.BudgetExceeded:
+                runs.ask_done(job.ref, None, "budget", token)
+            except llm.LLMOff:
+                runs.ask_done(job.ref, None, "llm_off", token)
+            except Exception:
+                errors.log_exception("ask")
+                if job.attempts < self.q.cfg.max_attempts:
+                    with store.pool.connection() as c:  # 다음 시도가 다시 쥘 수 있게
+                        c.execute("UPDATE ask_request SET state = 'queued', claimed_by = NULL WHERE id = %s AND claimed_by = %s",
+                                  (job.ref, token))
+                    self.q.fail(job)
+                    return
+                runs.ask_done(job.ref, None, "internal", token)
+            else:
+                runs.ask_done(job.ref, out, None, token)
         self.q.ack(job)
 
     # ---------- 돌기 ----------
@@ -272,10 +315,17 @@ class Worker:
     def loop(self, kind, stopping: threading.Event):
         while not stopping.is_set():
             try:
-                self.run_once(kind, wait=self.q.poll if hasattr(self.q, "poll") else 1.0)
+                self.run_once(kind, wait=getattr(self.q, "poll", 1.0))
             except Exception:
                 errors.log_exception(f"[worker] {kind}")
                 stopping.wait(2.0)  # 대기열·DB가 잠깐 안 될 때 빈 돌기를 막는다
+
+    def sweeper(self, stopping: threading.Event):
+        while not stopping.wait(SWEEP_SECONDS):
+            try:
+                runs.sweep(self.q)
+            except Exception:
+                errors.log_exception("[worker] sweep")
 
 
 def drain(worker=None, kinds=KINDS, limit=10_000):
@@ -295,7 +345,7 @@ def drain(worker=None, kinds=KINDS, limit=10_000):
 
 def resume_unfinished(main=None):
     """기동 때: 그래프가 중간에 멈춘 철(검토 대기 아님)을 이어 간다 — 실행 중·한도 멈춤·마지막 실행 오류인 철은 빼고.
-    여러 워커가 함께 떠도 실행 번호 확정(commit)을 조건부로 해 하나만 넣는다. 넣은 철 목록"""
+    여러 워커가 함께 떠도 행 확정(runs.prepare, 끝난 행일 때만)이 하나만 이긴다. 넣은 철 목록"""
     main = main or _main()
     out = []
     for vol in main.volume_names():
@@ -309,21 +359,16 @@ def resume_unfinished(main=None):
             if store.run_stop(vol) == "budget":
                 continue
             run = runs.next_run()
-            with store.pool.connection() as c:  # 아직 아무도 확정하지 않았을 때만 (다른 워커와 겹치지 않게)
-                won = c.execute("""INSERT INTO vol_run (vol, run, kind, arg, state) VALUES (%s, %s, 'resume', '{}'::jsonb, 'queued')
-                                   ON CONFLICT (vol) DO UPDATE SET run = EXCLUDED.run, kind = 'resume', arg = '{}'::jsonb,
-                                     state = 'queued', outcome = NULL, graph_put = true, graph_job = NULL, started = false,
-                                     updated_at = clock_timestamp()
-                                   WHERE vol_run.state = 'ended' AND vol_run.outcome IS DISTINCT FROM 'error'
-                                     AND vol_run.outcome IS DISTINCT FROM 'budget'
-                                   RETURNING run""", (vol, run)).fetchone()
-            if not won:
+            try:
+                prev = runs.prepare(vol, run, "resume", {}, graph_put=True)
+            except runs.Busy:
                 continue
             try:
                 runs.put([NewJob(GRAPH, vol=vol, ref=str(run))])
             except (jobqueue.QueueFull, jobqueue.QueueBusy):
-                runs.end(vol, run, "error")
+                runs.rollback(vol, run, prev)
                 continue
+            runs.ready(vol, run)
             store.event(vol, "run", "start", None, resume=True, auto=True)
             out.append(vol)
         except Exception:
@@ -334,7 +379,7 @@ def resume_unfinished(main=None):
 
 
 def serve():
-    """`python -m app.worker` — 종류마다 스레드, SIGTERM이면 지금 작업을 끝내고 멈춘다 (못 끝낸 작업은 되찾기가 잇는다)"""
+    """`python -m app.worker` — 종류마다 스레드 + 감시, SIGTERM이면 지금 작업을 끝내고 멈춘다 (못 끝낸 작업은 되찾기가 잇는다)"""
     from langgraph.checkpoint.postgres import PostgresSaver
 
     from app import graph as flow
@@ -355,6 +400,7 @@ def serve():
     w = Worker()
     print(f"[worker] {w.name} 시작: {', '.join(kinds)}", flush=True)
     threads = [threading.Thread(target=w.loop, args=(k, stopping), name=f"worker-{k}", daemon=True) for k in kinds]
+    threads.append(threading.Thread(target=w.sweeper, args=(stopping,), name="worker-sweep", daemon=True))
     for t in threads:
         t.start()
     while not stopping.wait(5):
