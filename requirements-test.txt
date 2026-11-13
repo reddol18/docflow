@@ -17,3 +17,8 @@ numpy==2.4.6
 PyYAML==6.0.2
 openpyxl==3.1.5
 qdrant-client==1.20.0
+# 대기열 Redis Streams 구현 시험 (https://github.com/reddol18/docflow/issues/5 1단계). 이미지(requirements.txt·lock)에는 아직 없다 —
+# 앱이 대기열을 쓰는 2단계에서 lock_refresh.ps1로 lock에 넣는다. fakeredis: 서버 없이 Streams·XAUTOCLAIM을 흉내 (sortedcontainers는 그 의존성)
+redis==8.1.0
+fakeredis==2.40.0
+sortedcontainers==2.4.0
