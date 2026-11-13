@@ -9,3 +9,5 @@ requirements.lock text eol=lf
 evals/**/*.patch text eol=lf
 # 시험용 가짜 colima·kubectl (sh 스크립트, 확장자 없음): WSL·sh가 읽도록 LF
 tests/fixtures/fakebin/* text eol=lf
+# 시험용 가짜 kubectl (keycloak.sh 분기 시험, https://github.com/reddol18/docflow/issues/39): sh가 읽도록 LF
+tests/fixtures/fakekube/* text eol=lf

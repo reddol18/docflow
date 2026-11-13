@@ -1,0 +1,84 @@
+#!/bin/sh
+# 시험용 가짜 kubectl (tests/test_keycloak.py) — scripts/mac/keycloak.sh·kube_put.sh가 부르는 것만 흉내 낸다. 상태는 $FAKE 폴더:
+#   ns/<이름>                  네임스페이스
+#   secret/<ns>/<이름>/<키>    Secret 값(평문 파일)
+#   rv/<ns>/<이름>             Secret resourceVersion (만들고 바꿀 때마다 1씩 오른다)
+#   configmap/<ns>/<이름>/<키> ConfigMap 값
+#   pvc                        keycloak/keycloak-data PVC가 있음
+#   servicecidrs               'get servicecidrs' 출력 (없으면 실패)
+#   svcs                       'get svc -A' 출력 줄: <ns>/<이름> <clusterIP>
+#   svc_fail                   있으면 'get svc' 실패
+#   docflow_volumes            docs/docflow Deployment의 Secret 볼륨 이름들 (없으면 Deployment 없음)
+#   docflow_annotation         docflow 파드 템플릿 주석 docflow-oidc-secret-version 값 (patch가 쓴다)
+#   rollout_fail               있으면 keycloak rollout status 실패
+#   calls                      부른 명령 기록
+[ -n "${FAKE:-}" ] && [ -d "$FAKE" ] || { echo "fake kubectl: FAKE 폴더가 없음" >&2; exit 2; }
+echo "$*" >> "$FAKE/calls"
+ns=default; out=""; file=""; dry=""; jp=""; patch=""
+args=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) ns=$2; shift 2; continue ;;
+    -o) out=$2; shift 2; continue ;;
+    -f) file=$2; shift 2; continue ;;
+    -p) patch=$2; shift 2; continue ;;
+    --dry-run|--dry-run=*) dry=1; shift; continue ;;
+    -A|--timeout=*|--tail=*) shift; continue ;;
+  esac
+  args="$args $1"; shift
+done
+set -- $args
+case "$out" in jsonpath=*) jp=${out#jsonpath=} ;; esac
+emit() {  # 가짜 'yaml': 종류·네임스페이스·이름, 그 뒤 키 base64 줄
+  kind=$1; name=$2; shift 2
+  echo "$kind $ns $name"
+  for a in "$@"; do
+    case "$a" in --from-file=*) kv=${a#--from-file=}; printf '%s %s\n' "${kv%%=*}" "$(base64 < "${kv#*=}" | tr -d '\n')" ;; esac
+  done
+}
+datakey() { k=${jp#\{.data.}; k=${k%\}}; printf '%s' "$k" | tr -d '\\'; }  # {.data.a\.b} → a.b
+case "$1 ${2:-}" in
+  "create configmap"|"create secret")
+    [ -n "$dry" ] || { echo "fake kubectl: dry-run 없는 create $2" >&2; exit 2; }
+    if [ "$1 $2" = "create secret" ]; then kind=secret; shift 3; else kind=configmap; shift 2; fi
+    name=$1; shift
+    if [ "$name" = dry-run-probe ]; then echo "configmap/dry-run-probe"; exit 0; fi
+    emit $kind "$name" "$@" ;;
+  "create namespace") mkdir -p "$FAKE/ns/$3" ;;
+  "create "|"replace ")
+    read -r kind fns name < "$file"
+    rm -rf "$FAKE/$kind/$fns/$name"; mkdir -p "$FAKE/$kind/$fns/$name"
+    tail -n +2 "$file" | while read -r k v; do printf '%s' "$v" | base64 -d > "$FAKE/$kind/$fns/$name/$k"; done
+    if [ "$kind" = secret ]; then
+      mkdir -p "$FAKE/rv/$fns"; n=$(cat "$FAKE/rv/$fns/$name" 2>/dev/null || echo 100); echo $((n + 1)) > "$FAKE/rv/$fns/$name"
+    fi
+    echo "STORED $1 $kind $fns/$name" >> "$FAKE/calls" ;;
+  "get ns") [ -d "$FAKE/ns/$3" ] ;;
+  "get servicecidrs") [ -f "$FAKE/servicecidrs" ] && cat "$FAKE/servicecidrs" ;;
+  "get svc") [ ! -f "$FAKE/svc_fail" ] || { echo "Unable to connect to the server" >&2; exit 1; }; cat "$FAKE/svcs" 2>/dev/null; true ;;
+  "get pvc") [ -f "$FAKE/pvc" ] ;;
+  "get secret")
+    d="$FAKE/secret/$ns/$3"; [ -d "$d" ] || { echo "Error from server (NotFound)" >&2; exit 1; }
+    case "$jp" in
+      "{.data."*"}") base64 < "$d/$(datakey)" | tr -d '\n' ;;
+      "{.metadata.resourceVersion}") cat "$FAKE/rv/$ns/$3" | tr -d '\n' ;;
+    esac ;;
+  "get configmap")
+    d="$FAKE/configmap/$ns/$3"; [ -d "$d" ] || exit 1
+    case "$jp" in "{.data."*"}") cat "$d/$(datakey)" ;; esac ;;
+  "get deploy")
+    [ -f "$FAKE/docflow_volumes" ] || { echo "Error from server (NotFound)" >&2; exit 1; }
+    case "$jp" in
+      *volumes*) cat "$FAKE/docflow_volumes" ;;
+      *annotations*) cat "$FAKE/docflow_annotation" 2>/dev/null | tr -d '\n'; true ;;
+    esac ;;
+  "patch deploy")
+    v=$(printf '%s' "$patch" | sed -n 's/.*"docflow-oidc-secret-version":"\([^"]*\)".*/\1/p')
+    printf '%s' "$v" > "$FAKE/docflow_annotation"; echo "PATCHED docflow $v" >> "$FAKE/calls" ;;
+  "get pods") echo "NAME READY (fake)" ;;
+  "apply ") echo "applied $file" ;;
+  "rollout status") case "$3" in deploy/keycloak) [ ! -f "$FAKE/rollout_fail" ] ;; *) true ;; esac ;;
+  "rollout restart") echo "restarted $3" ;;
+  "logs "*) echo "(fake logs)" ;;
+  *) echo "fake kubectl: 모르는 명령: $*" >&2; exit 2 ;;
+esac

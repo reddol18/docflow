@@ -53,6 +53,11 @@ sh ~/doc_platform/scripts/owner_migrate.sh check
 kubectl get secret tls-web tls-postgres tls-qdrant tls-redis qdrant-api-key redis-auth -n docs >/dev/null </dev/null \
   && kubectl get configmap docflow-ca -n docs >/dev/null </dev/null \
   || { echo "TLS Secret(tls-web·tls-postgres·tls-qdrant·tls-redis·qdrant-api-key·redis-auth)·ConfigMap docflow-ca가 없음 — Windows에서 scripts/tls_secrets.ps1 먼저. 배포하지 않음" >&2; exit 1; }
+# OIDC client secret (https://github.com/reddol18/docflow/issues/39). 마운트는 optional — 없으면 docflow가 OIDC만 끄고(경고) 로컬 로그인으로
+# 뜬다(app/auth.py oidc_startup). 데모 Keycloak 없이도 배포는 그대로 간다. 켜려면 Windows에서 scripts/keycloak.ps1
+if ! kubectl get secret oidc -n docs >/dev/null 2>&1 </dev/null; then
+  echo "== Secret oidc 없음 — 이번 배포의 docflow는 OIDC(SSO) 꺼짐, 로컬 로그인만. 켜려면 scripts/keycloak.ps1 (https://github.com/reddol18/docflow/issues/39)"
+fi
 # 빌드 → 바로 고정('== 이미지 고정' 줄). 고정이 확인되지 않으면 build_image.sh가 실패로 멈춰 apply에 가지 않는다 —
 # 그래서 apply 전 확인은 따로 두지 않는다(고정 줄이 같은 것을 방금 확인했다)
 sh ~/doc_platform/scripts/build_image.sh all deploy </dev/null

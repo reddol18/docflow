@@ -25,8 +25,8 @@ foreach ($f in $files.Values) { if (-not (Test-Path $f)) { throw "없음: $f —
 
 ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts"
 if ($LASTEXITCODE) { throw "맥 접속 실패" }
-scp -q (Join-Path $root "scripts/mac/tls_secrets.sh") "${Mac}:doc_platform/scripts/"
-if ($LASTEXITCODE) { throw "복사 실패 (tls_secrets.sh)" }
+scp -q (Join-Path $root "scripts/mac/tls_secrets.sh") (Join-Path $root "scripts/mac/kube_put.sh") "${Mac}:doc_platform/scripts/"  # kube_put.sh: put·DRY (tls_secrets.sh가 불러 씀)
+if ($LASTEXITCODE) { throw "복사 실패 (tls_secrets.sh·kube_put.sh)" }
 
 $lines = foreach ($k in $files.Keys) { "$k " + [Convert]::ToBase64String([IO.File]::ReadAllBytes($files[$k])) }
 $prevEnc = $OutputEncoding

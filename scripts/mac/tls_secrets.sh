@@ -15,6 +15,7 @@ set -eu
 umask 077
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 NS=docs
+HERE=$(cd "$(dirname "$0")" && pwd)
 D=$(mktemp -d "${TMPDIR:-/tmp}/docflow-tls.XXXXXX")
 trap 'rm -rf "$D"' EXIT
 trap 'exit 1' HUP INT TERM   # ssh가 끊겨도(HUP) EXIT 트랩으로 임시 폴더를 지운다
@@ -22,19 +23,8 @@ if ! kubectl get ns $NS >/dev/null 2>&1 </dev/null; then
   kubectl create namespace $NS >/dev/null </dev/null
   echo "namespace $NS: 새로 만듦"
 fi
-DRY=--dry-run=client
-kubectl create configmap dry-run-probe --from-literal=a=b $DRY -o name >/dev/null 2>&1 </dev/null || DRY=--dry-run
-# put 종류 이름 <kubectl create 인자…>: 오브젝트를 만들어(클러스터에 보내지 않고) 있으면 replace, 없으면 create
-put() {
-  kind=$1; name=$2; shift 2
-  kubectl create "$@" -n $NS $DRY -o yaml </dev/null > "$D/obj.yaml"
-  if kubectl get "$kind" "$name" -n $NS >/dev/null 2>&1 </dev/null; then
-    kubectl replace -f "$D/obj.yaml" >/dev/null </dev/null
-  else
-    kubectl create -f "$D/obj.yaml" >/dev/null </dev/null
-  fi
-  rm -f "$D/obj.yaml"
-}
+# put·DRY: 같은 폴더의 kube_put.sh (keycloak.sh와 같이 씀)
+. "$HERE/kube_put.sh"
 # Windows PowerShell 5.1은 콘솔 입력 인코딩이 BOM 있는 UTF-8이면 표준 입력 앞에 BOM을 붙인다 — 첫 줄에서 뗀다(zap_scan.ps1과 같은 방식)
 perl -pe 's/^\xEF\xBB\xBF// if $. == 1; s/\r//g' | while read -r n b; do
   [ -n "$n" ] || continue
@@ -54,24 +44,24 @@ for s in web postgres qdrant redis; do
   openssl verify -CAfile "$D/ca.crt" "$D/$s.crt" >/dev/null || { echo "$s: CA로 확인되지 않음" >&2; exit 1; }
 done
 for s in web postgres qdrant redis; do
-  put secret "tls-$s" secret tls "tls-$s" --cert="$D/$s.crt" --key="$D/$s.key"
+  put $NS secret "tls-$s" secret tls "tls-$s" --cert="$D/$s.crt" --key="$D/$s.key"
   fp=$(openssl x509 -noout -fingerprint -sha256 -in "$D/$s.crt" | cut -d= -f2)
   end=$(openssl x509 -noout -enddate -in "$D/$s.crt" | cut -d= -f2)
   echo "secret $NS/tls-$s: SHA-256 $fp, 만료 $end"
 done
-put configmap docflow-ca configmap docflow-ca --from-file=ca.crt="$D/ca.crt"
+put $NS configmap docflow-ca configmap docflow-ca --from-file=ca.crt="$D/ca.crt"
 echo "configmap $NS/docflow-ca: SHA-256 $(openssl x509 -noout -fingerprint -sha256 -in "$D/ca.crt" | cut -d= -f2)"
 if kubectl get secret qdrant-api-key -n $NS >/dev/null 2>&1 </dev/null; then
   echo "secret $NS/qdrant-api-key: 있음 (그대로)"
 else
   head -c 32 /dev/urandom | base64 | tr -d '/+=\n' > "$D/api-key"
-  put secret qdrant-api-key secret generic qdrant-api-key --from-file=api-key="$D/api-key"
+  put $NS secret qdrant-api-key secret generic qdrant-api-key --from-file=api-key="$D/api-key"
   echo "secret $NS/qdrant-api-key: 새로 만듦 (값은 찍지 않음)"
 fi
 if kubectl get secret redis-auth -n $NS >/dev/null 2>&1 </dev/null; then
   echo "secret $NS/redis-auth: 있음 (그대로)"
 else
   head -c 32 /dev/urandom | base64 | tr -d '/+=\n' > "$D/redis-pass"
-  put secret redis-auth secret generic redis-auth --from-file=password="$D/redis-pass"
+  put $NS secret redis-auth secret generic redis-auth --from-file=password="$D/redis-pass"
   echo "secret $NS/redis-auth: 새로 만듦 (값은 찍지 않음)"
 fi

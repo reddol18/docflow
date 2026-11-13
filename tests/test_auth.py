@@ -110,7 +110,7 @@ def test_oidc_config_check(monkeypatch):
     for kw in bad:
         with pytest.raises(RuntimeError):
             auth.OidcConfig(**kw).check()
-    auth.OidcConfig(**{**ok, "issuer": "http://keycloak:8080/realms/x", "allow_http": True}).check()
+    auth.OidcConfig(**{**ok, "issuer": "http://keycloak.idp.svc:8080/realms/x", "allow_http": True}).check()
     with pytest.raises(RuntimeError):
         auth.OidcConfig(**ok).check(cookie_secure=False)  # https 콜백인데 Secure 쿠키를 끔
 

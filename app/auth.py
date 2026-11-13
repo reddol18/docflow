@@ -24,7 +24,9 @@ OIDC 설정 (oidc를 켤 때)
   OIDC_ROLE_CLAIM        역할을 읽을 클레임. 점으로 내려간다 (Keycloak: realm_access.roles). 비우면 DB 역할 유지
   OIDC_ROLE_MAP          {"제공자 값": "docflow 역할"} JSON. 지도에 없는 값은 무시
   OIDC_DEFAULT_ROLE      클레임으로 역할을 못 정했을 때. 기본 none(로그인 거절). viewer 등으로 열려면 명시
-  OIDC_ALLOW_HTTP        1이면 http 발급자 허용 (클러스터 안 시험 제공자 전용). 기본은 https만
+  OIDC_ALLOW_HTTP        1이면 http 발급자 허용 (클러스터 안 시험 제공자 전용). 기본은 https만. 켜면 발급자 호스트가
+                         localhost·*.localhost·*.svc·*.svc.cluster.local·루프백·사설 IP여야 시작한다 (internal_issuer_host)
+  client secret 파일이 없으면(local,oidc) OIDC만 끄고 경고 — oidc_startup
 
 그 밖에
   COOKIE_SECURE          기본 1(Secure·`__Host-` 쿠키, 위 루프백 예외만 http 이름). 0이면 모든 요청에 http 이름(시험·http 전용 설치).
@@ -539,6 +541,29 @@ Admin = Annotated[User, require("admin")]
 
 # ---------- OIDC ----------
 
+def _origin(url):
+    """(scheme, 호스트, 포트) — 사용자 정보(@)·빈 호스트·잘못된 포트는 None"""
+    p = urllib.parse.urlsplit(url)
+    try:
+        port = p.port or {"https": 443, "http": 80}.get(p.scheme)
+    except ValueError:
+        return None
+    if p.username is not None or p.password is not None or not p.hostname or port is None:
+        return None
+    return p.scheme, p.hostname.rstrip(".").lower(), port
+
+
+def web_origin(url):
+    """브라우저 window.location.origin과 같은 꼴: scheme://호스트[:포트] (기본 포트는 뺀다). http·https 절대 주소가 아니면 None.
+    로그인 화면이 SSO 버튼을 보일지 정하는 데 쓴다 (/auth/config oidc_origin, https://github.com/reddol18/docflow/issues/39)"""
+    o = _origin(url or "")
+    if o is None or o[0] not in ("http", "https"):
+        return None
+    scheme, host, port = o
+    host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host}" + ("" if port == {"http": 80, "https": 443}[scheme] else f":{port}")
+
+
 def _env_secret(name):
     f = os.environ.get(name + "_FILE")
     if f and os.path.exists(f):
@@ -571,11 +596,22 @@ class OidcConfig:
                    allow_http=os.environ.get("OIDC_ALLOW_HTTP") == "1")
 
     def check(self, cookie_secure=True):
+        """설정만 본다 (client secret 값은 보지 않음 — 없을 때의 처리는 oidc_startup). 틀리면 시작하지 않는다"""
         missing = [k for k in ("issuer", "client_id", "redirect_uri") if not getattr(self, k)]
         if missing:
             raise RuntimeError(f"oidc를 켰는데 설정이 없음: {', '.join('OIDC_' + k.upper() for k in missing)}")
         if not self.allow_http and not self.issuer.startswith("https://"):
             raise RuntimeError("OIDC_ISSUER는 https여야 한다 (클러스터 안 시험 제공자만 OIDC_ALLOW_HTTP=1)")
+        iss = _origin(self.issuer)
+        if iss is None or iss[0] not in ("http", "https"):
+            raise RuntimeError("OIDC_ISSUER를 읽지 못함 (http·https 절대 주소)")
+        # OIDC_ALLOW_HTTP는 클러스터 안·이 기계 안 시험 제공자 전용 (https://github.com/reddol18/docflow/issues/39) —
+        # 켜 두고 바깥 발급자를 쓰면(값을 잘못 옮김) 시작하지 않는다. http 발급자는 이 값이 있어야만 받으므로
+        # 배포 표시(DOCFLOW_REQUIRE_TLS=1)에서도 http 발급자는 늘 내부 호스트다 (따로 보지 않는다)
+        if self.allow_http and not internal_issuer_host(iss[1]):
+            raise RuntimeError("OIDC_ALLOW_HTTP=1은 발급자 호스트가 localhost·*.localhost·*.svc·*.svc.cluster.local·루프백·사설 IP일 때만")
+        if web_origin(self.redirect_uri) is None:  # 로그인 화면의 SSO 버튼 출처(/auth/config oidc_origin)도 이것으로 정한다
+            raise RuntimeError("OIDC_REDIRECT_URI를 읽지 못함 (http·https 절대 주소)")
         if self.redirect_uri.startswith("https://") and not cookie_secure:
             raise RuntimeError("https로 서비스하면서 COOKIE_SECURE=0 — 세션 쿠키가 http로도 나간다")
         if self.default_role is not None and self.default_role not in ROLES:
@@ -585,9 +621,48 @@ class OidcConfig:
             raise RuntimeError(f"OIDC_ROLE_MAP의 역할이 잘못됨: {bad}")
 
 
+INTERNAL_SUFFIXES = (".localhost", ".svc", ".svc.cluster.local")
+
+
+def internal_issuer_host(host):
+    """http 발급자로 받아도 되는 호스트: localhost·*.localhost, 클러스터 안 이름(*.svc, *.svc.cluster.local), 루프백·사설 IP
+    (링크 로컬 169.254 — 클라우드 메타데이터 — 와 0.0.0.0은 뺀다). 한 마디 이름(keycloak)은 검색 도메인 따라 어디로 갈지 몰라 받지 않는다"""
+    h = (host or "").rstrip(".").lower()
+    if not h:
+        return False
+    if h == "localhost" or h.endswith(INTERNAL_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:  # ::ffff:a.b.c.d는 v4 주소로 판단 (::ffff:8.8.8.8을 사설로 보지 않게)
+        ip = ip.ipv4_mapped
+    if ip.version == 4 and ip in ipaddress.ip_network("0.0.0.0/8"):  # "이 네트워크" — 어디로 갈지 모름
+        return False
+    if ip.is_loopback:
+        return True
+    return ip.is_private and not (ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved)
+
+
+def oidc_startup(modes, cfg, env=os.environ, cookie_secure=True):
+    """시작할 때 OIDC 설정 확인 → 쓸 방식(modes). client secret을 파일로 받게 했는데(OIDC_CLIENT_SECRET_FILE) 파일이 없거나 비면
+    (k8s Secret oidc가 아직 없음 — optional 마운트) 경고하고 OIDC만 끈다 → 로컬 로그인은 그대로 뜬다 (https://github.com/reddol18/docflow/issues/39).
+    oidc만 켠 설치면 끌 수 없어(인증이 꺼져 버린다) 시작을 거부한다. 파일이 생기면 docflow를 다시 띄워야 읽는다."""
+    if "oidc" not in modes:
+        return modes
+    cfg.check(cookie_secure)  # 설정 오류는 Secret이 있든 없든 배포 때 바로 드러나게 먼저
+    if env.get("OIDC_CLIENT_SECRET_FILE") and not cfg.client_secret:
+        if modes == {"oidc"}:
+            raise RuntimeError("AUTH_MODES=oidc인데 OIDC client secret 파일(OIDC_CLIENT_SECRET_FILE)이 없거나 비어 있음")
+        print("경고: OIDC client secret 파일(OIDC_CLIENT_SECRET_FILE)이 없거나 비어 OIDC(SSO)를 끔 — 로컬 로그인만. "
+              "Secret을 넣은 뒤 docflow를 다시 띄운다", flush=True)
+        return modes - {"oidc"}
+    return modes
+
+
 OIDC = OidcConfig.from_env()
-if "oidc" in MODES:
-    OIDC.check(COOKIE_SECURE)
+MODES = oidc_startup(MODES, OIDC, cookie_secure=COOKIE_SECURE)
 
 
 def _get_json(url):
@@ -616,18 +691,6 @@ def _cached(key, fn, ttl=3600):
 
 
 DISCOVERY_URLS = ("jwks_uri", "token_endpoint", "authorization_endpoint")  # docflow가 따라가는 주소 (userinfo 등은 쓰지 않음)
-
-
-def _origin(url):
-    """(scheme, 호스트, 포트) — 사용자 정보(@)·빈 호스트·잘못된 포트는 None"""
-    p = urllib.parse.urlsplit(url)
-    try:
-        port = p.port or {"https": 443, "http": 80}.get(p.scheme)
-    except ValueError:
-        return None
-    if p.username is not None or p.password is not None or not p.hostname or port is None:
-        return None
-    return p.scheme, p.hostname.rstrip(".").lower(), port
 
 
 def check_discovery(d, issuer, allow_http=False):
@@ -750,8 +813,11 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.get("/config")
 def auth_config():
-    """로그인 화면이 켜진 방식만 보여 주도록."""
-    return {"modes": sorted(MODES), "off": not MODES, "oidc_label": OIDC.label if "oidc" in MODES else None}
+    """로그인 화면이 켜진 방식만 보여 주도록. oidc_origin: 등록한 콜백(OIDC_REDIRECT_URI)의 출처 — 화면은 자기 출처가 이것과 같을 때만
+    SSO 버튼을 보인다 (다른 출처에서 시작하면 state 쿠키가 콜백 쪽에 없어 늘 실패한다, https://github.com/reddol18/docflow/issues/39)"""
+    on = "oidc" in MODES
+    return {"modes": sorted(MODES), "off": not MODES, "oidc_label": OIDC.label if on else None,
+            "oidc_origin": web_origin(OIDC.redirect_uri) if on else None}
 
 
 class LoginBody(BaseModel):

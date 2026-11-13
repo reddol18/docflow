@@ -138,7 +138,8 @@ export type Report = {
 
 export type Role = "viewer" | "reviewer" | "inspector" | "admin";
 export type Me = { username: string; name: string; role: Role };
-export type AuthConfig = { modes: ("local" | "oidc")[]; off: boolean; oidc_label: string | null };
+// oidc_origin: 등록한 콜백의 출처 — 로그인 화면은 자기 출처가 이것과 같을 때만 SSO 버튼을 보인다 (https://github.com/reddol18/docflow/issues/39)
+export type AuthConfig = { modes: ("local" | "oidc")[]; off: boolean; oidc_label: string | null; oidc_origin: string | null };
 export type EditRow = {
   // source·stage: 설정 흐름의 검수 단계에서 고친 칸은 source "stage:<단계>", stage "<단계>"
   ts: string; field: string; old: string | null; new: string; source: string; stage: string;

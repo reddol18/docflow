@@ -1,0 +1,127 @@
+# 데모·시험용 OIDC 제공자 Keycloak (https://github.com/reddol18/docflow/issues/39). 운영·기관 SSO가 아니다.
+# docs 네임스페이스와 따로 둔다: docs의 ResourceQuota(한도 메모리 여유 약 768Mi)·PVC(4/4)를 쓰지 않게, 그리고 지우기 쉽게
+# (kubectl delete namespace keycloak — 이 파일의 모든 것과 H2 데이터가 함께 지워진다. docs 쪽 hostAliases·egress 규칙은 남아도 해가 없다).
+#
+# 저장소: Keycloak 자체 H2 파일 DB(dev-file)를 작은 PVC에. 별도 Postgres를 두지 않는 까닭 — 파드·Secret·메모리(≥128Mi)가 하나씩 더 들고,
+#   데모 realm은 저장소의 내보내기 JSON(k8s/keycloak/docflow-realm.json)에서 언제든 다시 만들 수 있다. PVC는 관리 화면에서 바꾼 것
+#   (그룹 빼기 시험 등)을 파드 재시작 뒤에도 남기려고 둔다. dev-file은 Keycloak이 운영용이 아니라고 경고한다(데모라 받아들임).
+#
+# 주소 (issuer는 브라우저와 docflow가 같은 글자여야 한다 — app/auth.py check_discovery):
+#   issuer = http://keycloak.localhost:8180/realms/docflow  (KC_HOSTNAME)
+#   브라우저(이 PC): *.localhost는 브라우저가 늘 127.0.0.1로 푼다(docflow.localhost:8443과 같은 방식) → ssh -L 8180:127.0.0.1:8180
+#     → 맥 kubectl port-forward -n keycloak svc/keycloak 8180:8180 → 파드 8080. port-forward는 NetworkPolicy를 거치지 않는다.
+#   docflow 파드: k8s/docs.yaml hostAliases가 keycloak.localhost를 아래 Service의 고정 clusterIP(10.43.0.39)로 → 8180 → 파드 8080.
+#     고정 IP는 서비스 대역 아래쪽 정적 몫(10.43.0.0–10.43.0.255, 자동 배정이 피하는 칸)에서 골랐다 — 바꾸면 docs.yaml hostAliases도
+#     (tests/test_keycloak.py가 둘이 같은지 본다). 가정: 맥 k3s 서비스 대역이 10.43.0.0/16이고 이 IP를 다른 Service가 쓰지 않는다 —
+#     scripts/mac/keycloak.sh가 apply 전에 ServiceCIDR·Service 목록으로 확인하고, 아니면 멈춘다(다른 클러스터면 IP를 그 대역으로 바꾼다).
+#   http인 까닭: 내부 CA(scripts/ca.py)의 이름 제약에 keycloak 이름이 없어 https면 CA를 다시 만들어야 한다. docflow는 이 설치에서만
+#     OIDC_ALLOW_HTTP=1 (그 값의 원래 용도 — 클러스터 안 시험 제공자). realm sslRequired=external: 사설·루프백 주소만 http 허용.
+#
+# 시작: start --optimized — 공식 이미지에 미리 만들어 둔 빌드(기본 빌드 옵션: db dev-file, cache ispn, health·metrics 꺼짐)를 그대로 쓰고
+#   빌드 옵션은 주지 않는다. 그래서 /opt/keycloak/lib/quarkus를 다시 쓰지 않아 루트 파일시스템을 읽기 전용으로 둘 수 있다.
+#   쓰는 곳은 /opt/keycloak/data(PVC: H2·임시·트랜잭션 로그)와 /tmp뿐. 빌드 옵션(--cache=local 등)을 더하면 시작할 때 다시 빌드하려다
+#   읽기 전용이라 실패한다 — 그때는 lib/quarkus를 초기화 컨테이너로 emptyDir에 복사해 마운트하는 방식으로 바꾼다.
+# realm 가져오기: --import-realm이 /opt/keycloak/data/import/*.json(ConfigMap keycloak-realm, scripts/mac/keycloak.sh가 만든다)을
+#   읽는다. 같은 이름의 realm이 이미 있으면 건너뛴다 — JSON을 바꿔 다시 넣으려면 관리 화면에서 realm을 지우거나 PVC째 지운다.
+#   JSON 안의 ${DOCFLOW_CLIENT_SECRET}·${DEMO_PW_*}는 가져올 때 아래 환경 변수(Secret)로 바뀐다 — 저장소에는 값이 없다.
+# Secret (scripts/mac/keycloak.sh가 없을 때만 무작위로 만든다, 값은 찍지 않음):
+#   keycloak-admin          password            관리자(kcadmin, 처음 시작할 때만 만들어지는 임시 관리자)
+#   keycloak-realm-secrets  client-secret       docflow 클라이언트 비밀값 (docs/oidc의 client-secret과 같은 값)
+#                           demo-pw-hangaram, demo-pw-seonuri   시험 사용자 비밀번호
+#
+# 메모리: 요청 512Mi·한도 1Gi. 힙은 한도의 50%(512m)·메타스페이스 256m 상한 — 나머지는 스레드·코드 캐시 몫.
+#   이미지 기본(KC_RUN_IN_CONTAINER)은 MaxRAMPercentage=70이라 1Gi에서 힙 밖 몫이 모자랄 수 있어 줄였다.
+# 컨테이너 최소 권한 (https://github.com/reddol18/docflow/issues/29): docs.yaml과 같음 — root 아님(이미지 사용자 1000)·권한 상승 없음·
+#   capability 전부 버림·seccomp RuntimeDefault·SA 토큰 없음·루트 파일시스템 읽기 전용.
+apiVersion: v1
+kind: Namespace
+metadata: {name: keycloak, labels: {purpose: doc-platform-demo-idp}}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: keycloak-quota, namespace: keycloak}
+spec:
+  hard: {requests.cpu: 500m, requests.memory: 640Mi, limits.memory: 1Gi, persistentvolumeclaims: "1"}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: keycloak}
+spec: {podSelector: {}, policyTypes: [Ingress, Egress]}
+---
+# 바깥으로는 DNS만 (Keycloak은 이 데모에서 다른 곳을 부르지 않는다 — 메일·외부 IdP 없음)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: keycloak}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+# 들어오는 것은 docflow API 파드(discovery·JWKS·토큰 교환)뿐. 워커·web·다른 네임스페이스는 막는다.
+# 브라우저 경로는 kubectl port-forward라 이 정책을 거치지 않는다 (docs.yaml의 web·docflow와 같음)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: keycloak-from-docflow, namespace: keycloak}
+spec:
+  podSelector: {matchLabels: {app: keycloak}}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: docs}}, podSelector: {matchLabels: {app: docflow}}}]
+    ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: keycloak-data, namespace: keycloak}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 512Mi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}  # H2 파일은 한 파드만 연다
+  selector: {matchLabels: {app: keycloak}}
+  template:
+    metadata: {labels: {app: keycloak}}
+    spec:
+      # 이미지 사용자 1000(/opt/keycloak 소유 1000:0). local-path PVC 폴더는 누구나 쓸 수 있게 만들어진다(fsGroup은 듣지 않음)
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
+      enableServiceLinks: false  # 서비스 이름(keycloak)으로 KEYCLOAK_* 환경 변수가 들어가지 않게
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332  # 다이제스트 고정 (https://github.com/reddol18/docflow/issues/46). 판을 올리면 다이제스트도 (sh scripts/mac/image_tags.sh)
+        args: [start, --optimized, --import-realm]
+        env:
+        - {name: KC_HOSTNAME, value: "http://keycloak.localhost:8180"}  # issuer의 앞부분 — docs.yaml OIDC_ISSUER와 같게
+        - {name: KC_HTTP_ENABLED, value: "true"}
+        - {name: KC_HTTP_PORT, value: "8080"}
+        - {name: KC_LOG_CONSOLE_COLOR, value: "false"}
+        - {name: KC_BOOTSTRAP_ADMIN_USERNAME, value: kcadmin}
+        - {name: KC_BOOTSTRAP_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: keycloak-admin, key: password}}}
+        # realm 가져오기 자리표시자 (docflow-realm.json). KC_ 앞붙이를 쓰지 않는다 — Keycloak이 설정 옵션으로 읽으려 한다
+        - {name: DOCFLOW_CLIENT_SECRET, valueFrom: {secretKeyRef: {name: keycloak-realm-secrets, key: client-secret}}}
+        - {name: DEMO_PW_HANGARAM, valueFrom: {secretKeyRef: {name: keycloak-realm-secrets, key: demo-pw-hangaram}}}
+        - {name: DEMO_PW_SEONURI, valueFrom: {secretKeyRef: {name: keycloak-realm-secrets, key: demo-pw-seonuri}}}
+        - {name: JAVA_OPTS_KC_HEAP, value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -XX:MaxMetaspaceSize=256m"}
+        ports: [{containerPort: 8080}]
+        resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {memory: 1Gi}}
+        # health 엔드포인트는 빌드 옵션이라 꺼져 있다 → realm discovery 문서가 나오면 준비(가져오기까지 끝난 것)
+        readinessProbe: {httpGet: {path: /realms/docflow/.well-known/openid-configuration, port: 8080}, initialDelaySeconds: 30, periodSeconds: 10}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: data, mountPath: /opt/keycloak/data}
+        - {name: realm, mountPath: /opt/keycloak/data/import, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: keycloak-data}}
+      - {name: realm, configMap: {name: keycloak-realm}}
+      - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+---
+# 고정 clusterIP: docflow 파드의 hostAliases(keycloak.localhost)가 가리킨다 (위 '주소')
+apiVersion: v1
+kind: Service
+metadata: {name: keycloak, namespace: keycloak}
+spec: {clusterIP: 10.43.0.39, selector: {app: keycloak}, ports: [{port: 8180, targetPort: 8080}]}

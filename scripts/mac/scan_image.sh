@@ -1,5 +1,5 @@
 #!/bin/sh
-# 맥에서: 배포하는 이미지(k8s/docs.yaml의 image: 전부)의 OS·파이썬 패키지 취약점을 trivy로 본다
+# 맥에서: 배포하는 이미지(k8s/docs.yaml·k8s/keycloak.yaml의 image: 전부)의 OS·파이썬 패키지 취약점을 trivy로 본다
 # (https://github.com/reddol18/docflow/issues/25). 보고만 한다 — 취약점이 있어도 그것으로 실패하지 않는다.
 #   sh scan_image.sh             이미지별 요약 + 표 (결과를 이슈·PR에 붙인다)
 #   sh scan_image.sh --summary   이미지별 HIGH·CRITICAL 요약 한 줄만 (deploy.sh가 롤아웃 뒤 부른다, issues/46)
@@ -102,7 +102,10 @@ fi
 GOT=$(sha "$TRIVY")
 [ "$GOT" = "$EXE_SHA" ] || bad "$TRIVY 해시가 tool_pins.txt와 다름 ($GOT) — 실행하지 않음. 확인 뒤 $DIR 를 지우면 다시 받는다"
 
-IMAGES=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$HERE/../k8s/docs.yaml" | sort -u)  # 맥: ~/doc_platform/k8s
+img_of() { [ -f "$1" ] && sed -n 's/^[[:space:]]*image:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$1"; }
+# 데모 Keycloak(k8s/keycloak.yaml, https://github.com/reddol18/docflow/issues/39)은 따로 올리는 것이라 k3s에 없으면 건너뛰기만 (실패 아님)
+OPTIONAL=$(img_of "$HERE/../k8s/keycloak.yaml" | sort -u)
+IMAGES=$( { img_of "$HERE/../k8s/docs.yaml"; printf '%s\n' "$OPTIONAL"; } | sed '/^$/d' | sort -u)  # 맥: ~/doc_platform/k8s
 [ -n "$IMAGES" ] || { echo "k8s/docs.yaml에서 image:를 찾지 못함"; exit 1; }
 # 이미지 tar(가장 큰 것 약 2GB)·trivy DB를 맥 디스크에 쓰므로 먼저 여유 확인 (반드시) — scripts/mac/disk_check.sh
 sh "$HERE/disk_check.sh" </dev/null || exit 1
@@ -140,7 +143,10 @@ for IMG in $IMAGES; do
   LIST=$(colima nerdctl -- --namespace k8s.io images --no-trunc --format '{{.ID}}' "$REF" </dev/null) \
     || { echo "== 이미지 $IMG: 이미지 목록 실패"; FAIL=1; continue; }
   ID=$(printf '%s\n' "$LIST" | sed -n 1p)
-  [ -n "$ID" ] || { echo "== 이미지 $IMG: k3s에 없음 (건너뜀)"; FAIL=1; continue; }
+  if [ -z "$ID" ]; then
+    case " $(echo $OPTIONAL) " in *" $IMG "*) echo "== 이미지 $IMG: k3s에 없음 (따로 올리는 데모 — 건너뜀)"; continue ;; esac
+    echo "== 이미지 $IMG: k3s에 없음 (건너뜀)"; FAIL=1; continue
+  fi
   KEY=$(printf '%s' "${ID#sha256:}" | tr -dc '0-9a-f') || { echo "== 이미지 $IMG ($ID): 요약 실패 (키)"; FAIL=1; continue; }
   CF="$CACHE/$KEY.$VER.$DBSTAMP.json"  # 캐시 키: 이미지 ID + trivy 판 + DB 갱신 시각
   HIT=""

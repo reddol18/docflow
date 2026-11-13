@@ -377,6 +377,53 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 - k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
 - emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi(업로드 본문을 Starlette가 흘려 쓰는 곳). 넘으면 kubelet이 docflow 파드를 내쫓으므로 앱이 업로드를 묶는다(`app/upload.py`, https://github.com/reddol18/docflow/issues/26): 파일 하나 `UPLOAD_MAX_MB`(기본 20, 넘으면 413), 요청 하나 `UPLOAD_MAX_FILES`장(기본 50, 넘으면 400), 픽셀 수 `UPLOAD_MAX_MPX`(기본 100MP — A3 600dpi ≈ 70MP, 넘으면 400), 스캔 수 `UPLOAD_MAX_SCANS`(기본 64, 넘으면 400), 요청 본문 `UPLOAD_MAX_BODY_MB`(기본 210 — 화면이 10장씩 보냄, 받은 바이트로 세어 413), 동시에 받는 본문 합계 `UPLOAD_TMP_MB`(기본 1536, 넘으면 429), 동시 디코드 검사 `UPLOAD_DECODE_SLOTS`(기본 2). 본문은 로그인·역할·CSRF 확인 뒤에 읽는다. 같은 이름의 다른 내용은 409, `?replace=true`면 바꾸고 그 쪽 OCR을 지운다. 새 쪽·교체는 처음·끝난 철만(실행 중·검토 대기·멈춤은 409), 끝난 철은 `/run`으로 다시.
 
+### 데모 Keycloak — OIDC 실연결 (https://github.com/reddol18/docflow/issues/39)
+
+시험·시연용 OIDC 제공자. 기관 SSO가 아니다. `AUTH_MODES=local,oidc` — 로컬 로그인은 그대로 있고, 등록한 콜백과 같은 출처(`http://localhost:3000`)의 로그인 화면에만 'Keycloak(데모)로 로그인' 버튼이 더해진다.
+
+| 무엇 | 값 |
+|---|---|
+| 매니페스트 | `k8s/keycloak.yaml` — 네임스페이스 `keycloak`(docs 쿼터·PVC를 쓰지 않음, 자체 쿼터 요청 메모리 640Mi·한도 1Gi·PVC 1), 기본 차단 NetworkPolicy, 들어오는 것은 docs의 docflow API 파드 8080만 |
+| 이미지 | `quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e…` (amd64 압축 약 253MB). `start --optimized` — 이미지에 미리 된 빌드를 그대로 써서 루트 파일시스템 읽기 전용. 배포 때 스캔(`scan_image.sh`, k3s에 없으면 건너뜀)·고정 다이제스트 확인(`image_tags.sh`)에 들어간다 |
+| 저장소 | Keycloak 자체 H2 파일(dev-file)을 PVC `keycloak-data`(512Mi)에. 별도 Postgres 없음 — realm은 저장소 JSON에서 언제든 다시 만든다 |
+| 메모리 | 요청 512Mi · 한도 1Gi, 힙은 한도의 50%(`JAVA_OPTS_KC_HEAP`) |
+| realm | `k8s/keycloak/docflow-realm.json` — realm `docflow`(비밀번호 정책 `length(12)`, 무차별 대입 보호), 기밀 클라이언트 `docflow`(PKCE S256 필수, 콜백 `http://localhost:3000/api/auth/oidc/callback` 하나), 그룹 `/docflow-admin`·`/docflow-reviewer`, 가상 사용자 `hangaram`(두 그룹)·`seonuri`(reviewer). 비밀값 칸은 `${…}` 자리표시자뿐 — 가져올 때 Secret에서 채운다 |
+| issuer | `http://keycloak.localhost:8180/realms/docflow` — 브라우저와 docflow 파드가 같은 글자 |
+| docflow 설정 | `k8s/docs.yaml` `OIDC_*`, client secret은 Secret `oidc`(`/etc/oidc/client-secret`, optional 마운트), NetworkPolicy `docflow-to-keycloak`(API 파드만 → keycloak 8080, 워커는 아님), `hostAliases` keycloak.localhost → Keycloak Service 고정 IP `10.43.0.39` |
+
+- **주소가 하나로 맞는 길:** 브라우저는 `*.localhost`를 늘 127.0.0.1로 푼다(`docflow.localhost:8443`과 같은 방식) → ssh 터널 8180 → 맥 `kubectl port-forward svc/keycloak 8180:8180` → 파드 8080. docflow 파드는 `hostAliases`로 같은 이름을 Keycloak Service(고정 clusterIP, 서비스 대역 아래쪽 정적 몫)로 보낸다. 그래서 discovery 문서의 issuer·토큰·JWKS 주소가 docflow 설정과 같아 `auth.check_discovery`를 통과한다. 가정: 그 IP가 클러스터 서비스 대역(맥 k3s `10.43.0.0/16`) 안이고 비어 있다 — `scripts/mac/keycloak.sh`가 apply 전에 ServiceCIDR·Service 목록으로 확인하고 아니면 멈춘다.
+- **http인 까닭:** 내부 데모 CA(`scripts/ca.py`)는 이름 제약에 keycloak 이름이 없어 https로 하려면 CA를 다시 만들어야 한다. 그래서 이 설치만 `OIDC_ALLOW_HTTP=1`, realm은 `sslRequired=external`(사설·루프백 주소만 http). 바깥에 열지 않는다(port-forward·ssh 터널뿐). `OIDC_ALLOW_HTTP=1`이면 docflow는 발급자 호스트가 `localhost`·`*.localhost`·`*.svc`·`*.svc.cluster.local`·루프백·사설 IP일 때만 시작한다(`auth.internal_issuer_host`) — 배포 표시 `DOCFLOW_REQUIRE_TLS=1`에서 http 발급자도 같은 규칙.
+- **역할 = 그룹:** 클라이언트의 그룹 매퍼가 ID 토큰에 `groups`(전체 경로 `/docflow-admin` — 다른 부모 밑 같은 이름 하위 그룹이 역할을 얻지 않게)를 넣고 docflow가 `OIDC_ROLE_CLAIM=groups`·`OIDC_ROLE_MAP`으로 옮긴다. 로그인할 때마다 다시 맞추므로 그룹을 빼면 **다음 로그인 때** 남은 그룹 중 가장 넓은 역할로 내려가고, 지도에 있는 그룹이 없으면 로그인이 거절된다(`OIDC_DEFAULT_ROLE=none`, 감사 사유 `oidc_role`). 이미 열린 docflow 세션은 로그아웃·만료까지 그 역할 그대로다.
+- **SSO는 `localhost:3000`(이 PC 개발 서버)에서만:** 콜백을 그 주소 하나로 등록했다. 다른 출처에서 시작하면 state 쿠키가 콜백 쪽에 없어 늘 실패하므로, 로그인 화면은 `/auth/config`의 `oidc_origin`(콜백의 출처)이 자기 출처와 같을 때만 SSO 버튼을 보이고 아니면 SSO가 되는 주소로 가는 링크와 함께 "SSO 로그인은 … 에서만" 안내를 낸다(`https://docflow.localhost:8443` web 파드는 로컬 로그인. 로컬 로그인이 꺼진 설치면 이 안내가 눈에 띄는 상자로 — 빈 화면이 아니게). 판단은 `frontend/src/lib/sso.ts`(시험 `sso.test.mjs`), `oidc_origin`을 모르는 서버면 예전처럼 버튼. docflow는 `OIDC_REDIRECT_URI`를 http·https 절대 주소로 읽지 못하면 시작하지 않는다. Keycloak 쪽 로그아웃 연동(RP-initiated logout)은 범위 밖이라 docflow 로그아웃 뒤에도 Keycloak 세션이 남아 다음 SSO 로그인은 비밀번호 없이 된다(다른 사용자로 시험하려면 Keycloak 계정 화면에서 로그아웃하거나 시크릿 창).
+- **데모 없이도 배포된다:** Secret `oidc` 마운트는 optional이다. 없으면 맥 `deploy.sh`가 "OIDC(SSO) 꺼짐"을 알리고, docflow는 경고를 남기고 OIDC만 끈 채 로컬 로그인으로 뜬다(`auth.oidc_startup`). `AUTH_MODES=oidc`만인 설치는 끌 수 없어 시작을 거부한다.
+- **비밀값의 정본:** Secret `keycloak/keycloak-realm-secrets` 하나. `keycloak.sh`는 값을 돌리지 않는다 — Secret은 realm이 든 PVC가 없을 때(처음)만 만들고, PVC가 있는데 Secret이 없으면 새 값을 만들지 않고 멈춘다(전부 새로 `kubectl delete namespace keycloak`, 또는 옛 값으로 Secret을 다시 만드는 명령을 찍는다). `docs/oidc`는 정본과 다를 때만 바꾸고, docflow가 그 Secret을 마운트하고 있으면 docflow를 다시 띄운다(시작할 때 한 번 읽음).
+
+**올리기 (처음, 이 PC에서):**
+
+```powershell
+.\scripts\keycloak.ps1        # 맥: 디스크 확인(1GB) → clusterIP 확인 → Secret(처음만 무작위) → docs/oidc 맞추기 → realm ConfigMap → apply → 준비 대기
+.\scripts\deploy.ps1          # docflow가 아직 옛 매니페스트면 (AUTH_MODES=local,oidc). 이미 새 매니페스트면 keycloak.ps1이 docflow를 다시 띄웠다
+.\scripts\keycloak.ps1 -Verify  # docflow 파드에서 discovery — issuer·authorization/token/jwks 주소 출처가 다르면 실패(throw)
+```
+
+**데모 로그인:**
+
+```powershell
+# 맥 (터미널 두 개 또는 백그라운드)
+kubectl port-forward -n docs svc/docflow 8000:8000
+kubectl port-forward -n keycloak svc/keycloak 8180:8180
+# 이 PC
+ssh -N -L 8000:127.0.0.1:8000 -L 8180:127.0.0.1:8180 user@mac
+cd frontend; npm run dev      # http://localhost:3000/login → 'Keycloak(데모)로 로그인'
+# 시험 사용자 비밀번호를 이 PC 클립보드로 (화면에 찍지 않음, 사용자가 직접)
+ssh user@mac "PATH=/usr/local/bin:`$PATH kubectl get secret keycloak-realm-secrets -n keycloak -o jsonpath='{.data.demo-pw-hangaram}' | base64 -D" | Set-Clipboard
+```
+
+- 관리 화면: `http://keycloak.localhost:8180/admin/` — 사용자 `kcadmin`, 비밀번호는 Secret `keycloak-admin`(`password`)을 위와 같이 클립보드로. realm `docflow` → Clients·Groups·Users에서 확인하고, 그룹 빼기 시험은 Users → `hangaram` → Groups → `docflow-admin` Leave → docflow 로그아웃 → 다시 SSO 로그인 → 검토자 화면.
+- **realm을 바꿀 때:** Keycloak은 같은 이름의 realm이 있으면 가져오기를 건너뛴다 — `k8s/keycloak/docflow-realm.json`을 고쳐도(매퍼·그룹·클라이언트·비밀번호 정책) **이미 올라간 Keycloak에는 들어가지 않는다.** 넣으려면 둘 중 하나: `kubectl delete namespace keycloak` 뒤 `keycloak.ps1`(H2·Secret 모두 새로, docs/oidc와 docflow도 맞춰진다), 또는 관리 화면에서 realm `docflow`를 지우고 `kubectl rollout restart deploy/keycloak -n keycloak`(같은 Secret 값으로 다시 가져온다). `keycloak.sh`는 PVC가 있는데 ConfigMap의 realm JSON과 저장소 JSON이 다르면 이 안내를 `!!`로 찍는다. 그룹 경로를 바꾸면 `OIDC_ROLE_MAP`(`k8s/docs.yaml`)도 함께.
+- **docflow 쪽 순서:** `keycloak.sh`는 Keycloak이 준비된 뒤에만 `docs/oidc`를 맞추고, docflow 파드 템플릿 주석 `docflow-oidc-secret-version`(= `docs/oidc`의 resourceVersion)이 지금 Secret과 다르면 그 주석을 고쳐(patch) docflow를 다시 띄운다. 중간에 끊겨도 다음 실행이 맞춘다. `keycloak.ps1 -Verify`는 discovery에 더해 docflow 파드의 client secret 파일이 비어 있지 않은지(크기만)와 `/auth/config` modes에 oidc가 있는지도 본다.
+- **지우기:** `kubectl delete namespace keycloak`, 그리고 docflow를 `AUTH_MODES=local`로 되돌려 배포(`OIDC_*`·`hostAliases`·`oidc` 볼륨·NetworkPolicy `docflow-to-keycloak`은 그 커밋에서 함께 뺀다). Keycloak만 지우고 docflow를 그대로 두면 SSO 시작이 discovery 실패(502)로 끝나고 로컬 로그인은 그대로다.
+
 ### colima 디스크 정리 기준 (https://github.com/reddol18/docflow/issues/119)
 
 맥 colima VM의 이미지 디스크(`/var/lib/containerd`·`/var/lib/rancher`·`/mnt/lima-colima`가 같은 `/dev/vdb1` 30GB)가 kubelet 이미지 GC 문턱(이 노드 configz 실측 high 85% / low 80%)에 닿으면 kubelet이 **돌고 있는 컨테이너가 쓰지 않고 고정(pin)되지 않은 이미지**를 오래된 것부터 low까지 지운다. 배포 중(빌드 뒤~새 파드 전, Recreate로 옛 파드가 내려간 사이) `docflow:dev`가 여기에 걸려 지워지면 `imagePullPolicy: Never`라 새 파드가 `ErrImageNeverPull`로 멈춘다(2026-11-10 약 10분 중단).
@@ -447,7 +494,7 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 |---|---|
 | `app/` | FastAPI · LangGraph 흐름(`graph.py`) · OCR · 규칙(`layout.py`) · GPT 호출(`llm.py`) · 저장소 |
 | `frontend/` | Next.js 16 대시보드 (업로드 · 진행 단계 · 검토 에디터 · 검색). 운영 이미지 `Dockerfile`(next build → next start)·TLS 종단 `tls-proxy.mjs` |
-| `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow |
+| `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow (`docs.yaml`), 데모 Keycloak(`keycloak.yaml`, realm `keycloak/docflow-realm.json`) |
 | `eval/` | 정답 채점(`score.py`), 모델·지시문 비교 하네스(`promptfoo/`, 예전 일회성 `cell_variants.py`, `extract_variants.py`). 정답 데이터와 채점 규칙은 이전 PoC 폴더에 있어 이 레포만으로는 돌지 않음 |
 | `sim/` | breakscale_wrap 부하 시나리오 (지금 구성 / 클라우드)와 실행기 |
 | `docs/` | 설계(`design.md`), 실습 기록(`lab_log.md`), 화면 캡처·시뮬레이션 영상 |
