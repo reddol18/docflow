@@ -56,7 +56,7 @@ def q(request):
     return acl_queue(request)
 
 
-def acl_queue(request):
+def acl_queue(request, cfg=None):
     import secrets
 
     import redis
@@ -74,7 +74,7 @@ def acl_queue(request):
     request.addfinalizer(cleanup)
     kw = admin.connection_pool.connection_kwargs
     client = redis.Redis(host=kw["host"], port=kw["port"], db=0, username=user, password=pw, decode_responses=True)
-    return RedisQueue(client, CFG, prefix=prefix, poll=0.05)
+    return RedisQueue(client, cfg or CFG, prefix=prefix, poll=0.05)
 
 
 def inject_raw(q, kind, body: str) -> None:
@@ -326,7 +326,7 @@ def test_too_many_attempts_goes_dead(q):
     for n in (1, 2, 3):
         job = q.take(OCR_PAGE, f"w{n}")
         assert job and job.attempts == n
-        time.sleep(IDLE + 0.2)
+        time.sleep(IDLE + 0.4)  # 실제 Redis(WSL)는 서버 시계가 조금 흔들린다 — 다른 되찾기 시험처럼 넉넉히
     assert q.take(OCR_PAGE, "w4") is None
     s = q.stats(OCR_PAGE)
     assert (s.length, s.dead) == (0, 1)

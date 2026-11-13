@@ -102,7 +102,17 @@ class Keeper:
         self._stop.set()
         return False
 
+    def settle(self, fn):
+        """결과를 남길 때: 아직 쥐고 있으면 표시를 먼저 멈추고 fn() — 끝난 행에 표시하다 거절돼 '잃음'으로 잘못 보거나
+        되찾기를 부르지 않게. 이미 잃었으면 False"""
+        if self.lost.is_set():
+            return False
+        self._stop.set()
+        return fn()
+
     def _lose(self, why):
+        if self._stop.is_set():
+            return  # 결과를 남기는 중·끝난 뒤의 거절은 잃음이 아니다
         self.lost.set()
         print(f"[worker] {self.job.kind} 작업 임대를 잃음 ({why})", flush=True)
         if self.on_lost:
@@ -113,6 +123,8 @@ class Keeper:
         while not self._stop.wait(self.beat):
             try:
                 ok = self.q.heartbeat(self.job) and (self.row_beat() if self.row_beat else True)
+                if self._stop.is_set():
+                    return
             except Exception as e:  # noqa: BLE001 — 대기열·DB가 잠깐 안 될 때: 다시 해 보다가 늦으면 잃은 것으로
                 print(f"[worker] 살아 있음 표시 실패: {type(e).__name__}", flush=True)
                 if time.monotonic() - last_ok > self.idle - self.beat:
@@ -170,7 +182,23 @@ class Worker:
 
     def _later(self, job):
         time.sleep(NOT_YET_WAIT)
-        self.q.release(job)  # 시도로 세지 않는다
+        self.q.release(job)  # 시도로 세지 않는다 (행이 준비 중일 때만 — 아직 아무도 그래프를 쥐지 않았다)
+
+    def _hold(self, job, attempt):
+        """같은 작업을 쥔 채 기다리며 attempt()를 다시 한다 — 대기열 살아 있음 표시를 계속하면서. 되돌리지(release) 않는다:
+        Redis는 되돌리면 새 항목 id가 생겨, 앞선 임대가 쥔 작업 id(graph_job)와 달라져 '다른 작업'으로 버려진다.
+        attempt()가 'retry'가 아닌 값을 주면 그것을, 이 작업의 대기열 임대를 잃으면 None"""
+        while True:
+            time.sleep(NOT_YET_WAIT)
+            try:
+                if not self.q.heartbeat(job):
+                    return None
+            except Exception as e:  # noqa: BLE001 — 잠깐 안 되면 다시 (잃었으면 다음 표시가 거절된다)
+                print(f"[worker] 기다리는 중 표시 실패: {type(e).__name__}", flush=True)
+                continue
+            got = attempt()
+            if got != "retry":
+                return got
 
     def handle(self, job):
         try:
@@ -241,8 +269,19 @@ class Worker:
         spec = self.q.cfg.spec(GRAPH)
         token = (job.id, job.lease)
         status, claim = runs.claim_graph(vol, run, job.id, job.lease, stale=spec.idle)
-        if status == "wait":  # 같은 작업의 앞선 임대가 아직 살아 있다 — 그쪽이 잃으면(표시가 멈추면) 넘겨받는다
-            return self._later(job)
+        if status == "wait":  # 같은 작업의 앞선 임대가 아직 살아 있다 — 쥔 채 기다렸다가 그쪽 표시가 멈추면 넘겨받는다
+
+            def again():
+                if self._row_for(job, run) is None:
+                    return ("gone", None)
+                got = runs.claim_graph(vol, run, job.id, job.lease, stale=spec.idle)
+                return "retry" if got[0] == "wait" else got
+            got = self._hold(job, again)
+            if got is None:
+                return  # 기다리는 사이 이 작업의 대기열 임대를 잃었다 — 다른 워커가 잇는다
+            status, claim = got
+            if status == "gone":
+                return self.q.ack(job)
         if status == "dup":  # 같은 실행을 다른 graph 작업이 쥐고 있다 (넣기 재시도로 생긴 겹침) — 이것은 버린다
             return self.q.ack(job)
         user = _user(claim)
@@ -253,7 +292,7 @@ class Worker:
                 try:
                     what, inp = self._input(job, run, claim, token)
                     execute(main, vol, inp, user, invoke=what == "go",
-                            claim=lambda outcome: not keep.lost.is_set() and runs.end(vol, run, outcome, token))
+                            claim=lambda outcome: keep.settle(lambda: runs.end(vol, run, outcome, token)))
                     if not keep.lost.is_set():
                         self.q.ack(job)
                 except cancel.Cancelled:
@@ -280,27 +319,36 @@ class Worker:
         spec = self.q.cfg.spec(ASK)
         token = f"{job.id}:{job.lease}"
         r = runs.ask_claim(job.ref, token, stale=spec.idle)
-        if r is None:  # 이미 끝났거나 다른 워커가 처리 중 (한 번만)
-            return self.q.ack(job)
+        if r is None:  # 끝났거나(버림) 다른 워커가 처리 중 — 그 워커가 죽으면 넘겨받도록 쥔 채 기다린다
+
+            def again():
+                row = runs.ask_get(job.ref)
+                if row is None or row["state"] in ("done", "error"):
+                    return "gone"
+                return runs.ask_claim(job.ref, token, stale=spec.idle) or "retry"
+            row = runs.ask_get(job.ref)
+            r = "gone" if row is None or row["state"] in ("done", "error") else self._hold(job, again)
+            if r is None:
+                return  # 기다리는 사이 대기열 임대를 잃었다
+            if r == "gone":
+                return self.q.ack(job)
         user = SimpleNamespace(id=r["user_id"], username=r["username"] or "dev")
-        with Keeper(self.q, job, spec.heartbeat, spec.idle, row_beat=lambda: runs.ask_beat(job.ref, token)):
+        with Keeper(self.q, job, spec.heartbeat, spec.idle, row_beat=lambda: runs.ask_beat(job.ref, token)) as keep:
             try:
                 out = main.ask_answer(r["q"], r["year_from"], r["year_to"], user)
             except llm.BudgetExceeded:
-                runs.ask_done(job.ref, None, "budget", token)
+                keep.settle(lambda: runs.ask_done(job.ref, None, "budget", token))
             except llm.LLMOff:
-                runs.ask_done(job.ref, None, "llm_off", token)
+                keep.settle(lambda: runs.ask_done(job.ref, None, "llm_off", token))
             except Exception:
                 errors.log_exception("ask")
                 if job.attempts < self.q.cfg.max_attempts:
-                    with store.pool.connection() as c:  # 다음 시도가 다시 쥘 수 있게
-                        c.execute("UPDATE ask_request SET state = 'queued', claimed_by = NULL WHERE id = %s AND claimed_by = %s",
-                                  (job.ref, token))
+                    keep.settle(lambda: runs.ask_unclaim(job.ref, token))  # 다음 시도가 다시 쥘 수 있게
                     self.q.fail(job)
                     return
-                runs.ask_done(job.ref, None, "internal", token)
+                keep.settle(lambda: runs.ask_done(job.ref, None, "internal", token))
             else:
-                runs.ask_done(job.ref, out, None, token)
+                keep.settle(lambda: runs.ask_done(job.ref, out, None, token))
         self.q.ack(job)
 
     # ---------- 돌기 ----------
@@ -353,14 +401,11 @@ def resume_unfinished(main=None):
             snap = main.G.get_state(main.cfg(vol))
             if not snap.next or snap.interrupts:
                 continue
-            r = runs.row(vol)
-            if r and (r["state"] in runs.ACTIVE or r["outcome"] in ("error", "budget")):
-                continue
             if store.run_stop(vol) == "budget":
                 continue
             run = runs.next_run()
-            try:
-                prev = runs.prepare(vol, run, "resume", {}, graph_put=True)
+            try:  # 실행 중·마지막 실행 오류·한도 멈춤이면 확정 조건(WHERE)에서 거른다 — 확인과 확정 사이에 끼는 일 없음
+                prev = runs.prepare(vol, run, "resume", {}, graph_put=True, skip_outcomes=("error", "budget"))
             except runs.Busy:
                 continue
             try:
@@ -385,7 +430,10 @@ def serve():
     from app import graph as flow
     main = _main()
     store.init()
-    saver = PostgresSaver(store.pool)
+
+    class FencedSaver(cancel.FenceMixin, PostgresSaver):
+        """임대를 잃은 뒤 진행 중이던 노드의 늦은 체크포인트 쓰기를 막는다 (app/cancel.py FenceMixin)"""
+    saver = FencedSaver(store.pool)
     saver.setup()
     main.G = flow.build(saver)
     kinds = [k.strip() for k in os.environ.get("WORKER_KINDS", ",".join(KINDS)).split(",") if k.strip()]

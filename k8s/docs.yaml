@@ -290,7 +290,8 @@ spec:
       initContainers:
       - name: auth-conf
         image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
-        command: [sh, -c, 'umask 077 && printf "user default off\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$(cat /auth/password)" > /conf/auth.conf']
+        # 비밀번호는 글자·숫자만(scripts/mac/tls_secrets.sh가 그렇게 만든다) — 아니면 ACL 줄이 깨지므로 시작하지 않는다
+        command: [sh, -c, 'p="$(cat /auth/password)" && case "$p" in "" | *[!A-Za-z0-9]*) echo "redis-auth password는 [A-Za-z0-9]+ 이어야 함" >&2; exit 1;; esac && umask 077 && printf "user default off\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$p" > /conf/auth.conf']
         resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:

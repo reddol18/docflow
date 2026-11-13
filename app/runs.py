@@ -85,20 +85,22 @@ def active_all() -> dict[str, str]:
             "SELECT vol, state FROM vol_run WHERE state = ANY(%s)", (list(ACTIVE),)).fetchall()}
 
 
-def prepare(vol, run, kind, arg, user=None, pages_left=0, graph_put=False):
-    """1단계: 행 확정 (preparing). 끝난 행·행 없음일 때만 — 아니면 Busy. 앞선 행(되돌리기용)을 돌려준다"""
-    prev = row(vol)
-    with store.pool.connection() as c:
+def prepare(vol, run, kind, arg, user=None, pages_left=0, graph_put=False, skip_outcomes=()):
+    """1단계: 행 확정 (preparing). 끝난 행·행 없음일 때만 — 아니면 Busy. 앞선 행(되돌리기용)을 돌려준다.
+    skip_outcomes: 마지막 실행의 결과가 이것이면 확정하지 않는다 (자동 재개: 오류·한도 멈춤 철은 사람이 이어 감).
+    앞선 행 읽기와 확정은 한 트랜잭션 (행을 FOR UPDATE로 잡는다 — 그 사이 다른 확정이 끼면 되돌릴 행이 어긋나므로)"""
+    with store.pool.connection() as c, c.transaction():
+        prev = c.execute(f"SELECT {_COLS} FROM vol_run WHERE vol = %s FOR UPDATE", (vol,)).fetchone()  # noqa: S608
         won = c.execute("""INSERT INTO vol_run (vol, run, kind, arg, state, user_id, username, graph_put, pages_left)
                            VALUES (%s, %s, %s, %s::jsonb, 'preparing', %s, %s, %s, %s)
                            ON CONFLICT (vol) DO UPDATE SET run = EXCLUDED.run, kind = EXCLUDED.kind, arg = EXCLUDED.arg,
                              state = 'preparing', outcome = NULL, user_id = EXCLUDED.user_id, username = EXCLUDED.username,
                              graph_put = EXCLUDED.graph_put, graph_job = NULL, graph_lease = NULL, graph_beat = NULL,
                              started = false, pages_left = EXCLUDED.pages_left, updated_at = clock_timestamp()
-                           WHERE vol_run.state = 'ended'
+                           WHERE vol_run.state = 'ended' AND NOT (coalesce(vol_run.outcome, '') = ANY(%s))
                            RETURNING run""",
                         (vol, run, kind, json.dumps(arg, ensure_ascii=False), getattr(user, "id", None),
-                         getattr(user, "username", None), graph_put, pages_left)).fetchone()
+                         getattr(user, "username", None), graph_put, pages_left, list(skip_outcomes))).fetchone()
         if not won:
             raise Busy(vol)
         c.execute("DELETE FROM run_page WHERE vol = %s AND run <> %s", (vol, run))
@@ -322,6 +324,14 @@ def ask_done(req_id, result, code=None, token=None) -> bool:
         return c.execute(sql, args).rowcount == 1  # noqa: S608 — 고정 조각만 붙인다
 
 
-def ask_forget(req_id):
+def ask_unclaim(req_id, token) -> bool:
+    """실패한 시도가 내려놓는다 — 다음 시도가 다시 쥘 수 있게"""
     with store.pool.connection() as c:
-        c.execute("DELETE FROM ask_request WHERE id = %s", (req_id,))
+        return c.execute("UPDATE ask_request SET state = 'queued', claimed_by = NULL WHERE id = %s AND claimed_by = %s",
+                         (req_id, token)).rowcount == 1
+
+
+def ask_forget(req_id) -> bool:
+    """지운 쪽만 True — 같은 결과를 두 조회가 동시에 가져가도 한쪽만 돌려주고(호출 제한 되돌리기도 한 번)"""
+    with store.pool.connection() as c:
+        return c.execute("DELETE FROM ask_request WHERE id = %s RETURNING id", (req_id,)).fetchone() is not None

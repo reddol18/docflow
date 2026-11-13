@@ -1601,7 +1601,8 @@ def _ask_result(req_id, user, wait, refund=False):
                          or (r["user_id"] is None and r["username"] != getattr(user, "username", None))):
             raise HTTPException(404)
         if r["state"] in ("done", "error"):
-            runs.ask_forget(req_id)
+            if not runs.ask_forget(req_id):  # 다른 조회가 먼저 가져갔다 (지운 쪽만 돌려주고 되돌린다)
+                raise HTTPException(404)
             if r["code"] in ("budget", "llm_off"):
                 # 503 (budget_exceeded·llm_off 처리기). 결과 조회 경로는 rate_limited 밖이라 여기서 1회 되돌린다
                 # (동기 경로는 rate_limited가 같은 예외로 되돌린다 — 두 번 되돌리지 않게 refund 인자로 고른다)

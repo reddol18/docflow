@@ -3,6 +3,7 @@ Postgres 대기열(app/jobqueue_pg.py)로 돌린다 — API 경로(main) → 대
 그래프는 호출만 적는 가짜(LLM·OCR 없음), 쪽 OCR도 가짜(conftest). 이름·값은 모두 지어낸 것. 표를 지우므로 운영 DB에 대지 말 것.
 """
 import collections
+import json
 import os
 import time
 from dataclasses import replace
@@ -341,6 +342,29 @@ def test_resume_unfinished_on_worker_start(app):
     assert ("run", "start") in events("s1")
 
 
+BACKENDS = ["pg", "fakeredis", "redis-real"]
+
+
+def use_backend(app, backend, request):
+    """대기열 구현을 바꿔 끼운다 — Redis는 되돌리기·실패가 새 항목 id를 만든다(PG는 같은 행)는 차이가 임대 판단에 걸리므로
+    임대 시험은 세 구현 모두에. redis-real은 실제 Redis 7.4 + 앱 전용 ACL 사용자 (TEST_REDIS_URL, 선택)"""
+    if backend == "pg":
+        return
+    import fakeredis
+
+    from app.jobqueue_redis import RedisQueue
+    if backend == "fakeredis":
+        q = RedisQueue(fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True), cfg(), prefix="t:app",
+                       poll=0.05)
+    else:
+        from test_jobqueue import REAL_REDIS, acl_queue
+        if not REAL_REDIS:
+            pytest.skip("TEST_REDIS_URL 없음 — 실제 Redis 시험은 선택")
+        q = acl_queue(request, cfg())
+    app.q = q
+    runs.set_queue(q)
+
+
 def _graph_job(app, vol, pages=1):
     upload(app, vol, pages)
     assert app.c.post(f"/volumes/{vol}/run", headers=ADMIN).status_code == 200
@@ -350,76 +374,96 @@ def _graph_job(app, vol, pages=1):
     return runs.row(vol)["run"]
 
 
-def test_heartbeat_failure_cancels_graph_and_only_reclaimer_records(app, monkeypatch):
-    """살아 있음 표시가 계속 실패하면(대기열 오류) 워커는 (유휴 - 표시 간격)초 뒤 임대를 잃은 것으로 보고 그래프를 끊는다
-    (노드·LLM 예약 직전의 취소 표시). 되찾은 워커만 결과를 남기고, 두 워커의 그래프가 겹쳐 돌지 않는다"""
+def test_heartbeat_failure_cancels_graph_before_reclaimer_starts(app, monkeypatch):
+    """A가 긴 노드 안에 있는 동안 살아 있음 표시가 계속 실패하면(대기열 오류) A는 (유휴 - 표시 간격)초 뒤 임대를 잃은 것으로
+    보고 다음 노드 경계에서 끊긴다. B는 A가 노드 안에 있을 때부터 계속 꺼내려 하지만, 대기열 유휴 시간과 A의 행 표시가
+    멈출 때까지 쥐지 못한다 — 'A가 끊김'이 'B 시작'보다 먼저이고, 결과는 B만 남긴다"""
     import threading
 
     from app import cancel
     run = _graph_job(app, "vh")
-    spans, lock = [], threading.Lock()
+    order, lock, a_in = [], threading.Lock(), threading.Event()
+
+    def note(*x):
+        with lock:
+            order.append(x)
 
     class SlowGraph(FakeGraph):
-        def invoke(self, arg, cfg):
-            vol = cfg["configurable"]["thread_id"]
-            t0 = time.monotonic()
-            try:
-                for _ in range(200):  # 노드 여러 개 — 노드 경계마다 취소 표시를 본다
-                    cancel.check(vol)
-                    time.sleep(0.02)
-                    if threading.current_thread().name == "B":
-                        break
-            finally:
-                with lock:
-                    spans.append((threading.current_thread().name, t0, time.monotonic()))
+        def invoke(self, arg, cfg_):
+            who = threading.current_thread().name
+            vol = cfg_["configurable"]["thread_id"]
+            note(who, "start")
+            if who == "A":
+                a_in.set()
+                try:
+                    for _ in range(500):  # 긴 노드들 — 노드 경계마다 취소 표시를 본다 (app/graph.py traced)
+                        cancel.check(vol)
+                        time.sleep(0.02)
+                except cancel.Cancelled:
+                    note("A", "cancelled")
+                    raise
+                raise AssertionError("A가 끊기지 않음")
             self.state.next, self.state.values = (), {"docs": [], "indexed": 0}
-    g = SlowGraph(nxt=("doc",))  # 끊긴 그래프는 멈춘 곳이 남는다 → 되찾은 워커가 체크포인트에서 이어 감
-    monkeypatch.setattr(app.main, "G", g)
+            note(who, "end")
+    monkeypatch.setattr(app.main, "G", SlowGraph(nxt=("doc",)))
     real_hb = app.q.heartbeat
-    broken = {"A"}
 
-    def hb(job):
-        if threading.current_thread().name.startswith("keeper") and job.consumer == "A":
+    def hb(job):  # A의 살아 있음 표시만 대기열 오류
+        if job.consumer == "A":
             raise ConnectionError("가상 대기열 끊김")
         return real_hb(job)
     monkeypatch.setattr(app.q, "heartbeat", hb)
-    wa = worker.Worker(q=app.q, name="A")
-    ta = threading.Thread(target=wa.run_once, args=(GRAPH,), name="A")
+    ta = threading.Thread(target=worker.Worker(q=app.q, name="A").run_once, args=(GRAPH,), name="A")
     ta.start()
-    ta.join(10)
-    assert not ta.is_alive() and spans and spans[0][0] == "A"
-    assert runs.row("vh")["state"] == "running"  # A는 결과를 남기지 않았다
-    time.sleep(IDLE + 0.3)  # A의 행 표시도 멈췄다 → 넘겨받을 수 있다
-    broken.clear()
+    assert a_in.wait(5)
     wb = worker.Worker(q=app.q, name="B")
-    tb = threading.Thread(target=wb.run_once, args=(GRAPH,), name="B")
-    tb.start()
-    tb.join(10)
-    assert runs.row("vh")["outcome"] == "ok" and runs.row("vh")["run"] == run
-    (na, a0, a1), (nb, b0, b1) = sorted(spans, key=lambda s: s[1])
-    assert (na, nb) == ("A", "B") and a1 <= b0  # 겹치지 않음
-    assert app.q.stats(GRAPH).length == 0
+
+    def b_loop():
+        end = time.monotonic() + 15
+        while time.monotonic() < end and runs.row("vh")["state"] != "ended":
+            wb.run_once(GRAPH, wait=0.05)
+    tb = threading.Thread(target=b_loop, name="B")
+    tb.start()  # A가 노드 안에 있는 동안 B가 떠 있다
+    ta.join(15)
+    tb.join(15)
+    assert not ta.is_alive() and not tb.is_alive()
+    assert ("A", "cancelled") in order and ("B", "start") in order
+    assert order.index(("A", "cancelled")) < order.index(("B", "start"))  # 겹치지 않음
+    assert ("A", "end") not in order and order[-1] == ("B", "end")
+    r = runs.row("vh")
+    assert (r["run"], r["outcome"]) == (run, "ok") and app.q.stats(GRAPH).length == 0
 
 
-def test_claim_waits_while_previous_lease_alive(app):
-    """같은 graph 작업을 되찾았어도 앞선 임대의 행 표시가 살아 있으면 쥐지 않고(시도 안 셈) 되돌린다 — 표시가 멈추면 넘겨받는다"""
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_claim_waits_while_previous_lease_alive(app, backend, request):
+    """같은 graph 작업을 되찾았어도 앞선 임대의 행 표시가 살아 있으면 쥐지 않고, 작업을 쥔 채(되돌리지 않고 — Redis는 되돌리면
+    새 id가 되어 '다른 작업'으로 버려진다) 기다린다. 앞선 표시가 멈추면 넘겨받아 한 번 돌린다. 옛 임대로는 결과를 못 남긴다"""
+    import threading
+    use_backend(app, backend, request)
     run = _graph_job(app, "vw")
     old = app.q.take(GRAPH, "old")
     assert runs.claim_graph("vw", run, old.id, old.lease, stale=IDLE)[0] == "ok"
+    alive = threading.Event()
+    alive.set()
+
+    def old_row_beat():  # 옛 워커: 행 표시만 (대기열 표시는 끊김 → 대기열은 되찾게 해 줌)
+        while alive.is_set():
+            runs.beat_graph("vw", run, (old.id, old.lease))
+            time.sleep(0.1)
+    tb = threading.Thread(target=old_row_beat, daemon=True)
+    tb.start()
     time.sleep(IDLE + 0.2)
-    keep = True
-    while keep:  # 옛 워커가 행 표시만 계속한다 (대기열 표시는 끊김 → 대기열은 되찾게 해 줌)
-        assert runs.beat_graph("vw", run, (old.id, old.lease))
-        keep = False
     w = worker.Worker(q=app.q, name="new")
-    assert w.run_once(GRAPH)  # 되찾았지만 'wait' → release
-    assert app.g.calls == [] and runs.row("vw")["graph_lease"] == old.lease
-    job = app.q.take(GRAPH, "peek")
-    assert job.attempts == old.attempts + 1  # 되돌리기는 시도로 세지 않았다 (되찾기만 셈)
-    app.q.release(job)
-    time.sleep(IDLE + 0.2)  # 옛 임대 표시가 멈춤
-    worker.drain(w)
-    assert len(app.g.calls) == 1 and runs.row("vw")["outcome"] == "ok"
+    tw = threading.Thread(target=w.run_once, args=(GRAPH, 5.0))  # 되찾을 때까지 기다리며 꺼낸다 (부하에도)
+    tw.start()
+    time.sleep(1.2)
+    assert tw.is_alive() and app.g.calls == []  # 쥔 채 기다리는 중
+    s = app.q.stats(GRAPH)
+    assert (s.length, s.running) == (1, 1)  # 되돌리지 않았다 (새 항목 없음)
+    alive.clear()  # 옛 워커가 사라짐
+    tw.join(10)
+    assert not tw.is_alive() and len(app.g.calls) == 1 and runs.row("vw")["outcome"] == "ok"
+    assert app.q.stats(GRAPH).length == 0
     assert not runs.end("vw", run, "error", (old.id, old.lease))  # 옛 임대로는 결과를 못 남긴다
 
 
@@ -491,29 +535,51 @@ def test_bad_page_name_closes_run(app):
     assert (r["run"], r["outcome"]) == (run, "error")
 
 
-def test_ask_runs_once_even_if_reclaimed(app, monkeypatch):
-    """ask 작업을 되찾아도(앞선 워커가 살아 있음 표시 중) 같은 요청을 두 번 처리하지 않는다. 앞선 워커가 사라지면 넘겨받는다"""
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_ask_runs_once_even_if_reclaimed(app, monkeypatch, backend, request):
+    """ask 작업을 되찾았는데 앞선 워커가 행 표시 중이면 처리하지 않고 쥔 채 기다린다. 앞선 워커가 끝내면 버리고(한 번만),
+    사라지면 넘겨받아 한 번 처리한다 — 영구 running 없음"""
+    import threading
+    use_backend(app, backend, request)
     calls = []
-    monkeypatch.setattr(app.main, "ask_answer", lambda q, yf, yt, user: calls.append(q) or {"answer": "가상", "sources": []})
+    monkeypatch.setattr(app.main, "ask_answer", lambda q, yf, yt, user: calls.append(q) or {"answer": "새 워커", "sources": []})
     monkeypatch.setattr(app.main, "ASK_WAIT", 0)
-    req = app.c.get("/ask", params={"q": "가상 질문"}, headers=ADMIN).json()["id"]
-    first = app.q.take(ASK, "old")
-    assert runs.ask_claim(req, f"{first.id}:{first.lease}", stale=IDLE) is not None  # 옛 워커가 쥠
-    assert runs.ask_beat(req, f"{first.id}:{first.lease}")
-    time.sleep(IDLE + 0.2)
-    runs.ask_beat(req, f"{first.id}:{first.lease}")  # 아직 살아 있다 (행 표시)
-    w = worker.Worker(q=app.q, name="new")
-    assert w.run_once(ASK)  # 되찾았지만 처리하지 않는다
-    assert calls == []
-    assert runs.ask_done(req, {"answer": "옛 워커", "sources": []}, None, f"{first.id}:{first.lease}")
+
+    def old_holds(req):
+        first = app.q.take(ASK, "old")
+        tok = f"{first.id}:{first.lease}"
+        assert runs.ask_claim(req, tok, stale=IDLE) is not None
+        alive = threading.Event()
+        alive.set()
+
+        def beat():
+            while alive.is_set():
+                runs.ask_beat(req, tok)
+                time.sleep(0.1)
+        threading.Thread(target=beat, daemon=True).start()
+        time.sleep(IDLE + 0.2)
+        tw = threading.Thread(target=worker.Worker(q=app.q, name="new").run_once, args=(ASK, 5.0))
+        tw.start()
+        time.sleep(1.0)
+        assert tw.is_alive() and calls == []  # 처리하지 않고 쥔 채 기다림
+        return tok, alive, tw
+    # 1) 앞선 워커가 끝냄 → 새 워커는 버린다
+    req = app.c.get("/ask", params={"q": "가상 하나"}, headers=ADMIN).json()["id"]
+    tok, alive, tw = old_holds(req)
+    assert runs.ask_done(req, {"answer": "옛 워커", "sources": []}, None, tok)
+    alive.clear()
+    tw.join(10)
+    assert not tw.is_alive() and calls == []
     assert app.c.get(f"/ask/{req}", headers=ADMIN).json()["answer"] == "옛 워커"
-    # 앞선 워커가 사라진 경우: 표시가 멈추면 넘겨받아 한 번 처리
+    # 2) 앞선 워커가 사라짐 → 표시가 멈추면 넘겨받아 한 번 처리
     req = app.c.get("/ask", params={"q": "가상 둘"}, headers=ADMIN).json()["id"]
-    gone = app.q.take(ASK, "gone")
-    assert runs.ask_claim(req, f"{gone.id}:{gone.lease}", stale=IDLE)
-    time.sleep(IDLE + 0.3)
-    worker.drain(w)
-    assert calls == ["가상 둘"] and app.c.get(f"/ask/{req}", headers=ADMIN).status_code == 200
+    tok, alive, tw = old_holds(req)
+    alive.clear()
+    tw.join(10)
+    assert not tw.is_alive() and calls == ["가상 둘"]
+    r = app.c.get(f"/ask/{req}", headers=ADMIN)
+    assert r.status_code == 200 and r.json()["answer"] == "새 워커"
+    assert app.q.stats(ASK).length == 0
 
 
 def test_ask_poll_refunds_quota_on_budget(app, monkeypatch):
@@ -526,8 +592,16 @@ def test_ask_poll_refunds_quota_on_budget(app, monkeypatch):
                                                                           real(key, route, wins)))
     req = app.c.get("/ask", params={"q": "가상"}, headers=ADMIN).json()["id"]
     worker.drain(worker.Worker(q=app.q))
+    row = runs.ask_get(req)
     assert app.c.get(f"/ask/{req}", headers=ADMIN).status_code == 503
-    assert refunds == [("1", "ask", ["min", "day"])]
+    # 같은 결과를 두 조회가 동시에 읽었어도(행을 먼저 읽고 늦게 지움) 지운 쪽만 되돌린다
+    with store.pool.connection() as c:
+        c.execute("INSERT INTO ask_request (id, user_id, username, q, state, code, quota_key, quota_wins) "
+                  "VALUES (%s, 1, 'a', '', 'error', 'budget', %s, %s::jsonb)",
+                  (req, row["quota_key"], json.dumps(row["quota_wins"])))
+    monkeypatch.setattr(runs, "ask_forget", lambda req_id, real=runs.ask_forget: (real(req_id), False)[1])  # 다른 조회가 먼저 지움
+    assert app.c.get(f"/ask/{req}", headers=ADMIN).status_code == 404
+    assert refunds == [("1", "ask", ["min", "day"])]  # 한 번만
     with store.pool.connection() as c:
         assert c.execute("SELECT coalesce(sum(n), 0) AS n FROM api_quota WHERE route = 'ask' AND kind = 'min'").fetchone()["n"] == 0
 
