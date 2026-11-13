@@ -7,6 +7,9 @@
 #     ACL: 앱 사용자 docflow(Secret redis-auth password, 규칙은 k8s/docs.yaml·app/jobqueue_redis.py acl_rules와 같게),
 #     KEDA 읽기 전용 사용자 keda(Secret redis-keda password): ~{docflow:q}:* resetchannels -@all +ping +xlen +xinfo|groups +xinfo|stream +xpending
 #     — 관리형 Redis의 ACL·보안 그룹(워커·API·KEDA에서만 6379)은 https://github.com/reddol18/docflow/issues/16 에서 정한다
+#     직접 띄우는 Redis/Valkey에 AOF를 켜면 default 사용자를 리셋 권한(-@all)으로 두지 않는다 — 꺼 두되 규칙은
+#     app/jobqueue_redis.py AOF_LOADER_ACL ("user default " + 그것). 아니면 재시작 때 Lua 효과의 MULTI/EXEC가 NOPERM으로 버려진다
+#     (https://github.com/reddol18/docflow/issues/5, 정할 곳 https://github.com/reddol18/docflow/issues/16)
 #   - 쪽 이미지·OCR 결과 공유: 여러 노드의 워커가 같은 파일을 봐야 한다 → RWO PVC가 아니라 RWX(파일 스토리지) 또는
 #     오브젝트 스토리지가 필요하다. 아래는 RWX PVC 이름(docflow-data-rwx) 자리만 둔다 — 정하는 것은 https://github.com/reddol18/docflow/issues/16
 # 이미지는 레지스트리 이름·다이제스트로 (맥의 docflow:dev·imagePullPolicy: Never는 단일 노드 전용)
