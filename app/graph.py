@@ -121,9 +121,7 @@ def off_flags(d, schema=None):
     names = set(prompt_names) if "extract" in skipped else set()
     if "read" in skipped:
         names |= {f["name"] for f in schema["fields"] if f.get("rule") in HW_RULES}
-    failed = set(info.get("llm_failed") or ())
-    # 예전 표시 "extract"(이 PR의 첫 판 — 문서 단위 실패)가 남은 상태는 추출 칸 모두 실패로 읽는다
-    failed = set(prompt_names) if "extract" in failed else prompt_names & failed
+    failed = prompt_names & set(info.get("llm_failed") or ())
     out = {}
     for why, ns in ((OFF_FLAG, names), (FAIL_FLAG, failed)):
         for k in sorted({fields.flag_key(f) for f in schema["fields"] if f["name"] in ns}):

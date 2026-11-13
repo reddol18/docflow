@@ -236,15 +236,6 @@ def test_one_bad_extract_marks_only_that_doc(tmp_path, monkeypatch, capsys, case
     assert "[graph] extract 응답 형식 오류 v1/v1-0002" in capsys.readouterr().err
 
 
-def test_off_flags_old_extract_marker():
-    """예전 표시 llm_failed: ["extract"](이 PR 첫 판, 문서 단위)가 남은 상태는 추출 칸 모두 실패로 읽는다. 칸 이름이면 그 칸만"""
-    from app import graph
-    old = graph.off_flags({"info": {"llm_failed": ["extract"]}}, GIMHAE)
-    assert {k for k, v in old.items() if graph.FAIL_FLAG in v} == ALL_KEYS
-    new = graph.off_flags({"info": {"llm_failed": ["title"]}}, GIMHAE)
-    assert new == {"title": [graph.FAIL_FLAG]}
-
-
 def test_validate_extract_float_values():
     """value 소수: 정수면 정수 꼴(12345.0 → "12345"), 아니면 str. NaN·Infinity는 그 칸 실패"""
     out = fields.validate_extract(GIMHAE, '{"docno": {"value": 12345.0, "confidence": 0.5}, '
@@ -337,24 +328,21 @@ def test_citation_variants_normalized(variant):
     assert llm.drop_unknown_citations(f"가상 답 {bad}.", DOCS) == ("가상 답.", 1)
 
 
-def test_citation_broader_recognition():
-    """근거 표시로 보는 범위: 저장소에 있는 철 이름이 앞쪽이거나, 넘긴 문서 id가 뒤쪽이면 id 꼴이 아니어도 근거 표시.
-    전각 빗금(／∕⁄)도 같은 표시. [1997/05]·[총무과/서무계]는 그런 철이 없으면 그대로"""
-    docs = [*DOCS, {"vol": "vc", "doc_id": "첫쪽"}]
-    exists = {"옛철"}.__contains__  # 저장소에 있는 철 (가짜)
-    text = "가 [옛철/서무계] 나 [zz/첫쪽] 다 ［evil／p-0009］ 라 [vb∕p-0002] 마 [1997/05] [총무과/서무계]"
-    out, n = llm.drop_unknown_citations(text, docs, vol_exists=exists)
-    assert n == 3 and out == "가 나 다 라 [vb/p-0002] 마 [1997/05] [총무과/서무계]"
-    assert llm.drop_unknown_citations("[vc/첫쪽]", docs, vol_exists=exists) == ("[vc/첫쪽]", 0)
+def test_citation_nfkc_and_slash_variants():
+    """후보 안쪽을 NFKC로 바꿔 본다 — 전각 영숫자·괄호·빗금도 같은 표시. NFKC가 바꾸지 않는 ∕ ⁄도 받는다"""
+    only_vb = [DOCS[1]]  # va/p-0001은 넘기지 않음
+    assert llm.drop_unknown_citations("가 [ｖａ/ｐ-０００１] 나", only_vb) == ("가 나", 1)
+    assert llm.drop_unknown_citations("가 ［evil／p-0009］ 나", only_vb) == ("가 나", 1)
+    assert llm.drop_unknown_citations("가 [ｖｂ∕ｐ-０００２] 나 [vb⁄p-0002]", only_vb) == ("가 [vb/p-0002] 나 [vb/p-0002]", 0)
 
 
-def test_volume_exists_uses_store(tmp_path, monkeypatch):
-    """기본 철 확인은 저장소의 쪽 폴더 — 경로 한 칸이 아닌 이름('..')은 없음으로"""
-    from app import store
-    monkeypatch.setattr(store, "DATA", tmp_path)
-    (tmp_path / "pages" / "가상철").mkdir(parents=True)
-    assert llm.volume_exists("가상철") and not llm.volume_exists("없는철") and not llm.volume_exists("..")
-    assert llm.drop_unknown_citations("답 [가상철/서무계] 끝", DOCS) == ("답 끝", 1)
+def test_citation_plain_text_survives_even_with_matching_doc_id():
+    """[1997/05]는 넘긴 문서 id가 '05'여도 본문 글 (넘긴 철도 아니고 id 꼴도 아님). [총무과/서무계]도 그대로.
+    알려진 한계: 넘기지 않은 철 + 숫자·낱말뿐인 뒤쪽([가짜철/05])도 본문 글로 남는다"""
+    docs = [*DOCS, {"vol": "vc", "doc_id": "05"}]
+    text = "가 [1997/05] 나 [총무과/서무계] 다 [가짜철/05]"
+    assert llm.drop_unknown_citations(text, docs) == (text, 0)
+    assert llm.drop_unknown_citations("[vc/05]", docs) == ("[vc/05]", 0)  # 넘긴 철이면 근거 표시 (넘긴 문서라 남음)
 
 
 def test_citation_removal_cleans_only_the_spot():
@@ -367,47 +355,56 @@ def test_citation_removal_cleans_only_the_spot():
 
 # ---------- 조건 5: 로그·추적에 실명 0건 ----------
 
-def test_mask_hangul_hanja_and_number_values():
-    """예외 repr의 따옴표 글자: 한글·한자·주민등록번호·전화번호 꼴은 가리고, 경로·영문 글자는 둔다"""
-    s = errors.mask("KeyError: '남궁가온'\nValueError: input_value='李明博士' a=\"010-1234-5678\" b='900101-1234567' "
-                    "c='/data/pages/v1/v1-0001.jpg' d='C:\\data\\v1' e='v1-0001' f='plain'")
-    for bad in ("남궁가온", "李明博士", "010-1234-5678", "900101-1234567"):
+N2, N3 = "명가람", "탁누리"  # 지어낸 실명 꼴 더
+
+
+@pytest.mark.parametrize("msg", [
+    f"ValueError: can't parse '{NAME}'",
+    f"KeyError: \"{NAME}'s 결재\"",
+    "ValueError: input_value='" + NAME + "\\'s 이력'",  # 이스케이프한 따옴표가 든 repr
+    f"FileNotFoundError: '{NAME} 1997/05/03 이력서.pdf'",
+    f"FileNotFoundError: '{NAME}/{N2}/{N3}.txt'",
+    f"ValueError: {NAME} 李明博士 010-1234-5678 900101-1234567",  # 따옴표 없이도
+])
+def test_mask_message_lines(msg):
+    """메시지 줄: 따옴표와 상관없이 한글·한자 묶음과 주민등록번호·전화번호 꼴을 *** 로"""
+    s = errors.mask(msg)
+    for bad in (NAME, N2, N3, "李明博士", "010-1234-5678", "900101-1234567", "이력서", "결재"):
         assert bad not in s
-    for keep in ("'/data/pages/v1/v1-0001.jpg'", "'C:\\data\\v1'", "'v1-0001'", "'plain'"):
-        assert keep in s  # 경로(철·문서 id)·영문은 그대로
+    assert s.split(":")[0] == msg.split(":")[0]  # 예외 이름은 그대로
 
 
-def test_mask_keeps_traceback_source_lines():
-    """traceback의 소스 위치 줄과 그 다음 코드 줄은 가리지 않는다 (예외 메시지 줄만)"""
+def test_mask_keeps_location_and_source_lines():
+    """위치 줄과 그 바로 다음의 들여쓴 소스 줄은 그대로(코드라 이름이 있어도 둔다). 메시지 줄만 가린다.
+    소스 없는 프레임(<string>)이면 위치 줄 다음 줄은 메시지라 가린다"""
     tb = ('Traceback (most recent call last):\n  File "E:\\app\\가상.py", line 3, in f\n'
-          '    raise KeyError("한글 소스 글자")\nKeyError: \'남궁가온\'')
-    s = errors.mask(tb)
-    assert 'File "E:\\app\\가상.py", line 3' in s and 'raise KeyError("한글 소스 글자")' in s
-    assert "남궁가온" not in s and "KeyError: '***'" in s
-
-
-def test_mask_mixed_quote_kinds_and_long_values():
-    """다른 종류 따옴표가 든 값("…'s")과 긴 따옴표 글자도 가린다 (길이 제한 없음)"""
-    s = errors.mask(f'KeyError("{NAME}\'s")\n' + "{'name': \"" + NAME + "'s 결재\"}\n" + "x = '" + "a" * 300 + NAME + "'")
-    assert NAME not in s and "{'name': \"***\"}" in s
-
-
-def test_mask_frame_without_source():
-    """소스 없는 프레임(<string>)이면 위치 줄 다음 줄은 예외 메시지(0칸) — 가린다. 들여쓴 소스 줄만 그대로"""
+          f'    raise KeyError("{N2}")\nKeyError: \'{NAME}\'')
+    lines = errors.mask(tb).split("\n")
+    assert lines[:3] == tb.split("\n")[:3] and lines[3] == "KeyError: '***'"
     s = errors.mask(f'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nKeyError: \'{NAME}\'')
     assert NAME not in s and 'File "<string>", line 1' in s
 
 
-def test_mask_pathlike_rule():
-    """경로로 보고 두는 것은 구분자 2개 이상 + 알려진 확장자로 끝나고 번호 꼴이 없을 때만"""
-    s = errors.mask(f"a='{NAME}/97.5.15' b='D:/{NAME} 800101-1234567' c='E:/data/가상철/v1-0001.jpg' "
-                    f"d='/data/{NAME}/800101-1234567.json'")
-    assert NAME not in s.replace("'E:/data/가상철/v1-0001.jpg'", "") and "800101-1234567" not in s
-    assert "c='E:/data/가상철/v1-0001.jpg'" in s
+def test_mask_exception_group_traceback():
+    """ExceptionGroup traceback: '  | ' 머리를 떼고 같은 규칙 — 하위 예외의 소스 줄은 그대로, 메시지 줄은 가림"""
+    tb = ("  + Exception Group Traceback (most recent call last):\n"
+          '  |   File "E:\\app\\run.py", line 9, in main\n'
+          "  |     raise ExceptionGroup('가상 묶음', errs)\n"
+          "  | ExceptionGroup: 가상 묶음 (1 sub-exception)\n"
+          "  +-+---------------- 1 ----------------\n"
+          "    | Traceback (most recent call last):\n"
+          '    |   File "E:\\app\\run.py", line 4, in f\n'
+          f"    |     raise KeyError('{NAME}')\n"
+          f"    | KeyError: '{NAME}'\n"
+          "    +------------------------------------")
+    src, out = tb.split("\n"), errors.mask(tb).split("\n")
+    for i in (1, 2, 6, 7):  # 위치 줄·소스 줄 (소스 줄의 이름은 코드라 남는다)
+        assert out[i] == src[i]
+    assert out[3] == "  | ExceptionGroup: *** *** (1 sub-exception)" and out[8] == "    | KeyError: '***'"
 
 
 def test_mask_linear_time_on_unclosed_quote():
-    """닫히지 않은 따옴표 뒤에 한글 50,000자 — 따옴표 길이를 묶어 되짚기가 제곱으로 늘지 않는다"""
+    """닫히지 않은 따옴표 뒤에 한글·한자 50,000자 — 선형 시간 정규식이라 바로 끝난다"""
     import time
     for s in ("x = '" + "가" * 50_000, 'x = "' + "一" * 50_000, "가" * 50_000 + "password=1"):
         t = time.perf_counter()

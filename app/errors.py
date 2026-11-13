@@ -1,8 +1,9 @@
 """화면·API로 내보낼 오류 분류 (https://github.com/reddol18/docflow/issues/28, ASVS V7.4.1·API3).
 
 화면(events, 응답)에는 분류 코드와 짧은 문구만 — 예외 이름·메시지·경로는 서버 로그(표준 오류)에만 남긴다.
-서버 로그에 남기는 traceback도 키·비밀번호 꼴 문자열과 한글이 든 따옴표 글자(예외 repr에 실린 문서 값)는 가린다(mask).
-따옴표 없이 실린 실명 같은 값은 가리지 못한다 — 로그 줄에 문서 값을 넣지 않는 것이 먼저다(README).
+서버 로그에 남기는 traceback도 키·비밀번호 꼴 문자열과, 위치·소스 줄이 아닌 줄의 한글·한자 묶음·주민등록번호·전화번호 꼴
+(예외 문구에 실린 문서 값)은 가린다(mask). 영문으로 적힌 이름 같은 값은 가리지 못한다 — 로그 줄에 문서 값을 넣지 않는 것이
+먼저다(README).
 """
 import logging
 import re
@@ -56,46 +57,34 @@ _NAME = r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_]{0,64}(?:api[_-]?key|password|passwd|
 _KV_QUOTED = re.compile(_NAME + r"(['\"]?\s*[=:]\s*)(['\"])(?:(?!\3).)*\3")  # 'password': 'a b c' — 따옴표 안 전체
 _KV = re.compile(_NAME + r"(['\"]?\s*[=:]\s*)[^\s'\"}]+")
 _URI = re.compile(r"(://[^:/\s@]+:)[^@\s]+(@)")  # postgresql://user:비밀번호@host
-# 예외 repr(KeyError('…'), 라이브러리가 싣는 input_value='…' 등)에 실린 문서 값(실명·번호)을 가린다
-# (https://github.com/reddol18/docflow/issues/27): 따옴표 글자 안에 한글·한자가 있거나 주민등록번호·전화번호 꼴 숫자가 있으면 ***.
-# 따옴표 종류마다 따로 짝을 찾는다('…' | "…", 안쪽은 같은 종류 따옴표·줄바꿈만 빼고 아무 글자) — "홍길동's"처럼 다른 종류
-# 따옴표가 든 값도 가리고, 닫히지 않은 따옴표는 그 줄 끝에서 한 번 실패할 뿐이라 선형 시간이다.
-# 가리지 않는 것: traceback의 소스 위치 줄(File "…", line N)과 그 바로 다음의 들여쓴(4칸) 코드 줄 — 소스가 없는 프레임
-# (<string>·.pyc)이면 다음 줄이 예외 메시지(0칸)라 그 줄은 가린다. 파일 경로 꼴 글자(구분자 2개 이상 + 아래 확장자로 끝남,
-# 번호 꼴이 없을 때만 — 철·문서 id가 든 경로). 따옴표 없이 실린 값 — 그래서 로그 줄에는 애초에 문서 값을 넣지 않는다 (README)
-_QUOTED = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"")
-_NAMEISH = re.compile(r"[가-힣ㄱ-ㅎㅏ-ㅣ一-鿿]")
-_IDISH = re.compile(r"(?<!\d)(?:\d{6}-?[1-8]\d{6}|0\d{1,2}-?\d{3,4}-?\d{4})(?!\d)")  # 주민등록번호·전화번호 꼴
-PATH_EXTS = ("jpg", "jpeg", "png", "tif", "tiff", "pdf", "json", "py", "txt", "xlsx", "yaml", "log")
-_PATH_END = re.compile(r"\.(?:%s)$" % "|".join(PATH_EXTS), re.IGNORECASE)
+# 예외 문구에 실린 문서 값(실명·번호)을 가린다 (https://github.com/reddol18/docflow/issues/27). traceback 줄을 먼저 나눈다
+# (ExceptionGroup의 '  | ' 머리는 떼고 본다):
+#   위치 줄   File "…", line N          — 그대로
+#   소스 줄   위치 줄 바로 다음의 4칸 들여쓴 줄 — 그대로 (코드다. 소스 없는 프레임이면 다음 줄은 메시지라 아래로)
+#   메시지 줄 그 밖의 모든 줄 — 따옴표와 상관없이 한글·한자 글자 묶음과 주민등록번호·전화번호 꼴을 *** 로
+# 경로 속 한글·우리 앱의 한국어 메시지도 가려지지만, 어디서 났는지는 위치 줄이 남아 알 수 있다. 모두 선형 시간 정규식이다
+_GROUP_PREFIX = re.compile(r"^[ \t]*(?:\| ?)+")  # ExceptionGroup 하위 예외 줄의 '  | ' 머리 (그 뒤 들여쓰기는 남긴다)
 _SOURCE_LOC = re.compile(r'^\s*File ".*", line \d+')
-
-
-def _is_path(s):
-    """경로로 보고 두는 글자: 번호 꼴이 없고, 구분자('/'·'\\')가 2개 이상이며, 알려진 확장자로 끝남"""
-    return not _IDISH.search(s) and len(re.findall(r"[\\/]", s)) >= 2 and bool(_PATH_END.search(s))
-
-
-def _quoted(m):
-    q = "'" if m.group(1) is not None else '"'
-    s = m.group(1) if m.group(1) is not None else m.group(2)
-    if not (_NAMEISH.search(s) or _IDISH.search(s)) or _is_path(s):
-        return m.group(0)
-    return f"{q}***{q}"
+_HAN = re.compile(r"[가-힣ㄱ-ㅎㅏ-ㅣ㐀-䶿一-鿿豈-﫿]+")
+_IDISH = re.compile(r"(?<!\d)(?:\d{6}-?[1-8]\d{6}|0\d{1,2}-?\d{3,4}-?\d{4})(?!\d)")  # 주민등록번호·전화번호 꼴
 
 
 def _mask_values(text):
-    """따옴표 글자의 문서 값 가리기 — traceback 소스 위치 줄과 그 다음의 들여쓴 코드 줄은 그대로"""
+    """traceback 줄을 위치·소스·메시지로 나눠 메시지 줄의 한글·한자·번호 꼴만 가린다"""
     out, after_loc = [], False
     for line in text.split("\n"):
-        if _SOURCE_LOC.match(line):
+        m = _GROUP_PREFIX.match(line)
+        body = line[m.end():] if m else line
+        if _SOURCE_LOC.match(body):
             out.append(line)
             after_loc = True
             continue
-        out.append(line if after_loc and line.startswith("    ") else _QUOTED.sub(_quoted, line))
+        if after_loc and body.startswith("    "):
+            out.append(line)
+        else:
+            out.append(_IDISH.sub("***", _HAN.sub("***", line)))
         after_loc = False
     return "\n".join(out)
-
 
 def mask(text):
     text = _KEY.sub("***", text)

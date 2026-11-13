@@ -38,6 +38,7 @@ import os
 import re
 import secrets
 import sys
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -410,33 +411,24 @@ def citations(text):
     return list(dict.fromkeys(CITE_RX.findall(text or "")))
 
 
-# 근거 표시처럼 보이는 글: 괄호 변형(［］【】〔〕)·빗금 변형(／∕⁄)·안쪽 빈칸까지 받는다 — 모델이 꼴을 조금 바꿔도
-# 검사를 빠져나가지 못하게
-CITE_LIKE_RX = re.compile(r"[\[［【〔][ \t　]*([\w.-]+)[ \t　]*[/／∕⁄][ \t　]*([\w.-]+)[ \t　]*[\]］】〕]")
+# 근거 표시 후보: 괄호(전각 ［］·【】·〔〕 포함) 하나 안의 글. 안쪽은 괄호·줄바꿈이 아닌 글자라 선형 시간이다
+CITE_CAND_RX = re.compile(r"[\[［【〔]([^\[\]［］【】〔〕\n]+)[\]］】〕]")
+# 후보 안쪽을 NFKC로 바꾼 뒤(전각 영숫자·빗금·빈칸이 보통 글자로) 'x/y' 꼴인지. NFKC가 바꾸지 않는 빗금 ∕ ⁄도 받는다
+CITE_INNER_RX = re.compile(r"\s*([\w.-]+)\s*[/∕⁄]\s*([\w.-]+)\s*")
 # 우리 문서 id 꼴: ASCII 영숫자·'.'·'_'·'-'로 숫자와 (영문자 또는 '_'·'-')가 다 있음 (예: p-0001, C0012_1994_0001).
-# [1997/05](숫자만)·[총무과/서무계](한글)는 (그런 철이 없으면) 근거 표시가 아니라 본문 글이다
+# [1997/05](숫자만)·[총무과/서무계](한글)는 근거 표시가 아니라 본문 글이다.
+# 알려진 한계: 넘기지 않은 철을 가리키면서 뒤쪽이 숫자·낱말뿐인 가짜 표시([가짜철/05])는 본문 글로 남는다
 DOC_ID_LIKE = re.compile(r"(?=[A-Za-z0-9._-]*\d)(?=[A-Za-z0-9._-]*[A-Za-z_-])[A-Za-z0-9._-]+")
 
 
-def volume_exists(vol):
-    """저장소에 그 이름의 철(쪽 폴더)이 있나 — 근거 표시 판단용. 경로 한 칸이 아닌 이름('..' 등)은 없음으로"""
-    try:
-        return store.pages_dir(vol).is_dir()
-    except (store.PathEscape, OSError):
-        return False
-
-
-def drop_unknown_citations(text, docs, vol_exists=None):
+def drop_unknown_citations(text, docs):
     """답변 글의 근거 표시를 넘긴 문서(docs)와 대조한다 → (고친 글, 지운 표시 수).
-    근거 표시로 보는 것 (CITE_LIKE_RX 꼴 중): 앞쪽이 넘긴 철이거나 저장소에 있는 철(vol_exists, 기본 volume_exists)이거나,
-    뒤쪽이 문서 id 꼴(DOC_ID_LIKE)이거나 넘긴 문서 id인 것. 넘긴 문서면 표준 꼴 [vol/doc_id]로 고쳐 남기고, 아니면 지운다 —
-    문서에 심어진 문장이 모델에게 없는 문서를 인용하게 만들어도 화면에는 실제로 넘긴 근거만 남는다.
-    빈칸은 지운 자리에서만 정리한다 (답의 다른 곳은 그대로)"""
+    근거 표시로 보는 것: 괄호 후보의 안쪽을 NFKC로 바꿔 'x/y' 꼴이고, x가 넘긴 철이거나 y가 문서 id 꼴(DOC_ID_LIKE)인 것.
+    넘긴 문서면 표준 꼴 [vol/doc_id]로 고쳐 남기고, 아니면 지운다 — 문서에 심어진 문장이 모델에게 없는 문서를 인용하게
+    만들어도 화면에는 실제로 넘긴 근거만 남는다. 빈칸은 지운 자리에서만 정리한다 (답의 다른 곳은 그대로)"""
     text = text or ""
-    vol_exists = vol_exists or volume_exists
     known = {cite_key(d["vol"], d["doc_id"]) for d in docs}
     vols = {d["vol"] for d in docs}
-    doc_ids = {d["doc_id"] for d in docs}
     out, last, n = [], 0, 0
     at_line_start = True  # 지금까지 낸 글이 비었거나 줄바꿈으로 끝나는가 (지울 때마다 다시 잇지 않게 따로 센다)
 
@@ -445,9 +437,12 @@ def drop_unknown_citations(text, docs, vol_exists=None):
         if s:
             out.append(s)
             at_line_start = s.endswith("\n")
-    for m in CITE_LIKE_RX.finditer(text):
-        vol, doc = m.group(1), m.group(2)
-        if not (vol in vols or doc in doc_ids or DOC_ID_LIKE.fullmatch(doc) or vol_exists(vol)):
+    for m in CITE_CAND_RX.finditer(text):
+        inner = CITE_INNER_RX.fullmatch(unicodedata.normalize("NFKC", m.group(1)))
+        if not inner:
+            continue
+        vol, doc = inner.group(1), inner.group(2)
+        if not (vol in vols or DOC_ID_LIKE.fullmatch(doc)):
             continue  # 근거 표시가 아닌 본문 글 — 그대로 둔다
         piece = text[last:m.start()]
         last = m.end()
