@@ -5,6 +5,8 @@
 fakeredis가 없으면 건너뛰지 않고 실패한다 (두 구현 모두 돌았다는 근거).
 """
 import os
+import re
+import socket
 import subprocess
 import sys
 import threading
@@ -598,13 +600,238 @@ def test_real_redis_acl_user_is_narrow(request):
             bad()
 
 
-def test_manifest_redis_acl_matches_code():
-    """맥 Redis 매니페스트가 코드와 같은 ACL 규칙을 쓰고 default 사용자를 끈다 (k8s/docs.yaml redis 초기화 컨테이너)"""
-    from pathlib import Path
+MANIFEST = Path(__file__).resolve().parents[1] / "k8s" / "docs.yaml"
 
-    from app.jobqueue_redis import ACL_COMMANDS, acl_rules
-    text = (Path(__file__).resolve().parents[1] / "k8s" / "docs.yaml").read_text(encoding="utf-8")
-    assert "user default off" in text
-    assert "user docflow on >%s " + " ".join(acl_rules()) in text
-    assert "requirepass" not in text
+
+def manifest_acl_lines(pw: str) -> list[str]:
+    """k8s/docs.yaml redis 초기화 컨테이너가 /conf/auth.conf에 쓰는 줄 그대로 (printf 형식, %s = 비밀번호)"""
+    fmt = re.findall(r'printf "(user default [^"]*)" "\$p"', MANIFEST.read_text(encoding="utf-8"))
+    assert len(fmt) == 1, fmt
+    return [line for line in fmt[0].replace("%s", pw).split("\\n") if line]
+
+
+def test_manifest_redis_acl_matches_code():
+    """맥 Redis 매니페스트가 코드와 같은 ACL 규칙을 쓰고, default 사용자는 끄되 AOF 적재기 몫 권한은 둔다
+    (k8s/docs.yaml redis 초기화 컨테이너). 실제 Redis 없이도 버그(default 리셋 → 재시작 때 NOPERM으로 대기열 잃음)를 막는다"""
+    from app.jobqueue_redis import ACL_COMMANDS, AOF_LOADER_ACL, AOF_LOADER_COMMANDS, acl_rules
+    default, docflow = manifest_acl_lines("PW")
+    assert docflow == "user docflow on >PW " + " ".join(acl_rules())
+    assert default == "user default " + AOF_LOADER_ACL
+    # AOF 적재기가 default 권한으로 다시 검사하는 명령(AOF_LOADER_COMMANDS — 실제 Redis 7.4.12 AOF의 MULTI/EXEC 안 명령 + SELECT,
+    # 아래 실제 Redis 시험이 확인)이 정확히 열려 있어야 한다: 빠지면 재시작 때 대기열을 잃고, 넓히면 켜졌을 때 위험하다
+    words = AOF_LOADER_ACL.split()
+    assert words[0] == "off"
+    assert {w for w in words if w.startswith("+")} == {f"+{c}" for c in AOF_LOADER_COMMANDS}
+    assert {w for w in words if not w.startswith("+")} == {"off", "resetchannels", "~{docflow:q}:*"}  # '-' 규칙·비밀번호·on 없음
+    assert "requirepass" not in MANIFEST.read_text(encoding="utf-8")
     assert all(c in ("ping", "client|setinfo", "time") or c.startswith(("x", "eval", "script")) for c in ACL_COMMANDS)
+
+
+# 선택: 실제 redis-server를 띄우는 명령 (예: "wsl -e /home/<나>/redis74/root/usr/bin/redis-server"). 공백으로만 나눈다 — 따옴표·공백 든
+# 경로는 쓰지 않는다. 설정은 표준 입력("-")으로 주고 작업 폴더(dir ./, logfile, pidfile)는 pytest 임시 폴더 — wsl -e는 Windows 현재
+# 폴더를 /mnt/... 로 이어 받는다
+REDIS_SERVER = os.environ.get("TEST_REDIS_SERVER")
+AOF_CFG = QueueConfig(kinds={OCR_PAGE: KindSpec(idle=60, limit=LIMIT), GRAPH: KindSpec(idle=60, heartbeat=G_BEAT),
+                             ASK: KindSpec(idle=0.3)},
+                      retry_after=30, max_attempts=2, dead_keep=2, dead_days=1 / 86400, lock_timeout=0.5)  # 죽은 작업 1초 보관
+
+
+class RedisProc:
+    """앞에 띄운 redis-server 하나 (설정은 표준 입력). 관리 연결은 시험 전용 사용자 t-admin. 포트는 높은 무작위 — 서버가 WSL 쪽
+    네트워크에 있을 수 있어 이 PC에서 빈 포트를 미리 알 수 없으므로, "Address already in use"면 다른 포트로 몇 번 다시 띄운다"""
+
+    def __init__(self, workdir: Path, conf: str, admin_pw: str):
+        self.cmd, self.dir, self.conf, self.admin_pw = REDIS_SERVER.split() + ["-"], workdir, conf, admin_pw
+        self.p, self.port, self.admin = None, None, None
+
+    def log(self) -> str:
+        f = self.dir / "redis.log"
+        return f.read_text(encoding="utf-8", errors="replace") if f.exists() else ""
+
+    def start(self) -> None:
+        import random
+
+        import redis
+        for _ in range(5):
+            self.port = random.randint(20000, 60000)  # noqa: S311 — 시험 포트
+            self.admin = redis.Redis(host="127.0.0.1", port=self.port, username="t-admin", password=self.admin_pw,
+                                     decode_responses=True, socket_timeout=5)
+            seen = len(self.log())
+            (self.dir / "redis.pid").unlink(missing_ok=True)  # 정리(kill)가 지난 시도의 pid를 죽이지 않게
+            self.p = subprocess.Popen(self.cmd, cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, text=True)
+            self.p.stdin.write(f"port {self.port}\n{self.conf}")
+            self.p.stdin.close()
+            end, timed_out = time.monotonic() + 20, False
+            while True:
+                try:
+                    if self.admin.ping():
+                        return
+                except redis.exceptions.TimeoutError:  # 이 포트로는 닿지 않는다 (WSL 전달 등) → 다른 포트로
+                    timed_out = True
+                    break
+                except redis.exceptions.ConnectionError:
+                    pass
+                if self.p.poll() is not None or time.monotonic() > end:
+                    break
+                time.sleep(0.1)
+            if not timed_out and "Address already in use" not in self.log()[seen:]:
+                break
+            self.kill()
+        pytest.fail(f"redis-server 시작 실패 (종료 코드 {self.p.poll()})\n{self.log()[-2000:]}")
+
+    def stop(self) -> None:
+        """SHUTDOWN(AOF fsync 뒤 종료) → 프로세스가 끝나고 포트가 닫혀야 한다. 남아 있으면 실패"""
+        import redis
+        try:
+            self.admin.shutdown()
+        except redis.exceptions.ConnectionError:
+            pass
+        try:
+            self.p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pytest.fail("SHUTDOWN 뒤에도 redis-server 프로세스가 남음")
+        self.admin.connection_pool.disconnect()
+        end = time.monotonic() + 5  # WSL 전달은 조금 늦게 닫히고, 거절 대신 시간 초과일 수 있다 (둘 다 OSError)
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+            except OSError:
+                return
+            if time.monotonic() > end:
+                pytest.fail(f"SHUTDOWN 뒤에도 포트 {self.port}가 열려 있음")
+            time.sleep(0.2)
+
+    def kill(self) -> None:
+        """정리: 정상 종료가 안 되면 서버 프로세스를 죽인다 — 앞에 붙은 실행 명령(예: wsl -e)이 있으면 그것으로 그쪽
+        redis-server도 (pidfile)"""
+        if not self.p or self.p.poll() is not None:
+            return
+        try:
+            self.admin.shutdown(nosave=True)
+        except Exception:  # noqa: BLE001,S110 — 이미 죽었으면 그만
+            pass
+        try:
+            self.p.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        pid_file = self.dir / "redis.pid"
+        if pid_file.exists():
+            pid = pid_file.read_text().strip()
+            prefix = self.cmd[:-2]  # redis-server 경로 앞 (예: ["wsl", "-e"] 또는 ["wsl", "-d", "Ubuntu", "-e"])
+            if prefix:
+                subprocess.run([*prefix, "kill", "-9", pid], timeout=30, check=False)  # noqa: S603 — 시험 정리
+            else:
+                os.kill(int(pid), 9)
+        self.p.kill()
+
+
+def queue_snapshot(r) -> dict:
+    """대기열 상태 전부: 스트림·죽은 작업 항목, 대기 중(pending) 목록, 그룹·스트림 정보 (유휴 시간처럼 흐르는 값은 뺀다)"""
+    from app.jobqueue_redis import GROUP
+    out = {}
+    for kind in (OCR_PAGE, GRAPH, ASK):
+        k = f"{{docflow:q}}:{kind}"
+        info = r.xinfo_stream(k)
+        out[kind] = {
+            "entries": r.xrange(k), "dead": r.xrange(f"{k}:dead"),
+            "pending": [(p["message_id"], p["consumer"], p["times_delivered"]) for p in r.xpending_range(k, GROUP, "-", "+", 100)],
+            "groups": [{f: g[f] for f in ("name", "pending", "last-delivered-id", "entries-read")} for g in r.xinfo_groups(k)],
+            "stream": {f: info[f] for f in ("length", "last-generated-id", "max-deleted-entry-id", "entries-added")},
+        }
+    return out
+
+
+def aof_commands(workdir: Path) -> tuple[set[str], set[str]]:
+    """AOF(appendonlydir의 *.incr.aof, RESP)에 남은 명령 이름 — (MULTI/EXEC 안, 밖). 하위 명령은 xgroup|setid처럼"""
+    inside, outside, in_multi = set(), set(), False
+    for f in sorted((workdir / "appendonlydir").glob("*.incr.aof")):
+        b, i = f.read_bytes(), 0
+        while i < len(b):
+            assert b[i:i + 1] == b"*", (f.name, i)
+            j = b.index(b"\r\n", i)
+            n, i, args = int(b[i + 1:j]), j + 2, []
+            for _ in range(n):
+                j = b.index(b"\r\n", i)
+                size = int(b[i + 1:j])
+                args.append(b[j + 2:j + 2 + size])
+                i = j + 2 + size + 2
+            name = args[0].decode().lower()
+            if name in ("xgroup", "xinfo", "client", "config", "script", "object"):
+                name += "|" + args[1].decode().lower()
+            if name == "multi":
+                in_multi = True
+            (inside if in_multi else outside).add(name)
+            if name == "exec":
+                in_multi = False
+    return inside, outside
+
+
+@pytest.mark.parametrize("default_line", [None, "user default off"], ids=["manifest", "old-default-off"])
+def test_redis_aof_restart_keeps_queue(tmp_path, request, default_line):
+    """실제 Redis(TEST_REDIS_SERVER)를 매니페스트의 ACL 줄로 띄우고 앱 코드(RedisQueue, 사용자 docflow)로 넣기·꺼내기·완료·실패→죽은
+    작업·놓기·살아 있음·되찾기를 한 뒤 재시작 — 상태가 그대로이고 로그에 NOPERM이 없어야 한다. 옛 줄("user default off")은 잃어야
+    한다 (이 시험이 버그를 잡는다는 근거, https://github.com/reddol18/docflow/issues/5). Redis 판을 올리면 다시 돌린다"""
+    if not REDIS_SERVER:
+        pytest.skip("TEST_REDIS_SERVER 없음 — 실제 Redis AOF 재시작 시험은 선택")
+    import secrets
+
+    import redis
+
+    from app.jobqueue_redis import AOF_LOADER_COMMANDS, RedisQueue
+    pw, admin_pw = secrets.token_hex(16), secrets.token_hex(16)
+    acl = manifest_acl_lines(pw)
+    assert acl[0].startswith("user default ") and acl[1].startswith("user docflow on >")
+    if default_line:
+        acl[0] = default_line
+    conf = "\n".join(["bind 127.0.0.1", "dir ./", "logfile redis.log", "pidfile redis.pid", "appendonly yes",
+                      "appendfsync always", 'save ""', "protected-mode yes", *acl,
+                      f"user t-admin on >{admin_pw} ~* &* +@all"]) + "\n"  # t-admin: 시험 전용 관리(종료·상태 보기)
+    srv = RedisProc(tmp_path, conf, admin_pw)
+    request.addfinalizer(srv.kill)
+    srv.start()
+
+    q = RedisQueue(redis.Redis(host="127.0.0.1", port=srv.port, username="docflow", password=pw, decode_responses=True),
+                   AOF_CFG, poll=0.05)
+    q.put(pages(3) + [NewJob(GRAPH, vol="철1"), NewJob(GRAPH, vol="철2"), NewJob(ASK, ref="r1")])
+    j = q.take(OCR_PAGE, "w1")
+    assert j.page == "001" and q.ack(j)
+    j = q.take(OCR_PAGE, "w1")
+    assert j.page == "002" and q.fail(j)                 # 실패 → 다시 넣음 (시도 1)
+    assert q.take(OCR_PAGE, "w1").page == "003"          # 놓아 둠 (pending)
+    j = q.take(OCR_PAGE, "w1")
+    assert (j.page, j.attempts) == ("002", 2) and q.fail(j)  # 다시 실패 → 다시 넣음 (시도 2)
+    assert q.take(OCR_PAGE, "w1") is None                # 002가 시도를 다 써서 죽은 작업으로 (DEAD: XADD MAXLEN·TIME·XTRIM)
+    g = q.take(GRAPH, "w1")
+    assert q.heartbeat(g)                                # 살아 있음 (XCLAIM), 놓아 둠
+    assert q.release(q.take(GRAPH, "w1"))               # 놓기 → 다시 넣음
+    a = q.take(ASK, "w1")
+    time.sleep(1.2)                                      # ask 유휴(0.3초)와 죽은 작업 보관(1초)을 넘긴다
+    assert q.take(ASK, "w2").id == a.id                  # 유휴 지나 되찾기 (XAUTOCLAIM → XCLAIM), 놓아 둠
+    inject_raw(q, OCR_PAGE, "{")
+    assert q.take(OCR_PAGE, "w1") is None                # 깨진 본문 → 죽은 작업, 1초 지난 002는 XTRIM MINID로 빠진다
+
+    before = queue_snapshot(srv.admin)
+    assert [len(before[k]["entries"]) for k in (OCR_PAGE, GRAPH, ASK)] == [1, 2, 1]
+    assert [len(before[k]["pending"]) for k in (OCR_PAGE, GRAPH, ASK)] == [1, 1, 1]
+    assert [len(before[k]["dead"]) for k in (OCR_PAGE, GRAPH, ASK)] == [1, 0, 0]
+    assert before[OCR_PAGE]["dead"][0][1]["reason"] == "invalid"
+    srv.stop()
+    inside, outside = aof_commands(tmp_path)
+    srv.start()
+    after = queue_snapshot(srv.admin) if srv.admin.exists(*(f"{{docflow:q}}:{k}" for k in (OCR_PAGE, GRAPH, ASK))) == 3 else None
+    noperm = srv.log().count("NOPERM")
+
+    def brief(s):  # 종류별 (항목 수, pending 수, 죽은 작업 수) — -s로 보면 남는다
+        return {k: (len(v["entries"]), len(v["pending"]), len(v["dead"])) for k, v in s.items()} if s else "스트림 없음"
+    print(f"\n[{default_line or acl[0]}] 전 {brief(before)} 후 {brief(after)} 같음={after == before} NOPERM={noperm}"
+          f"\n  AOF MULTI/EXEC 안 명령: {sorted(inside)}\n  밖: {sorted(outside)}")
+    # MULTI/EXEC 안 명령은 모두 AOF_LOADER_COMMANDS 안에 있어야 한다 (정적 시험이 매니페스트가 그것과 같은지 본다)
+    assert inside <= set(AOF_LOADER_COMMANDS), inside - set(AOF_LOADER_COMMANDS)
+    if default_line:  # 옛 줄: 재시작 때 NOPERM으로 묶음을 버려 상태를 잃는다
+        assert noperm > 0 and after != before
+    else:
+        assert noperm == 0, srv.log()[-3000:]
+        assert after == before
+    srv.stop()

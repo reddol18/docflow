@@ -246,7 +246,9 @@ spec: {selector: {app: qdrant}, ports: [{port: 6333}]}
 # ACL: default 사용자는 끈다. 앱 전용 사용자 docflow만 — 키 {docflow:q}:*, 명령은 app/jobqueue_redis.py ACL_COMMANDS(대기열·Lua가
 # 쓰는 것)뿐 (-@all 뒤 하나씩. 관리 명령·KEYS·CONFIG·FLUSH·SELECT 없음 — tests/test_jobqueue.py가 규칙이 코드와 같은지 본다).
 # 비밀번호(Secret redis-auth)는 명령줄·환경 변수에 두지 않고 초기화 컨테이너가 메모리 emptyDir의 설정 조각(ACL 줄)으로 옮긴다.
-# 관리(측정·점검)는 파드 안 redis-cli로 같은 사용자 — PR https://github.com/reddol18/docflow/pull/128 배포 칸의 명령.
+# 관리(측정·점검)는 파드 안 redis-cli로 같은 사용자 — PR https://github.com/reddol18/docflow/pull/128 배포 칸의 명령. 단 파드 안에서는
+# -h 127.0.0.1 --sni redis.docs.svc.cluster.local 로 붙는다 (서비스 이름으로는 NetworkPolicy redis-no-egress가 막아 connection refused):
+#   kubectl exec -n docs deploy/redis -- sh -c 'REDISCLI_AUTH="$(cat /auth/password)" redis-cli --tls --cacert /ca/ca.crt -h 127.0.0.1 --sni redis.docs.svc.cluster.local --user docflow XLEN "{docflow:q}:ocr_page"'
 apiVersion: v1
 kind: ConfigMap
 metadata: {name: redis-conf, namespace: docs}
@@ -291,7 +293,11 @@ spec:
       - name: auth-conf
         image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
         # 비밀번호는 글자·숫자만(scripts/mac/tls_secrets.sh가 그렇게 만든다) — 아니면 ACL 줄이 깨지므로 시작하지 않는다
-        command: [sh, -c, 'p="$(cat /auth/password)" && case "$p" in "" | *[!A-Za-z0-9]*) echo "redis-auth password는 [A-Za-z0-9]+ 이어야 함" >&2; exit 1;; esac && umask 077 && printf "user default off\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$p" > /conf/auth.conf']
+        # default는 off(비밀번호 없음 → 누구도 default로 인증 못 함, NOAUTH)지만 AOF 적재기 몫 권한은 둔다 (app/jobqueue_redis.py
+        # AOF_LOADER_ACL과 같은 글자 — 시험이 본다). "user default off"만 두면 -@all로 리셋되고, 재시작 때 AOF 적재기가 Lua 효과의
+        # MULTI/EXEC를 default 권한으로 다시 검사해 NOPERM으로 버린다 (XLEN 3 → 0, https://github.com/reddol18/docflow/issues/5).
+        # 실제 Redis 시험: tests/test_jobqueue.py test_redis_aof_restart_keeps_queue (TEST_REDIS_SERVER)
+        command: [sh, -c, 'p="$(cat /auth/password)" && case "$p" in "" | *[!A-Za-z0-9]*) echo "redis-auth password는 [A-Za-z0-9]+ 이어야 함" >&2; exit 1;; esac && umask 077 && printf "user default off resetchannels ~{docflow:q}:* +multi +exec +select +xadd +xack +xdel +xclaim +xgroup|setid +xtrim\nuser docflow on >%s ~{docflow:q}:* resetchannels -@all +ping +client|setinfo +xadd +xlen +xrange +xpending +xautoclaim +xclaim +xack +xdel +xtrim +xreadgroup +xgroup|create +evalsha +eval +script|load +time\n" "$p" > /conf/auth.conf']
         resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
@@ -300,6 +306,8 @@ spec:
       containers:
       - name: redis
         image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe  # 다이제스트 고정 (issues/46)
+        # 판(이미지)을 올리면 그 판의 redis-server로 AOF 재시작 시험(tests/test_jobqueue.py, TEST_REDIS_SERVER)을 다시 돌린다 —
+        # AOF 적재기의 ACL 재검사·Lua 효과 전파 형태가 판마다 바뀔 수 있다 (https://github.com/reddol18/docflow/issues/5)
         command: [redis-server, /etc/redis/redis.conf]
         ports: [{containerPort: 6379}]
         resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 128Mi}}
