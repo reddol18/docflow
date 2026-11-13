@@ -306,6 +306,7 @@ spec:
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
         - {name: data, mountPath: /data}
+        - {name: auth, mountPath: /auth, readOnly: true}  # 점검·측정용 redis-cli가 읽는다 (REDISCLI_AUTH, 명령줄에 안 남김)
         - {name: conf, mountPath: /conf, readOnly: true}
         - {name: redis-conf, mountPath: /etc/redis, readOnly: true}
         - {name: tls, mountPath: /tls, readOnly: true}
