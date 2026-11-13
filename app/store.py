@@ -28,6 +28,7 @@ PG_TLS_MODES = ("require", "verify-ca", "verify-full")
 def check_transport(env=os.environ):
     """배포 표시 DOCFLOW_REQUIRE_TLS=1(k8s/docs.yaml)이면 안쪽 통신이 평문·무키일 때 시작을 멈춘다 (https://github.com/reddol18/docflow/issues/48).
     PG_URL(또는 PGSSLMODE)의 sslmode가 require 이상, QDRANT_URL이 https, QDRANT_API_KEY_FILE이 있어야 한다.
+    QUEUE_BACKEND=redis이면 REDIS_URL이 rediss://, REDIS_PASSWORD_FILE이 있어야 한다.
     표시가 없으면(이 PC 시험 PGlite·개발) 아무것도 보지 않는다 — 기본값은 개발용 평문 그대로."""
     if env.get("DOCFLOW_REQUIRE_TLS") != "1":
         return
@@ -49,6 +50,11 @@ def check_transport(env=os.environ):
         bad.append("QDRANT_URL이 https가 아님")
     if not env.get("QDRANT_API_KEY_FILE"):
         bad.append("QDRANT_API_KEY_FILE 없음")
+    if env.get("QUEUE_BACKEND") == "redis":  # 대기열 Redis (https://github.com/reddol18/docflow/issues/5). 값(주소)은 싣지 않는다
+        if not str(env.get("REDIS_URL") or "").startswith("rediss://"):
+            bad.append("REDIS_URL이 rediss가 아님")
+        if not env.get("REDIS_PASSWORD_FILE"):
+            bad.append("REDIS_PASSWORD_FILE 없음")
     if bad:
         raise RuntimeError("DOCFLOW_REQUIRE_TLS=1인데 " + ", ".join(bad))
 
@@ -194,8 +200,21 @@ CREATE TABLE IF NOT EXISTS run_stop (vol text PRIMARY KEY, reason text NOT NULL,
 CREATE INDEX IF NOT EXISTS budget_hold_day ON budget_hold (scope, day);
 CREATE TABLE IF NOT EXISTS api_quota (
   user_key text NOT NULL, route text NOT NULL, kind text NOT NULL, win timestamptz NOT NULL, n int NOT NULL,
-  PRIMARY KEY (user_key, route, kind, win))
+  PRIMARY KEY (user_key, route, kind, win));
+CREATE SEQUENCE IF NOT EXISTS job_queue_seq;
+CREATE TABLE IF NOT EXISTS job_queue (
+  id bigserial PRIMARY KEY, seq bigint NOT NULL DEFAULT nextval('job_queue_seq'), kind text NOT NULL, body jsonb NOT NULL,
+  attempts int NOT NULL DEFAULT 0, owner text, taken_at timestamptz,
+  dead boolean NOT NULL DEFAULT false, dead_at timestamptz, dead_reason text,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp());
+CREATE INDEX IF NOT EXISTS job_queue_new ON job_queue (kind, seq) WHERE owner IS NULL AND NOT dead;
+CREATE INDEX IF NOT EXISTS job_queue_taken ON job_queue (kind, seq) WHERE owner IS NOT NULL AND NOT dead;
+CREATE INDEX IF NOT EXISTS job_queue_dead ON job_queue (kind, dead_at) WHERE dead;
+CREATE TABLE IF NOT EXISTS job_queue_kind (kind text PRIMARY KEY)
 """
+# ↑ job_queue·job_queue_kind (https://github.com/reddol18/docflow/issues/5): 대기열 Postgres 구현(app/jobqueue_pg.py).
+#   새 작업은 job_queue_new(seq 순), 되찾기는 job_queue_taken(쥔 작업만 — 워커 수만큼이라 작다)을 훑는다.
+#   job_queue_kind = 종류마다 한 행: 넣을 때 FOR UPDATE로 잡고 세어 상한을 지킨다. 죽은 작업은 QUEUE_DEAD_KEEP·QUEUE_DEAD_DAYS로 지운다
 # ↑ 비용 한도 (https://github.com/reddol18/docflow/issues/7): usage.scope = 어느 예산을 썼나(index 색인·수정 / query 검색·질문),
 #   usage.user_id = 검색·질문을 부른 사람. 예전 행은 둘 다 NULL (vol '-'가 검색·질문이었다).
 #   budget_day = 예산·날짜(KST)마다 한 행: 정산된 사용액. 예약할 때 이 행을 FOR UPDATE로 잡는다 (프로세스·Pod 사이 원자적).
