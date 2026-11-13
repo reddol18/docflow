@@ -34,7 +34,15 @@ def clean_pg(store):
         c.execute("DELETE FROM job_queue_kind")
 
 
-@pytest.fixture(params=["postgres", "redis"])
+# 선택: 실제 Redis 7.4 관리자 연결 (예: WSL redis-server, redis://:pw@127.0.0.1:56379/0). 시험은 이 연결로 시험마다 앱 전용 ACL 사용자
+# (app/jobqueue_redis.py acl_rules — 운영 k8s/docs.yaml과 같은 규칙)를 만들고, 대기열은 그 사용자로 붙는다 — Lua가 부르는 명령까지
+# ACL에 다 들어 있는지 공통 시험 전체로 확인한다
+REAL_REDIS = os.environ.get("TEST_REDIS_URL")
+# 되찾기를 기다리는 시간: 실제 Redis(WSL)는 서버 시계·부하로 조금 흔들려 넉넉히 (그래도 유휴 시간 0.6초보다 길게만 기다림)
+RECLAIM_WAIT = IDLE + (0.7 if REAL_REDIS else 0.3)
+
+
+@pytest.fixture(params=["postgres", "redis", "redis-real"])
 def q(request):
     if request.param == "postgres":
         store = request.getfixturevalue("pg_store")
@@ -42,8 +50,33 @@ def q(request):
         clean_pg(store)
         return PgQueue(store.pool, CFG, poll=0.05)
     from app.jobqueue_redis import RedisQueue
-    return RedisQueue(fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True), CFG,
-                      prefix="t:q", poll=0.05)
+    if request.param == "redis":
+        return RedisQueue(fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True), CFG,
+                          prefix="t:q", poll=0.05)
+    if not REAL_REDIS:
+        pytest.skip("TEST_REDIS_URL 없음 — 실제 Redis 시험은 선택 (fakeredis 시험은 늘 돈다)")
+    return acl_queue(request)
+
+
+def acl_queue(request, cfg=None):
+    import secrets
+
+    import redis
+
+    from app.jobqueue_redis import RedisQueue, acl_rules
+    admin = redis.Redis.from_url(REAL_REDIS, decode_responses=True, db=0)  # 시험 전용: URL 비밀번호 허용
+    prefix = f"t:{os.getpid()}:{time.monotonic_ns()}"  # 시험마다 새 키
+    user, pw = f"t-docflow-{os.getpid()}-{time.monotonic_ns()}", secrets.token_hex(16)
+    admin.execute_command("ACL", "SETUSER", user, "reset", "on", f">{pw}", *acl_rules(prefix))
+
+    def cleanup():
+        for k in admin.scan_iter(f"{{{prefix}}}:*"):
+            admin.delete(k)
+        admin.execute_command("ACL", "DELUSER", user)
+    request.addfinalizer(cleanup)
+    kw = admin.connection_pool.connection_kwargs
+    client = redis.Redis(host=kw["host"], port=kw["port"], db=0, username=user, password=pw, decode_responses=True)
+    return RedisQueue(client, cfg or CFG, prefix=prefix, poll=0.05)
 
 
 def inject_raw(q, kind, body: str) -> None:
@@ -111,7 +144,7 @@ def test_due_job_counts_as_waiting_and_first(q):
     q.put(pages(1))
     lost = q.take(OCR_PAGE, "dead-worker")
     assert q.stats(OCR_PAGE).running == 1
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     s = q.stats(OCR_PAGE)
     assert (s.waiting, s.running) == (1, 0)
     assert q.position(OCR_PAGE, lost.id) == 1
@@ -149,7 +182,7 @@ def test_dead_worker_job_reclaimed_after_idle(q):
     q.put(pages(1))
     lost = q.take(OCR_PAGE, "dead-worker")
     assert q.take(OCR_PAGE, "w2") is None  # 유휴 시간 전에는 못 가져간다
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     got = q.take(OCR_PAGE, "w2")
     assert got and got.id == lost.id and got.page == "001"
     assert got.attempts == 2 and got.consumer == "w2"
@@ -161,11 +194,47 @@ def test_dead_worker_job_reclaimed_after_idle(q):
     assert q.stats(OCR_PAGE).length == 0
 
 
+def test_release_then_retake_old_lease_is_fenced(q):
+    """같은 consumer가 되돌린 뒤 다시 꺼내면 attempts는 같아도(되돌림은 시도로 안 셈) 옛 Job으로는 ack·heartbeat가 안 된다 (ABA)"""
+    q.put(pages(1))
+    first = q.take(OCR_PAGE, "w1")
+    assert q.release(first)
+    second = q.take(OCR_PAGE, "w1")
+    assert second.attempts == first.attempts == 1
+    assert not q.ack(first) and not q.heartbeat(first) and q.release(first) is None and q.fail(first) is None
+    assert q.heartbeat(second) and q.ack(second)
+    assert q.stats(OCR_PAGE).length == 0
+
+
+def test_fail_counts_attempts_then_dead(q):
+    """실패(fail)는 맨 뒤로 되돌리되 시도로 센다 — max_attempts(3)번 실패하면 네 번째로 꺼내지 않고 죽은 작업, on_dead 알림"""
+    seen = []
+    q.on_dead = lambda kind, body, reason: seen.append((kind, body, reason))
+    q.put(pages(1))
+    for n in (1, 2, 3):
+        job = q.take(OCR_PAGE, "w1")
+        assert job and job.attempts == n
+        assert q.fail(job)
+    assert q.take(OCR_PAGE, "w1") is None
+    s = q.stats(OCR_PAGE)
+    assert (s.length, s.dead) == (0, 1)
+    assert seen == [(OCR_PAGE, {"vol": "철1", "page": "001"}, "attempts")]
+
+
+def test_on_dead_failure_does_not_block(q):
+    def boom(*_):
+        raise RuntimeError("x")
+    q.on_dead = boom
+    inject_raw(q, OCR_PAGE, '{"bad": 1}')
+    q.put(pages(1))
+    assert q.take(OCR_PAGE, "w1").page == "001"
+
+
 def test_same_consumer_old_attempt_is_fenced(q):
     """같은 consumer 이름이 다시 되찾아도 옛 시도(attempts)로는 ack·heartbeat가 안 된다 (펜싱 토큰)"""
     q.put(pages(1))
     first = q.take(OCR_PAGE, "w1")
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     second = q.take(OCR_PAGE, "w1")
     assert second.id == first.id and second.attempts == 2
     assert not q.ack(first) and not q.heartbeat(first)
@@ -175,7 +244,7 @@ def test_same_consumer_old_attempt_is_fenced(q):
 def test_reclaim_comes_before_new_jobs(q):
     q.put(pages(1))
     q.take(OCR_PAGE, "dead-worker")
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     q.put(pages(1, vol="철2"))
     assert q.take(OCR_PAGE, "w2").vol == "철1"
     assert q.take(OCR_PAGE, "w2").vol == "철2"
@@ -259,7 +328,7 @@ def test_too_many_attempts_goes_dead(q):
     for n in (1, 2, 3):
         job = q.take(OCR_PAGE, f"w{n}")
         assert job and job.attempts == n
-        time.sleep(IDLE + 0.2)
+        time.sleep(RECLAIM_WAIT)  # 실제 Redis(WSL)는 서버 시계가 조금 흔들린다 — 다른 되찾기 시험처럼 넉넉히
     assert q.take(OCR_PAGE, "w4") is None
     s = q.stats(OCR_PAGE)
     assert (s.length, s.dead) == (0, 1)
@@ -275,6 +344,19 @@ def test_poison_body_goes_dead_and_does_not_block(q, body):
     assert job and job.page == "001" and job.vol == "철1"
     s = q.stats(OCR_PAGE)
     assert (s.length, s.dead) == (1, 1)
+
+
+def test_dead_days_removes_old(q):
+    """죽은 작업은 dead_days보다 오래되면 지운다 — 다음 죽은 작업을 뺄 때 정리"""
+    from dataclasses import replace
+    q.cfg = replace(CFG, dead_days=0.5 / 86400, dead_keep=0)  # 0.5초, 개수 제한 없음
+    inject_raw(q, OCR_PAGE, '{"bad": 1}')
+    assert q.take(OCR_PAGE, "w1") is None
+    assert q.stats(OCR_PAGE).dead == 1
+    time.sleep(1.2)
+    inject_raw(q, OCR_PAGE, '{"bad": 2}')
+    assert q.take(OCR_PAGE, "w1") is None
+    assert q.stats(OCR_PAGE).dead == 1  # 앞의 것은 지워지고 방금 것만
 
 
 def test_dead_keeps_only_recent(q):
@@ -362,6 +444,35 @@ def test_pg_schema_created_by_store_init(pg_store):
     assert "job_queue" in pg_store.SCHEMA
 
 
+def test_pg_old_dev_table_upgraded(pg_store):
+    """1단계 첫 판(daa3417)으로 만든 개발 DB: dead_at·dead_reason·lease 열이 없고 옛 인덱스 job_queue_take가 있다 —
+    store.init()이 열을 더하고 옛 인덱스를 지운 뒤 대기열이 그대로 돈다"""
+    from app.jobqueue_pg import PgQueue
+    with pg_store.pool.connection() as c:
+        c.execute("DROP TABLE job_queue")
+        c.execute("""CREATE TABLE job_queue (id bigserial PRIMARY KEY, seq bigint NOT NULL DEFAULT nextval('job_queue_seq'),
+                     kind text NOT NULL, body jsonb NOT NULL, attempts int NOT NULL DEFAULT 0, owner text, taken_at timestamptz,
+                     dead boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT clock_timestamp())""")
+        c.execute("CREATE INDEX job_queue_take ON job_queue (kind, seq) WHERE NOT dead")
+        c.execute("INSERT INTO job_queue (kind, body, dead) VALUES ('ocr_page', '{}'::jsonb, true)")  # 옛 판의 죽은 작업
+    pg_store.init()
+    with pg_store.pool.connection() as c:
+        cols = {r["column_name"] for r in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'job_queue'")}
+        assert c.execute("SELECT to_regclass('job_queue_take')::text AS n").fetchone()["n"] is None
+    assert {"dead_at", "dead_reason", "lease"} <= cols
+    q = PgQueue(pg_store.pool, CFG, poll=0.05)
+    q.put(pages(1))
+    job = q.take(OCR_PAGE, "w1")
+    assert job.lease and q.ack(job)
+    for i in range(3):  # dead_keep 2: dead_at 없는 옛 행(NULLS LAST → 가장 오래된 것)부터 지운다
+        inject_raw(q, OCR_PAGE, f'{{"bad": {i}}}')
+    assert q.take(OCR_PAGE, "w1") is None
+    with pg_store.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM job_queue WHERE dead AND dead_at IS NULL").fetchone()["n"] == 0
+    assert q.stats(OCR_PAGE).dead == 2
+
+
 def test_consumer_name_unique():
     a, b = jobqueue.consumer_name(), jobqueue.consumer_name()
     assert a != b and a.startswith("worker-") and len(a) < 100
@@ -371,8 +482,9 @@ def test_config_defaults_match_decision():
     """구현 전 결정(2026-11-13 이슈 댓글)의 값이 기본값"""
     cfg = QueueConfig.from_env({})
     assert cfg.spec(OCR_PAGE) == KindSpec(idle=120.0, limit=2000)
-    assert cfg.spec(GRAPH) == KindSpec(idle=180.0, limit=0, heartbeat=30.0)
-    assert cfg.retry_after == 30
+    assert cfg.spec(GRAPH) == KindSpec(idle=180.0, limit=200, heartbeat=30.0)
+    assert cfg.spec(ASK) == KindSpec(idle=60.0, limit=100, heartbeat=20.0)  # 살아 있음 표시는 2차 리뷰 반영(결정값 60은 그대로)
+    assert cfg.retry_after == 30 and cfg.max_attempts == 3  # 2단계 전 결정 (2026-11-13)
     assert (cfg.dead_keep, cfg.dead_days, cfg.lock_timeout) == (1000, 14.0, 5.0)
 
 
@@ -409,6 +521,27 @@ def test_redis_connect_password_file_and_ca(tmp_path):
         RedisQueue.connect({"REDIS_URL": "redis://redis:6379/0", "REDIS_CA_FILE": str(ca)}, CFG)  # 평문에 CA
     with pytest.raises(ValueError):
         RedisQueue.connect({"REDIS_URL": "http://redis:6379"}, CFG)
+    for url in ("redis://redis:6379/0?password=leakme", "redis://redis:6379/0?PassWord=leakme"):  # redis-py가 쓰는 쿼리
+        with pytest.raises(ValueError) as e:
+            RedisQueue.connect({"REDIS_URL": url}, CFG)
+        assert "leakme" not in str(e.value)
+    up = RedisQueue.connect({"REDIS_URL": "REDISS://redis.docs:6379/0", "REDIS_CA_FILE": str(ca)}, CFG)  # 대문자 scheme
+    assert up.r.connection_pool.connection_kwargs["ssl_ca_certs"] == str(ca)
+    with pytest.raises(ValueError):
+        RedisQueue(up.r, CFG, prefix="a{b}")  # 해시 태그를 깨는 prefix
+
+
+def test_redis_keys_share_one_cluster_slot():
+    """여러 종류를 한 스크립트로 넣고(상한 확인), 스트림과 dead 스트림을 한 스크립트로 만진다 — 모든 키가 한 슬롯이어야
+    클러스터에서 CROSSSLOT이 나지 않는다 (해시 태그 {prefix})"""
+    from redis.crc import key_slot
+
+    from app.jobqueue_redis import RedisQueue
+    q = RedisQueue(fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True), CFG)
+    keys = [q.key(k) for k in (OCR_PAGE, GRAPH, ASK)]
+    keys += [f"{k}:dead" for k in keys]
+    assert keys[0] == "{docflow:q}:ocr_page"
+    assert len({key_slot(k.encode()) for k in keys}) == 1
 
 
 def test_check_transport_requires_rediss():
@@ -417,8 +550,9 @@ def test_check_transport_requires_rediss():
             "QDRANT_URL": "https://qdrant:6333", "QDRANT_API_KEY_FILE": "/run/k"}
     store.check_transport(safe)  # Postgres 대기열(기본)은 Redis를 보지 않는다
     store.check_transport({**safe, "QUEUE_BACKEND": "redis", "REDIS_URL": "rediss://redis:6379/0", "REDIS_PASSWORD_FILE": "/p"})
+    store.check_transport({**safe, "QUEUE_BACKEND": "redis", "REDIS_URL": "REDISS://redis:6379/0", "REDIS_PASSWORD_FILE": "/p"})
     for bad in ({"REDIS_URL": "redis://redis-host-xyz:6379/0", "REDIS_PASSWORD_FILE": "/p"},
-                {"REDIS_URL": "rediss://redis:6379/0"}):
+                {"REDIS_URL": "rediss://redis:6379/0"}, {"REDIS_URL": "rediss", "REDIS_PASSWORD_FILE": "/p"}):
         with pytest.raises(RuntimeError) as e:
             store.check_transport({**safe, "QUEUE_BACKEND": "redis", **bad})
         assert "redis-host-xyz" not in str(e.value)  # 주소는 싣지 않는다
@@ -448,3 +582,29 @@ except ModuleNotFoundError:
     r = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, r.stderr[-3000:]
     assert "redis-blocked-ok" in r.stdout
+
+
+def test_real_redis_acl_user_is_narrow(request):
+    """실제 Redis: 앱 전용 ACL 사용자는 대기열 키(접두어) 밖·위험 명령을 못 한다 (선택 시험)"""
+    if not REAL_REDIS:
+        pytest.skip("TEST_REDIS_URL 없음")
+    import redis
+    q = acl_queue(request)
+    q.put(pages(1))
+    for bad in (lambda: q.r.set("other-key", "x"), lambda: q.r.flushall(), lambda: q.r.keys("*"),
+                lambda: q.r.config_get("*"), lambda: q.r.xadd("{other:q}:ocr_page", {"a": "1"}),
+                lambda: q.r.execute_command("ACL", "LIST"), lambda: q.r.execute_command("SELECT", 1)):
+        with pytest.raises(redis.exceptions.NoPermissionError):
+            bad()
+
+
+def test_manifest_redis_acl_matches_code():
+    """맥 Redis 매니페스트가 코드와 같은 ACL 규칙을 쓰고 default 사용자를 끈다 (k8s/docs.yaml redis 초기화 컨테이너)"""
+    from pathlib import Path
+
+    from app.jobqueue_redis import ACL_COMMANDS, acl_rules
+    text = (Path(__file__).resolve().parents[1] / "k8s" / "docs.yaml").read_text(encoding="utf-8")
+    assert "user default off" in text
+    assert "user docflow on >%s " + " ".join(acl_rules()) in text
+    assert "requirepass" not in text
+    assert all(c in ("ping", "client|setinfo", "time") or c.startswith(("x", "eval", "script")) for c in ACL_COMMANDS)

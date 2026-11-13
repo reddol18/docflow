@@ -29,8 +29,9 @@ SERVICES = {
     "web": ["docflow.localhost"],  # 브라우저 주소 https://docflow.localhost:<포트> (*.localhost는 루프백으로 풀린다)
     "postgres": [f"postgres.{NS}.svc.cluster.local"],
     "qdrant": [f"qdrant.{NS}.svc.cluster.local"],
+    "redis": [f"redis.{NS}.svc.cluster.local"],  # 실행 대기열 (https://github.com/reddol18/docflow/issues/5)
 }
-# 이름 제약: 위 이름 셋만 (dNSName 제약은 그 이름의 하위 이름도 허용한다 — RFC 5280 4.2.1.10, 피할 수 없음).
+# 이름 제약: 위 이름들만 (dNSName 제약은 그 이름의 하위 이름도 허용한다 — RFC 5280 4.2.1.10, 피할 수 없음).
 # IP는 전부 막고, 메일(rfc822Name)·URI는 쓸 수 없는 이름(.invalid, RFC 6761)만 허용해 사실상 막는다
 PERMITTED = [n for names in SERVICES.values() for n in names]
 BLOCKED_DOMAIN = "docflow.invalid"

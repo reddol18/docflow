@@ -291,6 +291,7 @@
 - **병목은 OCR CPU 하나뿐입니다.** GPT 단계(쪽당 약 2.8초, 동시 4건)는 B에서도 가동률 50% 안팎이라 처리 상한이 분당 약 85쪽입니다. 워커를 12개 넘게 늘리면 그다음은 GPT 동시 호출 수와 계정 분당 한도가 막힙니다.
 - **A에서 실패가 없는 이유는 대기열 덕분이지만, 그 대기열이 Pod 메모리에 있습니다.** 56분 사이에 Pod가 재시작되면 대기 중인 쪽이 사라집니다 → [#5](https://github.com/reddol18/docflow/issues/5). B는 이 대기열을 Redis/SQS로 빼는 것이 전제입니다.
 - **B로 가려면 바뀌는 것:** 철 단위 실행을 쪽 단위 OCR 작업으로 쪼개 대기열에 넣고, OCR 워커를 API와 분리한 Deployment로 띄워 KEDA가 대기열 길이로 늘립니다.
+  → [#5](https://github.com/reddol18/docflow/issues/5)에서 구현: `/run`은 쪽마다 `ocr_page` 작업, 마지막 쪽 뒤 `graph` 작업 하나(`app/runs.py`), 워커는 `python -m app.worker`(`app/worker.py`), 대기열은 Redis Streams(맥 docs·클라우드) 또는 Postgres(`app/jobqueue.py`). 대기열이 가득 차면 `429` + `Retry-After: 30`. 맥은 워커 1개, 클라우드 노드 그룹 B·KEDA 매니페스트는 `k8s/cloud/`(측정은 [#16](https://github.com/reddol18/docflow/issues/16)).
   LangGraph 그래프는 OCR이 끝난 철부터 이어서 돌립니다(체크포인트는 그대로 Postgres).
 - **고정비 어림** [가정, 서울 온디맨드]: EKS 제어부 약 $73/월 + OCR 노드 1대 상시 약 $140/월 + API·DB 노드 약 $76/월 ≈ **월 $290**. GPT는 680쪽에 약 $0.35.
 

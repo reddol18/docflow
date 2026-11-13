@@ -12,18 +12,21 @@
                          시도 횟수가 max_attempts를 넘었거나 본문이 약속(NewJob)에 맞지 않는 작업은 꺼내지 않고 죽은 작업으로 뺀다
   ack(job)               완료. 지금도 이 워커가 이 시도(attempts)로 쥐고 있을 때만 지운다 → True.
                          늦게 끝난 옛 워커는 새 워커가 되찾은 작업을 지우지 못한다 (False). 작업은 두 번 돌아도 같은 결과여야 한다
-  release(job)           되돌리기(자발적). 맨 뒤로 다시 넣고, 이번 시도는 시도 횟수에서 뺀다 (실패·죽음과 구분). 주인·시도가 다르면 None
+  release(job)           되돌리기(자발적). 맨 뒤로 다시 넣고, 이번 시도는 시도 횟수에서 뺀다 (실패·죽음과 구분). 주인·임대가 다르면 None
+  fail(job)              실패. 맨 뒤로 다시 넣되 이번 시도는 센 채로 — max_attempts를 다 쓰면 다음 꺼냄에서 죽은 작업
   heartbeat(job)         살아 있음 표시. 유휴 시계를 0으로. 이미 다른 워커가 되찾았으면 False (그 작업은 그만둔다)
+  on_dead                (속성) 죽은 작업으로 뺄 때 부르는 함수 on_dead(kind, 본문 dict|None, 사유 'attempts'|'invalid')
   stats(kind)            길이: waiting(꺼낼 수 있는 = 새 작업 + 되찾을 차례) · running(쥐고 있고 유휴 시간 안) · dead
   position(kind, id)     순번: 꺼낼 수 있는 작업이면 1부터 (되찾을 차례인 작업이 새 작업보다 앞), 쥐고 있거나 없으면 None
-  주인 확인(ack·release·heartbeat)은 job.consumer와 job.attempts(펜싱 토큰)를 함께 본다 — 확인과 동작은 원자적으로.
+  주인 확인(ack·release·fail·heartbeat)은 job.consumer와 job.lease(임대 번호, 펜싱 토큰)를 함께 본다 — 확인과 동작은 원자적으로.
+  lease는 꺼낼 때마다 새 값이다 (Postgres: 단조 증가 시퀀스, Redis: 시도 횟수 — Redis는 release가 새 항목 id를 만들어 겹치지 않는다).
   consumer 이름은 consumer_name()으로 프로세스마다 유일하게.
 
 값 (통제자 결정 2026-11-13, https://github.com/reddol18/docflow/issues/5 댓글 — 모두 환경 변수로 바꾼다):
   QUEUE_LIMIT_OCR_PAGE=2000   쪽 OCR 작업 상한. 넘으면 429 + Retry-After: QUEUE_RETRY_AFTER(30)
   QUEUE_IDLE_OCR_PAGE=120     쪽 OCR 작업 되찾기 유휴 시간(초)
   QUEUE_IDLE_GRAPH=180        그래프 작업 되찾기 유휴 시간(초), QUEUE_HEARTBEAT_GRAPH=30마다 살아 있음 표시
-  QUEUE_IDLE_ASK=60 · QUEUE_LIMIT_ASK=0 · QUEUE_LIMIT_GRAPH=0 · QUEUE_MAX_ATTEMPTS=5   ← 결정 전 임시값 (2단계 구현 전 결정 댓글)
+  QUEUE_MAX_ATTEMPTS=3 · QUEUE_LIMIT_GRAPH=200 · QUEUE_LIMIT_ASK=100 · QUEUE_IDLE_ASK=60   ← 2단계 전 결정 (2026-11-13 이슈 댓글)
   QUEUE_DEAD_KEEP=1000 · QUEUE_DEAD_DAYS=14   죽은 작업 보존 (종류마다 최근 개수·기간, 넘으면 지운다)
   QUEUE_LOCK_TIMEOUT=5        (Postgres) 넣기가 상한 잠금을 기다리는 최대 초 — 넘으면 QueueBusy (pool 연결을 오래 쥐지 않게)
   상한 0 = 상한 없음.
@@ -66,7 +69,7 @@ def _num(env, name, default, cast=float):
 class QueueConfig:
     kinds: dict[str, KindSpec]
     retry_after: int = 30
-    max_attempts: int = 5
+    max_attempts: int = 3
     dead_keep: int = 1000
     dead_days: float = 14.0
     lock_timeout: float = 5.0
@@ -77,9 +80,11 @@ class QueueConfig:
             OCR_PAGE: KindSpec(idle=_num(env, "QUEUE_IDLE_OCR_PAGE", 120.0),
                                limit=_num(env, "QUEUE_LIMIT_OCR_PAGE", 2000, int)),
             GRAPH: KindSpec(idle=_num(env, "QUEUE_IDLE_GRAPH", 180.0),
-                            limit=_num(env, "QUEUE_LIMIT_GRAPH", 0, int),
+                            limit=_num(env, "QUEUE_LIMIT_GRAPH", 200, int),
                             heartbeat=_num(env, "QUEUE_HEARTBEAT_GRAPH", 30.0)),
-            ASK: KindSpec(idle=_num(env, "QUEUE_IDLE_ASK", 60.0), limit=_num(env, "QUEUE_LIMIT_ASK", 0, int)),
+            # ask도 살아 있음 표시(20초): 답변 LLM이 늦어도(최악 시간 > 유휴 60초) 다른 워커가 같은 요청을 되찾지 않게
+            ASK: KindSpec(idle=_num(env, "QUEUE_IDLE_ASK", 60.0), limit=_num(env, "QUEUE_LIMIT_ASK", 100, int),
+                          heartbeat=_num(env, "QUEUE_HEARTBEAT_ASK", 20.0)),
         }
         for name, k in kinds.items():
             if k.idle <= 0:
@@ -90,7 +95,7 @@ class QueueConfig:
         if lock_timeout <= 0:
             raise ValueError("QUEUE_LOCK_TIMEOUT은 0보다 커야 합니다 (0이면 Postgres가 끝없이 기다린다)")
         return cls(kinds=kinds, retry_after=_num(env, "QUEUE_RETRY_AFTER", 30, int),
-                   max_attempts=max(1, _num(env, "QUEUE_MAX_ATTEMPTS", 5, int)),
+                   max_attempts=max(1, _num(env, "QUEUE_MAX_ATTEMPTS", 3, int)),
                    dead_keep=_num(env, "QUEUE_DEAD_KEEP", 1000, int), dead_days=_num(env, "QUEUE_DEAD_DAYS", 14.0),
                    lock_timeout=lock_timeout)
 
@@ -136,7 +141,8 @@ class NewJob:
 @dataclass(frozen=True)
 class Job:
     """꺼낸 작업. id는 구현이 매긴다 (Redis 스트림 id / Postgres 행 id, 문자열).
-    attempts는 이번 꺼냄을 포함한 시도 횟수이자 펜싱 토큰 — ack·release·heartbeat가 consumer와 함께 확인한다"""
+    attempts는 이번 꺼냄을 포함한 시도 횟수. lease는 이번 꺼냄의 임대 번호(펜싱 토큰) — ack·release·fail·heartbeat가
+    consumer와 함께 확인한다"""
     id: str
     kind: str
     consumer: str
@@ -144,9 +150,29 @@ class Job:
     vol: str | None = None
     page: str | None = None
     ref: str | None = None
+    lease: str = ""
 
 
-def parse_job(job_id: str, kind: str, consumer: str, attempts: int, body) -> Job:
+def notify_dead(fn, kind: str, body, reason: str) -> None:
+    """죽은 작업 알림 (on_dead). 본문은 약속 칸(vol·page·ref)만 문자열일 때 넘긴다. 알림이 실패해도 꺼내기는 멈추지 않는다"""
+    if fn is None:
+        return
+    if isinstance(body, str):
+        try:
+            body = json.loads(body) if len(body) <= BODY_MAX else None
+        except json.JSONDecodeError:
+            body = None
+    if isinstance(body, dict):
+        body = {k: v for k, v in body.items() if k in ("vol", "page", "ref") and isinstance(v, str) and len(v) <= FIELD_MAX}
+    else:
+        body = None
+    try:
+        fn(kind, body, reason)
+    except Exception as e:  # noqa: BLE001 — 알림 실패가 대기열을 막지 않게 (상세는 서버 로그)
+        print(f"[queue] on_dead 실패: {type(e).__name__}", flush=True)
+
+
+def parse_job(job_id: str, kind: str, consumer: str, attempts: int, body, lease: str | None = None) -> Job:
     """꺼낸 본문을 다시 검사한다 — 대기열에 누가 무엇을 넣었든 약속(NewJob)에 맞는 것만 워커에 넘긴다. 아니면 ValueError"""
     if isinstance(body, str):
         if len(body) > BODY_MAX:
@@ -159,7 +185,8 @@ def parse_job(job_id: str, kind: str, consumer: str, attempts: int, body) -> Job
         raise ValueError("본문 칸이 약속과 다름")
     new = NewJob(kind=kind, vol=body.get("vol"), page=body.get("page"), ref=body.get("ref"))
     new.validate()
-    return Job(id=job_id, kind=kind, consumer=consumer, attempts=attempts, vol=new.vol, page=new.page, ref=new.ref)
+    return Job(id=job_id, kind=kind, consumer=consumer, attempts=attempts, vol=new.vol, page=new.page, ref=new.ref,
+               lease=str(attempts) if lease is None else lease)
 
 
 @dataclass(frozen=True)
@@ -218,9 +245,11 @@ class JobQueue(Protocol):
     def take(self, kind: str, consumer: str, wait: float = 0.0) -> Job | None: ...
     def ack(self, job: Job) -> bool: ...
     def release(self, job: Job) -> str | None: ...  # 새 id. 이미 끝났거나 다른 워커가 되찾았으면 None
+    def fail(self, job: Job) -> str | None: ...     # 같음, 시도로 센다
     def heartbeat(self, job: Job) -> bool: ...
     def stats(self, kind: str) -> QueueStats: ...
     def position(self, kind: str, job_id: str) -> int | None: ...
+    def count_for(self, vol: str) -> int: ...  # 그 철의 작업 수 (죽은 것 빼고, 모든 종류) — 감시(app/runs.py sweep)용
 
 
 def open_queue(env=os.environ) -> JobQueue:

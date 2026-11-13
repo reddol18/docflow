@@ -25,7 +25,9 @@
   POST  /review/{vol}                  검토 화면 폼 제출
   POST  /review/{vol}/json             검토 값을 JSON으로 제출 (스크립트·Next 검토 화면)
   GET   /search                        ?q=&year_from=&year_to=&k= 벡터(Qdrant) + 낱말(Postgres) 결과를 RRF로 합침 (사용자별 호출 제한)
-  GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다 (사용자별 호출 제한)
+  GET   /ask                           ?q= 검색 상위 문서로 GPT가 답하고 근거 doc_id를 단다 (사용자별 호출 제한). 워커가 대기열에서
+                                       처리한다 — ASK_WAIT_SECONDS(30) 안에 끝나면 답, 아니면 202 {id}
+  GET   /ask/{req_id}                  202로 받은 /ask 요청의 결과 (요청한 사람만)
   GET   /graph                         흐름 그림 (mermaid)
   GET   /schema                        색인 칸 스키마 (보이는 칸·rule·손글씨 칸, 검색 열) — 화면이 칸 목록을 여기서 받는다
   GET   /report                        공정·품질 리포트 (?day_from=&day_to=, 기본 최근 14일)
@@ -41,6 +43,11 @@
 역할은 경로마다 더 좁힌다 — 보기 viewer, 검토·수정(입력) reviewer, 검사 inspector, 업로드·실행 admin.
 검토 단계(입력 뒤 검수 단계들)와 단계마다 맡는 역할은 흐름 설정 WORKFLOW가 정한다 (app/workflow.py,
 https://github.com/reddol18/docflow/issues/86). 설정이 없으면 위의 입력 → 표본 검사 2단계 그대로.
+
+실행은 대기열로 (https://github.com/reddol18/docflow/issues/5): /run·/resume·검토 제출·/ask는 작업을 넣고 바로 돌아온다.
+워커(app/worker.py, `python -m app.worker`)가 쪽 OCR·그래프·질문을 처리한다. 대기열이 가득 차면 429 + Retry-After(넣은 것 없음),
+상한 잠금을 못 얻으면 503 + Retry-After. 실행 상태는 vol_run 행(app/runs.py) — API·워커가 같이 본다.
+WORKER_INLINE=1이면 이 프로세스 안에서도 워커를 돌린다 (워커 Pod 없는 개발용).
 """
 import datetime as dt
 import filecmp
@@ -50,9 +57,10 @@ import re
 import secrets
 import sys
 import threading
+import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
+from types import SimpleNamespace
 from typing import Annotated, Literal
 
 import cv2
@@ -62,12 +70,11 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.types import Command
 from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, error_list, errors, export, field_rules, flags, inspection, layout, llm, ocr, report, store, workflow
+from app import auth, error_list, errors, export, field_rules, flags, inspection, jobqueue, layout, llm, ocr, report, runs, store, workflow
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app import upload as uploads  # 경로 함수 이름 upload와 겹치지 않게
@@ -79,8 +86,9 @@ VOL_RX = re.compile(r"(?!\.+\Z)[\w.-]{1,80}")
 Q_MAX = 200  # 검색어 길이 상한: 질의는 문서 제목(색인 칸 500자 안)보다 짧고, 임베딩·답변 입력 토큰을 묶는다
 CELL_MAX = 500  # 색인 칸 하나의 길이 상한 (제목도 이 안에 든다) — JSON·폼 검토와 검토 화면 입력칸이 같이 쓴다
 CellValue = Annotated[str, Field(max_length=CELL_MAX)]
-runner = ThreadPoolExecutor(max_workers=1)  # OCR이 CPU를 다 쓰므로 철은 한 번에 하나씩
-running: dict[str, str] = {}  # vol -> 상태 문자열
+# 이 API 프로세스 안의 짧은 일 표시 (vol -> 'queued'·'uploading'·'purging'): 넣는 동안·쓰는 동안 같은 철의 다른 요청을 막는다.
+# 철 실행 자체(대기열 작업이 도는 동안)는 vol_run 행이 표시한다 (runs.active) — 둘을 합쳐 본다 (busy)
+running: dict[str, str] = {}
 G = None
 
 
@@ -92,7 +100,16 @@ async def lifespan(_):
     saver.setup()
     G = flow.build(saver)
     startup_migrate()
+    inline = None
+    if os.environ.get("WORKER_INLINE") == "1":  # 개발용: 워커 Pod 없이 이 프로세스에서 대기열 처리
+        from app import worker
+        inline = threading.Event()
+        w = worker.Worker()
+        for kind in worker.KINDS:
+            threading.Thread(target=w.loop, args=(kind, inline), daemon=True).start()
     yield
+    if inline is not None:
+        inline.set()
     auth.audit_flush()  # 미뤄 둔 로그인·로그아웃 감사 행을 쓰고 닫는다
     store.lock_pool.close()
     store.pool.close()
@@ -289,41 +306,47 @@ def unaudited_routes(application):
             if set(r.methods) - set(auth.SAFE_METHODS) and not getattr(r.endpoint, "audit_action", None)]
 
 
-def submit(vol, arg, user=None, reserved=False):
-    """철 흐름을 뒤에서 돌린다. 끝난 결과도 감사 로그에 남긴다(run_done: ok / review_waiting / error+분류 코드).
-    reserved: 부른 쪽이 이미 running[vol]을 세웠다 (/run이 리셋 전에)"""
-    if not reserved and reserve(vol, "queued") is None:
-        raise HTTPException(409, f"{vol} 이미 실행 중")
+def busy(vol, act=None):
+    """실행 중인가: 이 프로세스의 짧은 일 표시 또는 철 실행(대기열) 상태. 값은 상태 글자 ('queued'·'running'·'uploading' …).
+    act: 미리 읽은 {철: 실행 상태} (runs.active_all — 철 목록이 철마다 DB를 다시 읽지 않게)"""
+    if vol in running:
+        return running[vol]
+    return act.get(vol) if act is not None else runs.active(vol)
 
-    def job():
-        running[vol] = Busy("running")
-        store.event(vol, "run", "start", None, resume=arg is None or isinstance(arg, Command))
-        try:
-            store.set_run_stop(vol, None)  # 다시 돌리면 앞선 멈춤 이유는 없어진다
-            G.invoke(arg, cfg(vol))
-            snap = G.get_state(cfg(vol))
-            print(f"run {vol} stopped/finished: next={snap.next}", flush=True)
-            if snap.interrupts:
-                store.event(vol, "review", "waiting", None, flagged=len(snap.interrupts[0].value["flagged"]))
-                audit_safe(user, "run_done", vol, None, "review_waiting")
-            else:
-                store.event(vol, "run", "end", None)
-                audit_safe(user, "run_done", vol, None, "ok")
-        except llm.BudgetExceeded as e:
-            # 오류가 아니라 한도 멈춤 (https://github.com/reddol18/docflow/issues/7): 체크포인트까지 한 일은 남고, 멈춤 이유를
-            # run_stop 표에 남겨 철 단계가 'budget'으로 보인다 (_stage). 한도가 풀리면(다음 날·한도 올림) /resume으로 이어 간다
-            print(f"run {vol} budget stop: {e}", file=sys.stderr, flush=True)
-            store.set_run_stop(vol, "budget")  # 철 단계의 근거 (run_stop 표)
-            store.event(vol, "run", "budget", None, **errors.public(e))
-            audit_safe(user, "run_done", vol, None, "budget_stop")
-        except Exception as e:
-            errors.log_exception(f"run {vol}")  # 상세는 서버 로그에만 (키 꼴 문자열은 가림)
-            store.event(vol, "run", "error", None, **errors.public(e))  # 화면엔 분류 코드만
-            audit_safe(user, "run_done", vol, None, "error", code=errors.code_of(e))
-        finally:
-            running.pop(vol, None)
 
-    runner.submit(job)
+def start_run(vol, kind, arg, user, before=None):
+    """철 실행을 대기열에 넣는다 (app/runs.py 머리말 순서): 행 확정(preparing, 끝난 행일 때만 — 아니면 409) → 작업 넣기 →
+    before()(리셋·검토 기록) → 준비 끝(queued) → 진행 이벤트. 넣기·before가 실패하면 행을 앞선 것으로 되돌린다:
+    대기열이 가득 차면 429, 상한 잠금을 못 얻으면 503 (둘 다 대기열이 준 Retry-After) — 그때는 아무것도 바뀌지 않는다.
+    넣기는 한 번(put 하나)뿐이고 before보다 앞이라, 리셋한 뒤에 429가 나는 일은 없다.
+    kind: start(처음부터, arg {review_mode}) / resume(멈춘 곳부터) / review(검토 값으로 이어 감, arg {resume: {interrupt id: 값}})"""
+    run = runs.next_run()
+    if kind == "start":
+        jobs, left = runs.start_jobs(vol, run, flow.vol_pages(vol))
+    else:
+        jobs, left = [jobqueue.NewJob(jobqueue.GRAPH, vol=vol, ref=str(run))], 0
+    try:
+        prev = runs.prepare(vol, run, kind, arg, user, pages_left=left, graph_put=left == 0)
+    except runs.Busy:
+        raise HTTPException(409, f"{vol} 이미 실행 중") from None
+    try:
+        runs.put(jobs)
+        if before is not None:
+            before()
+    except jobqueue.QueueFull as e:
+        runs.rollback(vol, run, prev)
+        print(f"[queue] {vol} 넣기 거절: {e}", file=sys.stderr, flush=True)
+        raise HTTPException(429, "처리 대기열이 가득 찼습니다 — 잠시 뒤 다시 실행하세요", headers=e.headers()) from None
+    except jobqueue.QueueBusy as e:
+        runs.rollback(vol, run, prev)
+        raise HTTPException(503, "처리 대기열이 바쁩니다 — 잠시 뒤 다시 실행하세요", headers=e.headers()) from None
+    except BaseException:
+        runs.rollback(vol, run, prev)  # 넣은 작업은 실행 번호가 행과 달라져 워커가 버린다
+        raise
+    runs.ready(vol, run)
+    store.set_run_stop(vol, None)  # 다시 돌리면 앞선 멈춤 이유는 없어진다
+    store.event(vol, "run", "start", None, resume=kind != "start", jobs=len(jobs))
+    return run
 
 
 @app.get("/healthz")
@@ -425,6 +448,8 @@ def _upload(vol, files, replace):
             if tok is None:
                 raise HTTPException(409, f"{vol} 실행 중 — 끝난 뒤 올린다")
             try:
+                if runs.active(vol):  # 대기열에서 도는 실행 (표시를 세운 뒤에 본다 — 그사이 /run이 넣을 수 없다)
+                    raise HTTPException(409, f"{vol} 실행 중 — 끝난 뒤 올린다")
                 stage = _flow_stage(G.get_state(cfg(vol)))  # 표시를 세운 뒤에 읽는다 — 그사이 /run이 시작할 수 없다
                 if stage not in ("new", "done"):
                     raise HTTPException(409, "검토 대기·중간에 멈춘 철 — 끝까지 마치거나(/review·/resume) "
@@ -479,16 +504,19 @@ def run(vol: str, user: Admin, review: str = "human"):
         if tok is None:
             raise HTTPException(409, f"{vol} 이미 실행 중")
         try:
-            if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (검사 이력은 edits에 남음)
-                store.event(vol, "inspection", "reset", None, user=user.username)
-            # 검토 단계 위치도 처음으로, 실행 세대를 올린다 (승인·반려 기록 stage_log는 세대와 함께 남음)
-            info["stage_reset"] = moved = store.reset_stages(vol)
-            if moved:
-                store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
-            submit(vol, {"vol": vol, "review_mode": review}, user, reserved=True)
-        except BaseException:
-            release(vol, tok)
-            raise
+            if runs.active(vol):
+                raise HTTPException(409, f"{vol} 이미 실행 중")
+
+            def reset():  # 대기열에 넣은 뒤에만 (가득 차서 429면 검사 목록·단계를 건드리지 않는다)
+                if store.reset_inspection(vol):  # 처음부터 다시 돌리면 문서가 바뀐다 → 예전 검사 목록은 버린다 (이력은 edits에)
+                    store.event(vol, "inspection", "reset", None, user=user.username)
+                # 검토 단계 위치도 처음으로, 실행 세대를 올린다 (승인·반려 기록 stage_log는 세대와 함께 남음)
+                info["stage_reset"] = moved = store.reset_stages(vol)
+                if moved:
+                    store.event(vol, "workflow", "reset", None, user=user.username, docs=moved)
+            start_run(vol, "start", {"review_mode": review}, user, before=reset)
+        finally:
+            release(vol, tok)  # 실행 표시는 이제 vol_run 행이 한다
     return {"vol": vol, "started": True}
 
 
@@ -501,16 +529,25 @@ def resume(vol: str, user: Admin):
             raise HTTPException(409, "이어 갈 단계가 없음 (끝났거나 시작 안 함)")
         if snap.interrupts:
             raise HTTPException(409, "사람 검토 대기 중 → /review 에서 이어 감")
-        submit(vol, None, user)
+        tok = reserve(vol, "queued")
+        if tok is None or runs.active(vol):
+            if tok is not None:
+                release(vol, tok)
+            raise HTTPException(409, f"{vol} 이미 실행 중")
+        try:
+            start_run(vol, "resume", {}, user)
+        finally:
+            release(vol, tok)
     return {"vol": vol, "resumed_at": list(snap.next)}
 
 
-def _stage(vol, snap):
-    if running.get(vol) == "queued":
+def _stage(vol, snap, act=None):
+    act = act if act is not None else busy(vol)
+    if act in ("queued", "preparing"):
         return "queued"
     if snap.interrupts:
         return "review"
-    if vol in running:
+    if act:
         return "running"
     stage = _flow_stage(snap)
     if stage == "stopped" and store.run_stop(vol) == "budget":
@@ -536,14 +573,15 @@ def day_totals():
             "budget": store.budget_today(llm.LIMITS)}  # 오늘 예산 {index·query: {used, held, limit}}
 
 
-def summary(vol, totals=None):
+def summary(vol, totals=None, active=None):
     snap = G.get_state(cfg(vol))
     v = snap.values or {}
     docs = v.get("docs", [])
+    act = busy(vol, active) or None
     return {
         "vol": vol,
-        "stage": _stage(vol, snap),
-        "running": running.get(vol),
+        "stage": _stage(vol, snap, act or ""),
+        "running": act,
         "next": list(snap.next),
         "waiting_review": bool(snap.interrupts),
         "pages": len(v.get("pages", [])),
@@ -568,7 +606,8 @@ def volume_names():
 def volumes(_: Viewer):
     vols = volume_names()
     totals = day_totals() if vols else None
-    return [summary(v, totals) for v in vols]
+    act = runs.active_all() if vols else {}  # 실행 상태를 한 번에 (철마다 읽지 않게)
+    return [summary(v, totals, act) for v in vols]
 
 
 @app.get("/volumes/{vol}")
@@ -602,7 +641,7 @@ def _edit_document(vol, doc_id, fields, user, source="edit"):
     # 잠금 순서는 문서(부른 쪽) → 철로 고정 (https://github.com/reddol18/docflow/issues/86)
     with store.vol_lock(vol):
         snap = G.get_state(cfg(vol))
-        if snap.interrupts or vol in running:
+        if snap.interrupts or busy(vol):
             raise HTTPException(409, "실행 중이거나 검토 대기 중")
         docs = {d["doc_id"]: d for d in (snap.values or {}).get("docs", [])}
         if doc_id not in docs:
@@ -1174,16 +1213,19 @@ def resume_review(vol, flagged, fixes, user, interrupt_id):
     if tok is None:
         raise HTTPException(409, f"{vol} 이미 실행 중")
     try:
+        if runs.active(vol):  # 이미 넣은 검토 제출이 아직 돌기 전 (두 번 누름)
+            raise HTTPException(409, f"{vol} 이미 실행 중")
         # 화면이 읽은 대기와 지금 대기가 같은지 실행 표시 아래에서 다시 본다 — 그 사이 철이 다시 돌아 대기가 끝났거나
         # 바뀌었으면 이력을 남기지 않고 409 (옛 id로 이어 가면 지도에서 집히지 않아 제출이 조용히 버려진다)
         snap = G.get_state(cfg(vol))
         if not snap.interrupts or snap.interrupts[0].id != interrupt_id:
             raise HTTPException(409, "검토 대기가 바뀜 — 검토 화면을 다시 열어 주세요")
-        record_review(vol, flagged, fixes, user)
-        submit(vol, Command(resume={interrupt_id: fixes}), user, reserved=True)
-    except BaseException:
+        # 대기열에 넣은 뒤 이력을 남기고, 그다음 실행을 확정한다 — 이력 저장이 실패하면 확정하지 않아 넣은 작업은 옛 것이 되어
+        # 버려진다 (고친 값이 반영되지 않음). 가득 차서 429면 이력도 남지 않는다
+        start_run(vol, "review", {"resume": {interrupt_id: fixes}}, user,
+                  before=lambda: record_review(vol, flagged, fixes, user))
+    finally:
         release(vol, tok)
-        raise
 
 
 @app.post("/review/{vol}")
@@ -1402,7 +1444,7 @@ def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False
     with audited(user, "purge", vol, allow_problems=allow_problems) as info:
         if confirm != vol:
             raise HTTPException(400, "confirm에 철 이름을 그대로 넣어야 함")
-        if vol in running:
+        if busy(vol):
             raise HTTPException(409, "실행 중인 철")
         last = store.last_export(vol, stage_moves=WORKFLOW["count_unconfirmed"])
         if not last:
@@ -1415,6 +1457,8 @@ def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False
         if tok is None:
             raise HTTPException(409, "실행 중인 철")
         try:
+            if runs.active(vol):
+                raise HTTPException(409, "실행 중인 철")
             info.update(store.purge_volume(vol, G.checkpointer.delete_thread))
         finally:
             release(vol, tok)
@@ -1505,13 +1549,18 @@ def rate_limited(route, user):
         raise HTTPException(429, f"{route} 오늘 호출 한도 {RATE[route]['day']}회를 다 썼습니다",
                             headers={"Retry-After": str(_until_tomorrow())})
     try:
-        yield
+        yield SimpleNamespace(key=key, wins=wins)
     except (llm.BudgetExceeded, llm.LLMOff):  # 둘 다 503 — 설치·예산 쪽 거절
-        try:
-            store.refund_quota(key, route, wins)
-        except Exception:
-            errors.log_exception(f"[rate] {route} 되돌리기 실패")
+        refund_quota(key, route, wins)
         raise
+
+
+def refund_quota(key, route, wins):
+    """사용자 탓이 아닌 거절(예산·LLM 꺼짐 503)로 쓴 호출 1회를 되돌린다 — /ask 동기 경로와 결과 조회 경로가 같이 쓴다"""
+    try:
+        store.refund_quota(key, route, wins)
+    except Exception:
+        errors.log_exception(f"[rate] {route} 되돌리기 실패")
 
 
 @app.get("/search")
@@ -1521,15 +1570,83 @@ def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewe
         return hybrid(q, year_from, year_to, k, user)
 
 
+def ask_answer(q, year_from, year_to, user):
+    """검색 상위 문서로 답한다 — 워커의 ask 작업(app/worker.py)이 부른다"""
+    hits = hybrid(q, year_from, year_to, 5, user)
+    for h in hits:
+        h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
+    return {"answer": llm.answer(q, hits, user_id=getattr(user, "id", None)),
+            "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
+
+
+# /ask가 워커의 답을 기다리는 최대 초 — 넘으면 202 {id}, 화면은 GET /ask/{id}를 1초마다 (frontend/src/lib/api.ts).
+# 짧게 둔다: 기다리는 동안 API 스레드 하나(기본 40개)를 쥔다 — 30초면 분당 상한(사용자당 10회)만으로도 스레드가 빠르게 묶인다.
+# 5초면 검색 + 짧은 답(대부분)은 한 번에 오고, 긴 답만 폴링으로 간다
+ASK_WAIT = float(os.environ.get("ASK_WAIT_SECONDS", "5"))
+ASK_POLL = 0.5
+ASK_ID_RX = re.compile(r"[A-Za-z0-9_-]{16,64}")
+
+
+def _wins_of(raw):
+    """ask_request.quota_wins(JSON) → 호출 제한 창 [(이름, 시작, 상한)] (store.take_quota와 같은 모양)"""
+    return [(kind, dt.datetime.fromisoformat(start), cap) for kind, start, cap in (raw or [])]
+
+
+def _ask_result(req_id, user, wait, refund=False):
+    """요청 행이 끝날 때까지(최대 wait초) 본다. 끝났으면 답(행은 지운다), 오류면 예외, 아직이면 None"""
+    end = time.monotonic() + wait
+    while True:
+        r = runs.ask_get(req_id)
+        if r is None or (r["user_id"] != getattr(user, "id", None)
+                         or (r["user_id"] is None and r["username"] != getattr(user, "username", None))):
+            raise HTTPException(404)
+        if r["state"] in ("done", "error"):
+            if not runs.ask_forget(req_id):  # 다른 조회가 먼저 가져갔다 (지운 쪽만 돌려주고 되돌린다)
+                raise HTTPException(404)
+            if r["code"] in ("budget", "llm_off"):
+                # 503 (budget_exceeded·llm_off 처리기). 결과 조회 경로는 rate_limited 밖이라 여기서 1회 되돌린다
+                # (동기 경로는 rate_limited가 같은 예외로 되돌린다 — 두 번 되돌리지 않게 refund 인자로 고른다)
+                if refund and r["quota_key"]:
+                    refund_quota(r["quota_key"], "ask", _wins_of(r["quota_wins"]))
+                if r["code"] == "budget":
+                    raise llm.BudgetExceeded("검색·질문 예산")
+                raise llm.LLMOff("LLM 꺼짐")
+            if r["code"]:
+                raise HTTPException(500, "질문을 처리하지 못했습니다")
+            return r["result"]
+        if time.monotonic() >= end:
+            return None
+        time.sleep(ASK_POLL)
+
+
 @app.get("/ask")
 def ask(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewer, year_from: int | None = None,
         year_to: int | None = None):
-    with rate_limited("ask", user):
-        hits = hybrid(q, year_from, year_to, 5, user)
-        for h in hits:
-            h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
-        return {"answer": llm.answer(q, hits, user_id=getattr(user, "id", None)),
-                "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
+    with rate_limited("ask", user) as quota:
+        req_id = secrets.token_urlsafe(18)
+        runs.ask_new(req_id, user, q, year_from, year_to, quota.key, quota.wins)  # 질문 본문은 DB에, 대기열에는 id만
+        try:
+            runs.put([jobqueue.NewJob(jobqueue.ASK, ref=req_id)])
+        except (jobqueue.QueueFull, jobqueue.QueueBusy) as e:
+            runs.ask_forget(req_id)
+            full = isinstance(e, jobqueue.QueueFull)
+            raise HTTPException(429 if full else 503, "질문 대기열이 " + ("가득 찼습니다" if full else "바쁩니다"),
+                                headers=e.headers()) from None
+        out = _ask_result(req_id, user, ASK_WAIT)
+        if out is None:
+            return JSONResponse({"id": req_id, "status": "queued"}, status_code=202)
+        return out
+
+
+@app.get("/ask/{req_id}")
+def ask_poll(req_id: str, user: Viewer):
+    """202로 받은 /ask 결과 — 요청한 사람만 (남의 id는 404). 끝났으면 답을 한 번 돌려주고 지운다"""
+    if not ASK_ID_RX.fullmatch(req_id):
+        raise HTTPException(404)
+    out = _ask_result(req_id, user, 0, refund=True)
+    if out is None:
+        return JSONResponse({"id": req_id, "status": "queued"}, status_code=202)
+    return out
 
 
 @app.get("/graph", response_class=PlainTextResponse)

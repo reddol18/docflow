@@ -15,28 +15,30 @@ param(
     [string]$Mac = $env:DOCFLOW_MAC
 )
 $ErrorActionPreference = "Stop"
+# 접속이 걸려 멈추지 않게: 5초 안에 못 붙으면 실패, 10초마다 살아 있음 확인 3번 실패면 끊는다
+$SshOpts = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3")
 if (-not $Mac) { throw "맥 주소가 없습니다: -Mac user@host 또는 `$env:DOCFLOW_MAC" }
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
 try {
     Write-Host "== 디스크 여유 확인"
     # 반드시: 모자란 채로 빌드하면 kubelet이 운영 파드를 내쫓는다 (2026-11-07). 맥 쪽 lock_refresh.sh도 빌드 전에 한 번 더 본다
-    ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts"
+    ssh @SshOpts $Mac "mkdir -p ~/doc_platform/scripts"
     if ($LASTEXITCODE) { throw "맥 접속 실패" }
-    scp -q scripts/mac/disk_check.sh scripts/mac/lock_refresh.sh "${Mac}:doc_platform/scripts/"
+    scp -q @SshOpts scripts/mac/disk_check.sh scripts/mac/lock_refresh.sh "${Mac}:doc_platform/scripts/"
     if ($LASTEXITCODE) { throw "복사 실패 (scripts)" }
-    ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/disk_check.sh 4"
+    ssh @SshOpts $Mac "sh ~/doc_platform/scripts/disk_check.sh 4"
     if ($LASTEXITCODE) { throw "디스크 여유가 모자랍니다. 정리한 뒤 다시 하세요 (위 메시지)." }
 
     Write-Host "== 복사 → linux/amd64에서 requirements.txt 풀기"
-    scp -q Dockerfile requirements.txt "${Mac}:doc_platform/"
+    scp -q @SshOpts Dockerfile requirements.txt "${Mac}:doc_platform/"
     if ($LASTEXITCODE) { throw "복사 실패" }
-    ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/lock_refresh.sh"
+    ssh @SshOpts $Mac "sh ~/doc_platform/scripts/lock_refresh.sh"
     if ($LASTEXITCODE) { throw "lock 풀기 실패 (위 로그)" }
 
     Write-Host "== 해시 붙이기 (PyPI)"
     $freeze = Join-Path ([IO.Path]::GetTempPath()) "docflow-lock-refresh.freeze"
-    scp -q "${Mac}:doc_platform/requirements.freeze" $freeze
+    scp -q @SshOpts "${Mac}:doc_platform/requirements.freeze" $freeze
     if ($LASTEXITCODE) { throw "freeze 받기 실패" }
     uv run --quiet --no-project python -I scripts/lock_hashes.py $freeze requirements.lock
     if ($LASTEXITCODE) { throw "해시 붙이기 실패" }

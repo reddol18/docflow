@@ -60,6 +60,7 @@ def main(monkeypatch, tmp_path):
     monkeypatch.setattr(auth, "session_user", lambda t: auth.User(1, "a", "a", "admin") if t == "a" else None)
     monkeypatch.setattr(store, "DATA", tmp_path)
     stage(main, monkeypatch)
+    monkeypatch.setattr(main.runs, "active", lambda vol: None)  # 대기열 실행 상태(DB)는 test_queue_app_pg에서
     main.running.pop("v1", None)
     return main
 
@@ -348,16 +349,19 @@ def test_review_resume_reserves_first(main, monkeypatch):
     waiting = SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": []}, id="0" * 32)])
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: waiting))
     monkeypatch.setattr(main, "record_review", lambda vol, fl, fx, user: seen.append(main.running.get(vol)))
-    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: (submitted.append(reserved),
-                                                                                    args.append(arg)))
+    # 대기열에 넣은 뒤 검토 기록(before) — 기록할 때도 실행 표시가 서 있다
+    monkeypatch.setattr(main, "start_run", lambda vol, kind, arg, user, before=None: (before(), submitted.append(kind),
+                                                                                      args.append(arg)))
     main.resume_review("v1", [], {}, None, "0" * 32)
-    assert seen == ["queued"] and submitted == [True]
+    assert seen == ["queued"] and submitted == ["review"]
+    assert "v1" not in main.running  # 실행 표시는 이제 vol_run 행이 한다
     # 빈 fixes도 interrupt id로 집어 넘긴다 (https://github.com/reddol18/docflow/issues/120)
-    assert isinstance(args[0], main.Command) and args[0].resume == {"0" * 32: {}}
+    assert args[0] == {"resume": {"0" * 32: {}}}
     main.running.pop("v1", None)
 
     def boom(vol, fl, fx, user):
         raise RuntimeError("가상 저장 실패")
+    monkeypatch.setattr(main, "start_run", lambda vol, kind, arg, user, before=None: before())
     monkeypatch.setattr(main, "record_review", boom)
     with pytest.raises(RuntimeError):
         main.resume_review("v1", [], {}, None, "0" * 32)
@@ -379,7 +383,7 @@ def test_review_resume_rejects_stale_interrupt(main, monkeypatch, now):
              "changed": SimpleNamespace(interrupts=[SimpleNamespace(value={"flagged": []}, id="f" * 32)])}
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: snaps[now]))
     monkeypatch.setattr(main, "record_review", lambda *a: pytest.fail("이력을 남기면 안 됨"))
-    monkeypatch.setattr(main, "submit", lambda *a, **k: pytest.fail("흐름을 이으면 안 됨"))
+    monkeypatch.setattr(main, "start_run", lambda *a, **k: pytest.fail("흐름을 이으면 안 됨"))
     with pytest.raises(main.HTTPException) as e:
         main.resume_review("v1", [], {}, None, "0" * 32)
     assert e.value.status_code == 409 and "v1" not in main.running

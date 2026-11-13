@@ -89,7 +89,7 @@ def test_review_empty_submit_both_routes(main, monkeypatch):
     assert got == [{}, {}] and ids == [INTR_ID, INTR_ID]
 
 
-def test_search_ask_limits(main, monkeypatch):
+def test_search_ask_limits(main, monkeypatch, ask_inline):
     monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k, user=None: [])
     monkeypatch.setattr(main.llm, "answer", lambda q, hits, user_id=None: "답")
     monkeypatch.setattr(main.store, "take_quota", lambda *a: None)  # 호출 제한은 test_budget_pg에서
@@ -104,7 +104,7 @@ def test_search_ask_limits(main, monkeypatch):
     assert c.get("/ask", params={"q": ok + "가"}, headers=ADMIN).status_code == 422
 
 
-def test_search_ask_rate_and_budget_responses(main, monkeypatch):
+def test_search_ask_rate_and_budget_responses(main, monkeypatch, ask_inline):
     """두 경로 모두 호출 제한을 거치고(넘으면 429 + Retry-After), 검색·질문 예산이 차면 503 + 공개 문구
     (https://github.com/reddol18/docflow/issues/7). 실제 셈은 test_budget_pg"""
     seen = []

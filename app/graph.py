@@ -26,7 +26,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import errors, fields, flags, layout, line_crops, llm, ocr, store
+from app import cancel, errors, fields, flags, layout, line_crops, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -123,6 +123,7 @@ def traced(name, fn):
     """노드 시작·끝·오류를 events 표에 남긴다 (대시보드 진행 화면용)."""
     def run(s):
         vol, doc = s.get("vol"), s.get("doc_id")
+        cancel.check(vol)  # 워커가 그래프 임대를 잃었으면 노드 경계에서 끊는다 (app/cancel.py)
         store.event(vol, name, "start", doc)
         t0 = time.time()
         try:
@@ -197,20 +198,33 @@ class DocOut(TypedDict):
 
 # ---------- 철 단위 노드 ----------
 
+def vol_pages(vol):
+    return sorted(p.stem for p in store.pages_dir(vol).glob("*.jpg"))
+
+
+def ocr_one(vol, p):
+    """쪽 하나 OCR → 결과 파일. 이미 있으면 건너뛴다 (False). 대기열 워커의 쪽 작업(app/worker.py)과 아래 ocr 노드가 같이 쓴다.
+    결과는 임시 파일에 다 쓴 뒤 바꿔 넣는다 — 두 워커가 같은 쪽을 읽어도(되찾기) 반쯤 쓴 결과 파일이 보이지 않는다"""
+    out = store.ocr_path(vol, p)
+    if out.exists():
+        return False
+    t0 = time.time()
+    d = ocr.ocr_page(store.page_path(vol, p))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    tmp.write_text(json.dumps({"page": p, "seconds": round(time.time() - t0, 2), **d}, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, out)
+    print(f"ocr {p} {time.time() - t0:.1f}s boxes={len(d['items'])}", flush=True)
+    store.event(vol, "ocr_page", "end", None, page=p, seconds=round(time.time() - t0, 2), boxes=len(d["items"]))
+    return True
+
+
 def ocr_pages(s: VolState):
+    """대기열을 쓰면 쪽 OCR은 워커의 쪽 작업이 먼저 끝내 두므로 여기서는 건너뛰기만 한다 (남은 쪽이 있으면 읽는다)"""
     vol = s["vol"]
-    pages = sorted(p.stem for p in store.pages_dir(vol).glob("*.jpg"))
+    pages = vol_pages(vol)
     for p in pages:
-        out = store.ocr_path(vol, p)
-        if out.exists():
-            continue
-        t0 = time.time()
-        d = ocr.ocr_page(store.pages_dir(vol) / f"{p}.jpg")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"page": p, "seconds": round(time.time() - t0, 2), **d}, ensure_ascii=False),
-                       encoding="utf-8")
-        print(f"ocr {p} {time.time() - t0:.1f}s boxes={len(d['items'])}", flush=True)
-        store.event(vol, "ocr_page", "end", None, page=p, seconds=round(time.time() - t0, 2), boxes=len(d["items"]))
+        ocr_one(vol, p)
     return {"pages": pages}
 
 

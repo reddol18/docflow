@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 
 from openai import OpenAI
 
-from app import errors, fields, store
+from app import cancel, errors, fields, store
 
 PROVIDERS = ("openai", "local", "off")
 MODEL_ENV = {"extract": "EXTRACT_MODEL", "cell": "CELL_MODEL", "embed": "EMBED_MODEL", "chat": "CHAT_MODEL"}
@@ -230,6 +230,7 @@ class _Meter:
 def _metered(vol, kind, model, scope, tin_max, tout_max, user_id=None):
     """예약 → 호출 → 정산. local은 예약 없이 0원으로 남긴다. openai는 PRICE에 없는 모델이면 UnpricedModel,
     예약이 한도를 넘으면 BudgetExceeded — 둘 다 클라이언트를 만들거나 부르기 전에"""
+    cancel.check(vol)  # 그래프 임대를 잃은 워커는 예약하지 않고 끊는다 (https://github.com/reddol18/docflow/issues/5)
     m = _Meter()
     if PROVIDER.name == "local":  # 내부 주소만 허용(check_local_url) — 돈이 들지 않는다 (사용량은 0원으로 남긴다)
         yield m

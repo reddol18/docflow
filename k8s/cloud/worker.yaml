@@ -1,0 +1,108 @@
+# 클라우드용 워커 (https://github.com/reddol18/docflow/issues/5 — 노드 그룹 B·KEDA 측정은 https://github.com/reddol18/docflow/issues/16).
+# 맥에는 적용하지 않는다: 맥 deploy(scripts/deploy.ps1 → scripts/mac/deploy.sh)는 k8s/docs.yaml만 복사·apply한다.
+# k8s/docs.yaml의 docflow-worker를 이것으로 바꿔 쓴다 (같은 이름) — 다른 점만:
+#   - 노드 그룹 B(워커 전용, taint docflow/worker=true:NoSchedule)에만: nodeSelector + toleration
+#   - replicas는 KEDA가 정한다 (1~4개, 대기열 쪽 OCR 작업 50개당 1개)
+#   - Redis는 관리형(Valkey/Redis, TLS) — 주소는 설치 환경마다. CA는 Secret redis-ca(ca.crt) 하나를 앱(REDIS_CA_FILE)과 KEDA가 같이 쓴다.
+#     ACL: 앱 사용자 docflow(Secret redis-auth password, 규칙은 k8s/docs.yaml·app/jobqueue_redis.py acl_rules와 같게),
+#     KEDA 읽기 전용 사용자 keda(Secret redis-keda password): ~{docflow:q}:* resetchannels -@all +ping +xlen +xinfo|groups +xinfo|stream +xpending
+#     — 관리형 Redis의 ACL·보안 그룹(워커·API·KEDA에서만 6379)은 https://github.com/reddol18/docflow/issues/16 에서 정한다
+#   - 쪽 이미지·OCR 결과 공유: 여러 노드의 워커가 같은 파일을 봐야 한다 → RWO PVC가 아니라 RWX(파일 스토리지) 또는
+#     오브젝트 스토리지가 필요하다. 아래는 RWX PVC 이름(docflow-data-rwx) 자리만 둔다 — 정하는 것은 https://github.com/reddol18/docflow/issues/16
+# 이미지는 레지스트리 이름·다이제스트로 (맥의 docflow:dev·imagePullPolicy: Never는 단일 노드 전용)
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: docflow-worker, namespace: docs}
+spec:
+  replicas: 1  # KEDA ScaledObject가 덮어쓴다
+  strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}  # 워커는 여럿이 같이 돌아도 된다 (대기열이 나눠 줌)
+  selector: {matchLabels: {app: docflow-worker}}
+  template:
+    metadata: {labels: {app: docflow-worker}}
+    spec:
+      nodeSelector: {docflow/node-group: b}
+      tolerations:
+      - {key: docflow/worker, operator: Equal, value: "true", effect: NoSchedule}
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      containers:
+      - name: worker
+        image: REGISTRY/docflow@sha256:DIGEST  # 배포 때 실제 레지스트리·다이제스트로
+        imagePullPolicy: IfNotPresent
+        command: [python, -m, app.worker]
+        env:
+        - {name: DOCFLOW_REQUIRE_TLS, value: "1"}
+        - {name: PG_URL, value: "postgresql://docflow@PG_HOST:5432/docflow?sslmode=verify-full&sslrootcert=/etc/docflow-ca/ca.crt"}
+        - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
+        - {name: QDRANT_URL, value: "https://QDRANT_HOST:6333"}
+        - {name: QDRANT_CA_FILE, value: /etc/docflow-ca/ca.crt}
+        - {name: QDRANT_API_KEY_FILE, value: /etc/qdrant/api-key}
+        - {name: OCR_THREADS, value: "4"}
+        - {name: QUEUE_BACKEND, value: redis}
+        - {name: REDIS_URL, value: "rediss://REDIS_HOST:6379/0"}
+        - {name: REDIS_USERNAME, value: docflow}
+        - {name: REDIS_PASSWORD_FILE, value: /etc/redis-auth/password}
+        - {name: REDIS_CA_FILE, value: /etc/redis-ca/ca.crt}  # KEDA TriggerAuthentication의 ca와 같은 Secret
+        - {name: DAILY_BUDGET_USD, value: "3.0"}
+        - {name: DAILY_QUERY_BUDGET_USD, value: "0.6"}
+        - {name: LLM_PROVIDER, value: "openai"}
+        - {name: AUTH_MODES, value: "local"}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: HOME, value: /home/app}
+        resources: {requests: {cpu: 1200m, memory: 1280Mi}, limits: {memory: 3Gi}}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+        - {name: openai, mountPath: /etc/openai, readOnly: true}
+        - {name: ca, mountPath: /etc/docflow-ca, readOnly: true}
+        - {name: qdrant-key, mountPath: /etc/qdrant, readOnly: true}
+        - {name: redis-auth, mountPath: /etc/redis-auth, readOnly: true}
+        - {name: redis-ca, mountPath: /etc/redis-ca, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+        - {name: pdx-temp, mountPath: /opt/paddlex/temp}
+        - {name: pdx-locks, mountPath: /opt/paddlex/locks}
+        - {name: pdx-func, mountPath: /opt/paddlex/func_ret}
+        - {name: home, mountPath: /home/app}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: docflow-data-rwx}}
+      - {name: openai, secret: {secretName: openai, optional: true}}
+      - {name: ca, configMap: {name: docflow-ca}}
+      - {name: qdrant-key, secret: {secretName: qdrant-api-key, defaultMode: 0440}}
+      - {name: redis-auth, secret: {secretName: redis-auth, defaultMode: 0440}}
+      - {name: redis-ca, secret: {secretName: redis-ca, defaultMode: 0440}}
+      - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+      - {name: pdx-temp, emptyDir: {sizeLimit: 256Mi}}
+      - {name: pdx-locks, emptyDir: {sizeLimit: 1Mi}}
+      - {name: pdx-func, emptyDir: {sizeLimit: 64Mi}}
+      - {name: home, emptyDir: {sizeLimit: 256Mi}}
+---
+# KEDA redis-streams 스케일러: 쪽 OCR 스트림 길이(완료하면 XDEL하므로 = 아직 안 끝난 작업 수) 50개당 워커 1개, 1~4개.
+# 스트림 이름은 해시 태그가 붙은 키 그대로 (app/jobqueue_redis.py — 클러스터 한 슬롯)
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: {name: docflow-worker, namespace: docs}
+spec:
+  scaleTargetRef: {name: docflow-worker}
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 300  # 줄일 때는 천천히 — 줄어드는 워커의 작업은 되찾기(120초)가 잇는다
+  triggers:
+  - type: redis-streams
+    metadata:
+      address: "REDIS_HOST:6379"
+      stream: "{docflow:q}:ocr_page"
+      consumerGroup: workers
+      streamLength: "50"
+      enableTLS: "true"
+    authenticationRef: {name: docflow-redis}
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata: {name: docflow-redis, namespace: docs}
+spec:
+  secretTargetRef:
+  - {parameter: username, name: redis-keda, key: username}  # 읽기 전용 사용자 (머리말)
+  - {parameter: password, name: redis-keda, key: password}
+  - {parameter: ca, name: redis-ca, key: ca.crt}  # 앱 REDIS_CA_FILE과 같은 Secret
