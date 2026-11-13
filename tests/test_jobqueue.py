@@ -601,9 +601,6 @@ def test_real_redis_acl_user_is_narrow(request):
 
 
 MANIFEST = Path(__file__).resolve().parents[1] / "k8s" / "docs.yaml"
-# AOF 적재기가 default 권한으로 다시 검사하는 명령 — 실제 Redis 7.4.12 AOF의 MULTI/EXEC 안에서 나온 것(아래 실제 Redis 시험이
-# 이보다 많으면 실패) + SELECT. 이것이 빠지면 재시작 때 대기열을 잃는다 (https://github.com/reddol18/docflow/issues/5)
-AOF_REQUIRED = {"multi", "exec", "select", "xadd", "xack", "xdel", "xclaim", "xgroup|setid", "xtrim"}
 
 
 def manifest_acl_lines(pw: str) -> list[str]:
@@ -616,16 +613,16 @@ def manifest_acl_lines(pw: str) -> list[str]:
 def test_manifest_redis_acl_matches_code():
     """맥 Redis 매니페스트가 코드와 같은 ACL 규칙을 쓰고, default 사용자는 끄되 AOF 적재기 몫 권한은 둔다
     (k8s/docs.yaml redis 초기화 컨테이너). 실제 Redis 없이도 버그(default 리셋 → 재시작 때 NOPERM으로 대기열 잃음)를 막는다"""
-    from app.jobqueue_redis import ACL_COMMANDS, AOF_LOADER_ACL, acl_rules
+    from app.jobqueue_redis import ACL_COMMANDS, AOF_LOADER_ACL, AOF_LOADER_COMMANDS, acl_rules
     default, docflow = manifest_acl_lines("PW")
     assert docflow == "user docflow on >PW " + " ".join(acl_rules())
     assert default == "user default " + AOF_LOADER_ACL
+    # AOF 적재기가 default 권한으로 다시 검사하는 명령(AOF_LOADER_COMMANDS — 실제 Redis 7.4.12 AOF의 MULTI/EXEC 안 명령 + SELECT,
+    # 아래 실제 Redis 시험이 확인)이 정확히 열려 있어야 한다: 빠지면 재시작 때 대기열을 잃고, 넓히면 켜졌을 때 위험하다
     words = AOF_LOADER_ACL.split()
     assert words[0] == "off"
-    assert not any(w in ("on", "nopass", "reset", "allcommands", "allkeys", "~*", "+@all") or w.startswith(("-", ">", "#", "<", "!"))
-                   for w in words), words  # '-'로 시작하는 규칙(-@all 등)이 있으면 리셋과 같다
-    assert "~{docflow:q}:*" in words
-    assert {f"+{c}" for c in AOF_REQUIRED} <= set(words), AOF_REQUIRED - {w[1:] for w in words}
+    assert {w for w in words if w.startswith("+")} == {f"+{c}" for c in AOF_LOADER_COMMANDS}
+    assert {w for w in words if not w.startswith("+")} == {"off", "resetchannels", "~{docflow:q}:*"}  # '-' 규칙·비밀번호·on 없음
     assert "requirepass" not in MANIFEST.read_text(encoding="utf-8")
     assert all(c in ("ping", "client|setinfo", "time") or c.startswith(("x", "eval", "script")) for c in ACL_COMMANDS)
 
@@ -660,21 +657,25 @@ class RedisProc:
             self.admin = redis.Redis(host="127.0.0.1", port=self.port, username="t-admin", password=self.admin_pw,
                                      decode_responses=True, socket_timeout=5)
             seen = len(self.log())
+            (self.dir / "redis.pid").unlink(missing_ok=True)  # 정리(kill)가 지난 시도의 pid를 죽이지 않게
             self.p = subprocess.Popen(self.cmd, cwd=self.dir, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                       stderr=subprocess.DEVNULL, text=True)
             self.p.stdin.write(f"port {self.port}\n{self.conf}")
             self.p.stdin.close()
-            end = time.monotonic() + 20
+            end, timed_out = time.monotonic() + 20, False
             while True:
                 try:
                     if self.admin.ping():
                         return
+                except redis.exceptions.TimeoutError:  # 이 포트로는 닿지 않는다 (WSL 전달 등) → 다른 포트로
+                    timed_out = True
+                    break
                 except redis.exceptions.ConnectionError:
                     pass
                 if self.p.poll() is not None or time.monotonic() > end:
                     break
                 time.sleep(0.1)
-            if "Address already in use" not in self.log()[seen:]:
+            if not timed_out and "Address already in use" not in self.log()[seen:]:
                 break
             self.kill()
         pytest.fail(f"redis-server 시작 실패 (종료 코드 {self.p.poll()})\n{self.log()[-2000:]}")
@@ -702,7 +703,8 @@ class RedisProc:
             time.sleep(0.2)
 
     def kill(self) -> None:
-        """정리: 정상 종료가 안 되면 서버 프로세스를 죽인다 — wsl로 띄웠으면 Linux 쪽 redis-server도 (pidfile)"""
+        """정리: 정상 종료가 안 되면 서버 프로세스를 죽인다 — 앞에 붙은 실행 명령(예: wsl -e)이 있으면 그것으로 그쪽
+        redis-server도 (pidfile)"""
         if not self.p or self.p.poll() is not None:
             return
         try:
@@ -717,8 +719,9 @@ class RedisProc:
         pid_file = self.dir / "redis.pid"
         if pid_file.exists():
             pid = pid_file.read_text().strip()
-            if Path(self.cmd[0]).stem.lower() == "wsl":
-                subprocess.run(["wsl", "-e", "kill", "-9", pid], timeout=30, check=False)  # noqa: S603,S607 — 시험 정리
+            prefix = self.cmd[:-2]  # redis-server 경로 앞 (예: ["wsl", "-e"] 또는 ["wsl", "-d", "Ubuntu", "-e"])
+            if prefix:
+                subprocess.run([*prefix, "kill", "-9", pid], timeout=30, check=False)  # noqa: S603 — 시험 정리
             else:
                 os.kill(int(pid), 9)
         self.p.kill()
@@ -824,8 +827,8 @@ def test_redis_aof_restart_keeps_queue(tmp_path, request, default_line):
         return {k: (len(v["entries"]), len(v["pending"]), len(v["dead"])) for k, v in s.items()} if s else "스트림 없음"
     print(f"\n[{default_line or acl[0]}] 전 {brief(before)} 후 {brief(after)} 같음={after == before} NOPERM={noperm}"
           f"\n  AOF MULTI/EXEC 안 명령: {sorted(inside)}\n  밖: {sorted(outside)}")
-    # MULTI/EXEC 안 명령은 모두 AOF_REQUIRED(정적 시험이 매니페스트에 있는지 본다)·AOF_LOADER_COMMANDS 안에 있어야 한다
-    assert inside <= AOF_REQUIRED <= set(AOF_LOADER_COMMANDS), (inside - AOF_REQUIRED, AOF_REQUIRED - set(AOF_LOADER_COMMANDS))
+    # MULTI/EXEC 안 명령은 모두 AOF_LOADER_COMMANDS 안에 있어야 한다 (정적 시험이 매니페스트가 그것과 같은지 본다)
+    assert inside <= set(AOF_LOADER_COMMANDS), inside - set(AOF_LOADER_COMMANDS)
     if default_line:  # 옛 줄: 재시작 때 NOPERM으로 묶음을 버려 상태를 잃는다
         assert noperm > 0 and after != before
     else:
