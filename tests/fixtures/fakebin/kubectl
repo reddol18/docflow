@@ -1,0 +1,4 @@
+#!/bin/sh
+# 시험용 가짜 kubectl — 클러스터에 닿지 못하는 상태를 흉내 낸다 (disk_check.sh의 보수적 문턱 시험)
+echo "fake kubectl: 클러스터 없음" >&2
+exit 1

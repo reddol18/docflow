@@ -353,6 +353,30 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 - k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
 - emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi(업로드 본문을 Starlette가 흘려 쓰는 곳). 넘으면 kubelet이 docflow 파드를 내쫓으므로 앱이 업로드를 묶는다(`app/upload.py`, https://github.com/reddol18/docflow/issues/26): 파일 하나 `UPLOAD_MAX_MB`(기본 20, 넘으면 413), 요청 하나 `UPLOAD_MAX_FILES`장(기본 50, 넘으면 400), 픽셀 수 `UPLOAD_MAX_MPX`(기본 100MP — A3 600dpi ≈ 70MP, 넘으면 400), 스캔 수 `UPLOAD_MAX_SCANS`(기본 64, 넘으면 400), 요청 본문 `UPLOAD_MAX_BODY_MB`(기본 210 — 화면이 10장씩 보냄, 받은 바이트로 세어 413), 동시에 받는 본문 합계 `UPLOAD_TMP_MB`(기본 1536, 넘으면 429), 동시 디코드 검사 `UPLOAD_DECODE_SLOTS`(기본 2). 본문은 로그인·역할·CSRF 확인 뒤에 읽는다. 같은 이름의 다른 내용은 409, `?replace=true`면 바꾸고 그 쪽 OCR을 지운다. 새 쪽·교체는 처음·끝난 철만(실행 중·검토 대기·멈춤은 409), 끝난 철은 `/run`으로 다시.
 
+### colima 디스크 정리 기준 (https://github.com/reddol18/docflow/issues/119)
+
+맥 colima VM의 이미지 디스크(`/var/lib/containerd`·`/var/lib/rancher`·`/mnt/lima-colima`가 같은 `/dev/vdb1` 30GB)가 kubelet 이미지 GC 문턱(이 노드 configz 실측 high 85% / low 80%)에 닿으면 kubelet이 **돌고 있는 컨테이너가 쓰지 않고 고정(pin)되지 않은 이미지**를 오래된 것부터 low까지 지운다. 배포 중(빌드 뒤~새 파드 전, Recreate로 옛 파드가 내려간 사이) `docflow:dev`가 여기에 걸려 지워지면 `imagePullPolicy: Never`라 새 파드가 `ErrImageNeverPull`로 멈춘다(2026-11-10 약 10분 중단).
+
+- **주 방어 — 고정(pin):** `scripts/mac/build_image.sh`가 빌드 직후 `docflow:dev`·`docflow-web:dev`에 containerd 라벨 `io.cri-containerd.pinned=pinned`를 붙이고 `crictl inspecti`의 `pinned: true`를 1초 간격으로 10번까지 확인한다(`== 이미지 고정` 줄, 라벨은 CRI에 아직 안 보여도 먼저 붙인다). 배포 경로(`build_image.sh all deploy`·`… rebuild`)에서는 두 번 시도해도 고정이 안 되면 빌드가 실패로 멈춰 apply·롤아웃까지 가지 않는다 — 손으로 빌드하면 경고만. kubelet GC는 고정 이미지를 지우지 않는다 — 2026-11-13 이 클러스터(k3s v1.35, containerd v2.3.1)에서 붙이고 떼어 `pinned`가 true/false로 바뀌는 것을 확인. 라벨은 이름 ref에만 붙이므로 새 빌드가 태그를 옮기면 옛 판 ID는 CRI가 고정을 푼다 — 빌드 뒤 그것을 확인만 하고, 남아 있으면 `!!`(고정된 옛 판은 GC되지 않아 디스크를 잡는다). 코드는 `scripts/mac/pin_image.sh`.
+- **보조 — 롤아웃 전 확인:** `scripts/mac/deploy.sh`가 docflow 재시작 전·web 재시작 전에 이미지가 있고 고정됐는지 본다(`== 이미지 확인(…)` 줄). 고정이 빠졌으면 다시 고정하고 안 되면 멈춘다. 없으면 빌드 캐시로 그 이미지만 다시 빌드(`build_image.sh api|web rebuild`), 그래도 없으면 롤아웃하지 않고 멈춘다. 롤아웃이 실패하고 파드가 `ErrImageNeverPull`이면 원인과 되살리는 순서를 크게 찍는다.
+- **디스크 확인:** `scripts/mac/disk_check.sh` — 사용률은 kubelet과 같은 식 `100 - 내림(여유×100/크기)`(df의 크기·여유; 예약 블록 때문에 '사용/크기'보다 약 5%p 높다). 이번에 더 쓸 양을 뺀 여유로 잰 사용률이 `GC high - 여유`(기본 85 - 3 = 82%) 이상이면 멈춘다. 문턱은 노드 kubelet 설정(`kubectl get --raw /api/v1/nodes/<노드>/proxy/configz`)에서 읽고, 못 읽으면 보수적으로 high 80%로 재며 `!!`로 알린다. 빌드는 2GB를 더 쓴다고 보고, 다시 빌드(`rebuild`)는 이미지 하나 크기(docflow 1400M, web 450M — 압축 층 + 풀린 스냅숏 실측)로 여유 1%p(기본 84% 이상이면 멈춤, `DISK_GC_REBUILD_MARGIN_PCT`)로 잰다. 경계 근거: 보통 여유 3%p(82%)면 GC 직후(low 80% 근처) 늘 막혀 되살릴 수 없고, 0%p면 high 바로 아래까지 채워 롤아웃 중 로그 같은 작은 쓰기로 high에 닿아 GC가 다른 프로젝트 이미지를 지울 수 있다 — 1%p는 이 디스크에서 약 300MB. 막히면 `!!`와 함께 "정리 뒤 `sh ~/doc_platform/scripts/build_image.sh api rebuild`"를 안내한다. 값은 그 파일 머리 한 곳(`DISK_GC_MARGIN_PCT`·`DISK_MIN_VM_GB`·`DISK_MIN_HOST_GB`·`DISK_IMAGE_FS` 등)이고, 배포(`scripts/deploy.ps1`·`scripts/mac/deploy.sh`)는 이 변수들을 모두 지우고 부른다. 시험 값은 넷을 함께: `DISK_TEST_IMG_PCT=84 DISK_TEST_IMG_SIZE_GB=30 DISK_TEST_VM_AVAIL_GB=8 DISK_TEST_HOST_AVAIL_GB=30 sh ~/doc_platform/scripts/disk_check.sh 2` → 91%로 멈춤(종료 코드 1).
+- **목록 보기 (읽기만, 지우지 않음):** 맥에서 `sh ~/doc_platform/scripts/image_list.sh` — 사용률·문턱, 이미지 ID마다 쓰는 네임스페이스와 판단, 고정된 이미지, 빌드 캐시 크기. 손으로 볼 때는:
+
+  | 무엇 | 명령 (맥) |
+  |---|---|
+  | 사용률 | `colima ssh -- df -Pk /var/lib/containerd` (사용률 = 100 - 내림(Available×100/1024-blocks)) |
+  | 이미지 (크기·태그 없음 포함) | `colima nerdctl -- --namespace k8s.io images` 또는 `colima ssh -- sudo crictl images` |
+  | 고정된 이미지 | `colima ssh -- sudo ctr -n k8s.io images ls \| grep pinned=pinned` |
+  | 워크로드가 쓰는 이미지 | `kubectl get deploy,statefulset,daemonset -A -o wide` (0개로 줄인 것도 정의가 남아 있으면 그 이미지는 그 프로젝트 것) |
+  | 빌드 캐시 | `colima ssh -- sudo buildctl du` (2026-11-13: 16.27GB, 디스크의 절반 남짓 — 이 VM에서 빌드하는 모든 프로젝트가 함께 씀) |
+  | GC 문턱 | `kubectl get --raw /api/v1/nodes/<노드>/proxy/configz` 의 `imageGC*` |
+
+- **판단 (사용자가 한다):** 지울지는 사용자가 정하고, 지우는 명령도 사용자가 직접 친다 — 스크립트는 지우지 않는다.
+  - 후보: `docs` 네임스페이스의 예전 판·태그 없는 docflow 빌드, 쌓인 빌드 캐시(가장 크다. 지우면 다음 빌드가 느려지고 다른 프로젝트 빌드 캐시도 함께 줄어든다).
+  - **대상 아님:** 다른 프로젝트 네임스페이스(bank-a·bank-b·gateway·ocr·queue·keda·sllm)가 쓰거나 같은 이름을 쓰는 이미지(0개로 줄였어도), `kube-system`·pause 같은 시스템 이미지, 지금 `docs`가 쓰는 이미지. 이름도 태그도 없는 이미지는 주인을 모르므로 확인 전엔 두기.
+  - 고정을 풀어야 지울 수 있다(우리 이미지만): `colima ssh -- sudo ctr -n k8s.io images label docker.io/library/docflow:dev io.cri-containerd.pinned=`.
+  - 목표: 다음 배포의 빌드 몫(2GB)을 더해도 멈춤 기준(82%) 아래 — 2026-11-13 실측은 지금 75%, +2GB면 82%라 **정리 전에는 배포가 멈춘다**. 맥 호스트(`df -g /Users`)도 10GB 이상.
+
 ## 개발 절차
 
 - 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).
