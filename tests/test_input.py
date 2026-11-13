@@ -91,7 +91,7 @@ def test_review_empty_submit_both_routes(main, monkeypatch):
 
 def test_search_ask_limits(main, monkeypatch, ask_inline):
     monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k, user=None: [])
-    monkeypatch.setattr(main.llm, "answer", lambda q, hits, user_id=None: "답")
+    monkeypatch.setattr(main.llm, "answer", lambda q, hits, user_id=None: ("답", []))
     monkeypatch.setattr(main.store, "take_quota", lambda *a: None)  # 호출 제한은 test_budget_pg에서
     c = TestClient(main.app)
     ok = "가" * main.Q_MAX

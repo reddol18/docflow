@@ -6,6 +6,8 @@ psycopg-pool==3.3.3
 fastapi==0.162.0
 python-multipart==0.0.32
 httpx==0.28.1
+# 접근 로그 질의 떼기를 실제 uvicorn으로 확인 (tests/test_llm_boundary.py, https://github.com/reddol18/docflow/issues/27). 이미지와 같은 판
+uvicorn==0.54.0
 argon2-cffi==25.1.0
 PyJWT[crypto]==2.15.1
 langgraph==1.2.18

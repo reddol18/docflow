@@ -81,6 +81,10 @@ from app import upload as uploads  # 경로 함수 이름 upload와 겹치지 �
 from app.auth import Admin, Reviewer, Viewer, audit_as
 from app.review_input import EDITABLE, changes, clean_fixes
 
+# uvicorn 접근 로그에서 질의 문자열(/search·/ask의 q — 실명 등이 들어갈 수 있음)을 뗀다. 접근 로그는 남긴다
+# (https://github.com/reddol18/docflow/issues/27, app/errors.py AccessLogNoQuery)
+errors.install_access_log_filter()
+
 # 점만으로 된 이름(., .., ...)은 경로 이탈이라 거부. fullmatch + \Z — '$'는 끝 줄바꿈 앞에서도 맞아 'v1\n'이 지나간다
 VOL_RX = re.compile(r"(?!\.+\Z)[\w.-]{1,80}")
 Q_MAX = 200  # 검색어 길이 상한: 질의는 문서 제목(색인 칸 500자 안)보다 짧고, 임베딩·답변 입력 토큰을 묶는다
@@ -1571,12 +1575,13 @@ def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewe
 
 
 def ask_answer(q, year_from, year_to, user):
-    """검색 상위 문서로 답한다 — 워커의 ask 작업(app/worker.py)이 부른다"""
+    """검색 상위 문서로 답한다 — 워커의 ask 작업(app/worker.py)이 부른다.
+    warnings: 답에서 지운 근거 없는 인용 등 (https://github.com/reddol18/docflow/issues/27, 없으면 빈 목록)"""
     hits = hybrid(q, year_from, year_to, 5, user)
     for h in hits:
         h["body"] = " ".join(store.load_ocr(h["vol"], h["doc_id"])["lines"][:40])
-    return {"answer": llm.answer(q, hits, user_id=getattr(user, "id", None)),
-            "sources": [{k: h[k] for k in h if k != "body"} for h in hits]}
+    text, warnings = llm.answer(q, hits, user_id=getattr(user, "id", None))
+    return {"answer": text, "sources": [{k: h[k] for k in h if k != "body"} for h in hits], "warnings": warnings}
 
 
 # /ask가 워커의 답을 기다리는 최대 초 — 넘으면 202 {id}, 화면은 GET /ask/{id}를 1초마다 (frontend/src/lib/api.ts).

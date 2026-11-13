@@ -281,7 +281,7 @@ def test_ask_through_queue(app, monkeypatch):
     """/ask → 요청 행(질문 본문) + 대기열(id만) → 워커 → 결과 조회. 기다림 안에 못 끝나면 202 {id} → /ask/{id}.
     다른 사람은 남의 요청을 못 본다. 대기열이 가득 차면 429"""
     monkeypatch.setattr(app.main, "hybrid", lambda q, yf, yt, k, user=None: [])
-    monkeypatch.setattr(app.main.llm, "answer", lambda q, hits, user_id=None: "가상 답")
+    monkeypatch.setattr(app.main.llm, "answer", lambda q, hits, user_id=None: ("가상 답", []))
     monkeypatch.setattr(app.main, "ASK_WAIT", 0)
     r = app.c.get("/ask", params={"q": "가상 질문"}, headers=ADMIN)
     assert r.status_code == 202
@@ -293,7 +293,7 @@ def test_ask_through_queue(app, monkeypatch):
     worker.drain(worker.Worker(q=app.q))
     assert app.c.get(f"/ask/{req}", headers=VIEWER2).status_code == 404  # 남의 요청
     r = app.c.get(f"/ask/{req}", headers=ADMIN)
-    assert r.status_code == 200 and r.json() == {"answer": "가상 답", "sources": []}
+    assert r.status_code == 200 and r.json() == {"answer": "가상 답", "sources": [], "warnings": []}
     assert app.c.get(f"/ask/{req}", headers=ADMIN).status_code == 404  # 한 번 돌려주면 지운다
     assert app.c.get("/ask/..%2F..", headers=ADMIN).status_code == 404
     # 기다림 안에 끝나면 예전처럼 바로 답 (워커가 다른 스레드에서 돈다)

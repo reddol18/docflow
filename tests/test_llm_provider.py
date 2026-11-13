@@ -10,6 +10,11 @@ import pytest
 
 from app import errors, llm
 
+# 김해 스키마 prompt 칸 4개를 다 채운 추출 응답 — 칸이 빠지면 '추출 실패'다
+# (fields.validate_extract, https://github.com/reddol18/docflow/issues/27)
+GOOD_EXTRACT = ('{"docno": {"value": "", "confidence": 0.5}, "date": {"value": "", "confidence": 0.5}, '
+                '"recipient": {"value": "", "confidence": 0.5}, "title": {"value": "가상 제목", "confidence": 0.9}}')
+
 
 class FakeOpenAI:
     """OpenAI 대신 끼우는 가짜. 만든 횟수·부른 인자를 센다"""
@@ -23,7 +28,7 @@ class FakeOpenAI:
             FakeOpenAI.calls.append(("chat", a))
             return SimpleNamespace(usage=None, choices=[SimpleNamespace(
                 finish_reason="stop", logprobs=None,
-                message=SimpleNamespace(content='{"title": {"value": "가상 제목", "confidence": 0.9}}'))])
+                message=SimpleNamespace(content=GOOD_EXTRACT))])
 
         def embed(**a):
             FakeOpenAI.calls.append(("embed", a))

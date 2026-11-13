@@ -27,7 +27,9 @@ rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 �
 칸 검증 규칙(validate: 필수·길이·정규식·코드표·철 안 중복)은 app/field_rules.py — 읽을 때 검사·컴파일한다
 (https://github.com/reddol18/docflow/issues/87).
 """
+import functools
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -330,7 +332,8 @@ def extract_prompt(s):
 
 def parse_extract(s, content):
     """추출 응답 JSON 글자 → prompt 칸별 {value, confidence}. 모양이 틀린 칸은 빈 값·확신도 0, JSON 자체가 깨지면 ValueError.
-    app/llm.extract와 모델 비교 하네스(eval/promptfoo/)가 같이 쓴다 (여기 두는 이유: openai를 불러오지 않는 가벼운 모듈)"""
+    틀린 칸을 알려 주지 않는 너그러운 읽기 — 지금은 빈 추출 값(parse_extract(s, "{}"))을 만들 때만 쓴다.
+    운영 추출·평가 하네스의 응답 판정은 validate_extract (https://github.com/reddol18/docflow/issues/27)"""
     out = json.loads(content)
     if not isinstance(out, dict):
         out = {}
@@ -343,6 +346,78 @@ def parse_extract(s, content):
             conf = 0.0
         return {"value": str(v.get("value") or ""), "confidence": conf}
     return {f["name"]: cell(out.get(f["name"])) for f in prompt_fields(s)}
+
+
+class ExtractInvalid(ValueError):
+    """운영 추출 응답이 스키마에 맞지 않음 (https://github.com/reddol18/docflow/issues/27).
+    메시지는 칸 이름·오류 종류만 — 응답 값(OCR에서 온 원문)은 넣지 않는다 (서버 로그에 그대로 남아도 되게)"""
+
+
+class Extracted(dict):
+    """validate_extract 결과: prompt 칸별 {value, confidence} (보통 dict처럼 쓴다) + 틀린 칸.
+    failed  모양이 틀려 빈 값으로 둔 칸 이름 (스키마 순서)
+    problems  칸마다 오류 분류 ('recipient: model_type' 꼴 — 칸 이름·종류만, 응답 값 없음. 서버 로그용)"""
+    failed: tuple = ()
+    problems: tuple = ()
+
+
+@functools.cache
+def _cell_model():
+    """추출 응답의 칸 하나 {value, confidence} pydantic 모델 — 처음 쓸 때 만든다 (pydantic은 여기서만 불러온다:
+    평가 하네스 eval/promptfoo가 문서마다 Python을 새로 띄워 이 모듈을 부르므로, 불러오는 비용을 쓰는 곳으로 미룬다).
+    value: 글자·숫자(글자로 바꿈 — 예전 parse_extract도 받던 것. 정수인 소수는 정수 꼴, NaN·Infinity는 validate_extract가
+    틀린 칸으로)·null. confidence: 0~1 숫자 (문자열 "0.9"·true·범위 밖은 틀림).
+    다른 키는 버린다"""
+    from typing import Annotated
+
+    from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr
+
+    class ExtractCell(BaseModel):
+        model_config = ConfigDict(extra="ignore", strict=True)
+        value: StrictStr | StrictInt | StrictFloat | None
+        confidence: Annotated[float, Field(ge=0, le=1)]
+    return ExtractCell
+
+
+def validate_extract(s, content):
+    """추출 응답(운영 app/llm.extract, 평가 하네스 eval/promptfoo check.py·gate.py가 같이 씀) → Extracted.
+    칸마다 따로 본다 (https://github.com/reddol18/docflow/issues/27): 칸이 없음·null·객체가 아님(문자열 등)·value가 글자/숫자가
+    아님·confidence가 숫자가 아님·0~1 밖이면 그 칸만 빈 값·확신도 0으로 두고 failed에 넣는다. 맞는 칸은 값을 그대로 쓴다.
+    응답 전체가 JSON 객체가 아닐 때만 ExtractInvalid (부른 쪽이 그 문서의 추출 칸을 모두 실패로).
+    모르는 칸은 버린다. pydantic 오류는 입력 값을 싣기 때문에 위치·종류만 옮긴다 (include_input=False)"""
+    from pydantic import ValidationError
+    try:
+        out = json.loads(content)
+    except (TypeError, ValueError):
+        raise ExtractInvalid("JSON이 아님") from None
+    if not isinstance(out, dict):
+        raise ExtractInvalid(f"JSON 객체가 아님 ({type(out).__name__})")
+    model = _cell_model()
+    res, failed, probs = Extracted(), [], []
+    for f in prompt_fields(s):
+        n = f["name"]
+        res[n] = {"value": "", "confidence": 0.0}
+        if out.get(n) is None:
+            failed.append(n)
+            probs.append(f"{n}: {'null' if n in out else '칸 없음'}")
+            continue
+        try:
+            c = model.model_validate(out[n])
+        except ValidationError as e:
+            failed.append(n)
+            probs += [n + "".join(f".{x}" for x in err["loc"]) + f": {err['type']}"
+                      for err in e.errors(include_input=False, include_url=False, include_context=False)]
+            continue
+        v = c.value
+        if isinstance(v, float) and not math.isfinite(v):  # NaN·Infinity(json이 받아 줌)는 값이 아니다
+            failed.append(n)
+            probs.append(f"{n}.value: finite_number")
+            continue
+        if isinstance(v, float) and v.is_integer():  # 12345.0 → "12345" (문서번호·연도 등이 소수점 꼴로 오면)
+            v = int(v)
+        res[n] = {"value": "" if v is None else str(v), "confidence": float(c.confidence)}
+    res.failed, res.problems = tuple(failed), tuple(probs)
+    return res
 
 
 def assemble(s, llm_out, rule_values):
