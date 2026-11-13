@@ -125,7 +125,9 @@ def test_cancelled_with_postgres_checkpointer(pg_store):
     with pytest.raises(cancel.Cancelled):
         G.invoke({"log": []}, cfg)
     snap = G.get_state(cfg)
-    assert not snap.next and snap.tasks  # PG에서는 next가 비고 tasks에만 남는다 — 워커는 둘 다 본다
+    # PG에서는 체크포인트를 다음 단계와 겹쳐 쓰므로 끊긴 때에 따라 next에 남거나(b 앞 체크포인트가 저장됨) next가 비고 tasks에만
+    # 남는다(앞 단계 대기 쓰기만 저장) — 둘 다 나온다(이 PC에서 두 경우 모두 봄). 워커는 둘 다 '중간에 멈춤'으로 본다
+    assert snap.next or snap.tasks
     from app.worker import unfinished
     assert unfinished(snap)
     cancel.disarm(vol, ev)
