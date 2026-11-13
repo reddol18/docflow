@@ -249,6 +249,25 @@ def test_keycloak_image_pinned_and_limited():
     assert quota["limits.memory"] == "1Gi" and quota["persistentvolumeclaims"] == "1"
 
 
+def test_keycloak_built_by_init_containers():
+    """공식 이미지는 미리 빌드돼 있지 않다 — 첫 시작에 --optimized가 거부된다(2026-11-13 맥 실측). 초기화 컨테이너가 lib/quarkus를
+    emptyDir로 복사(cp -R)하고 kc.sh build, 본 컨테이너가 그 결과로 start --optimized. 모두 같은 고정 이미지·루트 FS 읽기 전용"""
+    spec = _get(KC, "Deployment", "keycloak")["spec"]["template"]["spec"]
+    inits = {c["name"]: c for c in spec["initContainers"]}
+    assert list(inits) == ["copy-quarkus", "build"]  # 순서: 복사 → 빌드
+    assert "cp -R /opt/keycloak/lib/quarkus/. /qk/" in inits["copy-quarkus"]["command"][-1]
+    assert inits["build"]["args"][0] == "build" and "--db=dev-file" in inits["build"]["args"]
+    vols = {v["name"]: v for v in spec["volumes"]}
+    assert "emptyDir" in vols["quarkus"]
+    for c in [*inits.values(), KC_C]:
+        assert c["image"] == KC_C["image"]
+        assert c["securityContext"]["readOnlyRootFilesystem"] is True and c["securityContext"]["capabilities"]["drop"] == ["ALL"]
+        assert c["resources"]["limits"]["memory"]
+    mounts = lambda c: {m["name"]: m["mountPath"] for m in c["volumeMounts"]}  # noqa: E731
+    assert mounts(inits["copy-quarkus"])["quarkus"] == "/qk"
+    assert mounts(inits["build"])["quarkus"] == mounts(KC_C)["quarkus"] == "/opt/keycloak/lib/quarkus"
+
+
 def test_keycloak_image_scanned_and_tag_checked():
     """배포 때 이미지 스캔·고정 다이제스트 확인이 keycloak.yaml도 읽는다 (https://github.com/reddol18/docflow/issues/46)"""
     scan = (ROOT / "scripts/mac/scan_image.sh").read_text(encoding="utf-8")
@@ -267,7 +286,8 @@ def test_keycloak_pod_security():
     sc = KC_C["securityContext"]
     assert sc["allowPrivilegeEscalation"] is False and sc["readOnlyRootFilesystem"] is True and sc["capabilities"]["drop"] == ["ALL"]
     mounts = {m["mountPath"] for m in KC_C["volumeMounts"]}
-    assert mounts == {"/opt/keycloak/data", "/opt/keycloak/data/import", "/tmp"}
+    # 쓰는 곳: PVC·realm(읽기 전용)·/tmp·초기화 컨테이너가 만든 빌드 결과(emptyDir)
+    assert mounts == {"/opt/keycloak/data", "/opt/keycloak/data/import", "/tmp", "/opt/keycloak/lib/quarkus"}
 
 
 def test_keycloak_network_policies():
