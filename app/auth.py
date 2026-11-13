@@ -541,6 +541,29 @@ Admin = Annotated[User, require("admin")]
 
 # ---------- OIDC ----------
 
+def _origin(url):
+    """(scheme, 호스트, 포트) — 사용자 정보(@)·빈 호스트·잘못된 포트는 None"""
+    p = urllib.parse.urlsplit(url)
+    try:
+        port = p.port or {"https": 443, "http": 80}.get(p.scheme)
+    except ValueError:
+        return None
+    if p.username is not None or p.password is not None or not p.hostname or port is None:
+        return None
+    return p.scheme, p.hostname.rstrip(".").lower(), port
+
+
+def web_origin(url):
+    """브라우저 window.location.origin과 같은 꼴: scheme://호스트[:포트] (기본 포트는 뺀다). http·https 절대 주소가 아니면 None.
+    로그인 화면이 SSO 버튼을 보일지 정하는 데 쓴다 (/auth/config oidc_origin, https://github.com/reddol18/docflow/issues/39)"""
+    o = _origin(url or "")
+    if o is None or o[0] not in ("http", "https"):
+        return None
+    scheme, host, port = o
+    host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host}" + ("" if port == {"http": 80, "https": 443}[scheme] else f":{port}")
+
+
 def _env_secret(name):
     f = os.environ.get(name + "_FILE")
     if f and os.path.exists(f):
@@ -572,19 +595,23 @@ class OidcConfig:
                    default_role=None if d in ("", "none") else d, label=os.environ.get("OIDC_LABEL", "SSO"),
                    allow_http=os.environ.get("OIDC_ALLOW_HTTP") == "1")
 
-    def check(self, cookie_secure=True, require_tls=False):
+    def check(self, cookie_secure=True):
+        """설정만 본다 (client secret 값은 보지 않음 — 없을 때의 처리는 oidc_startup). 틀리면 시작하지 않는다"""
         missing = [k for k in ("issuer", "client_id", "redirect_uri") if not getattr(self, k)]
         if missing:
             raise RuntimeError(f"oidc를 켰는데 설정이 없음: {', '.join('OIDC_' + k.upper() for k in missing)}")
         if not self.allow_http and not self.issuer.startswith("https://"):
             raise RuntimeError("OIDC_ISSUER는 https여야 한다 (클러스터 안 시험 제공자만 OIDC_ALLOW_HTTP=1)")
+        iss = _origin(self.issuer)
+        if iss is None or iss[0] not in ("http", "https"):
+            raise RuntimeError("OIDC_ISSUER를 읽지 못함 (http·https 절대 주소)")
         # OIDC_ALLOW_HTTP는 클러스터 안·이 기계 안 시험 제공자 전용 (https://github.com/reddol18/docflow/issues/39) —
-        # 켜 두고 바깥 발급자를 쓰면(값을 잘못 옮김) 시작하지 않는다. 배포 표시(DOCFLOW_REQUIRE_TLS=1)에서 http 발급자도 같은 규칙
-        host = urllib.parse.urlsplit(self.issuer).hostname
-        if self.allow_http and not internal_issuer_host(host):
+        # 켜 두고 바깥 발급자를 쓰면(값을 잘못 옮김) 시작하지 않는다. http 발급자는 이 값이 있어야만 받으므로
+        # 배포 표시(DOCFLOW_REQUIRE_TLS=1)에서도 http 발급자는 늘 내부 호스트다 (따로 보지 않는다)
+        if self.allow_http and not internal_issuer_host(iss[1]):
             raise RuntimeError("OIDC_ALLOW_HTTP=1은 발급자 호스트가 localhost·*.localhost·*.svc·*.svc.cluster.local·루프백·사설 IP일 때만")
-        if require_tls and not self.issuer.startswith("https://") and not internal_issuer_host(host):
-            raise RuntimeError("DOCFLOW_REQUIRE_TLS: http 발급자는 클러스터 안·루프백 호스트만")
+        if web_origin(self.redirect_uri) is None:  # 로그인 화면의 SSO 버튼 출처(/auth/config oidc_origin)도 이것으로 정한다
+            raise RuntimeError("OIDC_REDIRECT_URI를 읽지 못함 (http·https 절대 주소)")
         if self.redirect_uri.startswith("https://") and not cookie_secure:
             raise RuntimeError("https로 서비스하면서 COOKIE_SECURE=0 — 세션 쿠키가 http로도 나간다")
         if self.default_role is not None and self.default_role not in ROLES:
@@ -609,7 +636,13 @@ def internal_issuer_host(host):
         ip = ipaddress.ip_address(h)
     except ValueError:
         return False
-    return ip.is_loopback or (ip.is_private and not ip.is_link_local and not ip.is_unspecified)
+    if ip.version == 6 and ip.ipv4_mapped:  # ::ffff:a.b.c.d는 v4 주소로 판단 (::ffff:8.8.8.8을 사설로 보지 않게)
+        ip = ip.ipv4_mapped
+    if ip.version == 4 and ip in ipaddress.ip_network("0.0.0.0/8"):  # "이 네트워크" — 어디로 갈지 모름
+        return False
+    if ip.is_loopback:
+        return True
+    return ip.is_private and not (ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved)
 
 
 def oidc_startup(modes, cfg, env=os.environ, cookie_secure=True):
@@ -618,13 +651,13 @@ def oidc_startup(modes, cfg, env=os.environ, cookie_secure=True):
     oidc만 켠 설치면 끌 수 없어(인증이 꺼져 버린다) 시작을 거부한다. 파일이 생기면 docflow를 다시 띄워야 읽는다."""
     if "oidc" not in modes:
         return modes
+    cfg.check(cookie_secure)  # 설정 오류는 Secret이 있든 없든 배포 때 바로 드러나게 먼저
     if env.get("OIDC_CLIENT_SECRET_FILE") and not cfg.client_secret:
         if modes == {"oidc"}:
             raise RuntimeError("AUTH_MODES=oidc인데 OIDC client secret 파일(OIDC_CLIENT_SECRET_FILE)이 없거나 비어 있음")
         print("경고: OIDC client secret 파일(OIDC_CLIENT_SECRET_FILE)이 없거나 비어 OIDC(SSO)를 끔 — 로컬 로그인만. "
               "Secret을 넣은 뒤 docflow를 다시 띄운다", flush=True)
         return modes - {"oidc"}
-    cfg.check(cookie_secure, require_tls=env.get("DOCFLOW_REQUIRE_TLS") == "1")
     return modes
 
 
@@ -658,18 +691,6 @@ def _cached(key, fn, ttl=3600):
 
 
 DISCOVERY_URLS = ("jwks_uri", "token_endpoint", "authorization_endpoint")  # docflow가 따라가는 주소 (userinfo 등은 쓰지 않음)
-
-
-def _origin(url):
-    """(scheme, 호스트, 포트) — 사용자 정보(@)·빈 호스트·잘못된 포트는 None"""
-    p = urllib.parse.urlsplit(url)
-    try:
-        port = p.port or {"https": 443, "http": 80}.get(p.scheme)
-    except ValueError:
-        return None
-    if p.username is not None or p.password is not None or not p.hostname or port is None:
-        return None
-    return p.scheme, p.hostname.rstrip(".").lower(), port
 
 
 def check_discovery(d, issuer, allow_http=False):
@@ -797,19 +818,6 @@ def auth_config():
     on = "oidc" in MODES
     return {"modes": sorted(MODES), "off": not MODES, "oidc_label": OIDC.label if on else None,
             "oidc_origin": web_origin(OIDC.redirect_uri) if on else None}
-
-
-def web_origin(url):
-    """브라우저 window.location.origin과 같은 꼴: scheme://호스트[:포트] (기본 포트는 뺀다). 못 읽으면 None"""
-    p = urllib.parse.urlsplit(url or "")
-    try:
-        port = p.port
-    except ValueError:
-        return None
-    if p.scheme not in ("http", "https") or not p.hostname:
-        return None
-    host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
-    return f"{p.scheme}://{host}" + (f":{port}" if port and port != {"http": 80, "https": 443}[p.scheme] else "")
 
 
 class LoginBody(BaseModel):

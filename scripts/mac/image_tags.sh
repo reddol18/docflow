@@ -10,6 +10,10 @@ ROOT=$(cd "$HERE/.." && pwd); [ -f "$ROOT/Dockerfile" ] || ROOT=$(cd "$HERE/../.
 CURL="/usr/bin/curl -fsS --proto =https --tlsv1.2"
 
 rc=0
+# 고정값을 읽는 매니페스트가 없으면 '확인할 것 없음'으로 넘어가지 않고 실패 (네트워크 전에)
+for f in "$ROOT/k8s/docs.yaml" "$ROOT/k8s/keycloak.yaml"; do
+  [ -f "$f" ] || { echo "$f 없음 — 고정 이미지를 확인할 수 없음"; exit 1; }
+done
 # 태그 목록: 받기 실패면 '확인 못 함' (빈 목록을 '새 태그 없음'으로 읽지 않게)
 tags() {  # 저장소 질의 grep식 개수
   T=$($CURL "https://hub.docker.com/v2/repositories/$1/tags?$2") || { echo "$1: 태그 확인 못 함"; rc=1; return; }

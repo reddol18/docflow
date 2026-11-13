@@ -3,6 +3,7 @@
 import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { api, oidcLoginUrl, type AuthConfig } from "@/lib/api";
+import { ssoView } from "@/lib/sso";
 
 const ERRORS: Record<string, string> = {
   oidc: "SSO 로그인이 취소되었거나 실패했습니다.",
@@ -47,11 +48,9 @@ function LoginForm() {
   };
 
   const local = cfg?.modes.includes("local");
-  // SSO는 등록한 콜백과 같은 출처에서만 — 다른 출처(예: web 파드 https)에서 시작하면 state 쿠키가 콜백 쪽에 없어 늘 실패한다
-  // (https://github.com/reddol18/docflow/issues/39). cfg는 브라우저에서만 채워지므로 window를 써도 된다
-  const oidcHere = !!cfg?.modes.includes("oidc") && cfg.oidc_origin === window.location.origin;
-  const oidcElsewhere = !!cfg?.modes.includes("oidc") && !oidcHere && cfg.oidc_origin;
-  const oidc = oidcHere;
+  // SSO 버튼은 등록한 콜백과 같은 출처에서만 (lib/sso.ts, https://github.com/reddol18/docflow/issues/39).
+  // cfg는 브라우저에서만 채워지므로 그때만 window를 읽는다
+  const { button: oidc, elsewhere: oidcElsewhere } = ssoView(cfg?.modes, cfg?.oidc_origin, cfg ? window.location.origin : "");
   return (
     <div className="mx-auto mt-16 w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
       <h1 className="mb-5 text-lg font-semibold">로그인</h1>
@@ -66,7 +65,20 @@ function LoginForm() {
       )}
       {oidc && local && <div className="my-4 text-center text-xs text-slate-400">또는</div>}
       {oidcElsewhere && (
-        <div className="mb-4 text-center text-xs text-slate-400">SSO 로그인은 {oidcElsewhere}에서만 됩니다.</div>
+        // 로컬 로그인이 없으면 이 안내가 화면의 전부 — 빈 화면 대신 눈에 띄게, SSO가 되는 주소로 가는 링크
+        <div
+          className={
+            local
+              ? "mb-4 text-center text-xs text-slate-400"
+              : "rounded-lg bg-amber-50 px-3 py-3 text-center text-sm text-amber-800"
+          }
+        >
+          SSO 로그인은{" "}
+          <a href={`${oidcElsewhere}/login`} className="underline">
+            {oidcElsewhere}
+          </a>
+          에서만 됩니다.
+        </div>
       )}
       {local && (
         <form onSubmit={submit} className="space-y-3">

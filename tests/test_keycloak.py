@@ -113,12 +113,12 @@ def test_role_map_matches_groups_and_drops_on_removal(monkeypatch):
 # ---- docflow 설정 ----
 
 def test_docflow_oidc_settings_check():
-    """배포 설정 그대로 OidcConfig.check(배포 표시 포함)를 통과하고, 비밀값은 파일(Secret 마운트)로만"""
+    """배포 설정 그대로 OidcConfig.check를 통과하고, 비밀값은 파일(Secret 마운트)로만"""
     from app import auth
     cfg = auth.OidcConfig(issuer=DF_ENV["OIDC_ISSUER"], client_id=DF_ENV["OIDC_CLIENT_ID"],
                           redirect_uri=DF_ENV["OIDC_REDIRECT_URI"], role_claim=DF_ENV["OIDC_ROLE_CLAIM"],
                           role_map=json.loads(DF_ENV["OIDC_ROLE_MAP"]), allow_http=DF_ENV["OIDC_ALLOW_HTTP"] == "1")
-    cfg.check(cookie_secure=True, require_tls=DF_ENV["DOCFLOW_REQUIRE_TLS"] == "1")
+    cfg.check(cookie_secure=True)
     assert "oidc" in DF_ENV["AUTH_MODES"].split(",") and "local" in DF_ENV["AUTH_MODES"].split(",")
     assert DF_ENV["OIDC_CLIENT_ID"] == REALM["clients"][0]["clientId"]
     assert "OIDC_CLIENT_SECRET" not in DF_ENV and DF_ENV["OIDC_CLIENT_SECRET_FILE"] == "/etc/oidc/client-secret"
@@ -152,47 +152,73 @@ def test_oidc_startup_without_secret_file_disables_oidc(tmp_path, capsys):
         auth.oidc_startup(frozenset({"local", "oidc"}), bad, {"OIDC_CLIENT_SECRET_FILE": str(f)})
 
 
+@pytest.mark.parametrize("bad", [
+    {"issuer": "http://sso.example.com/realms/x"},  # allow_http인데 바깥 발급자
+    {"redirect_uri": "localhost:3000/api/auth/oidc/callback"},  # 읽을 수 없는 콜백
+    {"role_map": {"/docflow-admin": "root"}},  # 없는 역할
+    {"client_id": ""},  # 필수값 없음
+])
+def test_oidc_startup_checks_config_before_missing_secret_fallback(tmp_path, capsys, bad):
+    """설정 오류는 Secret이 없어도(OIDC를 끌 상황이어도) 시작할 때 드러난다 — keycloak.sh 때가 아니라 배포 때"""
+    from app import auth
+    cfg = auth.OidcConfig(**{"issuer": DF_ENV["OIDC_ISSUER"], "client_id": "docflow", "redirect_uri": DF_ENV["OIDC_REDIRECT_URI"],
+                             "allow_http": True, **bad})
+    with pytest.raises(RuntimeError):
+        auth.oidc_startup(frozenset({"local", "oidc"}), cfg, {"OIDC_CLIENT_SECRET_FILE": str(tmp_path / "none")})
+    assert "OIDC(SSO)를 끔" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("host,ok", [
     ("localhost", True), ("keycloak.localhost", True), ("KEYCLOAK.localhost.", True), ("keycloak.keycloak.svc", True),
     ("keycloak.keycloak.svc.cluster.local", True), ("127.0.0.1", True), ("10.43.0.39", True), ("192.168.0.22", True),
-    ("::1", True), ("fd00::1", True),
+    ("::1", True), ("fd00::1", True), ("::ffff:127.0.0.1", True), ("::ffff:10.0.0.1", True),
     ("keycloak", False), ("sso.example.com", False), ("localhost.evil.test", False), ("svc.evil.test", False),
-    ("8.8.8.8", False), ("169.254.169.254", False), ("0.0.0.0", False), ("", False), (None, False),
+    ("8.8.8.8", False), ("169.254.169.254", False), ("0.0.0.0", False), ("0.1.2.3", False), ("::ffff:8.8.8.8", False),
+    ("::ffff:169.254.169.254", False), ("::ffff:0.1.2.3", False), ("224.0.0.1", False), ("ff02::1", False), ("fe80::1", False),
+    ("", False), (None, False),
 ])
 def test_internal_issuer_host(host, ok):
     from app import auth
     assert auth.internal_issuer_host(host) is ok
 
 
-def test_allow_http_and_require_tls_need_internal_issuer():
-    """OIDC_ALLOW_HTTP=1이면 발급자 호스트가 클러스터 안·루프백만, 배포 표시(DOCFLOW_REQUIRE_TLS=1)에서 http 발급자도 같은 규칙"""
+def test_external_http_issuer_refused():
+    """http 발급자는 OIDC_ALLOW_HTTP=1 + 내부 호스트일 때만 — 배포 표시(DOCFLOW_REQUIRE_TLS=1)에서도 이 규칙 하나로 막힌다"""
     from app import auth
     base = {"client_id": "docflow", "redirect_uri": "http://localhost:3000/api/auth/oidc/callback"}
-    auth.OidcConfig(issuer="http://keycloak.localhost:8180/realms/docflow", allow_http=True, **base).check(require_tls=True)
-    for iss in ("http://sso.example.com/realms/x", "https://sso.example.com/realms/x", "http://169.254.169.254/x", "http://keycloak:8080/x"):
+    auth.OidcConfig(issuer="http://keycloak.localhost:8180/realms/docflow", allow_http=True, **base).check()
+    auth.OidcConfig(issuer="http://[::ffff:127.0.0.1]:8180/realms/docflow", allow_http=True, **base).check()
+    for iss in ("http://sso.example.com/realms/x", "https://sso.example.com/realms/x", "http://169.254.169.254/x",
+                "http://keycloak:8080/x", "http://[::ffff:8.8.8.8]/x", "http://0.1.2.3/x"):
         with pytest.raises(RuntimeError):
             auth.OidcConfig(issuer=iss, allow_http=True, **base).check()
-    auth.OidcConfig(issuer="https://sso.example.com/realms/x", **base).check(require_tls=True)  # https 바깥 발급자는 그대로
-    cfg = auth.OidcConfig(issuer="http://sso.example.com/realms/x", **base)
-    cfg.allow_http = True
     with pytest.raises(RuntimeError):
-        cfg.check(require_tls=True)
+        auth.OidcConfig(issuer="http://sso.example.com/realms/x", **base).check()  # allow_http 없으면 http 자체가 거부
+    auth.OidcConfig(issuer="https://sso.example.com/realms/x", **base).check()  # https 바깥 발급자는 그대로
+    import inspect
+    assert "require_tls" not in inspect.signature(auth.OidcConfig.check).parameters  # 닿지 않던 분기는 뺐다
 
 
-def test_auth_config_exposes_callback_origin(monkeypatch):
-    """로그인 화면은 자기 출처가 oidc_origin과 같을 때만 SSO 버튼을 보인다 (frontend/src/app/login/page.tsx)"""
+def test_web_origin_and_auth_config(monkeypatch):
+    """/auth/config oidc_origin = 콜백 출처(_origin을 다시 씀). 읽을 수 없는 콜백이면 시작하지 않는다"""
     from app import auth
     assert auth.web_origin(DF_ENV["OIDC_REDIRECT_URI"]) == "http://localhost:3000"
     assert auth.web_origin("https://docflow.localhost:443/api/auth/oidc/callback") == "https://docflow.localhost"
     assert auth.web_origin("https://Docflow.Example:8443/cb") == "https://docflow.example:8443"
-    assert auth.web_origin("javascript:alert(1)") is None and auth.web_origin("") is None
+    assert auth.web_origin("http://[::1]:3000/cb") == "http://[::1]:3000"
+    for bad in ("javascript:alert(1)", "", None, "localhost:3000/cb", "https://u:p@docflow.example/cb", "https://docflow.example:99999/cb"):
+        assert auth.web_origin(bad) is None, bad
+    with pytest.raises(RuntimeError):
+        auth.OidcConfig(issuer="https://sso.example.com/x", client_id="d", redirect_uri="docflow/cb").check()
     monkeypatch.setattr(auth, "OIDC", auth.OidcConfig(redirect_uri=DF_ENV["OIDC_REDIRECT_URI"], label="Keycloak(데모)"))
     monkeypatch.setattr(auth, "MODES", frozenset({"local", "oidc"}))
     assert auth.auth_config()["oidc_origin"] == "http://localhost:3000"
     monkeypatch.setattr(auth, "MODES", frozenset({"local"}))
     assert auth.auth_config()["oidc_origin"] is None
+    # 화면 판단은 frontend/src/lib/sso.ts (node --test src/lib/sso.test.mjs, scripts/check.ps1 frontend 단계)
     page = (ROOT / "frontend/src/app/login/page.tsx").read_text(encoding="utf-8")
-    assert "cfg.oidc_origin === window.location.origin" in page
+    assert "ssoView(cfg?.modes, cfg?.oidc_origin" in page and "oidcElsewhere" in page
+    assert "src/lib/sso.test.mjs" in (ROOT / "scripts/check.ps1").read_text(encoding="utf-8-sig")
 
 
 def test_issuer_same_for_browser_and_pod():
@@ -288,9 +314,10 @@ def test_keycloak_script_static():
     for f in ("scripts/mac/keycloak.sh", "scripts/mac/tls_secrets.sh"):
         t = (ROOT / f).read_text(encoding="utf-8")
         assert '. "$HERE/kube_put.sh"' in t and "put() {" not in t and "DRY=--dry-run=client" not in t, f
+    from app import auth
     for k in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        assert k in text and k in __import__("app.auth", fromlist=["DISCOVERY_URLS"]).DISCOVERY_URLS
-    assert "sys.exit(0 if" in text
+        assert k in VERIFY_PY and k in auth.DISCOVERY_URLS
+    assert "OIDC_CHANGED" not in text  # 재시작은 '이번 실행에서 바꿨나'가 아니라 Secret 판으로 정한다
     ps = (ROOT / "scripts/keycloak.ps1").read_text(encoding="utf-8-sig")
     assert ps.count("scp -q @SshOpts") == 3 and "scp -q (" not in ps and "kube_put.sh" in ps
     assert "kube_put.sh" in (ROOT / "scripts/tls_secrets.ps1").read_text(encoding="utf-8-sig")
@@ -298,6 +325,62 @@ def test_keycloak_script_static():
         t = (ROOT / f).read_text(encoding="utf-8")
         for m in re.finditer(r"issues/\d+", t):  # 이슈는 전체 URL로
             assert t[:m.start()].endswith("https://github.com/reddol18/docflow/"), (f, t[m.start() - 30:m.end()])
+
+
+# ---- verify가 docflow 파드에서 돌리는 확인 (가짜 httpx로) ----
+
+VERIFY_PY = re.search(r"^VERIFY_PY='(.*?)'$", (ROOT / "scripts/mac/keycloak.sh").read_text(encoding="utf-8"), re.S | re.M).group(1)
+ISS = "http://keycloak.localhost:8180/realms/docflow"
+GOOD_DISC = {"issuer": ISS, "authorization_endpoint": ISS + "/protocol/openid-connect/auth",
+             "token_endpoint": ISS + "/protocol/openid-connect/token", "jwks_uri": ISS + "/protocol/openid-connect/certs",
+             "code_challenge_methods_supported": ["plain", "S256"]}
+FAKE_HTTPX = '''
+import json, os
+class R:
+    def __init__(self, d):
+        self.d = d
+    def json(self):
+        return self.d
+def get(url, timeout=None):
+    for k, v in json.loads(os.environ["FAKE_HTTP"]).items():
+        if url.endswith(k):
+            return R(v)
+    raise RuntimeError(url)
+'''
+
+
+def _verify(tmp_path, secret="Zz9secretvalue", modes=("local", "oidc"), disc=None):
+    import os
+    import subprocess
+    import sys
+    (tmp_path / "httpx.py").write_text(FAKE_HTTPX, encoding="utf-8")
+    f = tmp_path / "client-secret"
+    f.write_text(secret, encoding="utf-8")
+    http = {"/auth/config": {"modes": list(modes)}, "/.well-known/openid-configuration": disc or GOOD_DISC}
+    env = {**os.environ, "PYTHONPATH": str(tmp_path), "PYTHONUTF8": "1", "OIDC_ISSUER": ISS,
+           "OIDC_CLIENT_SECRET_FILE": str(f), "FAKE_HTTP": json.dumps(http)}
+    p = subprocess.run([sys.executable, "-c", VERIFY_PY], env=env, capture_output=True, timeout=60)
+    out = p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")
+    assert secret == "" or secret not in out  # 값은 찍지 않는다 (크기만 본다)
+    return p.returncode, out
+
+
+def test_verify_passes_when_oidc_on_and_discovery_matches(tmp_path):
+    code, out = _verify(tmp_path)
+    assert code == 0, out
+    assert "client secret 파일: 있음" in out and "issuer와 같음" in out and "**" not in out
+
+
+@pytest.mark.parametrize("kw,mark", [
+    ({"secret": ""}, "client secret 파일: **없음·빔**"),  # Secret 없이 떠서 빈 파일
+    ({"modes": ("local",)}, "**oidc 꺼짐**"),  # docflow가 OIDC를 끔
+    ({"disc": {**GOOD_DISC, "token_endpoint": "http://evil.test/token"}}, "**다름** token_endpoint"),
+    ({"disc": {**GOOD_DISC, "jwks_uri": "http://keycloak.localhost:8443/certs"}}, "**다름** jwks_uri"),
+    ({"disc": {**GOOD_DISC, "issuer": "http://other.localhost/realms/docflow"}}, "**다름** (설정"),
+])
+def test_verify_fails_nonzero(tmp_path, kw, mark):
+    code, out = _verify(tmp_path, **kw)
+    assert code == 1 and mark in out, out
 
 
 # ---- 맥 스크립트 (가짜 kubectl로 분기) ----
@@ -313,56 +396,96 @@ KC_SETUP = (
 )
 KC_RUN = (
     '\nsh "$B/doc/scripts/keycloak.sh" 2>&1; echo "rc=$?"; echo "--calls"; cat "$FAKE/calls"; echo "--state";'
-    ' find "$FAKE/secret" -type f 2>/dev/null | sort | while read -r f; do echo "${f#$FAKE/secret/}=$(cat "$f")"; done; rm -rf "$B"'
+    ' find "$FAKE/secret" -type f 2>/dev/null | sort | while read -r f; do echo "${f#$FAKE/secret/}=$(cat "$f")"; done;'
+    ' echo "annotation=$(cat "$FAKE/docflow_annotation" 2>/dev/null)"; echo "rv=$(cat "$FAKE/rv/docs/oidc" 2>/dev/null)"; rm -rf "$B"'
 )
+FIRST = 'sh "$B/doc/scripts/keycloak.sh" > "$B/first.out" 2>&1; echo "first_rc=$?"; '
 needs_sh = pytest.mark.skipif(RUNNER is None, reason="sh도 WSL도 없음 — 맥에서 손으로 확인 (PR 수동 확인 칸)")
 
 
 def kc(setup=""):
-    """가짜 kubectl 상태를 setup(sh)으로 만들고 keycloak.sh를 한 번 돌린다 → (rc, 출력, 부른 명령, Secret 값{경로: 값})"""
+    """가짜 kubectl 상태를 setup(sh)으로 만들고 keycloak.sh를 한 번 돌린다 → (rc, 출력, 부른 명령, 상태{Secret 경로·annotation·rv: 값})"""
     _, out = run_code(KC_SETUP + setup + KC_RUN)
     main, rest = out.split("--calls", 1)
     calls, state = rest.split("--state", 1)
-    secrets = dict(line.split("=", 1) for line in state.strip().splitlines() if "=" in line)
-    rc = int(re.search(r"rc=(\d+)", main).group(1))
-    return rc, main, calls, secrets
+    st = dict(line.split("=", 1) for line in state.strip().splitlines() if "=" in line)
+    rc = int(re.search(r"(?m)^rc=(\d+)", main).group(1))
+    return rc, main, calls, st
 
 
-def _no_values_in(out, secrets):
-    for v in secrets.values():
+def _secrets(st):
+    return {k: v for k, v in st.items() if "/" in k}
+
+
+def _no_values_in(out, st):
+    for v in _secrets(st).values():
         assert v not in out, "비밀값이 출력에 찍힘"
 
 
-@needs_sh
-def test_script_first_run_creates_secrets_once_and_syncs_docs():
-    rc, out, calls, sec = kc()
-    assert rc == 0, out
-    assert set(sec) == {"keycloak/keycloak-admin/password", "keycloak/keycloak-realm-secrets/client-secret",
-                        "keycloak/keycloak-realm-secrets/demo-pw-hangaram", "keycloak/keycloak-realm-secrets/demo-pw-seonuri",
-                        "docs/oidc/client-secret"}
-    assert sec["docs/oidc/client-secret"] == sec["keycloak/keycloak-realm-secrets/client-secret"]
-    assert all(re.fullmatch(r"[A-Za-z0-9]{32,}", v) for v in sec.values())  # 글자·숫자만 (HTTP Basic)
-    _no_values_in(out, sec)
-    assert "secret docs/oidc: Keycloak client secret과 같게 바꿈" in out
-    assert "docflow는 아직 Secret oidc를 마운트하지 않음" in out and "rollout restart" not in calls
-    assert "== clusterIP 10.43.0.39: 서비스 대역 10.43.0.0/16 안, 비어 있음" in out
+def _idx(calls, prefix):
     lines = calls.splitlines()
-    assert out.index("DISK_CHECK 1") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인
-    first = lambda p: lines.index(next(x for x in lines if x.startswith(p)))
-    assert first("get servicecidrs") < first("apply")
+    return lines.index(next(x for x in lines if x.startswith(prefix)))
 
 
 @needs_sh
-def test_script_rerun_keeps_values_and_does_not_touch_docs():
-    """두 번째 실행: Secret은 그대로(돌리지 않음), docs/oidc는 같으니 바꾸지 않고 docflow도 다시 띄우지 않는다"""
-    setup = ('sh "$B/doc/scripts/keycloak.sh" >/dev/null 2>&1; touch "$FAKE/pvc"; echo "data oidc redis-auth" > "$FAKE/docflow_volumes";'
-             ' : > "$FAKE/calls";\n')
-    rc, out, calls, sec = kc(setup + 'true')
+def test_script_first_run_creates_secrets_once_and_syncs_docs_after_rollout():
+    rc, out, calls, st = kc()
+    assert rc == 0, out
+    assert set(_secrets(st)) == {"keycloak/keycloak-admin/password", "keycloak/keycloak-realm-secrets/client-secret",
+                                 "keycloak/keycloak-realm-secrets/demo-pw-hangaram", "keycloak/keycloak-realm-secrets/demo-pw-seonuri",
+                                 "docs/oidc/client-secret"}
+    assert st["docs/oidc/client-secret"] == st["keycloak/keycloak-realm-secrets/client-secret"]
+    assert all(re.fullmatch(r"[A-Za-z0-9]{32,}", v) for v in _secrets(st).values())  # 글자·숫자만 (HTTP Basic)
+    _no_values_in(out, st)
+    assert "secret docs/oidc: Keycloak client secret과 같게 바꿈" in out
+    assert "docflow는 아직 Secret oidc를 마운트하지 않음" in out and "patch" not in calls
+    assert "== clusterIP 10.43.0.39: 서비스 대역 10.43.0.0/16 안, 비어 있음" in out
+    assert out.index("DISK_CHECK 1") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인
+    assert _idx(calls, "get servicecidrs") < _idx(calls, "get svc") < _idx(calls, "apply")
+    # docs/oidc는 Keycloak이 준비된 뒤에만
+    assert _idx(calls, "rollout status deploy/keycloak") < _idx(calls, "STORED create secret docs/oidc")
+
+
+@needs_sh
+def test_script_restarts_docflow_by_secret_version_and_rerun_is_quiet():
+    """docflow가 oidc를 마운트하면 주석=Secret 판이 될 때까지 맞춘다(patch → 롤아웃). 다시 실행하면 아무것도 바꾸지 않는다"""
+    setup = 'echo "data oidc redis-auth" > "$FAKE/docflow_volumes"; ' + FIRST + ' grep -c PATCHED "$FAKE/calls"; : > "$FAKE/calls";\n'
+    rc, out, calls, st = kc(setup)
+    assert "first_rc=0" in out and "\n1\n" in out  # 첫 실행에서 한 번 patch
     assert rc == 0, out
     assert "secret keycloak/keycloak-admin: 있음 (그대로)" in out and "secret keycloak/keycloak-realm-secrets: 있음 (그대로)" in out
     assert "secret docs/oidc: Keycloak client secret과 같음 (그대로)" in out
-    assert "STORED" not in calls.replace("STORED create configmap", "").replace("STORED replace configmap", "")
-    assert "rollout restart" not in calls
+    assert f"== docflow: 지금 docs/oidc 판({st['rv']})으로 떠 있음 (재시작 없음)" in out and st["annotation"] == st["rv"]
+    assert "STORED create secret" not in calls and "STORED replace secret" not in calls
+    assert "patch" not in calls and "rollout restart" not in calls
+
+
+@needs_sh
+def test_script_rollout_failure_leaves_docs_alone_and_rerun_recovers():
+    """Keycloak 롤아웃이 실패하면 docs/oidc·docflow를 건드리지 않는다. 고친 뒤 다시 부르면 맞춘다"""
+    setup = ('echo "data oidc" > "$FAKE/docflow_volumes"; touch "$FAKE/rollout_fail"; ' + FIRST
+             + '[ -d "$FAKE/secret/docs/oidc" ] && echo FIRST_DOCS_TOUCHED; grep -q PATCHED "$FAKE/calls" && echo FIRST_PATCHED;'
+             + ' grep -c "Keycloak이 준비되지 않음" "$B/first.out"; rm "$FAKE/rollout_fail"; : > "$FAKE/calls";\n')
+    rc, out, calls, st = kc(setup)
+    assert "first_rc=1" in out and "FIRST_DOCS_TOUCHED" not in out and "FIRST_PATCHED" not in out and "\n1\n" in out
+    assert rc == 0, out
+    assert st["docs/oidc/client-secret"] == st["keycloak/keycloak-realm-secrets/client-secret"]
+    assert "PATCHED docflow" in calls and st["annotation"] == st["rv"]
+
+
+@needs_sh
+def test_script_interrupted_after_secret_replace_rerun_restarts():
+    """docs/oidc를 바꾼 뒤 재시작 전에 끊긴 상태(값은 같고 docflow 주석은 옛 판) → 다음 실행이 docflow를 다시 띄운다"""
+    setup = ('S="$FAKE/secret"; R="$S/keycloak/keycloak-realm-secrets"; mkdir -p "$FAKE/ns/keycloak" "$S/keycloak/keycloak-admin" "$R"'
+             ' "$S/docs/oidc" "$FAKE/rv/docs"; touch "$FAKE/pvc"; printf a1b2c3 > "$S/keycloak/keycloak-admin/password";'
+             ' for k in client-secret demo-pw-hangaram demo-pw-seonuri; do printf Same$k > "$R/$k"; done;'
+             ' printf Sameclient-secret > "$S/docs/oidc/client-secret"; echo 205 > "$FAKE/rv/docs/oidc";'
+             ' echo "data oidc" > "$FAKE/docflow_volumes"; printf 204 > "$FAKE/docflow_annotation";\n')
+    rc, out, calls, st = kc(setup)
+    assert rc == 0, out
+    assert "secret docs/oidc: Keycloak client secret과 같음 (그대로)" in out
+    assert "== docflow 재시작: docs/oidc 판 204 → 205" in out and "PATCHED docflow 205" in calls and st["annotation"] == "205"
+    _no_values_in(out, st)
 
 
 @needs_sh
@@ -372,11 +495,11 @@ def test_script_stops_when_secret_missing_but_realm_exists(missing):
     other = {"keycloak-realm-secrets": "keycloak-admin", "keycloak-admin": "keycloak-realm-secrets"}[missing]
     setup = (f'mkdir -p "$FAKE/ns/keycloak" "$FAKE/secret/keycloak/{other}"; touch "$FAKE/pvc";'
              f' printf old > "$FAKE/secret/keycloak/{other}/password"; printf old > "$FAKE/secret/keycloak/{other}/client-secret";\n')
-    rc, out, calls, sec = kc(setup)
+    rc, out, calls, st = kc(setup)
     assert rc == 1, out
     assert f"Secret keycloak/{missing}이 없는데 PVC keycloak/keycloak-data가 있음" in out
     assert "kubectl delete namespace keycloak" in out and f"kubectl create secret generic {missing} -n keycloak" in out
-    assert not any(k.startswith(f"keycloak/{missing}/") for k in sec)  # 만들지 않음
+    assert not any(k.startswith(f"keycloak/{missing}/") for k in _secrets(st))  # 만들지 않음
     assert "apply" not in calls and "STORED" not in calls
 
 
@@ -387,14 +510,29 @@ def test_script_replaces_docs_secret_when_different_and_restarts_docflow():
              ' touch "$FAKE/pvc"; printf a1b2c3 > "$S/keycloak/keycloak-admin/password";'
              ' for k in client-secret demo-pw-hangaram demo-pw-seonuri; do printf Kc0rrect$k > "$R/$k"; done;'
              ' printf stale0 > "$S/docs/oidc/client-secret"; echo "data oidc" > "$FAKE/docflow_volumes";\n')
-    rc, out, calls, sec = kc(setup)
+    rc, out, calls, st = kc(setup)
     assert rc == 0, out
-    assert sec["docs/oidc/client-secret"] == "Kc0rrectclient-secret" == sec["keycloak/keycloak-realm-secrets/client-secret"]
-    assert sec["keycloak/keycloak-admin/password"] == "a1b2c3"  # 정본은 그대로
-    _no_values_in(out, sec)
-    assert "rollout restart deploy/docflow -n docs" in calls and "rollout status deploy/docflow -n docs" in calls
-    lines = calls.splitlines()
-    assert lines.index("rollout status deploy/keycloak -n keycloak --timeout=600s") < lines.index("rollout restart deploy/docflow -n docs")
+    assert st["docs/oidc/client-secret"] == "Kc0rrectclient-secret" == st["keycloak/keycloak-realm-secrets/client-secret"]
+    assert st["keycloak/keycloak-admin/password"] == "a1b2c3"  # 정본은 그대로
+    _no_values_in(out, st)
+    assert _idx(calls, "rollout status deploy/keycloak") < _idx(calls, "STORED replace secret docs/oidc") < _idx(calls, "PATCHED docflow")
+    assert _idx(calls, "PATCHED docflow") < _idx(calls, "rollout status deploy/docflow")
+
+
+@needs_sh
+@pytest.mark.parametrize("same", [False, True])
+def test_script_warns_when_realm_json_changed_but_realm_exists(same):
+    """PVC가 있고 ConfigMap의 realm JSON이 저장소 JSON과 다르면 '가져오기를 건너뛴다'를 알린다 (멈추지는 않음)"""
+    old = 'cp "$B/doc/k8s/keycloak/docflow-realm.json" "$C/docflow-realm.json"' if same else 'printf "{}" > "$C/docflow-realm.json"'
+    setup = ('S="$FAKE/secret"; R="$S/keycloak/keycloak-realm-secrets"; C="$FAKE/configmap/keycloak/keycloak-realm";'
+             ' mkdir -p "$FAKE/ns/keycloak" "$S/keycloak/keycloak-admin" "$R" "$C"; touch "$FAKE/pvc";'
+             ' printf a1b2c3 > "$S/keycloak/keycloak-admin/password";'
+             f' for k in client-secret demo-pw-hangaram demo-pw-seonuri; do printf X$k > "$R/$k"; done; {old};\n')
+    rc, out, calls, st = kc(setup)
+    assert rc == 0, out
+    assert ("realm JSON이 바뀌었지만" in out) is (not same)
+    if not same:
+        assert "kubectl delete namespace keycloak" in out
 
 
 @needs_sh
@@ -402,15 +540,26 @@ def test_script_replaces_docs_secret_when_different_and_restarts_docflow():
     ('echo "[10.44.0.0/16]" > "$FAKE/servicecidrs";', "clusterIP 10.43.0.39가 서비스 대역(10.44.0.0/16) 밖"),
     ('echo "bank-b/intake 10.43.0.39" >> "$FAKE/svcs";', "clusterIP 10.43.0.39를 이미 bank-b/intake가 쓴다"),
     ('rm "$FAKE/servicecidrs";', "서비스 대역(ServiceCIDR)을 읽지 못함"),
+    ('touch "$FAKE/svc_fail";', "Service 목록을 읽지 못함 — clusterIP 10.43.0.39가 비어 있는지 모름"),  # 실패를 '비어 있음'으로 읽지 않음
 ])
 def test_script_cluster_ip_checked_before_apply(setup, msg):
-    rc, out, calls, sec = kc(setup + "\n")
+    rc, out, calls, st = kc(setup + "\n")
     assert rc == 1 and msg in out, out
-    assert "apply" not in calls and not sec
+    assert "apply" not in calls and not _secrets(st)
 
 
 @needs_sh
 def test_script_cluster_ip_already_keycloak_is_ok():
-    rc, out, calls, sec = kc('echo "keycloak/keycloak 10.43.0.39" >> "$FAKE/svcs";\n')
+    rc, out, calls, st = kc('echo "keycloak/keycloak 10.43.0.39" >> "$FAKE/svcs";\n')
     assert rc == 0, out
     assert "== clusterIP 10.43.0.39: 서비스 대역 10.43.0.0/16 안, 이미 keycloak/keycloak" in out
+
+
+@needs_sh
+def test_image_tags_fails_without_keycloak_manifest():
+    """고정값을 읽는 매니페스트가 없으면 네트워크 전에 실패 (docs.yaml·keycloak.yaml 둘 다)"""
+    for missing in ("keycloak.yaml", "docs.yaml"):
+        _, out = run_code('B=$(mktemp -d); mkdir -p "$B/scripts" "$B/k8s"; cp scripts/mac/image_tags.sh "$B/scripts/";'
+                          ' touch "$B/Dockerfile" "$B/k8s/docs.yaml" "$B/k8s/keycloak.yaml"; rm "$B/k8s/' + missing + '";'
+                          ' sh "$B/scripts/image_tags.sh"; echo "rc=$?"; rm -rf "$B"')
+        assert "rc=1" in out and f"k8s/{missing} 없음" in out and "최근 태그" not in out, out

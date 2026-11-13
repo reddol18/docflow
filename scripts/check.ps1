@@ -7,7 +7,7 @@ https://github.com/reddol18/docflow/issues/24 , https://github.com/reddol18/docf
   .\scripts\check.ps1 -Skip frontend,pg
 
 검사                                   막음(실패 시 종료 코드 1)
-  frontend   이미지 npm(Dockerfile ARG NPM_VERSION)으로 lock 확인 → npm ci(없을 때) → next typegen → tsc → eslint → node --test(tls-proxy)  예
+  frontend   이미지 npm(Dockerfile ARG NPM_VERSION)으로 lock 확인 → npm ci(없을 때) → next typegen → tsc → eslint → node --test(tls-proxy·sso)  예
   ruff       보안 규칙(S) 포함                 예
   lock       requirements.txt 판이 lock과 같은지·해시 있는지  예
   pytest     실제 Postgres(PGlite) 시험 포함  예
@@ -142,7 +142,7 @@ try {
             npx next typegen | Out-Null; if ($LASTEXITCODE) { return }
             npx tsc --noEmit; if ($LASTEXITCODE) { return }
             npx eslint src; if ($LASTEXITCODE) { return }
-            node --test tls-proxy.test.mjs  # web 파드 TLS 종단 (https://github.com/reddol18/docflow/issues/48)
+            node --test tls-proxy.test.mjs src/lib/sso.test.mjs  # web 파드 TLS 종단 (https://github.com/reddol18/docflow/issues/48), 로그인 SSO 버튼 판단 (https://github.com/reddol18/docflow/issues/39)
         } finally { Pop-Location }
     }
 
