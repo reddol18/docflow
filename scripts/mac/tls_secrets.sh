@@ -25,8 +25,9 @@ if ! kubectl get ns $NS >/dev/null 2>&1 </dev/null; then
 fi
 # put·DRY: 같은 폴더의 kube_put.sh (keycloak.sh와 같이 씀)
 . "$HERE/kube_put.sh"
-# Windows PowerShell 5.1은 콘솔 입력 인코딩이 BOM 있는 UTF-8이면 표준 입력 앞에 BOM을 붙인다 — 첫 줄에서 뗀다(zap_scan.ps1과 같은 방식)
-perl -pe 's/^\xEF\xBB\xBF// if $. == 1; s/\r//g' | while read -r n b; do
+# 표준 입력은 scripts/lib/remote.ps1 Invoke-Mac이 BOM 없이 넘긴다 (https://github.com/reddol18/docflow/issues/117) — BOM 떼기는 지웠다.
+# CR 떼기는 남긴다: 손으로 CRLF 파일을 넘겨도 base64 끝에 CR이 붙지 않게 (해 없는 보호)
+tr -d '\r' | while read -r n b; do
   [ -n "$n" ] || continue
   case "$n" in
     ca.crt|web.crt|web.key|postgres.crt|postgres.key|qdrant.crt|qdrant.key|redis.crt|redis.key) ;;

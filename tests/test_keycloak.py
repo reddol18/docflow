@@ -344,7 +344,8 @@ def test_keycloak_script_static():
         assert k in VERIFY_PY and k in auth.DISCOVERY_URLS
     assert "OIDC_CHANGED" not in text  # 재시작은 '이번 실행에서 바꿨나'가 아니라 Secret 판으로 정한다
     ps = (ROOT / "scripts/keycloak.ps1").read_text(encoding="utf-8-sig")
-    assert ps.count("scp -q @SshOpts") == 3 and "scp -q (" not in ps and "kube_put.sh" in ps
+    # 복사 세 번 모두 공용 함수(ssh 옵션·시간 제한 한 곳, https://github.com/reddol18/docflow/issues/117)
+    assert ps.count("Copy-ToMac -Mac $Mac") == 3 and "scp " not in ps and "kube_put.sh" in ps
     assert "kube_put.sh" in (ROOT / "scripts/tls_secrets.ps1").read_text(encoding="utf-8-sig")
     for f in ("scripts/mac/keycloak.sh", "scripts/mac/kube_put.sh", "k8s/keycloak.yaml"):
         t = (ROOT / f).read_text(encoding="utf-8")

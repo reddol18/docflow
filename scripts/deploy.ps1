@@ -23,6 +23,7 @@ param(
     [switch]$NoCheck
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "lib/remote.ps1")  # 맥 명령은 Invoke-Mac·Copy-ToMac로만 (https://github.com/reddol18/docflow/issues/117)
 if (-not $Mac) { throw "맥 주소가 없습니다: -Mac user@host 또는 `$env:DOCFLOW_MAC" }
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
@@ -45,47 +46,43 @@ try {
 
     Write-Host "== 디스크 여유 확인"
     # 반드시: 모자란 채로 빌드하면 kubelet이 운영 파드를 내쫓는다 (2026-11-07). 맥 쪽 deploy.sh도 빌드 전에 한 번 더 본다
-    ssh -o BatchMode=yes $Mac "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s"
-    if ($LASTEXITCODE) { throw "맥 접속 실패" }
-    scp -q scripts/mac/disk_check.sh "${Mac}:doc_platform/scripts/"
+    Invoke-Mac -Mac $Mac -Script "mkdir -p ~/doc_platform/scripts ~/doc_platform/k8s" -Stream -FailMessage "맥 접속 실패"
+    Copy-ToMac -Mac $Mac -Path scripts/mac/disk_check.sh -Destination "doc_platform/scripts/" -AllowFail
     # 시험 값·바꾼 기준은 지우고 부른다 — 맥 deploy.sh의 unset과 같은 목록 (https://github.com/reddol18/docflow/issues/119)
-    ssh -o BatchMode=yes $Mac "unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_GC_REBUILD_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB; sh ~/doc_platform/scripts/disk_check.sh </dev/null"
-    if ($LASTEXITCODE) { throw "디스크 여유가 모자랍니다. 정리한 뒤 배포하세요 (위 메시지)." }
+    Invoke-Mac -Mac $Mac -Script "unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_GC_REBUILD_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB; sh ~/doc_platform/scripts/disk_check.sh </dev/null" -Stream -TimeoutSec 180 -FailMessage "디스크 여유가 모자랍니다. 정리한 뒤 배포하세요 (위 메시지)."
 
     Write-Host "== 복사 ($sha → $Mac)"
-    scp -q -r Dockerfile requirements.txt requirements.lock app "${Mac}:doc_platform/"
-    if ($LASTEXITCODE) { throw "복사 실패 (app)" }
+    Copy-ToMac -Mac $Mac -Recurse -Path Dockerfile, requirements.txt, requirements.lock, app -Destination "doc_platform/" -FailMessage "복사 실패 (app)"
     # keycloak.yaml: 맥 scan_image.sh·image_tags.sh가 데모 Keycloak 이미지도 읽는다 (apply는 scripts/keycloak.ps1만, https://github.com/reddol18/docflow/issues/39)
-    scp -q k8s/docs.yaml k8s/keycloak.yaml "${Mac}:doc_platform/k8s/"
-    if ($LASTEXITCODE) { throw "복사 실패 (k8s)" }
+    Copy-ToMac -Mac $Mac -Path k8s/docs.yaml, k8s/keycloak.yaml -Destination "doc_platform/k8s/" -FailMessage "복사 실패 (k8s)"
     # 프런트 소스: 커밋된 HEAD 그대로 (node_modules·.next·.env 없이). 파이프로 넘기면 PowerShell 5.1이 바이너리를 깨므로 파일로
     $webTar = Join-Path ([IO.Path]::GetTempPath()) "docflow-frontend.tar"
     try {
         git archive --format=tar -o $webTar HEAD frontend
         if ($LASTEXITCODE) { throw "git archive 실패 (frontend)" }
-        scp -q $webTar "${Mac}:doc_platform/frontend.tar"
-        if ($LASTEXITCODE) { throw "복사 실패 (frontend)" }
+        Copy-ToMac -Mac $Mac -Path $webTar -Destination "doc_platform/frontend.tar" -FailMessage "복사 실패 (frontend)"
     } finally { Remove-Item $webTar -ErrorAction SilentlyContinue }
-    ssh -o BatchMode=yes $Mac "cd ~/doc_platform && rm -rf frontend && tar -xf frontend.tar && rm -f frontend.tar && chmod -R a+rX frontend"
-    if ($LASTEXITCODE) { throw "풀기 실패 (frontend)" }
+    Invoke-Mac -Mac $Mac -Script "cd ~/doc_platform && rm -rf frontend && tar -xf frontend.tar && rm -f frontend.tar && chmod -R a+rX frontend" -Stream -TimeoutSec 180 -FailMessage "풀기 실패 (frontend)"
     # tool_pins.txt: scan_image.sh가 읽는 trivy 버전·고정 해시 (https://github.com/reddol18/docflow/issues/46)
-    scp -q (Get-ChildItem scripts/mac/*.sh).FullName scripts/tool_pins.txt "${Mac}:doc_platform/scripts/"
-    if ($LASTEXITCODE) { throw "복사 실패 (scripts)" }
+    Copy-ToMac -Mac $Mac -Path (@((Get-ChildItem scripts/mac/*.sh).FullName) + "scripts/tool_pins.txt") -Destination "doc_platform/scripts/" -FailMessage "복사 실패 (scripts)"
     # Windows scp가 새로 만든 폴더는 700 — 이미지 안 app 사용자가 못 읽는다 (Dockerfile chmod와 이중으로)
-    ssh -o BatchMode=yes $Mac "chmod -R a+rX ~/doc_platform/app"
-    if ($LASTEXITCODE) { throw "권한 고치기 실패" }
+    Invoke-Mac -Mac $Mac -Script "chmod -R a+rX ~/doc_platform/app" -Stream -FailMessage "권한 고치기 실패"
 
     Write-Host "== 빌드·재시작"
-    ssh -o BatchMode=yes $Mac "sh ~/doc_platform/scripts/deploy.sh"
-    if ($LASTEXITCODE) { throw "배포 실패 (위 로그). 태그를 남기지 않습니다." }
+    # 빌드(이미지 두 개)·롤아웃 대기(최대 300초×3 + 180초)를 넉넉히 덮는 시간 제한. 출력은 줄마다 바로 보인다
+    Invoke-Mac -Mac $Mac -Script "sh ~/doc_platform/scripts/deploy.sh" -Stream -TimeoutSec 3600 -FailMessage "배포 실패 (위 로그). 태그를 남기지 않습니다."
 
     # 이미지 안 설치 결과(pip freeze --all)를 저장소의 requirements.lock 판과 맞대 본다 (https://github.com/reddol18/docflow/issues/33).
     # 이미지는 lock으로 설치하고 빌드 안에서 이미 diff하므로(빌드 출력의 'lock 일치' 줄) 차이는 없어야 한다 — 있으면 실제 어긋남.
     # 이미 롤아웃이 끝난 뒤라 여기서 실패해도 경고만 하고 태그는 남긴다 (배포된 코드와 태그가 어긋나지 않게)
     $freeze = Join-Path ([IO.Path]::GetTempPath()) "docflow-requirements.freeze"
     Remove-Item $freeze -ErrorAction SilentlyContinue
-    scp -q "${Mac}:doc_platform/requirements.freeze" $freeze
-    if ($LASTEXITCODE -or -not (Test-Path $freeze) -or -not (Get-Item $freeze).Length) {
+    $copied = $false
+    try {  # 시간 제한(throw)이어도 경고만 — 롤아웃은 이미 끝났다
+        Copy-FromMac -Mac $Mac -Path "doc_platform/requirements.freeze" -Destination $freeze -TimeoutSec 120 -AllowFail
+        $copied = -not $LASTEXITCODE
+    } catch { Write-Warning $_ }
+    if (-not $copied -or -not (Test-Path $freeze) -or -not (Get-Item $freeze).Length) {
         Write-Warning "이미지 패키지 목록(requirements.freeze)을 받지 못해 lock 비교를 건너뜁니다. 빌드 출력의 'lock 일치' 줄을 확인하세요."
     } else {
         $pins = { param($p) Get-Content $p | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { ($_.Trim() -split '\s+')[0] } }

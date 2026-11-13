@@ -23,15 +23,14 @@ param(
     [int]$MaxMinutes = 20
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "lib/remote.ps1")  # 맥 명령은 Invoke-Mac로만 (https://github.com/reddol18/docflow/issues/117)
 $root = Split-Path $PSScriptRoot -Parent
 $ZAP = @{ ver = "2.17.0"; sha = "94c8f767b1c2e94f0db66b3ae56514d5e3f5a728ee1b6c798e0c8fe2d61fbff0" }  # GitHub 릴리스 자산 digest
 $out = Join-Path $env:TEMP "docflow-zap\$(Get-Date -Format yyyyMMdd-HHmm)"
 New-Item -ItemType Directory -Force $out | Out-Null
 $user = "zap-scan"
 $kubectl = "/usr/local/bin/kubectl exec -i -n docs deploy/docflow -- python -m app.users"
-# Windows PowerShell 5.1은 네이티브 명령으로 파이프할 때 앞에 BOM을 붙인다($OutputEncoding을 바꿔도 붙었다) → 맥에서 떼고 넘긴다
-# (app/users.py도 이제 BOM을 뗀다. 그 판이 배포된 뒤에는 이 perl 단계를 지워도 된다)
-$noBom = "perl -pe 's/^\xEF\xBB\xBF// if `$. == 1' |"
+# 비밀번호 표준 입력은 Invoke-Mac -Stdin이 BOM 없이 넘긴다 → 맥 쪽 perl BOM 떼기는 지웠다 (app/users.py의 BOM·CRLF 떼기는 해 없는 보호로 남음)
 
 # 1. ZAP
 $dir = Join-Path $env:LOCALAPPDATA "docflow-tools\zap-$($ZAP.ver)"
@@ -64,9 +63,9 @@ open(r'$spec', 'w', encoding='utf-8').write(json.dumps(d))
 $hdr = Join-Path $out "auth.hdr"  # curl에 토큰을 명령줄이 아니라 파일로 넘긴다 (프로세스 목록·감사 로그에 남지 않게). finally에서 지운다
 $failed = $false
 function Remote([string]$cmd, [string]$stdin) {
-    $o = if ($stdin) { $stdin | ssh -o BatchMode=yes $Mac $cmd } else { ssh -o BatchMode=yes $Mac $cmd }
+    $r = if ($stdin) { Invoke-Mac -Mac $Mac -Script $cmd -Stdin "$stdin`n" -TimeoutSec 120 -AllowFail } else { Invoke-Mac -Mac $Mac -Script $cmd -TimeoutSec 120 -AllowFail }
     if ($LASTEXITCODE) { throw "맥 명령 실패 ($LASTEXITCODE): $($cmd.Split('|')[-1].Trim())" }
-    $o
+    $r
 }
 try {
     # 3. 임시 viewer (있으면 비밀번호를 바꾸고 역할을 viewer로 되돌리고 켠다)
@@ -75,11 +74,11 @@ try {
     $rows = @(Remote "$kubectl list")
     $exists = $rows | Where-Object { $_ -match "^$([regex]::Escape($user))\s" -and $_ -notmatch "\bsso\b" }
     if ($exists) {
-        Remote "$noBom $kubectl passwd $user --password-stdin" $pw | Out-Null
+        Remote "$kubectl passwd $user --password-stdin" $pw | Out-Null
         Remote "$kubectl role $user viewer" | Out-Null   # 누가 역할을 올려 두었어도 스캔은 viewer로만 (바꾸는 요청이 403이어야 한다)
         Remote "$kubectl enable $user" | Out-Null
     } else {
-        Remote "$noBom $kubectl add $user --role viewer --display 'ZAP 스캔' --password-stdin" $pw | Out-Null
+        Remote "$kubectl add $user --role viewer --display 'ZAP 스캔' --password-stdin" $pw | Out-Null
     }
 
     # 로그인 → 세션 토큰. Set-Cookie 헤더에서 읽는다 (쿠키 저장소는 Secure 쿠키를 http 주소에 돌려주지 않는다)
@@ -188,9 +187,10 @@ $check
     Remove-Item -Force $hdr -ErrorAction SilentlyContinue
     $token = $null
     # 6. 정리: 계정 끄기(세션도 끊긴다). 실패하면 크게 알린다
-    ssh -o BatchMode=yes $Mac "$kubectl disable $user" | Out-Null
-    if ($LASTEXITCODE) {
-        Write-Warning "임시 계정 $user 를 끄지 못함 — 직접: ssh $Mac `"$kubectl disable $user`""
+    $disabled = $false
+    try { Invoke-Mac -Mac $Mac -Script "$kubectl disable $user" -TimeoutSec 120 | Out-Null; $disabled = $true } catch { Write-Host $_ -ForegroundColor Red }
+    if (-not $disabled) {
+        Write-Warning "임시 계정 $user 를 끄지 못함 — 직접: ssh $Mac `"$kubectl disable $user`""  # remote-ok: 사용자에게 보이는 안내 문구 (실행 아님)
         $failed = $true
     }
     $zh = Join-Path $out "zaphome"

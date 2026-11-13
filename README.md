@@ -451,6 +451,8 @@ ssh user@mac "PATH=/usr/local/bin:`$PATH kubectl get secret keycloak-realm-secre
 ## 개발 절차
 
 - 로컬 검사: `.\scripts\check.ps1` — 끝에 나오는 요약을 PR '테스트' 칸에 붙인다 (클라우드 CI 없음).
+- **맥 원격 명령은 `scripts/lib/remote.ps1`로만** (https://github.com/reddol18/docflow/issues/117, W46 회고 규칙 B): 스크립트는 이 파일을 dot-source하고 `Invoke-Mac`(sh 스크립트, `-Stdin`·`-Stream`·`-TimeoutSec`·`-FailMessage`·`-AllowFail`)·`Copy-ToMac`·`Copy-FromMac`만 쓴다 — `ssh`·`scp` 직접 호출 금지(`tests/test_remote_helper.py`가 막는다. 꼭 필요하면 그 줄 끝에 `# remote-ok: <이유>`).
+  스크립트는 base64로 넘겨 PowerShell 5.1이 큰따옴표를 지우는 문제가 없고, ssh 옵션(접속 5초·살아 있음 10초×3)·전체 시간 제한(넘으면 끊고 throw)·BOM 없는 표준 입력이 한 곳에 있다. 손으로 맥 명령을 돌릴 때도 `. .\scripts\lib\remote.ps1; Invoke-Mac -Mac $env:DOCFLOW_MAC -Script '...'`.
 - 검사 도구·이미지 고정 (https://github.com/reddol18/docflow/issues/46): gitleaks·osv-scanner·trivy의 버전과 플랫폼별 SHA256(받는 자산·풀린 실행 파일)은 `scripts/tool_pins.txt` 한 곳에 둔다.
   `scripts/check.ps1`·`scripts/mac/scan_image.sh`는 릴리스 체크섬 파일을 쓰지 않고 이 값과 비교하며, 받아 둔 실행 파일도 부를 때마다 다시 확인한다(다르면 실행하지 않음).
   고정 파일 칸 형식(해시 64자리 소문자, 이름·자산·실행 파일 `[A-Za-z0-9._-]`, 저장소 `owner/repo`)이 틀려도 멈춘다. 서명(cosign·SLSA)은 판을 올려 고정할 때 한 번 확인한다 — 절차는 그 파일 머리말.
