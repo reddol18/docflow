@@ -4,5 +4,9 @@
   "description": "모델·지시문 비교 하네스 (https://github.com/reddol18/docflow/issues/22). 실행은 run.ps1",
   "dependencies": {
     "promptfoo": "0.125.0"
+  },
+  "overrides": {
+    "@hono/node-server": ">=2.1.6 <3",
+    "basic-ftp": ">=6.2.4 <7"
   }
 }
