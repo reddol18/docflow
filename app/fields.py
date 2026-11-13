@@ -31,8 +31,10 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Annotated
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from app import field_rules, layout
 
@@ -343,6 +345,48 @@ def parse_extract(s, content):
             conf = 0.0
         return {"value": str(v.get("value") or ""), "confidence": conf}
     return {f["name"]: cell(out.get(f["name"])) for f in prompt_fields(s)}
+
+
+class ExtractInvalid(ValueError):
+    """운영 추출 응답이 스키마에 맞지 않음 (https://github.com/reddol18/docflow/issues/27).
+    메시지는 칸 이름·오류 종류만 — 응답 값(OCR에서 온 원문)은 넣지 않는다 (서버 로그에 그대로 남아도 되게)"""
+
+
+class ExtractCell(BaseModel):
+    """추출 응답의 칸 하나: {value: 글자 또는 null, confidence: 0~1 숫자}. 문자열 숫자("0.9")·true도 받지 않는다(strict).
+    다른 키는 버린다"""
+    model_config = ConfigDict(extra="ignore", strict=True)
+    value: StrictStr | None
+    confidence: Annotated[float, Field(ge=0, le=1)]
+
+
+def validate_extract(s, content):
+    """운영 추출(app/llm.extract) 응답 → prompt 칸별 {value, confidence}. parse_extract와 달리 모양이 틀리면 고쳐 쓰지 않고
+    ExtractInvalid: JSON이 아님·객체가 아님, prompt 칸 누락, 칸 값이 객체가 아님(문자열 등), value가 글자가 아님,
+    confidence가 숫자가 아님·0~1 밖. 부른 쪽(app/graph.py extract)이 그 문서만 '추출 실패'로 표시하고 실행은 이어 간다.
+    모르는 칸은 버린다. pydantic 오류는 입력 값을 싣기 때문에 위치·종류만 옮긴다 (include_input=False, 예외 연결 끊음)"""
+    try:
+        out = json.loads(content)
+    except (TypeError, ValueError):
+        raise ExtractInvalid("JSON이 아님") from None
+    if not isinstance(out, dict):
+        raise ExtractInvalid(f"JSON 객체가 아님 ({type(out).__name__})")
+    cells, probs = {}, []
+    for f in prompt_fields(s):
+        n = f["name"]
+        if n not in out:
+            probs.append(f"{n}: 칸 없음")
+            continue
+        try:
+            c = ExtractCell.model_validate(out[n])
+        except ValidationError as e:
+            probs += [n + "".join(f".{x}" for x in err["loc"]) + f": {err['type']}"
+                      for err in e.errors(include_input=False, include_url=False, include_context=False)]
+            continue
+        cells[n] = {"value": c.value or "", "confidence": float(c.confidence)}
+    if probs:
+        raise ExtractInvalid("; ".join(probs))
+    return cells
 
 
 def assemble(s, llm_out, rule_values):

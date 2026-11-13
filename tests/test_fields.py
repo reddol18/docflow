@@ -140,10 +140,11 @@ def test_llm_extract_keys_and_prompt_from_schema(monkeypatch):
     from app import llm
     seen = {}
 
+    body = {"made": {"value": None, "confidence": 0}, "subject": {"value": "가상 건명", "confidence": 0.9},
+            "kind": {"value": "신고", "confidence": 1}, "docno": {"value": "끼어든 칸"}}
+
     def create(**kw):
         seen["prompt"] = kw["messages"][0]["content"]
-        body = {"subject": {"value": "가상 건명", "confidence": 0.9}, "kind": {"value": "신고", "confidence": "x"},
-                "docno": {"value": "끼어든 칸"}}
         return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
                                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(body)))])
     monkeypatch.setattr(llm.store, "reserve_budget", lambda *a: 1)  # 비용 한도 예약·정산은 test_budget_pg에서
@@ -151,8 +152,13 @@ def test_llm_extract_keys_and_prompt_from_schema(monkeypatch):
     monkeypatch.setattr(llm, "client", lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
     out = llm.extract("v", ["줄"], other())
     assert list(out) == ["subject", "kind", "made"]  # 스키마의 prompt 칸만, 스키마 순서. 모르는 칸(docno)은 버림
-    assert out["kind"] == {"value": "신고", "confidence": 0.0} and out["made"] == {"value": "", "confidence": 0.0}
+    assert out["kind"] == {"value": "신고", "confidence": 1.0} and out["made"] == {"value": "", "confidence": 0.0}
     assert "아래 3칸을 뽑는다." in seen["prompt"] and "- kind: 문서 종류 (다음 중 하나: 허가, 신고)" in seen["prompt"]
+    # 모양이 틀린 응답(confidence가 글자, 칸 누락)은 예전처럼 빈 값으로 고쳐 쓰지 않고 추출 실패
+    # (https://github.com/reddol18/docflow/issues/27 — tests/test_llm_boundary.py)
+    body = {"subject": {"value": "가상 건명", "confidence": 0.9}, "kind": {"value": "신고", "confidence": "x"}}
+    with pytest.raises(llm.ExtractInvalid, match="kind.confidence: float_type; made: 칸 없음"):
+        llm.extract("v", ["줄"], other())
     no_llm = copy.deepcopy(OTHER)
     no_llm["fields"] = [f for f in no_llm["fields"] if "prompt" not in f]
     no_llm.pop("extract")

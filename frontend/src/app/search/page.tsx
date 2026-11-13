@@ -24,7 +24,7 @@ function Search() {
   const [yf, setYf] = useState("");
   const [yt, setYt] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
-  const [answer, setAnswer] = useState<{ text: string; sources: SearchHit[] } | null>(null);
+  const [answer, setAnswer] = useState<{ text: string; sources: SearchHit[]; warnings: string[] } | null>(null);
   const [busy, setBusy] = useState<"search" | "ask" | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [schema, setSchema] = useState<Schema | null>(null);
@@ -59,7 +59,7 @@ function Search() {
         setAnswer(null);
       } else {
         const r = await api.ask(query);
-        setAnswer({ text: r.answer, sources: r.sources });
+        setAnswer({ text: r.answer, sources: r.sources, warnings: r.warnings ?? [] });
         setHits(r.sources);
       }
     } catch (e) {
@@ -109,6 +109,12 @@ function Search() {
       {answer && (
         <Card title="답변 (검색 상위 5건만 근거로)">
           <p className="whitespace-pre-wrap text-sm leading-relaxed">{answer.text}</p>
+          {/* 서버가 답에서 지운 근거 없는 인용 등 (https://github.com/reddol18/docflow/issues/27) */}
+          {answer.warnings.map((w) => (
+            <p key={w} className="mt-2 text-xs text-amber-700">
+              주의: {w}
+            </p>
+          ))}
         </Card>
       )}
 

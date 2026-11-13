@@ -300,7 +300,8 @@ export const api = {
   // 질문은 대기열 워커가 답한다 (https://github.com/reddol18/docflow/issues/5): 몇 초 안에 끝나면 바로 답, 아니면 202 {id} →
   // 1초마다 GET /ask/{id} (최대 2분). 서버는 기다리는 동안 스레드를 쥐지 않게 처음 기다림을 짧게 둔다(ASK_WAIT_SECONDS)
   ask: async (q: string) => {
-    type Done = { answer: string; sources: SearchHit[] };
+    // warnings: 답에서 지운 근거 없는 인용 등 (https://github.com/reddol18/docflow/issues/27). 예전 서버 응답에는 없을 수 있다
+    type Done = { answer: string; sources: SearchHit[]; warnings?: string[] };
     type Pending = { id: string; status: "queued" };
     let r = await call<Done | Pending>(`/ask?q=${enc(q)}`);
     for (let i = 0; "status" in r && i < 120; i++) {
