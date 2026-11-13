@@ -44,3 +44,11 @@ class FenceMixin:
     def put_writes(self, config, *args, **kwargs):
         check((config.get("configurable") or {}).get("thread_id"))
         return super().put_writes(config, *args, **kwargs)
+
+    async def aput(self, config, *args, **kwargs):
+        check((config.get("configurable") or {}).get("thread_id"))
+        return await super().aput(config, *args, **kwargs)
+
+    async def aput_writes(self, config, *args, **kwargs):
+        check((config.get("configurable") or {}).get("thread_id"))
+        return await super().aput_writes(config, *args, **kwargs)

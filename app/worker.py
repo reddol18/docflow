@@ -27,6 +27,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 
 from app import cancel, errors, jobqueue, llm, runs, store
@@ -34,7 +35,9 @@ from app import upload as uploads
 from app.jobqueue import ASK, GRAPH, OCR_PAGE, NewJob
 
 KINDS = (OCR_PAGE, GRAPH, ASK)
-NOT_YET_WAIT = 1.0  # 행이 준비 중(preparing)이거나 앞선 임대가 아직 살아 있는 작업을 되돌리기 전 기다림
+NOT_YET_WAIT = 1.0  # 행이 준비 중(preparing)인 작업을 되돌리기 전 기다림
+HOLD_FACTOR = 2.0  # 작업을 쥔 채 기다리는 상한 = 유휴 시간 × 이것
+HOLD_WAIT = 2.0  # 앞선 임대가 살아 있어 작업을 쥔 채 기다릴 때 다시 볼 간격 (살아 있음 표시 간격 20·30초보다 짧게)
 SWEEP_SECONDS = float(os.environ.get("SWEEP_SECONDS", "120"))
 
 
@@ -46,6 +49,12 @@ def first_input(vol, kind, arg):
     if kind == "review":
         return Command(resume=arg.get("resume") or {})
     return None
+
+
+def unfinished(snap) -> bool:
+    """그래프가 중간에 멈췄나 (검토 대기 아님). next만 보면 안 된다: Postgres 체크포인터에서 끊기면(Cancelled — 다음 체크포인트는
+    막히고 앞 단계의 대기 쓰기만 남음) next가 비고 tasks에만 남는다 (tests/test_cancel_graph.py). 끝난 그래프는 둘 다 빈다"""
+    return bool(snap.next or getattr(snap, "tasks", ())) and not snap.interrupts
 
 
 def execute(main, vol, inp, user, invoke=True, claim=lambda outcome: True):
@@ -65,7 +74,7 @@ def execute(main, vol, inp, user, invoke=True, claim=lambda outcome: True):
         return "budget"
     snap = main.G.get_state(main.cfg(vol))
     print(f"run {vol} stopped/finished: next={snap.next}", flush=True)
-    outcome = "review" if snap.interrupts else "error" if snap.next else "ok"  # 끝나지도 멈추지도 않음 → 오류 (/resume)
+    outcome = "review" if snap.interrupts else "error" if unfinished(snap) else "ok"  # 끝나지도 멈추지도 않음 → 오류 (/resume)
     if claim(outcome):
         if outcome == "review":
             store.event(vol, "review", "waiting", None, flagged=len(snap.interrupts[0].value["flagged"]))
@@ -77,6 +86,13 @@ def execute(main, vol, inp, user, invoke=True, claim=lambda outcome: True):
             store.event(vol, "run", "error", None, code="internal")
             main.audit_safe(user, "run_done", vol, None, "error", code="internal")
     return outcome
+
+
+class FencedSaver(cancel.FenceMixin, PostgresSaver):
+    """워커의 체크포인터: 임대를 잃은 뒤 진행 중이던 노드의 늦은 체크포인트 쓰기를 막는다 (app/cancel.py FenceMixin).
+    langgraph-checkpoint-postgres 3.2.0에서 그래프 실행이 부르는 쓰기는 put(체크포인트 + 채널 블롭 — _dump_blobs·UPSERT 블롭이
+    put 안)과 put_writes(대기 쓰기)뿐이고(비동기 aput·aput_writes는 FenceMixin이 같이 덮는다), copy_thread·delete_thread·
+    delete_for_runs·prune은 그래프 실행이 부르지 않는 관리용 — 워커는 쓰지 않는다 (철 일괄 삭제의 delete_thread는 API)"""
 
 
 class BadJob(ValueError):
@@ -167,9 +183,10 @@ def _user(r):
 
 
 class Worker:
-    def __init__(self, q=None, name=None):
+    def __init__(self, q=None, name=None, stopping=None):
         self.q = q or runs.queue()
         self.name = name or jobqueue.consumer_name()
+        self.stopping = stopping or threading.Event()  # 멈추라는 신호 (SIGTERM) — 기다리던 작업은 되돌리지 않고 놓는다
 
     # ---------- 공통 ----------
 
@@ -187,11 +204,22 @@ class Worker:
     def _hold(self, job, attempt):
         """같은 작업을 쥔 채 기다리며 attempt()를 다시 한다 — 대기열 살아 있음 표시를 계속하면서. 되돌리지(release) 않는다:
         Redis는 되돌리면 새 항목 id가 생겨, 앞선 임대가 쥔 작업 id(graph_job)와 달라져 '다른 작업'으로 버려진다.
-        attempt()가 'retry'가 아닌 값을 주면 그것을, 이 작업의 대기열 임대를 잃으면 None"""
+        attempt()가 'retry'가 아닌 값을 주면 그것을, 아니면 None — 이 작업의 대기열 임대를 잃었을 때, 멈추라는 신호(stopping)를
+        받았을 때, 상한(유휴 시간 2배 — 앞선 임대는 그 안에 표시가 멈추거나 끝나야 한다)을 넘었을 때. None이면 작업을 그대로 두고
+        (ack·release 없이) 손을 뗀다 — 대기열의 되찾기가 유휴 시간 뒤 다시 준다"""
+        idle = self.q.cfg.spec(job.kind).idle
+        deadline = time.monotonic() + HOLD_FACTOR * idle
         while True:
-            time.sleep(NOT_YET_WAIT)
+            if self.stopping.wait(min(HOLD_WAIT, idle / 4)):
+                print(f"[worker] {job.kind} 기다리다 멈춤 신호 — 작업을 놓는다 (되찾기가 잇는다)", flush=True)
+                return None
+            if time.monotonic() > deadline:
+                print(f"[worker] {job.kind} 앞선 임대를 {HOLD_FACTOR * idle:.0f}초 기다려도 그대로 — 작업을 놓는다 (되찾기가 다시 준다)",
+                      flush=True)
+                return None
             try:
                 if not self.q.heartbeat(job):
+                    print(f"[worker] {job.kind} 기다리는 사이 대기열 임대를 잃음", flush=True)
                     return None
             except Exception as e:  # noqa: BLE001 — 잠깐 안 되면 다시 (잃었으면 다음 표시가 거절된다)
                 print(f"[worker] 기다리는 중 표시 실패: {type(e).__name__}", flush=True)
@@ -254,7 +282,7 @@ class Worker:
         if snap.interrupts and claim["kind"] == "review":
             if snap.interrupts[0].id in set((arg.get("resume") or {}).keys()):  # 검토 값을 넣기 전에 끊겼다
                 return "go", Command(resume=arg.get("resume") or {})
-        if snap.next and not snap.interrupts:
+        if unfinished(snap):
             return "go", None
         return "done", None
 
@@ -343,12 +371,15 @@ class Worker:
             except Exception:
                 errors.log_exception("ask")
                 if job.attempts < self.q.cfg.max_attempts:
-                    keep.settle(lambda: runs.ask_unclaim(job.ref, token))  # 다음 시도가 다시 쥘 수 있게
-                    self.q.fail(job)
+                    if keep.settle(lambda: runs.ask_unclaim(job.ref, token)):  # 다음 시도가 다시 쥘 수 있게
+                        self.q.fail(job)
                     return
                 keep.settle(lambda: runs.ask_done(job.ref, None, "internal", token))
             else:
                 keep.settle(lambda: runs.ask_done(job.ref, out, None, token))
+        if keep.lost.is_set():  # 임대를 잃어 결과를 남기지 않았다 — ack하면 행이 running으로 남는다. 되찾기에 맡긴다
+            print("[worker] ask 임대를 잃어 결과를 남기지 않음 (되찾은 워커가 잇는다)", flush=True)
+            return
         self.q.ack(job)
 
     # ---------- 돌기 ----------
@@ -361,6 +392,7 @@ class Worker:
         return True
 
     def loop(self, kind, stopping: threading.Event):
+        self.stopping = stopping
         while not stopping.is_set():
             try:
                 self.run_once(kind, wait=getattr(self.q, "poll", 1.0))
@@ -399,7 +431,7 @@ def resume_unfinished(main=None):
     for vol in main.volume_names():
         try:
             snap = main.G.get_state(main.cfg(vol))
-            if not snap.next or snap.interrupts:
+            if not unfinished(snap):
                 continue
             if store.run_stop(vol) == "budget":
                 continue
@@ -425,14 +457,9 @@ def resume_unfinished(main=None):
 
 def serve():
     """`python -m app.worker` — 종류마다 스레드 + 감시, SIGTERM이면 지금 작업을 끝내고 멈춘다 (못 끝낸 작업은 되찾기가 잇는다)"""
-    from langgraph.checkpoint.postgres import PostgresSaver
-
     from app import graph as flow
     main = _main()
     store.init()
-
-    class FencedSaver(cancel.FenceMixin, PostgresSaver):
-        """임대를 잃은 뒤 진행 중이던 노드의 늦은 체크포인트 쓰기를 막는다 (app/cancel.py FenceMixin)"""
     saver = FencedSaver(store.pool)
     saver.setup()
     main.G = flow.build(saver)
@@ -445,7 +472,7 @@ def serve():
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
-    w = Worker()
+    w = Worker(stopping=stopping)
     print(f"[worker] {w.name} 시작: {', '.join(kinds)}", flush=True)
     threads = [threading.Thread(target=w.loop, args=(k, stopping), name=f"worker-{k}", daemon=True) for k in kinds]
     threads.append(threading.Thread(target=w.sweeper, args=(stopping,), name="worker-sweep", daemon=True))

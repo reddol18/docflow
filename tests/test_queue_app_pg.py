@@ -70,6 +70,7 @@ def app(pg_store, monkeypatch, tmp_path):
     monkeypatch.setattr(auth, "_anon_state", {"dropped": 0, "overflow": 0})
     monkeypatch.setattr(store, "DATA", tmp_path)
     monkeypatch.setattr(worker, "NOT_YET_WAIT", 0.01)
+    monkeypatch.setattr(worker, "HOLD_FACTOR", 30.0)  # 기다림 상한은 test_hold_* 에서 따로
     q = PgQueue(pg_store.pool, cfg(), poll=0.05)
     runs.set_queue(q)
     g = FakeGraph()
@@ -612,3 +613,75 @@ def test_summary_reads_run_states_once(app, monkeypatch):
         upload(app, v, 1)
     monkeypatch.setattr(runs, "active", lambda vol: pytest.fail("철마다 읽음"))
     assert len(app.c.get("/volumes", headers=ADMIN).json()) >= 3
+
+
+def test_hold_gives_up_without_release(app, monkeypatch):
+    """쥔 채 기다리기(_hold): 자기 대기열 임대를 잃음·멈춤 신호·상한 → None (ack도 release도 없이 놓는다). 행이 끝나면 gone"""
+    run = _graph_job(app, "vg")
+    job = app.q.take(GRAPH, "w")
+    w = worker.Worker(q=app.q, name="w")
+    # 1) 기다리는 중 자기 임대를 잃음
+    real_hb, n = app.q.heartbeat, []
+    monkeypatch.setattr(app.q, "heartbeat", lambda j: (n.append(1), len(n) < 3 and real_hb(j))[1])
+    assert w._hold(job, lambda: "retry") is None and len(n) == 3
+    monkeypatch.setattr(app.q, "heartbeat", real_hb)
+    assert app.q.stats(GRAPH).length == 1  # 되돌리지 않았다 (같은 항목)
+    # 2) 멈춤 신호
+    w.stopping.set()
+    t0 = time.monotonic()
+    assert w._hold(job, lambda: "retry") is None and time.monotonic() - t0 < 1
+    w.stopping.clear()
+    # 3) 상한 (유휴 시간 × HOLD_FACTOR)
+    monkeypatch.setattr(worker, "HOLD_FACTOR", 1.0)
+    t0 = time.monotonic()
+    assert w._hold(job, lambda: "retry") is None and IDLE <= time.monotonic() - t0 < IDLE + 1
+    # 4) 기다리는 중 실행이 끝남 → graph는 작업을 버린다
+    monkeypatch.setattr(worker, "HOLD_FACTOR", 30.0)
+    old = SimpleNamespace(id=job.id, lease="old-lease")
+    with store.pool.connection() as c:  # 같은 작업의 앞선 임대가 쥐고 있고 표시가 살아 있다
+        c.execute("UPDATE vol_run SET graph_job = %s, graph_lease = %s, graph_beat = clock_timestamp() + interval '1 hour' "
+                  "WHERE vol = 'vg'", (old.id, old.lease))
+    import threading
+    tw = threading.Thread(target=w.graph, args=(job, run))
+    tw.start()
+    time.sleep(0.5)
+    assert tw.is_alive()  # 기다리는 중
+    with store.pool.connection() as c:
+        c.execute("UPDATE vol_run SET state = 'ended', outcome = 'ok' WHERE vol = 'vg'")
+    tw.join(5)
+    assert not tw.is_alive() and app.q.stats(GRAPH).length == 0 and app.g.calls == []  # 버림 (돌리지 않음)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_ask_lost_lease_does_not_ack(app, monkeypatch, backend, request):
+    """ask를 처리하던 워커가 임대를 잃으면(대기열 표시 오류가 이어짐) 결과를 남기지 않고 ack도 하지 않는다 — 그대로 두면
+    대기열 항목이 사라지고 행은 running으로 남는다. 되찾은 워커가 넘겨받아 답한다 (LLM은 두 번 불릴 수 있다 — 결과는 한 번)"""
+    import threading
+    use_backend(app, backend, request)
+    app.q.cfg = replace(app.q.cfg, kinds={**app.q.cfg.kinds, ASK: KindSpec(idle=IDLE, limit=100, heartbeat=0.15)})
+    monkeypatch.setattr(app.main, "ASK_WAIT", 0)
+    calls, release_a = [], threading.Event()
+
+    def answer(q, yf, yt, user):
+        who = threading.current_thread().name
+        calls.append(who)
+        if who == "A":
+            release_a.wait(10)  # A는 오래 걸린다 — 그 사이 임대를 잃는다
+        return {"answer": who, "sources": []}
+    monkeypatch.setattr(app.main, "ask_answer", answer)
+    real_hb = app.q.heartbeat
+    monkeypatch.setattr(app.q, "heartbeat", lambda j: (_ for _ in ()).throw(ConnectionError("가상"))
+                        if j.consumer == "A" else real_hb(j))
+    req = app.c.get("/ask", params={"q": "가상"}, headers=ADMIN).json()["id"]
+    ta = threading.Thread(target=worker.Worker(q=app.q, name="A").run_once, args=(ASK,), name="A")
+    ta.start()
+    time.sleep(IDLE + 0.3)  # A의 Keeper가 잃음으로 본다 (idle - beat 넘게 표시 실패)
+    release_a.set()
+    ta.join(5)
+    assert runs.ask_get(req)["state"] == "running" and app.q.stats(ASK).length == 1  # A는 ack하지 않았다
+    tb = threading.Thread(target=worker.Worker(q=app.q, name="B").run_once, args=(ASK, 5.0), name="B")
+    tb.start()
+    tb.join(10)
+    r = app.c.get(f"/ask/{req}", headers=ADMIN)
+    assert r.status_code == 200 and r.json()["answer"] == "B" and calls == ["A", "B"]
+    assert app.q.stats(ASK).length == 0

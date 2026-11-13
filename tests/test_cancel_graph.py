@@ -102,3 +102,34 @@ def test_fence_blocks_late_writes():
     snap = G.get_state(cfg)
     assert "a-late" not in (snap.values.get("log") or [])  # 늦은 쓰기는 막혔다
     cancel.disarm(vol, ev)
+
+
+def test_cancelled_with_postgres_checkpointer(pg_store):
+    """워커의 실제 체크포인터(FencedSaver = PostgresSaver + 펜싱, PGlite)에서도: 노드 안 Cancelled → invoke가 올림 →
+    멈춘 곳이 남고 → 다음 invoke(None)가 끝까지"""
+    from app.worker import FencedSaver
+    vol = "cg-pg"
+    saver = FencedSaver(pg_store.pool)
+    saver.setup()
+    saver.delete_thread(vol)
+    ev, calls = cancel.arm(vol), []
+
+    def b(s):
+        calls.append("b")
+        if calls.count("b") == 1:
+            ev.set()
+        cancel.check(vol)
+        return {"log": ["b"]}
+    G = build(saver, {"a": lambda s: {"log": ["a"]}, "b": b, "c": lambda s: {"log": ["c"]}})
+    cfg = {"configurable": {"thread_id": vol}}
+    with pytest.raises(cancel.Cancelled):
+        G.invoke({"log": []}, cfg)
+    snap = G.get_state(cfg)
+    assert not snap.next and snap.tasks  # PG에서는 next가 비고 tasks에만 남는다 — 워커는 둘 다 본다
+    from app.worker import unfinished
+    assert unfinished(snap)
+    cancel.disarm(vol, ev)
+    G.invoke(None, cfg)
+    snap = G.get_state(cfg)
+    assert not snap.next and snap.values["log"][-2:] == ["b", "c"]
+    saver.delete_thread(vol)

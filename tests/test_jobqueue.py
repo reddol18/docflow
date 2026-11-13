@@ -38,6 +38,8 @@ def clean_pg(store):
 # (app/jobqueue_redis.py acl_rules — 운영 k8s/docs.yaml과 같은 규칙)를 만들고, 대기열은 그 사용자로 붙는다 — Lua가 부르는 명령까지
 # ACL에 다 들어 있는지 공통 시험 전체로 확인한다
 REAL_REDIS = os.environ.get("TEST_REDIS_URL")
+# 되찾기를 기다리는 시간: 실제 Redis(WSL)는 서버 시계·부하로 조금 흔들려 넉넉히 (그래도 유휴 시간 0.6초보다 길게만 기다림)
+RECLAIM_WAIT = IDLE + (0.7 if REAL_REDIS else 0.3)
 
 
 @pytest.fixture(params=["postgres", "redis", "redis-real"])
@@ -142,7 +144,7 @@ def test_due_job_counts_as_waiting_and_first(q):
     q.put(pages(1))
     lost = q.take(OCR_PAGE, "dead-worker")
     assert q.stats(OCR_PAGE).running == 1
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     s = q.stats(OCR_PAGE)
     assert (s.waiting, s.running) == (1, 0)
     assert q.position(OCR_PAGE, lost.id) == 1
@@ -180,7 +182,7 @@ def test_dead_worker_job_reclaimed_after_idle(q):
     q.put(pages(1))
     lost = q.take(OCR_PAGE, "dead-worker")
     assert q.take(OCR_PAGE, "w2") is None  # 유휴 시간 전에는 못 가져간다
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     got = q.take(OCR_PAGE, "w2")
     assert got and got.id == lost.id and got.page == "001"
     assert got.attempts == 2 and got.consumer == "w2"
@@ -232,7 +234,7 @@ def test_same_consumer_old_attempt_is_fenced(q):
     """같은 consumer 이름이 다시 되찾아도 옛 시도(attempts)로는 ack·heartbeat가 안 된다 (펜싱 토큰)"""
     q.put(pages(1))
     first = q.take(OCR_PAGE, "w1")
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     second = q.take(OCR_PAGE, "w1")
     assert second.id == first.id and second.attempts == 2
     assert not q.ack(first) and not q.heartbeat(first)
@@ -242,7 +244,7 @@ def test_same_consumer_old_attempt_is_fenced(q):
 def test_reclaim_comes_before_new_jobs(q):
     q.put(pages(1))
     q.take(OCR_PAGE, "dead-worker")
-    time.sleep(IDLE + 0.3)
+    time.sleep(RECLAIM_WAIT)
     q.put(pages(1, vol="철2"))
     assert q.take(OCR_PAGE, "w2").vol == "철1"
     assert q.take(OCR_PAGE, "w2").vol == "철2"
@@ -326,7 +328,7 @@ def test_too_many_attempts_goes_dead(q):
     for n in (1, 2, 3):
         job = q.take(OCR_PAGE, f"w{n}")
         assert job and job.attempts == n
-        time.sleep(IDLE + 0.4)  # 실제 Redis(WSL)는 서버 시계가 조금 흔들린다 — 다른 되찾기 시험처럼 넉넉히
+        time.sleep(RECLAIM_WAIT)  # 실제 Redis(WSL)는 서버 시계가 조금 흔들린다 — 다른 되찾기 시험처럼 넉넉히
     assert q.take(OCR_PAGE, "w4") is None
     s = q.stats(OCR_PAGE)
     assert (s.length, s.dead) == (0, 1)
