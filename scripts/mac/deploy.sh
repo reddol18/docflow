@@ -53,6 +53,10 @@ sh ~/doc_platform/scripts/owner_migrate.sh check
 kubectl get secret tls-web tls-postgres tls-qdrant tls-redis qdrant-api-key redis-auth -n docs >/dev/null </dev/null \
   && kubectl get configmap docflow-ca -n docs >/dev/null </dev/null \
   || { echo "TLS Secret(tls-web·tls-postgres·tls-qdrant·tls-redis·qdrant-api-key·redis-auth)·ConfigMap docflow-ca가 없음 — Windows에서 scripts/tls_secrets.ps1 먼저. 배포하지 않음" >&2; exit 1; }
+# OIDC client secret (https://github.com/reddol18/docflow/issues/39). docflow 파드가 마운트한다 — 없으면 새 파드가 ContainerCreating에 멈춘다.
+# 넣는 법: Windows에서 scripts/keycloak.ps1 (데모 Keycloak과 같은 값으로 만든다)
+kubectl get secret oidc -n docs >/dev/null </dev/null \
+  || { echo "Secret oidc(OIDC client secret)가 없음 — Windows에서 scripts/keycloak.ps1 먼저. 배포하지 않음" >&2; exit 1; }
 # 빌드 → 바로 고정('== 이미지 고정' 줄). 고정이 확인되지 않으면 build_image.sh가 실패로 멈춰 apply에 가지 않는다 —
 # 그래서 apply 전 확인은 따로 두지 않는다(고정 줄이 같은 것을 방금 확인했다)
 sh ~/doc_platform/scripts/build_image.sh all deploy </dev/null

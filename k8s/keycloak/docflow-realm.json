@@ -1,0 +1,82 @@
+{
+  "realm": "docflow",
+  "displayName": "docflow 데모",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "failureFactor": 10,
+  "permanentLockout": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "groups": [
+    {"name": "docflow-admin", "path": "/docflow-admin"},
+    {"name": "docflow-reviewer", "path": "/docflow-reviewer"}
+  ],
+  "clients": [
+    {
+      "clientId": "docflow",
+      "name": "docflow",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${DOCFLOW_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": false,
+      "consentRequired": false,
+      "redirectUris": ["http://localhost:3000/api/auth/oidc/callback"],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "false",
+            "claim.name": "groups"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "hangaram",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "가람",
+      "lastName": "한",
+      "email": "hangaram@example.com",
+      "credentials": [{"type": "password", "value": "${DEMO_PW_HANGARAM}", "temporary": false}],
+      "groups": ["/docflow-admin", "/docflow-reviewer"]
+    },
+    {
+      "username": "seonuri",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "누리",
+      "lastName": "서",
+      "email": "seonuri@example.com",
+      "credentials": [{"type": "password", "value": "${DEMO_PW_SEONURI}", "temporary": false}],
+      "groups": ["/docflow-reviewer"]
+    }
+  ]
+}

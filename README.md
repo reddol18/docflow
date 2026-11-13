@@ -377,6 +377,50 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 - k3s local-path PVC는 hostPath라 `fsGroup`이 듣지 않는다. 데이터 소유자가 다르면 `scripts/mac/deploy.sh`가 apply 전에 멈춘다(`scripts/mac/owner_migrate.sh check`) — 백업 뒤 `owner_migrate.sh qdrant`로 한 번 넘기고 바로 배포.
 - emptyDir 상한: qdrant 스냅숏 2Gi(저장소 PVC보다 작지 않게 — PVC를 늘리면 함께, 스냅숏은 만든 뒤 바로 내려받는다. 파드가 다시 뜨면 사라짐), docflow `/tmp` 2Gi(업로드 본문을 Starlette가 흘려 쓰는 곳). 넘으면 kubelet이 docflow 파드를 내쫓으므로 앱이 업로드를 묶는다(`app/upload.py`, https://github.com/reddol18/docflow/issues/26): 파일 하나 `UPLOAD_MAX_MB`(기본 20, 넘으면 413), 요청 하나 `UPLOAD_MAX_FILES`장(기본 50, 넘으면 400), 픽셀 수 `UPLOAD_MAX_MPX`(기본 100MP — A3 600dpi ≈ 70MP, 넘으면 400), 스캔 수 `UPLOAD_MAX_SCANS`(기본 64, 넘으면 400), 요청 본문 `UPLOAD_MAX_BODY_MB`(기본 210 — 화면이 10장씩 보냄, 받은 바이트로 세어 413), 동시에 받는 본문 합계 `UPLOAD_TMP_MB`(기본 1536, 넘으면 429), 동시 디코드 검사 `UPLOAD_DECODE_SLOTS`(기본 2). 본문은 로그인·역할·CSRF 확인 뒤에 읽는다. 같은 이름의 다른 내용은 409, `?replace=true`면 바꾸고 그 쪽 OCR을 지운다. 새 쪽·교체는 처음·끝난 철만(실행 중·검토 대기·멈춤은 409), 끝난 철은 `/run`으로 다시.
 
+### 데모 Keycloak — OIDC 실연결 (https://github.com/reddol18/docflow/issues/39)
+
+시험·시연용 OIDC 제공자. 기관 SSO가 아니다. `AUTH_MODES=local,oidc` — 로컬 로그인은 그대로 있고 로그인 화면에 'Keycloak(데모)로 로그인' 버튼이 더해진다.
+
+| 무엇 | 값 |
+|---|---|
+| 매니페스트 | `k8s/keycloak.yaml` — 네임스페이스 `keycloak`(docs 쿼터·PVC를 쓰지 않음, 자체 쿼터 요청 메모리 640Mi·한도 1Gi·PVC 1), 기본 차단 NetworkPolicy, 들어오는 것은 docs의 docflow API 파드 8080만 |
+| 이미지 | `quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e…` (amd64 압축 약 253MB). `start --optimized` — 이미지에 미리 된 빌드를 그대로 써서 루트 파일시스템 읽기 전용 |
+| 저장소 | Keycloak 자체 H2 파일(dev-file)을 PVC `keycloak-data`(512Mi)에. 별도 Postgres 없음 — realm은 저장소 JSON에서 언제든 다시 만든다 |
+| 메모리 | 요청 512Mi · 한도 1Gi, 힙은 한도의 50%(`JAVA_OPTS_KC_HEAP`) |
+| realm | `k8s/keycloak/docflow-realm.json` — realm `docflow`, 기밀 클라이언트 `docflow`(PKCE S256 필수, 콜백 `http://localhost:3000/api/auth/oidc/callback` 하나), 그룹 `docflow-admin`·`docflow-reviewer`, 가상 사용자 `hangaram`(두 그룹)·`seonuri`(reviewer). 비밀값 칸은 `${…}` 자리표시자뿐 — 가져올 때 Secret에서 채운다 |
+| issuer | `http://keycloak.localhost:8180/realms/docflow` — 브라우저와 docflow 파드가 같은 글자 |
+| docflow 설정 | `k8s/docs.yaml` `OIDC_*`, client secret은 Secret `oidc`(`/etc/oidc/client-secret`), `docflow-egress`에 keycloak 8080 규칙, `hostAliases` keycloak.localhost → Keycloak Service 고정 IP `10.43.0.39` |
+
+- **주소가 하나로 맞는 길:** 브라우저는 `*.localhost`를 늘 127.0.0.1로 푼다(`docflow.localhost:8443`과 같은 방식) → ssh 터널 8180 → 맥 `kubectl port-forward svc/keycloak 8180:8180` → 파드 8080. docflow 파드는 `hostAliases`로 같은 이름을 Keycloak Service(고정 clusterIP, 서비스 대역 아래쪽 정적 몫)로 보낸다. 그래서 discovery 문서의 issuer·토큰·JWKS 주소가 docflow 설정과 같아 `auth.check_discovery`를 통과한다.
+- **http인 까닭:** 내부 데모 CA(`scripts/ca.py`)는 이름 제약에 keycloak 이름이 없어 https로 하려면 CA를 다시 만들어야 한다. 그래서 이 설치만 `OIDC_ALLOW_HTTP=1`(클러스터 안 시험 제공자 전용 값), realm은 `sslRequired=external`(사설·루프백 주소만 http). 바깥에 열지 않는다(port-forward·ssh 터널뿐).
+- **역할 = 그룹:** 클라이언트의 그룹 매퍼가 ID 토큰에 `groups`(경로 없는 이름)를 넣고 docflow가 `OIDC_ROLE_CLAIM=groups`·`OIDC_ROLE_MAP`으로 옮긴다. 로그인할 때마다 다시 맞추므로 그룹을 빼면 **다음 로그인 때** 남은 그룹 중 가장 넓은 역할로 내려가고, 지도에 있는 그룹이 없으면 로그인이 거절된다(`OIDC_DEFAULT_ROLE=none`, 감사 사유 `oidc_role`). 이미 열린 docflow 세션은 로그아웃·만료까지 그 역할 그대로다.
+- **SSO는 `localhost:3000`(이 PC 개발 서버)에서만:** 콜백을 그 주소 하나로 등록했다. `https://docflow.localhost:8443`(web 파드)에서 SSO 버튼을 누르면 콜백이 달라 로그인되지 않는다 — 그쪽은 로컬 로그인. Keycloak 쪽 로그아웃 연동(RP-initiated logout)은 범위 밖이라 docflow 로그아웃 뒤에도 Keycloak 세션이 남아 다음 SSO 로그인은 비밀번호 없이 된다(다른 사용자로 시험하려면 Keycloak 계정 화면에서 로그아웃하거나 시크릿 창).
+
+**올리기 (처음, 이 PC에서):**
+
+```powershell
+.\scripts\keycloak.ps1        # 맥: 디스크 확인(1GB) → Secret 3개(없을 때만 무작위, docs/oidc 포함) → realm ConfigMap → apply → 준비 대기
+.\scripts\deploy.ps1          # docflow를 AUTH_MODES=local,oidc로 (Secret oidc가 없으면 맥 deploy.sh가 apply 전에 멈춘다)
+.\scripts\keycloak.ps1 -Verify  # docflow 파드에서 discovery 문서 → "issuer 같음: True"
+```
+
+**데모 로그인:**
+
+```powershell
+# 맥 (터미널 두 개 또는 백그라운드)
+kubectl port-forward -n docs svc/docflow 8000:8000
+kubectl port-forward -n keycloak svc/keycloak 8180:8180
+# 이 PC
+ssh -N -L 8000:127.0.0.1:8000 -L 8180:127.0.0.1:8180 user@mac
+cd frontend; npm run dev      # http://localhost:3000/login → 'Keycloak(데모)로 로그인'
+# 시험 사용자 비밀번호를 이 PC 클립보드로 (화면에 찍지 않음, 사용자가 직접)
+ssh user@mac "PATH=/usr/local/bin:`$PATH kubectl get secret keycloak-realm-secrets -n keycloak -o jsonpath='{.data.demo-pw-hangaram}' | base64 -D" | Set-Clipboard
+```
+
+- 관리 화면: `http://keycloak.localhost:8180/admin/` — 사용자 `kcadmin`, 비밀번호는 Secret `keycloak-admin`(`password`)을 위와 같이 클립보드로. realm `docflow` → Clients·Groups·Users에서 확인하고, 그룹 빼기 시험은 Users → `hangaram` → Groups → `docflow-admin` Leave → docflow 로그아웃 → 다시 SSO 로그인 → 검토자 화면.
+- **realm을 바꿀 때:** Keycloak은 같은 이름의 realm이 있으면 가져오기를 건너뛴다. JSON을 고쳐 다시 넣으려면 관리 화면에서 realm을 지우고 파드를 다시 띄우거나 `kubectl delete namespace keycloak` 뒤 `keycloak.ps1`(Secret도 새로 만들어지고 docs/oidc도 맞춰진다 → docflow 재시작).
+- **지우기:** `kubectl delete namespace keycloak`, 그리고 docflow를 `AUTH_MODES=local`로 되돌려 배포(`OIDC_*`·`hostAliases`·`oidc` 볼륨·egress 규칙은 그 커밋에서 함께 뺀다).
+
 ### colima 디스크 정리 기준 (https://github.com/reddol18/docflow/issues/119)
 
 맥 colima VM의 이미지 디스크(`/var/lib/containerd`·`/var/lib/rancher`·`/mnt/lima-colima`가 같은 `/dev/vdb1` 30GB)가 kubelet 이미지 GC 문턱(이 노드 configz 실측 high 85% / low 80%)에 닿으면 kubelet이 **돌고 있는 컨테이너가 쓰지 않고 고정(pin)되지 않은 이미지**를 오래된 것부터 low까지 지운다. 배포 중(빌드 뒤~새 파드 전, Recreate로 옛 파드가 내려간 사이) `docflow:dev`가 여기에 걸려 지워지면 `imagePullPolicy: Never`라 새 파드가 `ErrImageNeverPull`로 멈춘다(2026-11-10 약 10분 중단).
@@ -447,7 +491,7 @@ cd frontend && npm install && npm run dev        # http://localhost:3000  (DOCFL
 |---|---|
 | `app/` | FastAPI · LangGraph 흐름(`graph.py`) · OCR · 규칙(`layout.py`) · GPT 호출(`llm.py`) · 저장소 |
 | `frontend/` | Next.js 16 대시보드 (업로드 · 진행 단계 · 검토 에디터 · 검색). 운영 이미지 `Dockerfile`(next build → next start)·TLS 종단 `tls-proxy.mjs` |
-| `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow |
+| `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow (`docs.yaml`), 데모 Keycloak(`keycloak.yaml`, realm `keycloak/docflow-realm.json`) |
 | `eval/` | 정답 채점(`score.py`), 모델·지시문 비교 하네스(`promptfoo/`, 예전 일회성 `cell_variants.py`, `extract_variants.py`). 정답 데이터와 채점 규칙은 이전 PoC 폴더에 있어 이 레포만으로는 돌지 않음 |
 | `sim/` | breakscale_wrap 부하 시나리오 (지금 구성 / 클라우드)와 실행기 |
 | `docs/` | 설계(`design.md`), 실습 기록(`lab_log.md`), 화면 캡처·시뮬레이션 영상 |
