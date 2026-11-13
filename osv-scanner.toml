@@ -8,7 +8,9 @@ reason = "minimatch 10.x (패턴 증폭 DoS, 11.0.1에서 고침): eslint(fronte
 
 # 아래: 모델 비교 하네스(eval/promptfoo, 개발 PC에서 손으로 돌림, 배포·이미지에 없음)의 promptfoo 0.125.0 간접 의존성.
 # 고친 판은 상위 패키지가 받지 않는 다음 메이저 판(13→14)이라 overrides로 올리면 semver 계약을 깬다 → promptfoo가 올리면 갱신. https://github.com/reddol18/docflow/issues/22
-# (basic-ftp는 새 권고까지 겹쳐 eval/promptfoo/package.json overrides로 6.2.4에 올렸다 — GHSA-c475-qrg2-pj4r 항목을 지움. https://github.com/reddol18/docflow/issues/77)
+# basic-ftp는 메이저(5→6)인데도 eval/promptfoo/package.json overrides로 올렸다(판은 그 파일 한 곳) — GHSA-c475-qrg2-pj4r 항목을 지움. https://github.com/reddol18/docflow/issues/123
+# 둘을 다르게 다루는 까닭: basic-ftp는 get-uri의 ftp: 경로 한 곳에서 Client.access·lastMod·list·downloadTo·close만 쓰고 6.x에 그대로 있음을 확인했다.
+# glob은 promptfoo가 직접 의존하고 여러 곳에서 부르는데, 14로 넘겼을 때 그 호출이 깨지는지는 확인하지 않았다 → 수용 유지.
 # IgnoredVulns는 ID 단위로 모든 lock 파일에 걸린다 — 나중에 다른 lock(frontend·requirements)에 같은 ID가 들어와도 조용히 걸러지므로
 # 만료(2026-12-07) 때 어느 lock에서 나오는지 함께 다시 본다. 위험 수용 이슈는 사용자 결정 대기.
 [[IgnoredVulns]]

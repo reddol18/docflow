@@ -56,7 +56,8 @@ $env:DOCFLOW_EVAL_WORK = $work
 $env:DOCFLOW_EVAL_VOLS = ($Vols -join ',')
 # .cmd 껍데기를 거치면 cmd.exe가 정규식의 '|'를 파이프로 읽는다 → node로 바로 부른다
 $pfjs = Join-Path $here 'node_modules\promptfoo\dist\src\entrypoint.js'
-if (-not (Test-Path $pfjs)) { Push-Location $here; npm ci --no-audit --no-fund; Pop-Location }
+. (Join-Path $here 'node_deps.ps1')
+if (Sync-NodeModules -Dir $here) { Write-Host 'promptfoo 의존성을 lock대로 다시 깔았다 (npm ci)' }   # lock이 바뀌면 다시 깐다 (#123)
 function Invoke-Promptfoo { node $pfjs @args }
 
 if ($View) {   # 127.0.0.1에서만 열고 다른 Host·Origin은 403 (localhost_only.cjs). 화면엔 키가 필요 없다 → 빼고 연다
