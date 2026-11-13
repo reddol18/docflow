@@ -73,6 +73,10 @@ def env(pg_store, monkeypatch, tmp_path):
         # 검토 단계 위치·기록 (https://github.com/reddol18/docflow/issues/86) — 반려 사유가 들어 있으므로 일괄 삭제 대상
         store.ensure_stage(vol, pages[0], "entry")
         store.add_stage_log(vol, pages[0], "qc", 1, "reject", "entry", 1, reason="가상 사유")
+        # 끝난 실행 행 (https://github.com/reddol18/docflow/issues/5) — 일괄 삭제 대상
+        from app import runs
+        runs.commit(vol, runs.next_run(), "start", {"review_mode": "human"})
+        runs.end(vol, runs.row(vol)["run"], "ok")
         q.upsert(store.COLLECTION, [PointStruct(id=i * 10 + j, vector=[1.0, float(j)], payload={"vol": vol, "doc_id": d})
                                     for j, d in enumerate((pages[0], pages[2]))])
         graph.invoke({"x": 0}, {"configurable": {"thread_id": vol}})

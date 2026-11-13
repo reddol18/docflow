@@ -225,8 +225,22 @@ DROP INDEX IF EXISTS job_queue_take;
 CREATE INDEX IF NOT EXISTS job_queue_new ON job_queue (kind, seq) WHERE owner IS NULL AND NOT dead;
 CREATE INDEX IF NOT EXISTS job_queue_taken ON job_queue (kind, seq) WHERE owner IS NOT NULL AND NOT dead;
 CREATE INDEX IF NOT EXISTS job_queue_dead ON job_queue (kind, dead_at) WHERE dead;
-CREATE TABLE IF NOT EXISTS job_queue_kind (kind text PRIMARY KEY)
+CREATE TABLE IF NOT EXISTS job_queue_kind (kind text PRIMARY KEY);
+CREATE SEQUENCE IF NOT EXISTS vol_run_seq;
+CREATE TABLE IF NOT EXISTS vol_run (
+  vol text PRIMARY KEY, run bigint NOT NULL, kind text NOT NULL, arg jsonb, state text NOT NULL, outcome text,
+  user_id bigint, username text, graph_put boolean NOT NULL DEFAULT false, graph_job text,
+  started boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT clock_timestamp());
+CREATE TABLE IF NOT EXISTS ask_request (
+  id text PRIMARY KEY, user_id bigint, username text, q text NOT NULL, year_from int, year_to int,
+  state text NOT NULL DEFAULT 'queued', result jsonb, code text,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(), done_at timestamptz);
+CREATE INDEX IF NOT EXISTS ask_request_created ON ask_request (created_at)
 """
+# ↑ vol_run (https://github.com/reddol18/docflow/issues/5 2단계): 철마다 마지막 실행 한 행 (app/runs.py). 예전 프로세스 안
+#   running 표시를 대신한다 — API와 워커(다른 Pod)가 같이 본다. run = vol_run_seq 번호(대기열 작업 ref), state queued/running/ended,
+#   arg = 그래프 입력(처음 실행·이어 가기·검토 값). 검토 값이 들어 있어 끝나면 지우고, 철 일괄 삭제도 행을 지운다.
+#   ask_request = /ask 요청 (질문 본문은 여기, 대기열에는 id만). 하루 지난 행은 새 요청 때 지운다
 # ↑ job_queue·job_queue_kind (https://github.com/reddol18/docflow/issues/5): 대기열 Postgres 구현(app/jobqueue_pg.py).
 #   새 작업은 job_queue_new(seq 순), 되찾기는 job_queue_taken(쥔 작업만 — 워커 수만큼이라 작다)을 훑는다.
 #   job_queue_kind = 종류마다 한 행: 넣을 때 FOR UPDATE로 잡고 세어 상한을 지킨다. 죽은 작업은 QUEUE_DEAD_KEEP·QUEUE_DEAD_DAYS로 지운다
@@ -1024,7 +1038,8 @@ def reset_stages(vol):
 # 납품 뒤 지우는 사업 데이터 (https://github.com/reddol18/docflow/issues/12): 값·원문이 든 표.
 # 남기는 표: usage(비용)·audit(감사)·review_time(작업 시간)·exports(출력 기록) — 개수·시각만 있고 값은 없다
 PURGE_TABLES = ("documents", "edits", "events", "inspection", "inspection_plan", "review_submitters",
-                "doc_stage", "stage_log")  # 단계 기록에는 반려 사유(사람이 쓴 글)가 있다
+                "doc_stage", "stage_log",  # 단계 기록에는 반려 사유(사람이 쓴 글)가 있다
+                "vol_run")  # 실행 행(검토 값이 남을 수 있음) — https://github.com/reddol18/docflow/issues/5
 
 
 def purge_volume(vol, delete_thread):

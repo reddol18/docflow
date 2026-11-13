@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from app import auth, store, workflow
+from app import auth, store, worker, workflow
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_PG_URL"), reason="TEST_PG_URL 없음")
 # w·w2 작업자(reviewer), q·q2 품질관리자(inspector), s·s2 감독관(admin), v 보기
@@ -294,11 +294,11 @@ def test_run_reset_between_check_and_write(main, monkeypatch):
     # /run: 리셋하는 동안 철은 이미 실행 중 → 그 사이 온 수정·승인은 _done_docs/_edit_document에서 409
     seen = []
     real_reset = store.reset_inspection
-    monkeypatch.setattr(store, "reset_inspection", lambda vol: seen.append(vol in main.running) or real_reset(vol))
+    monkeypatch.setattr(store, "reset_inspection", lambda vol: seen.append(bool(main.busy(vol))) or real_reset(vol))
     store.pages_dir("v1").mkdir(parents=True)
     (store.pages_dir("v1") / "p.jpg").write_bytes(b"\xff\xd8\xff")
     assert c.post("/volumes/v1/run", headers=h("s")).status_code == 200
-    main.runner.submit(lambda: None).result()
+    worker.drain()
     assert seen == [True]
 
 
@@ -497,7 +497,7 @@ def test_rerun_resets_stage_positions(main, monkeypatch):
     store.pages_dir("v1").mkdir(parents=True)
     (store.pages_dir("v1") / "p.jpg").write_bytes(b"\xff\xd8\xff")
     assert c.post("/volumes/v1/run", headers=h("s")).status_code == 200
-    main.runner.submit(lambda: None).result()  # 뒤에서 도는 실행이 끝날 때까지
+    worker.drain()  # 뒤에서 도는 실행이 끝날 때까지
     assert store.stage_rows("v1") == {}  # 처음부터 다시 돌리면 문서가 바뀐다 → 단계 위치도 처음으로
     run = next(r for r in store.audit_log() if r["action"] == "run")
     assert run["info"]["stage_reset"] == 1

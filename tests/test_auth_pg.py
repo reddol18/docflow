@@ -696,7 +696,9 @@ def _review_post(db, monkeypatch, via, snaps, fixes=None):
     left = list(snaps)
     monkeypatch.setattr(main, "G", SimpleNamespace(get_state=lambda cfg: left.pop(0) if len(left) > 1 else left[0]))
     sent = []
-    monkeypatch.setattr(main, "submit", lambda vol, arg, user=None, reserved=False: sent.append(arg))
+    # 대기열에 넣는 대신 검토 기록(before)을 하고 넘긴 검토 값을 모은다 (https://github.com/reddol18/docflow/issues/5)
+    monkeypatch.setattr(main, "start_run", lambda vol, kind, arg, user, before=None: (
+        before() if before else None, sent.append(SimpleNamespace(resume=arg["resume"]))))
     c = TestClient(main.app)
     h = {"authorization": "Bearer iris-token", **CSRF}
     try:
@@ -706,7 +708,7 @@ def _review_post(db, monkeypatch, via, snaps, fixes=None):
         else:
             r = c.post("/review/v3/json", json={"v3-0001": fixes} if fixes else {}, headers=h)
     finally:
-        main.running.pop("v3", None)  # submit을 대신 받아 실행 표시가 남는다
+        main.running.pop("v3", None)  # 혹시 남은 표시 (start_run을 대신 받음)
     return r, sent, uid
 
 

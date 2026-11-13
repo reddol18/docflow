@@ -339,11 +339,19 @@ def _waiting_review(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "record_review", lambda vol, fl, fx, user: None)  # 이력 저장은 test_auth_pg에서
     monkeypatch.setattr(store, "set_run_stop", lambda vol, reason: None)
     monkeypatch.setattr(store, "run_stop", lambda vol: None)
+    # 대기열 대신 이 스레드에서 워커의 그래프 실행(worker.execute)으로 — 넣기·되찾기는 test_queue_app_pg
+    from app import runs, worker
+    monkeypatch.setattr(runs, "active", lambda vol: None)
 
-    def settle():  # 일꾼이 하나라 앞선 실행이 끝날 때까지 기다린 뒤 상태
-        main.runner.submit(lambda: None).result()
+    def start_now(vol, kind, arg, user, before=None):
+        if before:
+            before()
+        worker.execute(main, vol, worker.first_input(vol, kind, arg), user)
+    monkeypatch.setattr(main, "start_run", start_now)
+
+    def settle():
         return main.G.get_state(main.cfg("v1"))
-    main.submit("v1", {"vol": "v1", "review_mode": "human"})
+    worker.execute(main, "v1", {"vol": "v1", "review_mode": "human"}, None)
     snap = settle()
     assert snap.next == ("review",)
     return rec, settle, snap
@@ -408,11 +416,12 @@ def test_budget_stop_is_not_error(tmp_path, monkeypatch, fake_openai):
     monkeypatch.setattr(store, "set_run_stop", lambda vol, reason: stops.pop(vol, None) if reason is None
                         else stops.__setitem__(vol, reason))
     monkeypatch.setattr(store, "run_stop", lambda vol: stops.get(vol))
-    main.submit("v1", {"vol": "v1", "review_mode": "auto"})
-    main.runner.submit(lambda: None).result()  # 일꾼이 하나라 앞선 실행이 끝날 때까지 기다린다
+    from app import worker
+    store.set_run_stop("v1", None)  # 실행을 넣을 때(main.start_run) 앞선 멈춤 이유를 지운다
+    assert worker.execute(main, "v1", {"vol": "v1", "review_mode": "auto"}, None) == "budget"  # 워커의 그래프 실행
 
     runs = [(s, k) for n, s, k in rec.events if n == "run"]
-    assert [s for s, _ in runs] == ["start", "budget"] and runs[-1][1]["code"] == "budget"
+    assert [s for s, _ in runs] == ["budget"] and runs[-1][1]["code"] == "budget"  # run.start는 넣을 때 API가 남긴다
     assert sum(n == "extract" and s == "budget" for n, s, _ in rec.events) >= 1
     assert not [e for e in rec.events if e[1] == "error"]  # 오류 이벤트 없음
     assert audits == [("run_done", "budget_stop")]
@@ -439,8 +448,11 @@ def test_budget_stop_cleared_when_run_fails_otherwise(tmp_path, monkeypatch, fak
     monkeypatch.setattr(store, "set_run_stop", lambda vol, reason: stops.pop(vol, None) if reason is None
                         else stops.__setitem__(vol, reason))
     monkeypatch.setattr(store, "run_stop", lambda vol: stops.get(vol))
-    main.submit("v1", {"vol": "v1", "review_mode": "auto"})
-    main.runner.submit(lambda: None).result()
+    from app import runs, worker
+    monkeypatch.setattr(runs, "active", lambda vol: None)
+    store.set_run_stop("v1", None)  # 실행을 넣을 때(main.start_run) 앞선 멈춤 이유를 지운다
+    with pytest.raises(TimeoutError):  # 한도가 아닌 오류는 워커로 올라간다 (재시도·마지막이면 오류로 닫음)
+        worker.execute(main, "v1", {"vol": "v1", "review_mode": "auto"}, None)
     assert stops == {} and main._stage("v1", main.G.get_state(main.cfg("v1"))) == "stopped"
 
 
@@ -525,7 +537,7 @@ def test_edit_budget_stop_saves_nothing(monkeypatch, fake_openai):
     assert rec.saved == [d] and rec.edits == [("v1-0001", "title", "옛 가상 제목", "새 가상 제목")] and rec.vectors == [[[0.5]]]
 
 
-def test_off_search_and_ask_unavailable(monkeypatch, fake_openai):
+def test_off_search_and_ask_unavailable(monkeypatch, fake_openai, ask_inline):
     from app import main, store
     use(monkeypatch, {"LLM_PROVIDER": "off"})
     monkeypatch.setattr(store, "keyword_search", lambda *a, **k: pytest.fail("off면 낱말 검색으로 바꿔 답하지 않는다 (정하지 않음)"))

@@ -43,15 +43,19 @@ SESSION_TOKEN = "SeSsIoN-TOKEN-fake-0000000000000000"  # 쿠키로 보내는 맞
 
 
 def wait_idle(main, vol):
+    """대기열 작업을 워커 하나로 모두 처리한 뒤 (https://github.com/reddol18/docflow/issues/5) 실행 표시가 없는지"""
+    from app import worker
+    worker.drain()
     for _ in range(100):
-        if vol not in main.running:
+        if not main.busy(vol):
             return
         time.sleep(0.05)
     raise AssertionError("실행이 끝나지 않음")
 
 
-def fake_graph(*, interrupts=(), docs=(), invoke=None):
-    snap = SimpleNamespace(next=(), interrupts=list(interrupts), values={"docs": list(docs)})
+def fake_graph(*, interrupts=(), docs=(), invoke=None, next_=()):
+    """next_: 실패한 실행처럼 멈춘 곳이 남은 상태 (워커가 다시 할 때 체크포인트에서 이어 간다 — 실제 LangGraph와 같게)"""
+    snap = SimpleNamespace(next=next_, interrupts=list(interrupts), values={"docs": list(docs)})
     return SimpleNamespace(get_state=lambda cfg: snap, invoke=invoke or (lambda arg, cfg: None),
                            update_state=lambda cfg, v, as_node=None: None)
 
@@ -91,7 +95,7 @@ def test_audit_four_actions_and_no_leak(main, monkeypatch, capsys):
     # 2) 실행 — 흐름이 키 꼴 문자열이 든 예외로 실패한다
     def boom(arg, cfg):
         raise RuntimeError(f"upstream said: Incorrect API key provided: {FAKE_KEY} at /app/app/llm.py")
-    monkeypatch.setattr(main, "G", fake_graph(invoke=boom))
+    monkeypatch.setattr(main, "G", fake_graph(invoke=boom, next_=("ocr",)))
     assert c.post("/volumes/v1/run", headers=ADMIN).status_code == 200
     wait_idle(main, "v1")
 
@@ -161,7 +165,8 @@ def test_audit_failure_does_not_break_request(main, monkeypatch):
 def test_run_outcome_audited(main, monkeypatch):
     (store.pages_dir("v5")).mkdir(parents=True)
     (store.pages_dir("v5") / "p.jpg").write_bytes(JPG)
-    monkeypatch.setattr(main, "G", fake_graph(invoke=lambda arg, cfg: (_ for _ in ()).throw(KeyError("x"))))
+    monkeypatch.setattr(main, "G", fake_graph(invoke=lambda arg, cfg: (_ for _ in ()).throw(KeyError("x")),
+                                                   next_=("ocr",)))
     c = TestClient(main.app)
     assert c.post("/volumes/v5/run?review=bogus-value-xyz", headers=ADMIN).status_code == 400
     assert c.post("/volumes/v5/run", headers=ADMIN).status_code == 200

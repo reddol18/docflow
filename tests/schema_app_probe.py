@@ -73,6 +73,15 @@ def setup(tmp):
     store.take_quota = lambda *a: None  # /search 호출 제한 (DB 없음 — 늘 통과)
     store.refund_quota = lambda *a: None
     store.usage_summary = lambda vol=None: []
+    # 실행 대기열(https://github.com/reddol18/docflow/issues/5) 대신 이 프로세스에서 워커의 그래프 실행으로 바로 잇는다
+    from app import runs, worker
+    runs.active = lambda vol: None
+
+    def start_now(vol, kind, arg, user, before=None):
+        if before:
+            before()
+        worker.execute(main, vol, worker.first_input(vol, kind, arg), user)
+    main.start_run = start_now
     auth.MODES = frozenset({"local"})
     auth.session_user = lambda t: auth.User(1, "probe", "가상 관리자", "admin")
 
@@ -123,7 +132,6 @@ def run(tmp, out, steps=None):
     if r["fixed"]:
         res = c.post(f"/review/{VOL}/json", json={r["fixed"]["doc_id"]: {r["fixed"]["field"]: FIX}})
         r["review_submit"] = res.status_code
-        main.runner.submit(lambda: None).result()  # 일꾼이 하나라 앞선 이어 가기(색인)가 끝날 때까지 기다린다
     r["status"] = c.get(f"/volumes/{VOL}").json()
     r["docs"] = c.get(f"/volumes/{VOL}/documents").json()
     saved = {d["doc_id"]: {"vol": VOL, "fields": d["fields"]} for d in r["docs"]}
