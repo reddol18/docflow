@@ -8,7 +8,6 @@ from urllib.parse import urlsplit
 
 import pytest
 import yaml
-
 from test_disk_check import RUNNER, run_code
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -349,7 +348,8 @@ def test_script_first_run_creates_secrets_once_and_syncs_docs():
     assert "== clusterIP 10.43.0.39: 서비스 대역 10.43.0.0/16 안, 비어 있음" in out
     lines = calls.splitlines()
     assert out.index("DISK_CHECK 1") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인
-    assert lines.index(next(x for x in lines if x.startswith("get servicecidrs"))) < lines.index(next(x for x in lines if x.startswith("apply")))
+    first = lambda p: lines.index(next(x for x in lines if x.startswith(p)))
+    assert first("get servicecidrs") < first("apply")
 
 
 @needs_sh
@@ -382,10 +382,11 @@ def test_script_stops_when_secret_missing_but_realm_exists(missing):
 
 @needs_sh
 def test_script_replaces_docs_secret_when_different_and_restarts_docflow():
-    setup = ('mkdir -p "$FAKE/ns/keycloak" "$FAKE/secret/keycloak/keycloak-admin" "$FAKE/secret/keycloak/keycloak-realm-secrets" "$FAKE/secret/docs/oidc";'
-             ' touch "$FAKE/pvc"; printf a1b2c3 > "$FAKE/secret/keycloak/keycloak-admin/password";'
-             ' for k in client-secret demo-pw-hangaram demo-pw-seonuri; do printf Kc0rrect$k > "$FAKE/secret/keycloak/keycloak-realm-secrets/$k"; done;'
-             ' printf stale0 > "$FAKE/secret/docs/oidc/client-secret"; echo "data oidc" > "$FAKE/docflow_volumes";\n')
+    setup = ('S="$FAKE/secret"; R="$S/keycloak/keycloak-realm-secrets";'
+             ' mkdir -p "$FAKE/ns/keycloak" "$S/keycloak/keycloak-admin" "$R" "$S/docs/oidc";'
+             ' touch "$FAKE/pvc"; printf a1b2c3 > "$S/keycloak/keycloak-admin/password";'
+             ' for k in client-secret demo-pw-hangaram demo-pw-seonuri; do printf Kc0rrect$k > "$R/$k"; done;'
+             ' printf stale0 > "$S/docs/oidc/client-secret"; echo "data oidc" > "$FAKE/docflow_volumes";\n')
     rc, out, calls, sec = kc(setup)
     assert rc == 0, out
     assert sec["docs/oidc/client-secret"] == "Kc0rrectclient-secret" == sec["keycloak/keycloak-realm-secrets/client-secret"]
