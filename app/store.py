@@ -25,6 +25,16 @@ KST = dt.timezone(dt.timedelta(hours=9))
 PG_TLS_MODES = ("require", "verify-ca", "verify-full")
 
 
+def _is_rediss(url) -> bool:
+    """rediss://<호스트> 인가 — scheme 대소문자는 무시한다 (urlsplit이 소문자로 바꾼다, Redis 연결도 같게 다시 짠다)"""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url or ""))
+        return parts.scheme == "rediss" and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
 def check_transport(env=os.environ):
     """배포 표시 DOCFLOW_REQUIRE_TLS=1(k8s/docs.yaml)이면 안쪽 통신이 평문·무키일 때 시작을 멈춘다 (https://github.com/reddol18/docflow/issues/48).
     PG_URL(또는 PGSSLMODE)의 sslmode가 require 이상, QDRANT_URL이 https, QDRANT_API_KEY_FILE이 있어야 한다.
@@ -51,7 +61,7 @@ def check_transport(env=os.environ):
     if not env.get("QDRANT_API_KEY_FILE"):
         bad.append("QDRANT_API_KEY_FILE 없음")
     if env.get("QUEUE_BACKEND") == "redis":  # 대기열 Redis (https://github.com/reddol18/docflow/issues/5). 값(주소)은 싣지 않는다
-        if not str(env.get("REDIS_URL") or "").startswith("rediss://"):
+        if not _is_rediss(env.get("REDIS_URL")):
             bad.append("REDIS_URL이 rediss가 아님")
         if not env.get("REDIS_PASSWORD_FILE"):
             bad.append("REDIS_PASSWORD_FILE 없음")
@@ -207,6 +217,11 @@ CREATE TABLE IF NOT EXISTS job_queue (
   attempts int NOT NULL DEFAULT 0, owner text, taken_at timestamptz,
   dead boolean NOT NULL DEFAULT false, dead_at timestamptz, dead_reason text,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp());
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS dead_at timestamptz;
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS dead_reason text;
+CREATE SEQUENCE IF NOT EXISTS job_queue_lease_seq;
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS lease bigint;
+DROP INDEX IF EXISTS job_queue_take;
 CREATE INDEX IF NOT EXISTS job_queue_new ON job_queue (kind, seq) WHERE owner IS NULL AND NOT dead;
 CREATE INDEX IF NOT EXISTS job_queue_taken ON job_queue (kind, seq) WHERE owner IS NOT NULL AND NOT dead;
 CREATE INDEX IF NOT EXISTS job_queue_dead ON job_queue (kind, dead_at) WHERE dead;
@@ -215,6 +230,8 @@ CREATE TABLE IF NOT EXISTS job_queue_kind (kind text PRIMARY KEY)
 # ↑ job_queue·job_queue_kind (https://github.com/reddol18/docflow/issues/5): 대기열 Postgres 구현(app/jobqueue_pg.py).
 #   새 작업은 job_queue_new(seq 순), 되찾기는 job_queue_taken(쥔 작업만 — 워커 수만큼이라 작다)을 훑는다.
 #   job_queue_kind = 종류마다 한 행: 넣을 때 FOR UPDATE로 잡고 세어 상한을 지킨다. 죽은 작업은 QUEUE_DEAD_KEEP·QUEUE_DEAD_DAYS로 지운다
+#   lease = 꺼낼 때마다 job_queue_lease_seq에서 받는 임대 번호(펜싱). ALTER … ADD COLUMN·DROP INDEX job_queue_take는
+#   1단계 첫 판(daa3417)으로 만든 개발 DB를 지금 모양으로 맞춘다 (dead_at·dead_reason·lease 없음, 옛 인덱스)
 # ↑ 비용 한도 (https://github.com/reddol18/docflow/issues/7): usage.scope = 어느 예산을 썼나(index 색인·수정 / query 검색·질문),
 #   usage.user_id = 검색·질문을 부른 사람. 예전 행은 둘 다 NULL (vol '-'가 검색·질문이었다).
 #   budget_day = 예산·날짜(KST)마다 한 행: 정산된 사용액. 예약할 때 이 행을 FOR UPDATE로 잡는다 (프로세스·Pod 사이 원자적).
