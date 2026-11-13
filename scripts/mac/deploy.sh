@@ -50,21 +50,25 @@ rollout_failed() {  # $1 Deployment, $2 logs 인자
 sh ~/doc_platform/scripts/owner_migrate.sh check
 # TLS 인증서·Qdrant API 키·CA가 있어야 한다 (https://github.com/reddol18/docflow/issues/48). 없이 apply하면 postgres·qdrant가
 # 뜨지 못한 채 내려간다 → apply 전에 멈춘다. 넣는 법: Windows에서 .\scripts\ca.ps1 issue → .\scripts\tls_secrets.ps1
-kubectl get secret tls-web tls-postgres tls-qdrant qdrant-api-key -n docs >/dev/null </dev/null \
+kubectl get secret tls-web tls-postgres tls-qdrant tls-redis qdrant-api-key redis-auth -n docs >/dev/null </dev/null \
   && kubectl get configmap docflow-ca -n docs >/dev/null </dev/null \
-  || { echo "TLS Secret(tls-web·tls-postgres·tls-qdrant·qdrant-api-key)·ConfigMap docflow-ca가 없음 — Windows에서 scripts/tls_secrets.ps1 먼저. 배포하지 않음" >&2; exit 1; }
+  || { echo "TLS Secret(tls-web·tls-postgres·tls-qdrant·tls-redis·qdrant-api-key·redis-auth)·ConfigMap docflow-ca가 없음 — Windows에서 scripts/tls_secrets.ps1 먼저. 배포하지 않음" >&2; exit 1; }
 # 빌드 → 바로 고정('== 이미지 고정' 줄). 고정이 확인되지 않으면 build_image.sh가 실패로 멈춰 apply에 가지 않는다 —
 # 그래서 apply 전 확인은 따로 두지 않는다(고정 줄이 같은 것을 방금 확인했다)
 sh ~/doc_platform/scripts/build_image.sh all deploy </dev/null
 kubectl apply -f ~/doc_platform/k8s/docs.yaml >/dev/null
 # postgres·qdrant 이미지를 바꾸면 apply가 둘을 다시 띄운다(Recreate) — docflow는 시작할 때 DB에 붙으므로 먼저 기다린다
-for d in postgres qdrant; do
+# redis = 실행 대기열 (https://github.com/reddol18/docflow/issues/5). docflow·워커가 시작할 때 붙으므로 같이 먼저 기다린다
+for d in postgres qdrant redis; do
   kubectl rollout status deploy/$d -n docs --timeout=300s || rollout_failed $d --tail=40
 done
 # 위 기다림 동안에도 GC가 돌 수 있어 재시작 바로 전에 본다 (고정이 됐으면 지워지지 않는다 — 보조 확인)
 ensure_image docflow:dev api "docflow 재시작 전"
 kubectl rollout restart deploy/docflow -n docs >/dev/null
 kubectl rollout status deploy/docflow -n docs --timeout=300s || rollout_failed docflow --tail=40
+# 워커(같은 이미지 docflow:dev, python -m app.worker). 태그가 같아 apply만으로는 다시 뜨지 않는다. 지금 쥔 작업은 되찾기가 잇는다
+kubectl rollout restart deploy/docflow-worker -n docs >/dev/null
+kubectl rollout status deploy/docflow-worker -n docs --timeout=300s || rollout_failed docflow-worker --tail=40
 # 프런트 운영 서버 (next start + TLS 종단, https://github.com/reddol18/docflow/issues/48). 이미지 태그가 같아(docflow-web:dev) apply만으로는 다시 뜨지 않는다
 ensure_image docflow-web:dev web "web 재시작 전"
 kubectl rollout restart deploy/web -n docs >/dev/null

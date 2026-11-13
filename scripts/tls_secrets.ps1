@@ -5,8 +5,9 @@ TLS 인증서·키를 맥 k3s(docs 네임스페이스) Secret으로 넣는다 (h
   .\scripts\tls_secrets.ps1
   .\scripts\tls_secrets.ps1 -Mac user@host
 
-읽는 것: %LOCALAPPDATA%\docflow-ca\ca.crt, issued\<web|postgres|qdrant>\tls.crt·tls.key (.\scripts\ca.ps1 init·issue로 만든다)
-넣는 것(맥 scripts/mac/tls_secrets.sh): Secret tls-web·tls-postgres·tls-qdrant, ConfigMap docflow-ca, Secret qdrant-api-key(없을 때만 무작위)
+읽는 것: %LOCALAPPDATA%\docflow-ca\ca.crt, issued\<web|postgres|qdrant|redis>\tls.crt·tls.key (.\scripts\ca.ps1 init·issue로 만든다)
+넣는 것(맥 scripts/mac/tls_secrets.sh): Secret tls-web·tls-postgres·tls-qdrant·tls-redis, ConfigMap docflow-ca,
+  Secret qdrant-api-key·redis-auth(없을 때만 무작위)
 키는 ssh 표준 입력으로만 넘긴다 — 명령줄·맥 디스크(임시 폴더는 끝나면 지움)·화면에 남기지 않는다. 출력은 지문·만료뿐.
 처음 배포 전에 한 번, 인증서를 갱신할 때마다(397일) 부른다. 갱신이면 그 뒤 postgres·web 파드를 다시 띄운다(재배포).
 #>
@@ -16,7 +17,7 @@ if (-not $Mac) { throw "맥 주소가 없습니다: -Mac user@host 또는 `$env:
 $root = Split-Path $PSScriptRoot -Parent
 $dir = Join-Path $env:LOCALAPPDATA "docflow-ca"
 $files = [ordered]@{ "ca.crt" = Join-Path $dir "ca.crt" }
-foreach ($s in "web", "postgres", "qdrant") {
+foreach ($s in "web", "postgres", "qdrant", "redis") {
     $files["$s.crt"] = Join-Path $dir "issued\$s\tls.crt"
     $files["$s.key"] = Join-Path $dir "issued\$s\tls.key"
 }

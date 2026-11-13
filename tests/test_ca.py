@@ -113,4 +113,5 @@ def test_ca_extensions(made):
     nc = root.extensions.get_extension_for_class(x509.NameConstraints)
     assert nc.critical
     dns = [n.value for n in nc.value.permitted_subtrees if isinstance(n, x509.DNSName)]
-    assert dns == ["docflow.localhost", "postgres.docs.svc.cluster.local", "qdrant.docs.svc.cluster.local"]
+    assert dns == ["docflow.localhost", "postgres.docs.svc.cluster.local", "qdrant.docs.svc.cluster.local",
+                   "redis.docs.svc.cluster.local"]

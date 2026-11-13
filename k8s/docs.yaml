@@ -1,4 +1,6 @@
-# 공문서 처리 플랫폼: docs 네임스페이스 하나에 docflow(API + LangGraph + PaddleOCR), Postgres, Qdrant.
+# 공문서 처리 플랫폼: docs 네임스페이스 하나에 docflow(API), docflow-worker(대기열 워커: 쪽 OCR·LangGraph·/ask), Redis(실행 대기열),
+# Postgres, Qdrant. 대기열·워커는 https://github.com/reddol18/docflow/issues/5 — 맥은 워커 1개(taint·KEDA 없음),
+# 클라우드용 노드 그룹 B·KEDA는 k8s/cloud/ (맥 deploy.sh는 이 파일만 apply한다).
 # 기본 차단 후 필요한 통신만 연다. 바깥으로는 docflow → 공인 IP 443만 (LLM_PROVIDER=openai일 때 OpenAI API용).
 # LLM_PROVIDER=local(현장 내부 서버)·off면 이 443 규칙은 쓰지 않는다 — 외부 송신 0을 막는 정책은 https://github.com/reddol18/docflow/issues/13 마지막 완료 조건.
 # 컨테이너는 최소 권한 (https://github.com/reddol18/docflow/issues/29): root 아님·권한 상승 없음·capability 전부 버림·seccomp RuntimeDefault·SA 토큰 없음,
@@ -19,6 +21,9 @@ kind: ResourceQuota
 metadata: {name: docs-quota, namespace: docs}
 spec:
   hard: {requests.cpu: "3", requests.memory: 4Gi, limits.memory: 8Gi, persistentvolumeclaims: "4"}  # 8Gi: web 파드(issues/48) 몫 640Mi
+  # 나눔 (issues/5 쿼터 A안, 한도 그대로): 요청 cpu docflow 300m·워커 1200m·redis 50m·postgres 100m·qdrant 100m·web 120m = 1870m,
+  # 요청 메모리 768Mi·1280Mi·64Mi·256Mi·256Mi·240Mi = 2864Mi, 한도 메모리 2Gi·3Gi·128Mi·512Mi·1Gi·640Mi = 7424Mi,
+  # PVC pg-data·qdrant-data·docflow-data·redis-data = 4/4 (여유 없음 — 더 두려면 다시 결정)
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -39,13 +44,16 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: docflow-egress, namespace: docs}
 spec:
-  podSelector: {matchLabels: {app: docflow}}
+  # API와 워커는 같은 곳으로 나간다 (워커도 LLM·임베딩을 부른다)
+  podSelector: {matchExpressions: [{key: app, operator: In, values: [docflow, docflow-worker]}]}
   policyTypes: [Egress]
   egress:
   - to: [{podSelector: {matchLabels: {app: postgres}}}]
     ports: [{protocol: TCP, port: 5432}]
   - to: [{podSelector: {matchLabels: {app: qdrant}}}]
     ports: [{protocol: TCP, port: 6333}]
+  - to: [{podSelector: {matchLabels: {app: redis}}}]
+    ports: [{protocol: TCP, port: 6379}]
   # 공인 IP 443만: 사설 대역 + 링크 로컬(169.254 — 클라우드 메타데이터)·루프백·CGNAT(100.64, 일부 클라우드 내부망)은 뺀다 (issues/48)
   - to:
     - ipBlock:
@@ -82,11 +90,23 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: stores-from-docflow, namespace: docs}
 spec:
-  podSelector: {matchExpressions: [{key: app, operator: In, values: [postgres, qdrant]}]}
+  podSelector: {matchExpressions: [{key: app, operator: In, values: [postgres, qdrant, redis]}]}
   policyTypes: [Ingress]
   ingress:
-  - from: [{podSelector: {matchLabels: {app: docflow}}}]
-    ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6333}]
+  - from: [{podSelector: {matchExpressions: [{key: app, operator: In, values: [docflow, docflow-worker]}]}}]
+    ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6333}, {protocol: TCP, port: 6379}]
+---
+# 워커는 아무것도 받지 않는다 (HTTP 없음)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: worker-no-ingress, namespace: docs}
+spec: {podSelector: {matchLabels: {app: docflow-worker}}, policyTypes: [Ingress]}
+---
+# Redis는 바깥으로 나가지 않는다 (DNS만 — allow-dns)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: redis-no-egress, namespace: docs}
+spec: {podSelector: {matchLabels: {app: redis}}, policyTypes: [Egress]}
 ---
 # Postgres 접속 규칙: 파드 안 소켓(준비 확인·kubectl exec psql)만 trust, TCP는 TLS + 비밀번호(scram)만 — 평문 TCP는 맞는 줄이 없어 거절.
 # PGDATA 안 pg_hba.conf는 건드리지 않는다 (되돌릴 때 옛 매니페스트만 apply하면 그 파일을 다시 쓴다)
@@ -220,6 +240,88 @@ kind: Service
 metadata: {name: qdrant, namespace: docs}
 spec: {selector: {app: qdrant}, ports: [{port: 6333}]}
 ---
+# 실행 대기열 Redis (https://github.com/reddol18/docflow/issues/5). 쪽 OCR·그래프·/ask 작업 (본문은 철·쪽 이름·요청 id뿐).
+# AOF(appendonly, 1초마다 fsync) — 재시작해도 작업이 남는다. 대기열은 지워지면 안 되므로 maxmemory-policy noeviction(가득 차면 쓰기 거절
+# → 앱은 넣기 실패). TLS만(port 0, tls-port 6379, 인증서 tls-redis — 내부 CA, scripts/ca.py redis), 비밀번호(Secret redis-auth)는
+# 명령줄·환경 변수에 두지 않고 초기화 컨테이너가 메모리 emptyDir의 설정 조각으로 옮긴다. 같은 이미지·같은 uid.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: redis-conf, namespace: docs}
+data:
+  redis.conf: |
+    port 0
+    tls-port 6379
+    tls-cert-file /tls/tls.crt
+    tls-key-file /tls/tls.key
+    tls-ca-cert-file /ca/ca.crt
+    tls-auth-clients no
+    tls-protocols "TLSv1.2 TLSv1.3"
+    dir /data
+    appendonly yes
+    appendfsync everysec
+    save ""
+    maxmemory 96mb
+    maxmemory-policy noeviction
+    protected-mode yes
+    include /conf/auth.conf
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: redis-data, namespace: docs}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 256Mi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: docs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      # 이미지의 redis 사용자(alpine uid 999). 그룹 1000 + fsGroup: Secret 파일(0440)을 읽게.
+      # local-path PVC(hostPath)는 fsGroup이 듣지 않는다 — 새 PVC 폴더는 누구나 쓸 수 있게 만들어진다(local-path 기본)
+      securityContext: {runAsNonRoot: true, runAsUser: 999, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
+      initContainers:
+      - name: auth-conf
+        image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+        command: [sh, -c, 'umask 077 && printf "requirepass %s\n" "$(cat /auth/password)" > /conf/auth.conf']
+        resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 32Mi}}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: auth, mountPath: /auth, readOnly: true}
+        - {name: conf, mountPath: /conf}
+      containers:
+      - name: redis
+        image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe  # 다이제스트 고정 (issues/46)
+        command: [redis-server, /etc/redis/redis.conf]
+        ports: [{containerPort: 6379}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 128Mi}}
+        readinessProbe: {tcpSocket: {port: 6379}, periodSeconds: 5}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+        - {name: conf, mountPath: /conf, readOnly: true}
+        - {name: redis-conf, mountPath: /etc/redis, readOnly: true}
+        - {name: tls, mountPath: /tls, readOnly: true}
+        - {name: ca, mountPath: /ca, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: redis-data}}
+      - {name: auth, secret: {secretName: redis-auth, defaultMode: 0440}}
+      - {name: conf, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
+      - {name: redis-conf, configMap: {name: redis-conf}}
+      - {name: tls, secret: {secretName: tls-redis, defaultMode: 0440}}
+      - {name: ca, configMap: {name: docflow-ca}}
+      - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: docs}
+spec: {selector: {app: redis}, ports: [{port: 6379}]}
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: docflow-data, namespace: docs}
@@ -252,7 +354,11 @@ spec:
         - {name: QDRANT_URL, value: "https://qdrant.docs.svc.cluster.local:6333"}
         - {name: QDRANT_CA_FILE, value: /etc/docflow-ca/ca.crt}
         - {name: QDRANT_API_KEY_FILE, value: /etc/qdrant/api-key}  # app/store.py qdrant_args — 없거나 비면 시작할 때 멈춤
-        - {name: OCR_THREADS, value: "4"}
+        # 실행 대기열 (https://github.com/reddol18/docflow/issues/5, app/jobqueue.py 머리말 — 값은 결정 댓글의 기본값)
+        - {name: QUEUE_BACKEND, value: redis}
+        - {name: REDIS_URL, value: "rediss://redis.docs.svc.cluster.local:6379/0"}  # 비밀번호는 URL에 두지 않는다
+        - {name: REDIS_PASSWORD_FILE, value: /etc/redis-auth/password}
+        - {name: REDIS_CA_FILE, value: /etc/docflow-ca/ca.crt}
         - {name: DAILY_BUDGET_USD, value: "3.0"}  # 색인·수정 하루 예산 (KST)
         - {name: DAILY_QUERY_BUDGET_USD, value: "0.6"}  # 검색·질문 하루 예산 — 색인과 따로 (issues/7)
         # LLM·임베딩 제공자 (app/llm.py 머리말, https://github.com/reddol18/docflow/issues/13): openai / local / off
@@ -293,7 +399,8 @@ spec:
         # 주의: 위 docflow-egress는 사설 IP(10/8, 172.16/12, 192.168/16)로 나가는 것을 막는다.
         #       기관 내부망 SSO나 클러스터 안 Keycloak을 쓰면 그 주소로 가는 규칙을 더해야 한다.
         ports: [{containerPort: 8000}]
-        resources: {requests: {cpu: 1500m, memory: 2Gi}, limits: {memory: 5Gi}}
+        # OCR·그래프는 워커로 옮겼다 (issues/5 쿼터 A안). 남은 것: 업로드 디코드 검사·검토 화면 이미지·/ask 기다림
+        resources: {requests: {cpu: 300m, memory: 768Mi}, limits: {memory: 2Gi}}
         readinessProbe: {httpGet: {path: /healthz, port: 8000}, periodSeconds: 5}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         # 쓰는 곳: /data(쪽 이미지·잘라낸 칸·결과, app/store.py DATA_DIR), /tmp(업로드 임시 파일),
@@ -304,6 +411,7 @@ spec:
         - {name: openai, mountPath: /etc/openai, readOnly: true}
         - {name: ca, mountPath: /etc/docflow-ca, readOnly: true}
         - {name: qdrant-key, mountPath: /etc/qdrant, readOnly: true}
+        - {name: redis-auth, mountPath: /etc/redis-auth, readOnly: true}
         - {name: tmp, mountPath: /tmp}
         # subPath 하나로 나누지 않는다 — kubelet이 만드는 subPath 폴더는 root 0750이라 1000이 못 쓸 수 있다
         - {name: pdx-temp, mountPath: /opt/paddlex/temp}
@@ -315,6 +423,7 @@ spec:
       - {name: openai, secret: {secretName: openai, optional: true}}
       - {name: ca, configMap: {name: docflow-ca}}
       - {name: qdrant-key, secret: {secretName: qdrant-api-key, defaultMode: 0440}}  # fsGroup 1000이 읽는다
+      - {name: redis-auth, secret: {secretName: redis-auth, defaultMode: 0440}}
       # 업로드 임시 파일(Starlette가 1MB 넘는 파일 조각을 /tmp에 흘려 씀). 넘으면 kubelet이 docflow 파드를 내쫓는다 →
       # 앱이 동시에 받는 업로드 본문 합계를 UPLOAD_TMP_MB(기본 1536MB)로, 요청 본문 하나를 UPLOAD_MAX_BODY_MB(기본 210MB)로 묶는다 (app/upload.py, https://github.com/reddol18/docflow/issues/26)
       - {name: tmp, emptyDir: {sizeLimit: 2Gi}}
@@ -327,6 +436,72 @@ apiVersion: v1
 kind: Service
 metadata: {name: docflow, namespace: docs}
 spec: {selector: {app: docflow}, ports: [{port: 8000}]}
+---
+# 대기열 워커 (https://github.com/reddol18/docflow/issues/5, app/worker.py). API와 같은 이미지, 명령만 다르다.
+# 맥: 1개, taint·KEDA 없음 (노드 하나 — RWO docflow-data를 API와 같이 마운트할 수 있다). 클라우드: k8s/cloud/worker.yaml.
+# 종류마다 스레드 하나: 쪽 OCR(PaddleOCR, OCR_THREADS) · 그래프(LLM) · /ask. SIGTERM이면 지금 작업을 끝내고 멈춘다 —
+# 못 끝낸 작업은 유휴 시간(쪽 120초·그래프 180초) 뒤 되찾는다. 기동 때 끝나지 않은 철을 이어 간다 (예전 Pod 재시작으로 끊긴 철)
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: docflow-worker, namespace: docs}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: docflow-worker}}
+  template:
+    metadata: {labels: {app: docflow-worker}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false  # k8s API를 쓰지 않는다
+      terminationGracePeriodSeconds: 120  # 쪽 하나(약 10초)·그래프 노드 하나가 끝날 시간
+      containers:
+      - name: worker
+        image: docflow:dev
+        imagePullPolicy: Never
+        command: [python, -m, app.worker]
+        env:
+        - {name: DOCFLOW_REQUIRE_TLS, value: "1"}  # API와 같은 안쪽 통신 확인 (app/store.py check_transport)
+        - {name: PG_URL, value: "postgresql://docflow@postgres.docs.svc.cluster.local:5432/docflow?sslmode=verify-full&sslrootcert=/etc/docflow-ca/ca.crt"}
+        - {name: PGPASSWORD, valueFrom: {secretKeyRef: {name: pg-auth, key: password}}}
+        - {name: QDRANT_URL, value: "https://qdrant.docs.svc.cluster.local:6333"}
+        - {name: QDRANT_CA_FILE, value: /etc/docflow-ca/ca.crt}
+        - {name: QDRANT_API_KEY_FILE, value: /etc/qdrant/api-key}
+        - {name: OCR_THREADS, value: "4"}
+        # 실행 대기열 (https://github.com/reddol18/docflow/issues/5, app/jobqueue.py 머리말 — 값은 결정 댓글의 기본값)
+        - {name: QUEUE_BACKEND, value: redis}
+        - {name: REDIS_URL, value: "rediss://redis.docs.svc.cluster.local:6379/0"}  # 비밀번호는 URL에 두지 않는다
+        - {name: REDIS_PASSWORD_FILE, value: /etc/redis-auth/password}
+        - {name: REDIS_CA_FILE, value: /etc/docflow-ca/ca.crt}
+        - {name: DAILY_BUDGET_USD, value: "3.0"}  # 예산은 DB(budget_day)에서 API와 함께 센다 — 값은 API와 같게
+        - {name: DAILY_QUERY_BUDGET_USD, value: "0.6"}
+        - {name: LLM_PROVIDER, value: "openai"}  # API와 같게 (LLM 설정을 바꾸면 두 곳 다)
+        - {name: AUTH_MODES, value: "local"}  # 앱 모듈을 불러올 때 읽는다 (워커는 로그인 경로를 쓰지 않음)
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        - {name: HOME, value: /home/app}
+        resources: {requests: {cpu: 1200m, memory: 1280Mi}, limits: {memory: 3Gi}}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+        - {name: openai, mountPath: /etc/openai, readOnly: true}
+        - {name: ca, mountPath: /etc/docflow-ca, readOnly: true}
+        - {name: qdrant-key, mountPath: /etc/qdrant, readOnly: true}
+        - {name: redis-auth, mountPath: /etc/redis-auth, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+        - {name: pdx-temp, mountPath: /opt/paddlex/temp}
+        - {name: pdx-locks, mountPath: /opt/paddlex/locks}
+        - {name: pdx-func, mountPath: /opt/paddlex/func_ret}
+        - {name: home, mountPath: /home/app}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: docflow-data}}
+      - {name: openai, secret: {secretName: openai, optional: true}}
+      - {name: ca, configMap: {name: docflow-ca}}
+      - {name: qdrant-key, secret: {secretName: qdrant-api-key, defaultMode: 0440}}
+      - {name: redis-auth, secret: {secretName: redis-auth, defaultMode: 0440}}
+      - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+      - {name: pdx-temp, emptyDir: {sizeLimit: 256Mi}}
+      - {name: pdx-locks, emptyDir: {sizeLimit: 1Mi}}
+      - {name: pdx-func, emptyDir: {sizeLimit: 64Mi}}
+      - {name: home, emptyDir: {sizeLimit: 256Mi}}
 ---
 # 프런트 운영 서버 (https://github.com/reddol18/docflow/issues/48). 이미지 docflow-web:dev = frontend/Dockerfile
 # (빌드 때 next build, 기반 이미지 다이제스트 고정). 개발 서버(next dev)·HMR·개발 오버레이·CSP 'unsafe-eval' 없음.
