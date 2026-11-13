@@ -19,9 +19,11 @@
 #
 # 시작: 공식 이미지는 미리 빌드돼 있지 않다 — 첫 시작에 start --optimized를 쓰면 "first ever server start"로 거부된다
 #   (2026-11-13 맥 실측, https://github.com/reddol18/docflow/issues/39). 그래서 초기화 컨테이너 둘: ① 이미지의 lib/quarkus를
-#   emptyDir로 복사(cp -R — 마운트 지점 시간 보존은 권한이 없어 -a는 실패) ② 그 emptyDir를 lib/quarkus에 붙여 kc.sh build --db=dev-file.
-#   본 컨테이너는 같은 emptyDir로 start --optimized. 세 컨테이너 모두 루트 파일시스템 읽기 전용, 쓰는 곳은 그 emptyDir·
-#   /opt/keycloak/data(PVC: H2·임시·트랜잭션 로그)·/tmp뿐. 빌드는 파드가 뜰 때마다 약 10초(맥 실측 Quarkus augmentation 10.3초).
+#   emptyDir로 복사(cp -R — 마운트 지점 시간 보존은 권한이 없어 -a는 실패) ② 그 emptyDir를 lib/quarkus에 붙여 kc.sh build --db=dev-file
+#   (빌드는 H2 PVC를 붙이지 않는다 — /tmp만). 본 컨테이너는 같은 emptyDir를 **읽기 전용**으로 붙여 start --optimized --cache=local
+#   (Keycloak에서 코드 실행을 얻어도 빌드 결과를 바꿔 재시작 뒤까지 남길 수 없게). 세 컨테이너 모두 루트 파일시스템 읽기 전용,
+#   본 컨테이너가 쓰는 곳은 /opt/keycloak/data(PVC: H2·임시·트랜잭션 로그)·/tmp뿐. 빌드는 파드가 뜰 때마다 약 10초(맥 실측 10.3초),
+#   시작 약 9초. 2026-11-13 맥에서 이 매니페스트 그대로 확인 (https://github.com/reddol18/docflow/pull/133).
 # realm 가져오기: --import-realm이 /opt/keycloak/data/import/*.json(ConfigMap keycloak-realm, scripts/mac/keycloak.sh가 만든다)을
 #   읽는다. 같은 이름의 realm이 이미 있으면 건너뛴다 — JSON을 바꿔 다시 넣으려면 관리 화면에서 realm을 지우거나 PVC째 지운다.
 #   JSON 안의 ${DOCFLOW_CLIENT_SECRET}·${DEMO_PW_*}는 가져올 때 아래 환경 변수(Secret)로 바뀐다 — 저장소에는 값이 없다.
@@ -108,12 +110,11 @@ spec:
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
         - {name: quarkus, mountPath: /opt/keycloak/lib/quarkus}
-        - {name: data, mountPath: /opt/keycloak/data}
         - {name: tmp, mountPath: /tmp}
       containers:
       - name: keycloak
         image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332  # 다이제스트 고정 (https://github.com/reddol18/docflow/issues/46). 판을 올리면 다이제스트도 (sh scripts/mac/image_tags.sh)
-        args: [start, --optimized, --import-realm]
+        args: [start, --optimized, --import-realm, --cache=local]  # 복제본 하나 — 클러스터 캐시(JGroups) 불필요. cache는 실행 옵션(빌드에 주면 무시됨, 맥 확인)
         env:
         - {name: KC_HOSTNAME, value: "http://keycloak.localhost:8180"}  # issuer의 앞부분 — docs.yaml OIDC_ISSUER와 같게
         - {name: KC_HTTP_ENABLED, value: "true"}
@@ -135,7 +136,7 @@ spec:
         - {name: data, mountPath: /opt/keycloak/data}
         - {name: realm, mountPath: /opt/keycloak/data/import, readOnly: true}
         - {name: tmp, mountPath: /tmp}
-        - {name: quarkus, mountPath: /opt/keycloak/lib/quarkus}
+        - {name: quarkus, mountPath: /opt/keycloak/lib/quarkus, readOnly: true}
       volumes:
       - {name: data, persistentVolumeClaim: {claimName: keycloak-data}}
       - {name: realm, configMap: {name: keycloak-realm}}

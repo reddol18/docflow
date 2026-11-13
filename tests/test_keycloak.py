@@ -261,11 +261,16 @@ def test_keycloak_built_by_init_containers():
     assert "emptyDir" in vols["quarkus"]
     for c in [*inits.values(), KC_C]:
         assert c["image"] == KC_C["image"]
-        assert c["securityContext"]["readOnlyRootFilesystem"] is True and c["securityContext"]["capabilities"]["drop"] == ["ALL"]
+        sc = c["securityContext"]
+        assert sc["readOnlyRootFilesystem"] is True and sc["capabilities"]["drop"] == ["ALL"] and sc["allowPrivilegeEscalation"] is False
         assert c["resources"]["limits"]["memory"]
-    mounts = lambda c: {m["name"]: m["mountPath"] for m in c["volumeMounts"]}  # noqa: E731
-    assert mounts(inits["copy-quarkus"])["quarkus"] == "/qk"
-    assert mounts(inits["build"])["quarkus"] == mounts(KC_C)["quarkus"] == "/opt/keycloak/lib/quarkus"
+        assert "env" not in c or not any("valueFrom" in e for e in c["env"]) or c is KC_C  # Secret은 본 컨테이너에만
+    mounts = lambda c: {m["name"]: m for m in c["volumeMounts"]}  # noqa: E731
+    assert mounts(inits["copy-quarkus"])["quarkus"]["mountPath"] == "/qk"
+    assert set(mounts(inits["build"])) == {"quarkus", "tmp"}  # 빌드는 H2 PVC(data)를 붙이지 않는다
+    assert mounts(inits["build"])["quarkus"]["mountPath"] == mounts(KC_C)["quarkus"]["mountPath"] == "/opt/keycloak/lib/quarkus"
+    assert mounts(KC_C)["quarkus"].get("readOnly") is True  # 본 컨테이너는 빌드 결과를 바꿀 수 없다
+    assert "--cache=local" in KC_C["args"]  # 복제본 하나 — 클러스터 캐시 없이 (cache는 실행 옵션)
 
 
 def test_keycloak_image_scanned_and_tag_checked():
@@ -460,7 +465,7 @@ def test_script_first_run_creates_secrets_once_and_syncs_docs_after_rollout():
     assert "secret docs/oidc: Keycloak client secret과 같게 바꿈" in out
     assert "docflow는 아직 Secret oidc를 마운트하지 않음" in out and "patch" not in calls
     assert "== clusterIP 10.43.0.39: 서비스 대역 10.43.0.0/16 안, 비어 있음" in out
-    assert out.index("DISK_CHECK 1") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인
+    assert out.index("DISK_CHECK 2") < out.index("applied")  # 이미지를 받기(apply) 전에 디스크 확인 (이미지 + emptyDir 몫)
     assert _idx(calls, "get servicecidrs") < _idx(calls, "get svc") < _idx(calls, "apply")
     # docs/oidc는 Keycloak이 준비된 뒤에만
     assert _idx(calls, "rollout status deploy/keycloak") < _idx(calls, "STORED create secret docs/oidc")
