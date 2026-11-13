@@ -57,35 +57,43 @@ _KV_QUOTED = re.compile(_NAME + r"(['\"]?\s*[=:]\s*)(['\"])(?:(?!\3).)*\3")  # '
 _KV = re.compile(_NAME + r"(['\"]?\s*[=:]\s*)[^\s'\"}]+")
 _URI = re.compile(r"(://[^:/\s@]+:)[^@\s]+(@)")  # postgresql://user:비밀번호@host
 # 예외 repr(KeyError('…'), 라이브러리가 싣는 input_value='…' 등)에 실린 문서 값(실명·번호)을 가린다
-# (https://github.com/reddol18/docflow/issues/27): 따옴표 글자(줄바꿈 없이 QUOTED_MAX자까지 — 길이를 묶어 닫히지 않은 따옴표에도
-# 선형 시간) 안에 한글·한자가 있거나 주민등록번호·전화번호 꼴 숫자가 있으면 ***.
-# 가리지 않는 것: traceback의 소스 위치 줄(File "…", line N)과 그 다음 코드 줄, 파일 경로 꼴 글자('/'·'\'와 확장자·드라이브 —
-# 철·문서 id가 든 경로라 실명이 아님), 따옴표 없이 실린 값 — 그래서 로그 줄에는 애초에 문서 값을 넣지 않는다 (README)
-QUOTED_MAX = 200
-_QUOTED = re.compile(r"(['\"])([^'\"\n]{0,%d})\1" % QUOTED_MAX)
+# (https://github.com/reddol18/docflow/issues/27): 따옴표 글자 안에 한글·한자가 있거나 주민등록번호·전화번호 꼴 숫자가 있으면 ***.
+# 따옴표 종류마다 따로 짝을 찾는다('…' | "…", 안쪽은 같은 종류 따옴표·줄바꿈만 빼고 아무 글자) — "홍길동's"처럼 다른 종류
+# 따옴표가 든 값도 가리고, 닫히지 않은 따옴표는 그 줄 끝에서 한 번 실패할 뿐이라 선형 시간이다.
+# 가리지 않는 것: traceback의 소스 위치 줄(File "…", line N)과 그 바로 다음의 들여쓴(4칸) 코드 줄 — 소스가 없는 프레임
+# (<string>·.pyc)이면 다음 줄이 예외 메시지(0칸)라 그 줄은 가린다. 파일 경로 꼴 글자(구분자 2개 이상 + 아래 확장자로 끝남,
+# 번호 꼴이 없을 때만 — 철·문서 id가 든 경로). 따옴표 없이 실린 값 — 그래서 로그 줄에는 애초에 문서 값을 넣지 않는다 (README)
+_QUOTED = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"")
 _NAMEISH = re.compile(r"[가-힣ㄱ-ㅎㅏ-ㅣ一-鿿]")
 _IDISH = re.compile(r"(?<!\d)(?:\d{6}-?[1-8]\d{6}|0\d{1,2}-?\d{3,4}-?\d{4})(?!\d)")  # 주민등록번호·전화번호 꼴
-_PATHISH = re.compile(r"^(?:[A-Za-z]:[\\/]|[^\s]*[\\/][^\s]*\.\w{1,8}$)")
+PATH_EXTS = ("jpg", "jpeg", "png", "tif", "tiff", "pdf", "json", "py", "txt", "xlsx", "yaml", "log")
+_PATH_END = re.compile(r"\.(?:%s)$" % "|".join(PATH_EXTS), re.IGNORECASE)
 _SOURCE_LOC = re.compile(r'^\s*File ".*", line \d+')
 
 
+def _is_path(s):
+    """경로로 보고 두는 글자: 번호 꼴이 없고, 구분자('/'·'\\')가 2개 이상이며, 알려진 확장자로 끝남"""
+    return not _IDISH.search(s) and len(re.findall(r"[\\/]", s)) >= 2 and bool(_PATH_END.search(s))
+
+
 def _quoted(m):
-    s = m.group(2)
-    if _PATHISH.search(s) or not (_NAMEISH.search(s) or _IDISH.search(s)):
+    q = "'" if m.group(1) is not None else '"'
+    s = m.group(1) if m.group(1) is not None else m.group(2)
+    if not (_NAMEISH.search(s) or _IDISH.search(s)) or _is_path(s):
         return m.group(0)
-    return f"{m.group(1)}***{m.group(1)}"
+    return f"{q}***{q}"
 
 
 def _mask_values(text):
-    """따옴표 글자의 문서 값 가리기 — traceback 소스 위치 줄과 그 다음 코드 줄은 그대로"""
-    out, keep_next = [], False
+    """따옴표 글자의 문서 값 가리기 — traceback 소스 위치 줄과 그 다음의 들여쓴 코드 줄은 그대로"""
+    out, after_loc = [], False
     for line in text.split("\n"):
         if _SOURCE_LOC.match(line):
             out.append(line)
-            keep_next = True
+            after_loc = True
             continue
-        out.append(line if keep_next else _QUOTED.sub(_quoted, line))
-        keep_next = False
+        out.append(line if after_loc and line.startswith("    ") else _QUOTED.sub(_quoted, line))
+        after_loc = False
     return "\n".join(out)
 
 

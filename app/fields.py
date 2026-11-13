@@ -29,6 +29,7 @@ rule 칸도 `prompt:`를 가질 수 있다 — 그 규칙이 LLM 추출값을 �
 """
 import functools
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -364,7 +365,8 @@ class Extracted(dict):
 def _cell_model():
     """추출 응답의 칸 하나 {value, confidence} pydantic 모델 — 처음 쓸 때 만든다 (pydantic은 여기서만 불러온다:
     평가 하네스 eval/promptfoo가 문서마다 Python을 새로 띄워 이 모듈을 부르므로, 불러오는 비용을 쓰는 곳으로 미룬다).
-    value: 글자·숫자(글자로 바꿈 — 예전 parse_extract도 받던 것)·null. confidence: 0~1 숫자 (문자열 "0.9"·true·범위 밖은 틀림).
+    value: 글자·숫자(글자로 바꿈 — 예전 parse_extract도 받던 것. 정수인 소수는 정수 꼴, NaN·Infinity는 validate_extract가
+    틀린 칸으로)·null. confidence: 0~1 숫자 (문자열 "0.9"·true·범위 밖은 틀림).
     다른 키는 버린다"""
     from typing import Annotated
 
@@ -406,7 +408,14 @@ def validate_extract(s, content):
             probs += [n + "".join(f".{x}" for x in err["loc"]) + f": {err['type']}"
                       for err in e.errors(include_input=False, include_url=False, include_context=False)]
             continue
-        res[n] = {"value": "" if c.value is None else str(c.value), "confidence": float(c.confidence)}
+        v = c.value
+        if isinstance(v, float) and not math.isfinite(v):  # NaN·Infinity(json이 받아 줌)는 값이 아니다
+            failed.append(n)
+            probs.append(f"{n}.value: finite_number")
+            continue
+        if isinstance(v, float) and v.is_integer():  # 12345.0 → "12345" (문서번호·연도 등이 소수점 꼴로 오면)
+            v = int(v)
+        res[n] = {"value": "" if v is None else str(v), "confidence": float(c.confidence)}
     res.failed, res.problems = tuple(failed), tuple(probs)
     return res
 

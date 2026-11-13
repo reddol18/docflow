@@ -236,6 +236,26 @@ def test_one_bad_extract_marks_only_that_doc(tmp_path, monkeypatch, capsys, case
     assert "[graph] extract 응답 형식 오류 v1/v1-0002" in capsys.readouterr().err
 
 
+def test_off_flags_old_extract_marker():
+    """예전 표시 llm_failed: ["extract"](이 PR 첫 판, 문서 단위)가 남은 상태는 추출 칸 모두 실패로 읽는다. 칸 이름이면 그 칸만"""
+    from app import graph
+    old = graph.off_flags({"info": {"llm_failed": ["extract"]}}, GIMHAE)
+    assert {k for k, v in old.items() if graph.FAIL_FLAG in v} == ALL_KEYS
+    new = graph.off_flags({"info": {"llm_failed": ["title"]}}, GIMHAE)
+    assert new == {"title": [graph.FAIL_FLAG]}
+
+
+def test_validate_extract_float_values():
+    """value 소수: 정수면 정수 꼴(12345.0 → "12345"), 아니면 str. NaN·Infinity는 그 칸 실패"""
+    out = fields.validate_extract(GIMHAE, '{"docno": {"value": 12345.0, "confidence": 0.5}, '
+                                          '"date": {"value": 1.5, "confidence": 0.5}, '
+                                          '"recipient": {"value": NaN, "confidence": 0.5}, '
+                                          '"title": {"value": Infinity, "confidence": 0.5}}')
+    assert out["docno"]["value"] == "12345" and out["date"]["value"] == "1.5"
+    assert out.failed == ("recipient", "title") and out["recipient"] == out["title"] == {"value": "", "confidence": 0.0}
+    assert out.problems == ("recipient.value: finite_number", "title.value: finite_number")
+
+
 def test_bad_extract_goes_to_human_review(tmp_path, monkeypatch):
     """human이면 '추출 실패' 칸이 있는 문서가 사람 검토(review)의 검토 대상 목록에 들어간다 (기존 검토 표시 흐름 그대로)"""
     from app import graph, main
@@ -317,6 +337,26 @@ def test_citation_variants_normalized(variant):
     assert llm.drop_unknown_citations(f"가상 답 {bad}.", DOCS) == ("가상 답.", 1)
 
 
+def test_citation_broader_recognition():
+    """근거 표시로 보는 범위: 저장소에 있는 철 이름이 앞쪽이거나, 넘긴 문서 id가 뒤쪽이면 id 꼴이 아니어도 근거 표시.
+    전각 빗금(／∕⁄)도 같은 표시. [1997/05]·[총무과/서무계]는 그런 철이 없으면 그대로"""
+    docs = [*DOCS, {"vol": "vc", "doc_id": "첫쪽"}]
+    exists = {"옛철"}.__contains__  # 저장소에 있는 철 (가짜)
+    text = "가 [옛철/서무계] 나 [zz/첫쪽] 다 ［evil／p-0009］ 라 [vb∕p-0002] 마 [1997/05] [총무과/서무계]"
+    out, n = llm.drop_unknown_citations(text, docs, vol_exists=exists)
+    assert n == 3 and out == "가 나 다 라 [vb/p-0002] 마 [1997/05] [총무과/서무계]"
+    assert llm.drop_unknown_citations("[vc/첫쪽]", docs, vol_exists=exists) == ("[vc/첫쪽]", 0)
+
+
+def test_volume_exists_uses_store(tmp_path, monkeypatch):
+    """기본 철 확인은 저장소의 쪽 폴더 — 경로 한 칸이 아닌 이름('..')은 없음으로"""
+    from app import store
+    monkeypatch.setattr(store, "DATA", tmp_path)
+    (tmp_path / "pages" / "가상철").mkdir(parents=True)
+    assert llm.volume_exists("가상철") and not llm.volume_exists("없는철") and not llm.volume_exists("..")
+    assert llm.drop_unknown_citations("답 [가상철/서무계] 끝", DOCS) == ("답 끝", 1)
+
+
 def test_citation_removal_cleans_only_the_spot():
     """지운 자리에서만 빈칸을 정리한다 — 답의 다른 곳의 겹친 빈칸·들여쓰기·줄바꿈은 그대로"""
     text = "표:  가상  값\n    들여쓴 줄 [vz/p-9999] 끝\n[vz/p-1]  줄 맨 앞\n둘 [va/p-0001][vz/p-2] 붙음"
@@ -344,6 +384,26 @@ def test_mask_keeps_traceback_source_lines():
     s = errors.mask(tb)
     assert 'File "E:\\app\\가상.py", line 3' in s and 'raise KeyError("한글 소스 글자")' in s
     assert "남궁가온" not in s and "KeyError: '***'" in s
+
+
+def test_mask_mixed_quote_kinds_and_long_values():
+    """다른 종류 따옴표가 든 값("…'s")과 긴 따옴표 글자도 가린다 (길이 제한 없음)"""
+    s = errors.mask(f'KeyError("{NAME}\'s")\n' + "{'name': \"" + NAME + "'s 결재\"}\n" + "x = '" + "a" * 300 + NAME + "'")
+    assert NAME not in s and "{'name': \"***\"}" in s
+
+
+def test_mask_frame_without_source():
+    """소스 없는 프레임(<string>)이면 위치 줄 다음 줄은 예외 메시지(0칸) — 가린다. 들여쓴 소스 줄만 그대로"""
+    s = errors.mask(f'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nKeyError: \'{NAME}\'')
+    assert NAME not in s and 'File "<string>", line 1' in s
+
+
+def test_mask_pathlike_rule():
+    """경로로 보고 두는 것은 구분자 2개 이상 + 알려진 확장자로 끝나고 번호 꼴이 없을 때만"""
+    s = errors.mask(f"a='{NAME}/97.5.15' b='D:/{NAME} 800101-1234567' c='E:/data/가상철/v1-0001.jpg' "
+                    f"d='/data/{NAME}/800101-1234567.json'")
+    assert NAME not in s.replace("'E:/data/가상철/v1-0001.jpg'", "") and "800101-1234567" not in s
+    assert "c='E:/data/가상철/v1-0001.jpg'" in s
 
 
 def test_mask_linear_time_on_unclosed_quote():
