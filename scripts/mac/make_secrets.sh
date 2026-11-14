@@ -10,7 +10,8 @@ if ! kubectl get secret pg-auth -n docs >/dev/null 2>&1; then
   echo "secret docs/pg-auth created"
 fi
 kubectl delete secret openai -n docs --ignore-not-found >/dev/null
-# PowerShell 파이프가 UTF-8 BOM(EF BB BF)을 앞에 붙였던 적이 있다 → 지운다
+# 맥에서 손으로 부른다(README: make_secrets.sh < openai_key) — 키 파일을 Windows 편집기·PowerShell로 만들면 앞에 BOM이 있을 수 있어
+# BOM 떼기는 남긴다 (해 없는 보호). 이 PC에서 ssh로 넘길 때는 scripts/lib/remote.ps1 Invoke-Mac -Stdin이 BOM 없이 넘긴다
 perl -pe 's/^\xEF\xBB\xBF//' | tr -d '\r\n' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" \
   | kubectl create secret generic openai -n docs --from-file=api-key=/dev/stdin >/dev/null
 n=$(kubectl get secret openai -n docs -o jsonpath='{.data.api-key}' | base64 -d | wc -c | tr -d ' ')

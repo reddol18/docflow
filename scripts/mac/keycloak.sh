@@ -69,7 +69,7 @@ sh "$HERE/disk_check.sh" 2 </dev/null || { echo "디스크 여유가 모자람 �
 
 D=$(mktemp -d "${TMPDIR:-/tmp}/docflow-kc.XXXXXX")
 trap 'rm -rf "$D"' EXIT
-trap 'exit 1' HUP INT TERM   # ssh가 끊겨도(HUP) EXIT 트랩으로 임시 폴더를 지운다
+trap 'exit 1' HUP INT TERM PIPE   # ssh가 끊겨도(HUP, 출력이 막히면 PIPE) EXIT 트랩으로 임시 폴더를 지운다
 . "$HERE/kube_put.sh"   # put·DRY (tls_secrets.sh와 같이 씀)
 # base64 풀기: 맥은 -D, GNU는 -d
 if printf 'YQ==' | base64 -D >/dev/null 2>&1; then B64D="base64 -D"; else B64D="base64 -d"; fi
