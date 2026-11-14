@@ -80,7 +80,7 @@ try {
     $copied = $false
     try { Copy-FromMac -Mac $Mac -Path "doc_platform/requirements.freeze" -Destination $freeze -TimeoutSec 120; $copied = $true }
     catch { Write-Host $_ }  # 실패·시간 제한 모두 경고만 — 롤아웃은 이미 끝났다
-    if (-not $copied -or -not (Get-Item $freeze).Length) {
+    if (-not $copied -or -not (Test-Path $freeze) -or -not (Get-Item $freeze).Length) {  # 파일이 없어도 경고만, 태그는 남긴다
         Write-Warning "이미지 패키지 목록(requirements.freeze)을 받지 못해 lock 비교를 건너뜁니다. 빌드 출력의 'lock 일치' 줄을 확인하세요."
     } else {
         $pins = { param($p) Get-Content $p | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { ($_.Trim() -split '\s+')[0] } }

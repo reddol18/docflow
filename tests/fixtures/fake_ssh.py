@@ -6,7 +6,8 @@ FAKE_SSH_DIR 폴더에 쓴다:
   script.txt  마지막 스크립트 바이트, boot.txt 부트스트랩 바이트, stdin.bin 표준 입력 바이트(-n이면 읽지 않고 빈 파일)
 FAKE_SSH_MODE:
   echo (기본)  한글 두 줄 출력 + 표준 오류 한 줄, 종료 코드 FAKE_SSH_EXIT (기본 0)
-  sleep        30초 잠 (시간 제한 시험). 단 멈추기 스크립트(kill -TERM)면 그 pidfile을 kill.txt에 적고 '멈춤'을 출력
+  sleep        30초 잠 (시간 제한 시험)
+  (모든 모드) 멈추기 스크립트(kill -TERM)면 그 pidfile을 kill.txt에 적고 '멈춤'을 출력
   decodefail   맥 /usr/bin/base64 -D가 실패한 것처럼: 부트스트랩의 오류 줄 + 종료 코드 97
 """
 import base64
@@ -37,11 +38,11 @@ def main() -> int:
     (out / "boot.txt").write_bytes(base64.b64decode(m.group(1)))
     (out / "script.txt").write_bytes(base64.b64decode(m.group(2)))
     mode = os.environ.get("FAKE_SSH_MODE", "echo")
+    if "kill -TERM" in script:
+        (out / "kill.txt").write_text(re.search(r"^pf=(\S+)$", script, re.M).group(1), encoding="utf-8")
+        sys.stdout.buffer.write("프로세스 그룹 4242 멈춤(TERM) / colima VM 안 docflow 빌드 없음\n".encode("utf-8"))
+        return 0
     if mode == "sleep":
-        if "kill -TERM" in script:
-            (out / "kill.txt").write_text(re.search(r"^pf=(\S+)$", script, re.M).group(1), encoding="utf-8")
-            sys.stdout.buffer.write("프로세스 그룹 4242 멈춤 (TERM)\n".encode("utf-8"))
-            return 0
         time.sleep(30)
         return 0
     if mode == "decodefail":

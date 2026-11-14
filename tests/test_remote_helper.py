@@ -78,6 +78,17 @@ BAD = [
     'Start-Process ssh.exe -ArgumentList $Mac',
     'ssh $Mac uname  # remote-ok:',  # 이유 없는 표식
     'ssh $Mac uname  # remote-ok: ab',  # 너무 짧은 이유
+    # 실행기 안의 문자열 (리뷰 2차 예시): 별칭은 풀어서 본다
+    'cmd /c "ssh $Mac uname"',
+    'cmd.exe /c ssh $Mac uname',
+    'Invoke-Expression "ssh $Mac uname"',
+    "iex 'scp a b:c'",
+    'start ssh.exe -ArgumentList $Mac',
+    "saps -FilePath 'scp' -ArgumentList 'a', 'b:c'",
+    '[Diagnostics.Process]::Start("ssh.exe", "$Mac uname")',
+    "[System.Diagnostics.Process]::Start('scp', 'a b:c')",
+    '& "$env:WINDIR\\System32\\OpenSSH\\ssh.exe" $Mac uname',
+    '. "$dir\\scp.exe" a b',
 ]
 OK = [
     "# 먼저 터널: ssh -L 18000:127.0.0.1:18000 user@mac",
@@ -87,6 +98,11 @@ OK = [
     '$sshHost = 1; $DOCFLOW_ssh = 2; $h = @{ ssh = 1 }',
     'Copy-ToMac -Mac $Mac -Path a -Destination b  # scp 대신',
     "$s = 'x # y'; Write-Host $s <# ssh $Mac #>",
+    'Write-Host "ssh 터널을 여세요: ssh -L 8000:127.0.0.1:8000 user@mac"',  # 실행기가 아닌 안내 문구
+    "Start-Process notepad.exe -ArgumentList 'readme.txt'",
+    "[Diagnostics.Process]::Start($psi)",
+    "cmd /c echo hello; iex $code",
+    "Get-Command ssh.exe -CommandType Application",
     'ssh $Mac uname  # remote-ok: 사용자 안내용 예시 실행',
 ]
 
@@ -116,6 +132,24 @@ def test_callers_dot_source_helper():
     deploy = (ROOT / "scripts" / "deploy.ps1").read_text(encoding="utf-8-sig")
     line = next(x for x in deploy.splitlines() if "Copy-ToMac" in x and "disk_check.sh" in x)
     assert "-AllowFail" not in line and "-FailMessage" in line  # 디스크 확인은 필수 → 복사 실패면 멈춘다
+    # freeze가 없어도 경고만 하고 태그는 남긴다 (Get-Item이 없는 파일에 throw하지 않게 Test-Path가 먼저)
+    line = next(x for x in deploy.splitlines() if "-not $copied" in x)
+    assert line.index("Test-Path $freeze") < line.index("Get-Item $freeze"), line
+
+
+def test_vm_build_stopped_on_timeout():
+    # 호스트 프로세스 그룹을 멈춰도 colima VM 안 빌드는 계속 돈다 → build_image.sh 트랩이 우리 빌드만 멈춘다
+    build = (ROOT / "scripts/mac/build_image.sh").read_text(encoding="utf-8")
+    helper = HELPER.read_text(encoding="utf-8-sig")
+    pat = re.search(r"^VM_BUILD='(.+)'$", build, re.M).group(1)
+    assert f"$RemoteVmBuildPattern = '{pat}'" in helper  # 두 곳이 같은 무늬
+    assert pat.startswith("([n]erdctl|[b]uildctl)") and "docflow(-web)?:dev" in pat  # 자기 셸을 잡지 않고, 우리 태그만
+    assert re.search(r"^trap stop_vm_build TERM INT HUP$", build, re.M)
+    assert 'colima ssh -- sudo pkill -TERM -f -- "$VM_BUILD"' in build
+    assert build.index("trap stop_vm_build") < build.index("nerdctl -- --namespace k8s.io build")
+    deploy = (ROOT / "scripts/mac/deploy.sh").read_text(encoding="utf-8")
+    assert re.search(r"^trap '.*exit 143' TERM INT HUP$", deploy, re.M)
+    assert deploy.index("trap '") < deploy.index("build_image.sh all deploy")
 
 
 def test_secret_tempdirs_trap_pipe():
@@ -219,7 +253,8 @@ def test_timeout_stops_remote_job_and_throws(tmp_path):
     r = run_ps(tmp_path, body, env={"FAKE_SSH_MODE": "sleep"})
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
     msg = read(tmp_path, "msg.txt").strip()
-    assert msg == ("시간 제한(2초)으로 끊음: sleep 100 — 맥 쪽 작업을 멈추려 했다(결과: 프로세스 그룹 4242 멈춤 (TERM)). "
+    assert msg == ("시간 제한(2초)으로 끊음: sleep 100 — 맥 쪽 작업을 멈추려 했다"
+                   "(결과: 프로세스 그룹 4242 멈춤(TERM) / colima VM 안 docflow 빌드 없음). "
                    "배포 상태를 확인한 뒤 다시"), msg
     c = calls(tmp_path)
     assert len(c) == 2 and c[0]["script"].endswith("sleep 100")
@@ -326,3 +361,53 @@ def test_ssh_resolved_to_full_path(tmp_path):
     ssh, scp, n = read(tmp_path, "exe.txt").splitlines()
     assert Path(ssh).is_absolute() and Path(ssh).name.lower() == "ssh.exe" and n == "1"
     assert Path(scp).is_absolute() and Path(scp).name.lower() == "scp.exe"
+
+
+def test_stop_script_handles_pidfile_race(tmp_path):
+    # 시간 제한이 pidfile보다 먼저면: 잠깐 기다리고, 그래도 없으면 그 이름을 먼저 만들어(set -C) 부트스트랩 O_EXCL이 실패하게
+    r = run_ps(tmp_path, "Invoke-Mac -Mac 'u@h' -Script 'sleep 100' -TimeoutSec 1 6>$null\n", env={"FAKE_SSH_MODE": "sleep"})
+    assert r.returncode != 0
+    kill = calls(tmp_path)[1]["script"]
+    assert 'while [ ! -s "$pf" ] && [ $i -lt 10 ]; do sleep 0.5' in kill
+    assert '( set -C; echo cancelled > "$pf" )' in kill and "이제는 시작하지 못함" in kill
+    assert "cancelled) echo" in kill  # 선점된 이름을 다시 만나도 그룹으로 오인하지 않음
+    assert "''|*[!0-9]*)" in kill  # 숫자만 kill
+    assert "pgrep -f -- '([n]erdctl|[b]uildctl).*docflow(-web)?:dev'" in kill  # VM 안 빌드가 남았는지 정직하게
+    boot = read(tmp_path, "boot.txt")
+    assert "O_WRONLY | O_CREAT | O_EXCL, 0600" in boot  # 선점된 이름이면 perl이 죽고 스크립트는 돌지 않는다
+
+
+def test_interrupted_call_stops_remote_job(tmp_path):
+    # Ctrl+C·파이프라인 중단·예외 대신: -Stream 출력(Write-Host)이 멈춤 예외를 내게 해 호출을 중간에 끊는다
+    body = (
+        "$InformationPreference = 'Stop'\n"
+        "try { Invoke-Mac -Mac 'u@h' -Script 'long job' -Stream; Save 'msg.txt' 'NO_THROW' } catch { Save 'msg.txt' 'THREW' }\n"
+    )
+    r = run_ps(tmp_path, body)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert read(tmp_path, "msg.txt").strip() == "THREW"
+    c = calls(tmp_path)
+    assert len(c) == 2 and c[0]["script"].endswith("long job") and "kill -TERM" in c[1]["script"]
+    assert read(tmp_path, "kill.txt") == c[0]["pidfile"]  # finally가 같은 pidfile로 멈추기를 불렀다
+
+
+def test_single_zero_byte_stdin(tmp_path):
+    # [byte[]]@(0)에 -and를 걸면 거짓 → 표준 입력이 빠지고 -n이 붙던 문제
+    r = run_ps(tmp_path, "Invoke-Mac -Mac 'u@h' -Script 'cat' -Stdin ([byte[]]@(0)) | Out-Null\n")
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert (tmp_path / "stdin.bin").read_bytes() == b"\x00"
+    assert "-n" not in json.loads(read(tmp_path, "argv.json"))
+
+
+def test_bootstrap_b64_precomputed(tmp_path):
+    body = (
+        "Save 'b64.txt' $RemoteBootstrapB64\n"
+        "Invoke-Mac -Mac 'u@h' -Script 'true' | Out-Null\n"
+        f"$src = Get-Content -Raw -Encoding UTF8 '{HELPER}'\n"
+        "Save 'decl.txt' ($src -match '\\$RemoteBootstrapB64 = ConvertTo-B64 \\$RemoteBootstrap')\n"
+    )
+    r = run_ps(tmp_path, body)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    m = CMD.match(json.loads(read(tmp_path, "argv.json"))[-1])
+    assert m.group(1) == read(tmp_path, "b64.txt").strip()  # 호출마다 다시 만들지 않고 dot-source 때 만든 값
+    assert read(tmp_path, "decl.txt").strip() == "True"

@@ -9,6 +9,9 @@ URL119=https://github.com/reddol18/docflow/issues/119
 # scripts/deploy.ps1의 사전 확인도 같은 목록 (tests/test_disk_check.py가 둘이 disk_check.sh의 변수를 모두 지우는지 본다)
 unset DISK_TEST_IMG_PCT DISK_TEST_IMG_SIZE_GB DISK_TEST_VM_AVAIL_GB DISK_TEST_HOST_AVAIL_GB DISK_GC_HIGH_PCT DISK_GC_LOW_PCT DISK_GC_QUERY DISK_GC_MARGIN_PCT DISK_GC_REBUILD_MARGIN_PCT DISK_IMAGE_FS DISK_MIN_VM_GB DISK_MIN_HOST_GB PIN_TRIES PIN_SLEEP
 . ~/doc_platform/scripts/pin_image.sh
+# 시간 제한·중단 (Windows scripts/lib/remote.ps1이 이 프로세스 그룹에 TERM): VM 안 빌드는 build_image.sh 트랩이 멈춘다.
+# apply·롤아웃은 어디까지 갔는지 모르므로 알리고 실패로 끝낸다
+trap 'echo "!! 배포 중단 신호 — apply·롤아웃이 어디까지 갔는지 확인: kubectl get pods -n docs" >&2; exit 143' TERM INT HUP
 
 # 이미지를 kubelet 이미지 GC에서 지키는 것 (https://github.com/reddol18/docflow/issues/119):
 #   주: build_image.sh가 빌드 직후 우리 두 이미지를 고정(pin)한다 — '== 이미지 고정' 줄. 배포 경로(deploy·rebuild)에서는

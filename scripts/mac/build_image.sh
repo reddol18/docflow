@@ -18,6 +18,17 @@ case "$MODE" in ""|deploy|rebuild) ;; *) echo "build_image.sh: 두 번째 인자
 [ "$MODE" != rebuild ] || [ "$WHAT" != all ] || { echo "build_image.sh: rebuild는 api·web 하나만" >&2; exit 1; }
 PIN_MODE=""; [ -z "$MODE" ] || PIN_MODE=strict
 export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
+# 시간 제한·중단 (Windows scripts/lib/remote.ps1이 이 프로세스 그룹에 TERM, https://github.com/reddol18/docflow/issues/117):
+# 호스트의 colima 클라이언트가 죽어도 VM 안 nerdctl build·buildctl은 계속 돈다 → 우리 빌드(docflow:dev·docflow-web:dev)만 멈춘다.
+# '[n]erdctl'은 pkill이 자기를 감싼 셸 명령줄을 잡지 않게 (remote.ps1 $RemoteVmBuildPattern과 같은 무늬 — 시험이 본다)
+VM_BUILD='([n]erdctl|[b]uildctl).*docflow(-web)?:dev'
+stop_vm_build() {
+  trap - TERM INT HUP
+  echo "!! 중단 신호 — colima VM 안 docflow 빌드를 멈춘다" >&2
+  colima ssh -- sudo pkill -TERM -f -- "$VM_BUILD" </dev/null >/dev/null 2>&1 || true
+  exit 143
+}
+trap stop_vm_build TERM INT HUP
 cd ~/doc_platform
 . ~/doc_platform/scripts/pin_image.sh
 # 빌드 전 디스크 확인 (반드시, 따로 불러도) — scripts/mac/disk_check.sh
