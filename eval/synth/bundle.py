@@ -58,8 +58,10 @@ def draw(c, kind, cont, attach, fonts, r, typewriter):
 
 def label(page_id, img_w, img_h, year, ann, boxes):
     return {
-        "images": {"image.make.code": "SYNTH", "image.make.year": str(year), "image.category": "합성.시행문",
-                   "image.width": img_w, "image.height": img_h, "image.file.name": f"{page_id}.jpg"},
+        # AI Hub 88 라벨처럼 images는 배열 하나. 만든 시각은 같은 시드 같은 결과를 위해 비워 둔다
+        "images": [{"image.make.code": "SYNTH", "image.make.year": str(year), "image.category": "합성.시행문",
+                    "image.width": img_w, "image.height": img_h, "image.file.name": f"{page_id}.jpg",
+                    "image.create.time": ""}],
         "annotations": [
             {"id": i, "annotation.type": "rectangle", "annotation.text": a["text"], "annotation.ttype": a["ttype"],
              "annotation.bbox": [b[0], b[1], b[2] - b[0], b[3] - b[1]], **({"annotation.field": a["field"]} if "field" in a else {})}

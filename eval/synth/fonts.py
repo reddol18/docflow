@@ -10,7 +10,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE = "https://raw.githubusercontent.com/google/fonts/main/ofl/"
+BASE = "https://raw.githubusercontent.com/google/fonts/5bd87dfc525c8a0d1d8529d3684716e00c3fc59a/ofl/"  # 커밋 고정 (2026-11-19)
 PINS = {  # 파일 이름: (저장소 경로, sha256)
     "NanumPenScript-Regular.ttf": ("nanumpenscript/NanumPenScript-Regular.ttf",
                                    "6f0d1ab29c7894010dc88831fb7a0a51edb79136e450344183de5b1a8b52bd43"),
@@ -21,6 +21,9 @@ PINS = {  # 파일 이름: (저장소 경로, sha256)
     "GamjaFlower-Regular.ttf": ("gamjaflower/GamjaFlower-Regular.ttf",
                                 "ece32819ed58536355a49a095b0cdfdd3b8ef9081c5ed9ca1cef8f5d999ae1ac"),
 }
+
+
+MAX_BYTES = 20 * 1024 * 1024  # 글꼴 하나 상한 (지금 가장 큰 것 약 12.6MB)
 
 
 def font_dir():
@@ -46,15 +49,22 @@ def fetch():
         if dst.is_file() and sha256(dst) == h:
             continue
         tmp = dst.with_suffix(".part")
-        with urllib.request.urlopen(BASE + path, timeout=60) as r:  # 고정 https 주소만
-            tmp.write_bytes(r.read())
-        if sha256(tmp) != h:
-            tmp.unlink()
-            print(f"!! 해시 불일치: {name}", file=sys.stderr)
-            bad += 1
-            continue
-        tmp.replace(dst)
-        print(f"받음 {name}")
+        try:
+            with urllib.request.urlopen(BASE + path, timeout=60) as r:  # 고정 https 주소(커밋 고정)만
+                data = r.read(MAX_BYTES + 1)
+            if len(data) > MAX_BYTES:
+                print(f"!! 너무 큼: {name}", file=sys.stderr)
+                bad += 1
+                continue
+            tmp.write_bytes(data)
+            if sha256(tmp) != h:
+                print(f"!! 해시 불일치: {name}", file=sys.stderr)
+                bad += 1
+                continue
+            tmp.replace(dst)
+            print(f"받음 {name}")
+        finally:
+            tmp.unlink(missing_ok=True)  # 실패·예외 때 반쯤 받은 파일을 남기지 않는다
     return bad
 
 

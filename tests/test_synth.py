@@ -6,6 +6,7 @@
     python -m pytest -q --noconftest tests/test_synth.py
 """
 import csv
+import json
 import random
 import re
 import sys
@@ -106,6 +107,12 @@ def test_bundle_end_to_end(tmp_path):
     d, rows, meta = bundle.make(tmp_path / "a", seed=4, n_docs=3, level="mix", fonts=NOFONTS)
     d2, rows2, _ = bundle.make(tmp_path / "b", seed=4, n_docs=3, level="mix", fonts=NOFONTS)
     assert rows == rows2  # 같은 시드 → 같은 정답
+    for r in rows:  # 낡게 한 뒤 저장한 라벨(옮긴 상자 포함)도 같다
+        assert (d / f"{r['page']}.json").read_bytes() == (d2 / f"{r['page']}.json").read_bytes()
+    lab = json.loads((d / f"{rows[0]['page']}.json").read_text(encoding="utf-8"))
+    assert isinstance(lab["images"], list) and len(lab["images"]) == 1  # AI Hub 88 라벨 꼴
+    assert {"image.file.name", "image.width", "image.height", "image.create.time"} <= set(lab["images"][0])
+    assert {a["annotation.field"] for a in lab["annotations"] if "annotation.field" in a} == set(render.FIELDS)
     with (d / "gt.csv").open(encoding="utf-8-sig") as f:
         got = list(csv.DictReader(f))
     assert list(got[0]) == bundle.GT_COLS
