@@ -17,3 +17,11 @@ reason = "minimatch 10.x (패턴 증폭 DoS, 11.0.1에서 고침): eslint(fronte
 id = "GHSA-3g3m-2fjr-6pw4"
 ignoreUntil = 2026-12-07
 reason = "glob 13.0.7 (AbortSignal로 멈춘 뒤에도 폴더를 계속 읽음, 14.0.2에서 고침): promptfoo가 우리 설정의 file:// 경로를 찾을 때 쓴다. 외부에서 중단 신호·경로를 넣는 입력이 없다."
+
+# picomatch 2.3.2·4.0.7 (extglob 반복 ReDoS, 2026-10-19 공개, 고친 판 없음 — last_affected 4.0.7): frontend eslint-config-next
+# (fast-glob·tinyglobby 경유, devDependency)와 eval/promptfoo가 쓰는 개발용 의존성. 배포 이미지(next standalone)에 들어가지 않고,
+# 패턴은 우리 설정 파일의 glob 글자뿐이라 외부 입력이 닿지 않는다. 2026-11-19 사용자 결정으로 수용. 고친 판이 나오면 올린다.
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+ignoreUntil = 2027-02-01
+reason = "picomatch ReDoS(고친 판 없음): eslint·promptfoo 개발용 간접 의존성, 패턴은 저장소 설정 글자뿐(외부 입력 없음), 배포 이미지에 없음. https://github.com/reddol18/docflow/issues/141"
