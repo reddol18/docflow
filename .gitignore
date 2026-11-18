@@ -28,3 +28,6 @@ __pycache__/
 node_modules/
 .next/
 *.tsbuildinfo
+
+# Augraphy가 실행 폴더에 만드는 캐시 (eval/synth, https://github.com/reddol18/docflow/issues/139)
+augraphy_cache/

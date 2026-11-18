@@ -1,0 +1,5 @@
+# 합성 기록물 생성기 환경 (https://github.com/reddol18/docflow/issues/139). 앱·검사 환경과 따로 쓴다 —
+# augraphy가 opencv-python(GUI판)·numba·scikit-image를 끌어와 requirements-test.txt의 opencv-headless와 겹치기 때문.
+augraphy==8.2.6
+pillow==13.0.0
+numpy==2.4.6

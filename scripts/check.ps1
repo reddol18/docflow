@@ -189,8 +189,10 @@ try {
         $osv = Get-Tool osv
         # --no-resolve: requirements.lock은 이미지에 깔리는 전체 목록(해시 포함)이라 다시 풀지 않는다 (풀면 setuptools 거짓 경보)
         # requirements.txt도 함께 본다 (lock 단계가 둘의 판이 같은지 막지만, 예전에 PyJWT 2.10.1이 lock에 없어 지나간 적이 있다)
+        # eval/synth/requirements.txt: 합성 기록물 생성기(개발 PC 전용)의 직접 의존성만 — augraphy 간접 의존성은 고정 안 됨 (https://github.com/reddol18/docflow/issues/139)
         & $osv scan source --no-resolve --config osv-scanner.toml --lockfile requirements.txt:requirements.lock `
             --lockfile requirements.txt:requirements.txt --lockfile requirements.txt:requirements-test.txt `
+            --lockfile requirements.txt:eval/synth/requirements.txt `
             --lockfile frontend/package-lock.json --lockfile eval/promptfoo/package-lock.json   # 평가 하네스(개발 PC 전용) 의존성
     }
 
