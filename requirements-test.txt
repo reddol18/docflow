@@ -17,6 +17,8 @@ openai==3.41.0
 opencv-python-headless==4.10.0.84
 numpy==2.4.6
 PyYAML==6.0.2
+# 합성 기록물 쪽 그리기 시험 (tests/test_synth.py, https://github.com/reddol18/docflow/issues/139). eval/synth/requirements.txt와 같은 판
+pillow==13.0.0
 openpyxl==3.1.5
 qdrant-client==1.20.0
 # 대기열 Redis Streams 구현 시험 (https://github.com/reddol18/docflow/issues/5 1단계). 이미지(requirements.txt·lock)에는 아직 없다 —
