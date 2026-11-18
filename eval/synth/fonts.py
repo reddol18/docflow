@@ -7,6 +7,7 @@
 import hashlib
 import os
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -63,6 +64,9 @@ def fetch():
                 continue
             tmp.replace(dst)
             print(f"받음 {name}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:  # 네트워크·디스크 오류는 이 글꼴만 실패로
+            print(f"!! 받기 실패: {name}: {e}", file=sys.stderr)
+            bad += 1
         finally:
             tmp.unlink(missing_ok=True)  # 실패·예외 때 반쯤 받은 파일을 남기지 않는다
     return bad

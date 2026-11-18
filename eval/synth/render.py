@@ -9,6 +9,7 @@
   attach    붙임 서식 쪽 ('[별지 제N호 서식]' 머리 + 표) — docflow 규칙상 문서 시작 쪽이 아니다
 단어 상자는 annotation 하나당 [x0, y0, x1, y1]. 칸 값 단어에는 field(docno·date·recipient·title)를 붙인다.
 """
+import functools
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,7 +66,10 @@ class Page:
             a["field"] = fld
         self.ann.append(a)
 
-    def _font(self, path, size):
+    @staticmethod
+    @functools.lru_cache(maxsize=256)
+    def _font(path, size):
+        """글꼴 파일·크기별로 한 번만 연다 (손글씨는 글자마다 크기를 바꿔 부른다)."""
         return ImageFont.truetype(path, size)
 
     def text(self, xy, s, size=46, fld=None):

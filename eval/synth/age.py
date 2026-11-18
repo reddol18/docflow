@@ -5,25 +5,30 @@
   종이   paper_tone(누렇게·고르지 않게·가장자리 어둡게), BrightnessTexturize·NoiseTexturize(결), Stains(얼룩)
   복사   BadPhotoCopy(토너 잡티), DirtyDrum(드럼 줄), heavy는 잡티를 한 번 더 (복사본의 복사)
   보관   BleedThrough(뒷면 비침), punch_holes(철끈 구멍), crease(접힌 자국)
-  스캔   낮은 해상도로 줄였다 키우기, 기울기, JPEG(저장 단계)
+  스캔   낮은 해상도로 줄였다 키우기, 기울기, JPEG(저장 단계, 품질 QUALITY)
 Augraphy의 LightingGradient·ColorPaper·Folding·BindingsAndFasteners·Letterpress는 종이가 회색으로 바뀌거나 너무 세서
 쓰지 않고 직접 한다 (2026-11-18 시제품).
-단어 상자: Augraphy 단계는 모양을 바꾸지 않으므로 그대로, 기울기만 여기서 옮긴다.
+단어 상자: Augraphy 단계는 모양을 바꾸지 않으므로 Augraphy에 넘기지 않고 원래 상자를 기울기(rotate)에서만 옮긴다.
 
-판독 어려움 (legibility): 깨끗한 쪽의 잉크 화소를 그대로 두고, 낡은 쪽에서 그 화소와 주변 종이의 밝기 차를 단어마다 잰다.
+판독 어려움 (legibility): 깨끗한 쪽의 잉크 화소를 그대로 두고, 낡은 쪽(기울이기 전, 저장 품질로 JPEG 왕복)에서
+그 화소와 주변 종이의 밝기 차를 단어마다 잰다.
 칸의 값은 그 칸 단어들 중 가장 낮은 값이다. LEGIBLE_MIN 아래면 사람이 읽기 어렵다고 보고 정답에 표시한다 (채점에서 따로 셈).
 Augraphy는 함수 안에서 불러온다 — 쪽 그리기·판독 잣대만 시험할 때는 없어도 된다.
 """
+import functools
+import io
 import math
+import random
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 LEVELS = ("light", "medium", "heavy")
+QUALITY = {"light": 80, "medium": 65, "heavy": 50}  # 저장 JPEG 품질 — 판독 밝기 차도 이 품질로 왕복한 그림에서 잰다
 LEGIBLE_MIN = 30  # 0~255 밝기 차. 2026-11-18 heavy 철 눈 확인: 12~24인 쪽은 읽을 수 없었고, 33인 제목은 흐리지만 읽혔다
 
 
-def _pipeline(level, seed, boxes, copy_only=False):
+def _pipeline(level, seed, copy_only=False):
     from augraphy import AugraphyPipeline
     from augraphy.augmentations import (
         BadPhotoCopy,
@@ -57,13 +62,46 @@ def _pipeline(level, seed, boxes, copy_only=False):
     if hv:
         post += [DirtyDrum(line_width_range=(1, 2), line_concentration=0.02, direction=1, noise_intensity=0.15,
                            noise_value=(120, 200), p=0.5)]
-    return AugraphyPipeline(ink_phase=ink, paper_phase=paper, post_phase=post,
-                            bounding_boxes=[list(b) for b in boxes] if boxes else None, random_seed=seed)
+    return AugraphyPipeline(ink_phase=ink, paper_phase=paper, post_phase=post, random_seed=seed)
 
 
-def _augraphy(bgr, boxes, level, seed, copy_only=False):
-    out = _pipeline(level, seed, boxes, copy_only).augment(bgr)
-    return out["output"], (out.get("bounding_boxes") or boxes)
+def _no_cache_image(random_image=0):
+    return None
+
+
+@functools.cache
+def _numba_seeder():
+    from numba import njit
+
+    @njit(cache=False)
+    def seed(x):  # numba는 random과 np.random 난수 상태를 따로 가진다
+        random.seed(x)
+        np.random.seed(x)
+
+    return seed
+
+
+def _augraphy(bgr, level, seed, copy_only=False):
+    """Augraphy 단계. 위 효과는 모두 화소 값만 바꾸고 모양·크기를 바꾸지 않으므로 단어 상자는 넘기지 않는다.
+
+    BleedThrough는 뒷면 그림을 실행 폴더 augraphy_cache/의 이전 출력 중 아무것이나 골라 쓰므로, 같은 시드라도
+    앞서 무엇을 돌렸느냐에 따라 결과가 바뀐다. 캐시를 읽지 않게 해 뒷면은 이 쪽을 뒤집은 그림으로 고정한다.
+    또 numba로 컴파일된 Augraphy 함수(BadPhotoCopy의 Worley 잡티 등)는 Python 쪽 random·np.random과 따로 난수 상태를
+    가져서, AugraphyPipeline(random_seed)만으로는 앞 쪽들을 돌린 이력에 따라 바뀐다 (2026-11-19 heavy 복사 단계에서 확인)
+    — numba 쪽도 같은 시드로 맞춘다. numba 시드는 32비트라 seed < 2**32 (bundle.SEED_MAX가 지킨다)."""
+    from augraphy.augmentations import bleedthrough
+
+    bleedthrough.load_image_from_cache = _no_cache_image
+    _numba_seeder()(seed)
+    return _pipeline(level, seed, copy_only).augment(bgr)["output"]
+
+
+def jpeg_roundtrip(img, quality):
+    """저장할 때와 같은 품질로 JPEG 인코딩·디코딩한 그림."""
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return Image.open(buf).convert(img.mode)
 
 
 def _lowfreq(rng, h, w, cells):
@@ -152,15 +190,20 @@ def field_legibility(ann, clean_gray, aged_gray):
 
 
 def age(page_img, ann, level, seed):
-    """깨끗한 쪽 → (낡은 쪽 이미지, 옮긴 상자 목록, 칸별 밝기 차, 기울기)."""
+    """깨끗한 쪽 → (낡은 쪽 이미지, 옮긴 상자 목록, 칸별 밝기 차, 기울기).
+
+    상자는 Augraphy 단계를 거치지 않고(모양을 바꾸는 효과가 없음) 원래 상자를 rotate()에서만 옮긴다.
+    칸별 밝기 차는 기울이기 전 그림(깨끗한 쪽과 좌표가 같음)을 저장 품질 QUALITY[level]로 JPEG 왕복한 회색조에서 잰다.
+    실제 저장은 기울인 뒤에 하므로 저장본과 화소까지 같지는 않다 — 같은 품질의 JPEG 손실을 넣은 근사다.
+    돌려준 이미지는 호출하는 쪽이 QUALITY[level]로 저장한다.
+    """
     if level not in LEVELS:
         raise ValueError(level)
     rng = np.random.default_rng(seed)
-    boxes = [a["box"] for a in ann]
     clean = np.asarray(page_img.convert("L"))
-    out, boxes = _augraphy(np.ascontiguousarray(np.asarray(page_img)[:, :, ::-1]), boxes, level, seed)
+    out = _augraphy(np.ascontiguousarray(np.asarray(page_img)[:, :, ::-1]), level, seed)
     if level == "heavy":
-        out, boxes = _augraphy(out, boxes, level, seed + 1, copy_only=True)
+        out = _augraphy(out, level, seed + 1, copy_only=True)
     rgb = stroke_dropout(np.ascontiguousarray(out[:, :, ::-1]), clean, level, rng)
     rgb = paper_tone(rgb, level, rng)
     if level == "heavy":
@@ -171,7 +214,8 @@ def age(page_img, ann, level, seed):
         f = 0.62 if level == "heavy" else 0.72  # 낮은 해상도 스캔을 다시 키운 것처럼
         w, h = img.size
         img = img.resize((int(w * f), int(h * f)), Image.BILINEAR).resize((w, h), Image.BICUBIC)
-    legib = field_legibility(ann, clean, np.asarray(img.convert("L")))  # 기울이기 전 (깨끗한 쪽과 좌표가 같을 때)
+    # 기울이기 전 (깨끗한 쪽과 좌표가 같을 때), 저장 품질로 JPEG 왕복한 뒤의 회색조에서
+    legib = field_legibility(ann, clean, np.asarray(jpeg_roundtrip(img, QUALITY[level]).convert("L")))
     ang = float(rng.uniform(-1.2, 1.2) if level == "heavy" else rng.uniform(-0.6, 0.6))
-    img, boxes = rotate(img, boxes, ang)
+    img, boxes = rotate(img, [a["box"] for a in ann], ang)
     return img, boxes, legib, ang
