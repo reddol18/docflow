@@ -17,3 +17,20 @@ reason = "minimatch 10.x (패턴 증폭 DoS, 11.0.1에서 고침): eslint(fronte
 id = "GHSA-3g3m-2fjr-6pw4"
 ignoreUntil = 2026-12-07
 reason = "glob 13.0.7 (AbortSignal로 멈춘 뒤에도 폴더를 계속 읽음, 14.0.2에서 고침): promptfoo가 우리 설정의 file:// 경로를 찾을 때 쓴다. 외부에서 중단 신호·경로를 넣는 입력이 없다."
+
+# picomatch 2.3.2·4.0.7 (extglob 반복 ReDoS, 2026-10-19 공개, 고친 판 없음 — last_affected 4.0.7). 2026-11-19 사용자 결정으로 수용.
+# frontend: 두 판 모두 lock에서 "dev": true — 2.3.2는 eslint-config-next → @next/eslint-plugin-next가 고정한 fast-glob 3.3.1
+#   → micromatch → picomatch ^2, 4.0.7은 tinyglobby(typescript-eslint·eslint-import-resolver-typescript) 경유.
+#   frontend/Dockerfile은 standalone이 아니라 next build → npm prune --omit=dev → node_modules 복사 → next start라 이 둘은 이미지에서 빠진다.
+#   2.x 줄은 fast-glob 판이 고정이라 picomatch 4.x만 고쳐져도 lock 갱신으로는 안 풀린다 → eslint-config-next 갱신이나 overrides가 필요.
+# next 16.4.5 자체 사본: node_modules/next/dist/compiled/picomatch (lock에 없어 osv가 못 보고, 이미지에 들어간다). 실행 때(next start)는
+#   dist/shared/lib/match-local-pattern.js·match-remote-pattern.js(next/image 패턴 매칭)에서만 부르는데 frontend/next.config.ts에
+#   images.localPatterns/remotePatterns가 없어 도달 불가. 나머지 호출(dist/build/*)은 빌드 때 우리 코드의 패턴만 받는다. next를 올려야 고쳐진다.
+# eval/promptfoo: 2.3.2(optional) ← anymatch·readdirp ← chokidar 3.6.0(nunjucks의 optional peer, 설치는 됨). 개발 PC에서 손으로 돌리는
+#   하네스이고 배포·이미지에 없다. nunjucks 감시 기능을 promptfoo가 켜는지, 감시 패턴이 어디서 오는지는 미확인.
+# IgnoredVulns는 ID 단위로 모든 lock에 걸린다 — 다른 lock에 같은 ID가 들어와도 조용히 걸러지므로 만료(2027-02-01) 때 어느 lock에서
+# 나오는지 다시 본다. promptfoo 쪽은 위 glob 항목과 같은 날(2026-12-07)에 다시 본다. 고친 판이 나오면 올린다.
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+ignoreUntil = 2027-02-01
+reason = "picomatch ReDoS(고친 판 없음): frontend npm 사본(2.3.2·4.0.7)은 dev라 npm prune으로 이미지에서 빠짐(2.x는 eslint-config-next의 fast-glob 3.3.1 고정 경로라 갱신·overrides 필요). next 내장 사본은 이미지에 있으나 next/image 패턴 매칭에서만 쓰고 images 패턴 설정이 없어 도달 불가 — next를 올려야 고쳐짐. promptfoo 사본은 nunjucks optional peer chokidar 경유 개발용(2026-12-07 재검토). https://github.com/reddol18/docflow/issues/141"
