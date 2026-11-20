@@ -14,6 +14,23 @@
                                                 (https://github.com/reddol18/docflow/issues/13). 기본 후보 '^local-ollama$', 판 '^current$'.
                                                 -Local 필요, -Replay와 같이 못 씀. 걸러진 후보·판이 기준과 겹치면 부르기 전에 멈춘다(plan.py).
                                                 기준 파일은 work 아래 사본을 gate.py에 넘긴다
+  .\eval\promptfoo\run.ps1 -Work ..\work_synth\w47 ...   다른 work 폴더 (합성 철: eval/synth/to_work.py가 만든 것, 정답도 그 폴더의 gt/review.csv)
+  ssh -N -L 18434:127.0.0.1:11434 root@<파드 IP> -p <SSH 포트>        (다른 창에 SSH 터널 — 기본. 이 PC Ollama 11434와 안 겹치게 18434)
+  .\eval\promptfoo\run.ps1 -Work ..\work_synth\w47 -Remote http://127.0.0.1:18434/v1 -RemoteModel gemma3:27b `
+                           -BaselineFrom ..\work_synth\w47\promptfoo\results_gpt41mini.json
+                                                원격 OpenAI 호환 서버(런파드 GPU의 Ollama·vLLM) (https://github.com/reddol18/docflow/issues/80).
+                                                대안: 런파드 프록시 https://<pod>-11434.proxy.runpod.net/v1 — 인증 없는 Ollama가 파드가 켜진 동안
+                                                공개되므로 터널을 먼저 쓴다 (위험 수용 https://github.com/reddol18/docflow/issues/144).
+                                                후보 label 'remote'. 부르기 전에 <주소>/models에 모델이 있는지 본다. 주소는 https, 또는 http면
+                                                127.0.0.1·localhost(터널)만, 주소 안 사용자·비밀번호(u:p@)는 거부. 서버 키(vLLM --api-key)는
+                                                환경변수 DOCFLOW_REMOTE_API_KEY에 두면 -Remote 실행에서 promptfoo를 부르는 동안만 넣는다 (화면·파일에 안 남김).
+                                                토큰 단가 0은 주소가 127.0.0.1·localhost·*.proxy.runpod.net일 때만 (그 밖은 gate.py가 단가 모름으로 멈춤).
+                                                끝나면 파드 정지·볼륨 삭제를 확인한다 (실행 끝에 안내).
+                                                -BaselineFrom이면 기본 후보 '^remote$', 아니면 '^(gpt-4\.1-mini|remote)$'. 판 기본 '^current$'.
+                                                -Concurrency로 동시 요청 수 (기본: -Local이면 1, 아니면 promptfooconfig.yaml의 4)
+외부 후보(OpenAI·remote·Ollama *-cloud 모델)는 합성 철에만 보낸다 (2026-11-20 #80 결정): 고른 철이 모두 work 폴더
+synth_manifest.json에 있지(이름 SYNTH…) 않으면 부르기 전에 멈춘다 (-Remote나 OpenAI 후보가 있으면 늘 확인).
+-Work·-Vols 등으로 바꾼 DOCFLOW_* 환경변수는 끝나면 시작 값으로 되돌린다. -Work면 그 드라이브 여유(2GB)를 먼저 본다. AI Hub 철은 -Local(이 PC Ollama)과 -BaselineFrom(지난 결과, 호출 없음)으로만 잰다.
   .\eval\promptfoo\run.ps1 -Replay              LLM 호출 없이 저장 결과로 채점 연결만 확인 (eval/score.py와 같아야 함)
   .\eval\promptfoo\run.ps1 -View                마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
 
@@ -37,13 +54,29 @@ param(
     [string]$Prompts = '',
     [string]$Providers = '',
     [string]$LocalModel = 'llama3.1:8b',
-    [string]$BaselineFrom = ''   # 기준 후보 줄을 가져올 지난 results.json (기준 모델을 다시 부르지 않는다)
+    [string]$BaselineFrom = '',  # 기준 후보 줄을 가져올 지난 results.json (기준 모델을 다시 부르지 않는다)
+    [string]$Work = '',          # work 폴더 (기본 records_poc/work 또는 DOCFLOW_EVAL_WORK)
+    [string]$Remote = '',        # 원격 OpenAI 호환 주소 (…/v1)
+    [string]$RemoteModel = '',
+    [int]$Concurrency = 0
 )
 $ErrorActionPreference = 'Stop'
+# 이 스크립트는 부른 셸 안에서 돈다 → 바꾼 DOCFLOW_* 환경변수는 맨 끝 finally에서 시작 값으로 되돌린다
+# (안 그러면 -Work 다음 실행이 -Work 없이도 그 work를 잰다). 키 두 개는 따로 아래에서 되돌린다
+$envNames = 'DOCFLOW_EVAL_WORK', 'DOCFLOW_EVAL_VOLS', 'DOCFLOW_LOCAL_MODEL', 'DOCFLOW_REMOTE_MODEL', 'DOCFLOW_REMOTE_BASE'
+$envSaved = @{}
+foreach ($n in $envNames) { $envSaved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
+try {   # 끝: 환경변수 되돌리기 (맨 아래 finally)
 $here = $PSScriptRoot
 $app = (Resolve-Path "$here\..\..").Path
-$work = if ($env:DOCFLOW_EVAL_WORK) { $env:DOCFLOW_EVAL_WORK } else { (Resolve-Path "$app\..\work").Path }
+$workArg = $Work   # PowerShell 변수 이름은 대소문자를 가리지 않는다 — 아래 $work 대입이 -Work 값을 덮으므로 먼저 받아 둔다
+$work = if ($workArg) { (Resolve-Path $workArg).Path } elseif ($env:DOCFLOW_EVAL_WORK) { $env:DOCFLOW_EVAL_WORK } else { (Resolve-Path "$app\..\work").Path }
 $out = Join-Path $work 'promptfoo'
+if ($workArg) {   # 다른 work는 평가 가상환경(.venv)을 새로 깔고 결과를 쓴다 → 그 드라이브 여유를 먼저 본다
+    $wfree = (Get-PSDrive ([IO.Path]::GetPathRoot($work).Substring(0, 1))).Free / 1GB
+    Write-Output ("디스크 여유: {0} {1:N1}GB (필요 2GB)" -f $work, $wfree)
+    if ($wfree -lt 2) { throw 'work 폴더 드라이브의 디스크 여유가 2GB보다 작아 멈춤' }
+}
 New-Item -ItemType Directory -Force $out | Out-Null
 
 $env:PROMPTFOO_DISABLE_TELEMETRY = '1'
@@ -82,8 +115,16 @@ if (-not (Test-Path $py) -or -not (Test-Path $stamp) -or (Get-Content $stamp) -n
 }
 $env:PROMPTFOO_PYTHON = $py
 
-# promptfoo는 거르기 전에 모든 제공자를 읽는다 → 로컬 모델 이름은 늘 채워 둔다
+# promptfoo는 거르기 전에 모든 제공자를 읽는다 → 로컬·원격 모델 이름과 주소는 늘 채워 둔다 (안 쓰면 닿지 않는 자리 값)
 $env:DOCFLOW_LOCAL_MODEL = $LocalModel
+$env:DOCFLOW_REMOTE_MODEL = if ($RemoteModel) { $RemoteModel } else { 'unused' }
+$env:DOCFLOW_REMOTE_BASE = if ($Remote) { $Remote.TrimEnd('/') } else { 'http://127.0.0.1:9/v1' }
+# 원격 서버 키: 이 프로세스 환경에서 먼저 빼 두고(Ollama 등 자식이 물려받지 않게) promptfoo를 부르는 동안만 넣는다.
+# 비어 있으면 promptfoo가 OPENAI_API_KEY로 떨어져 OpenAI 키가 원격 서버로 갈 수 있다 → 키가 없으면 'none'
+$prevRemoteKey = $env:DOCFLOW_REMOTE_API_KEY
+$remoteKey = if ($prevRemoteKey) { $prevRemoteKey } else { [Environment]::GetEnvironmentVariable('DOCFLOW_REMOTE_API_KEY', 'User') }
+if (-not $remoteKey) { $remoteKey = 'none' }
+Remove-Item Env:DOCFLOW_REMOTE_API_KEY -ErrorAction SilentlyContinue
 
 # OpenAI 키: 사용자 환경변수는 새 프로세스마다 물려지므로 이 프로세스 환경에서 먼저 뺀다 → Ollama·gate.py가 물려받지 않게.
 # promptfoo를 부르는 동안만 넣고 finally에서 원래 값(있었으면)으로 되돌린다. 키 값은 찍지 않는다.
@@ -112,21 +153,46 @@ try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원�
         $providers = '^replay$'
         if (-not $Prompts) { $Prompts = '^current$' }
     } else {
-        if ($BaselineFrom) {   # 기준은 지난 결과에서 → 이번엔 로컬 모델만
-            if (-not $Local) { throw '-BaselineFrom은 -Local과 같이 쓴다 (기준 재사용은 로컬 모델 비교용)' }
+        if ($Remote) {   # 원격 OpenAI 호환 서버 (#80): https, 또는 SSH 터널(http://127.0.0.1·localhost)만
+            if (-not $RemoteModel) { throw '-Remote에는 -RemoteModel이 필요하다' }
+            $u = [Uri]$Remote
+            if ($u.UserInfo) { throw '-Remote 주소에 사용자·비밀번호(u:p@)를 넣지 않는다 — 서버 키는 DOCFLOW_REMOTE_API_KEY로' }   # 화면에 찍히지 않게
+            if (-not ($u.Scheme -eq 'https' -or ($u.Scheme -eq 'http' -and $u.Host -in @('127.0.0.1', 'localhost')))) {
+                throw '-Remote 주소는 https://… 또는 SSH 터널 http://127.0.0.1:<포트>/v1 만 받는다 (평문으로 문서 글자를 보내지 않게)'
+            }
+        } elseif ($RemoteModel) { throw '-RemoteModel은 -Remote와 같이 쓴다' }
+        if ($BaselineFrom) {   # 기준은 지난 결과에서 → 이번엔 로컬·원격 모델만
+            if (-not ($Local -or $Remote)) { throw '-BaselineFrom은 -Local이나 -Remote와 같이 쓴다 (기준 재사용은 로컬·원격 모델 비교용)' }
             if (-not (Test-Path $BaselineFrom -PathType Leaf)) { throw "기준 결과가 없다: $BaselineFrom" }
-            if (-not $Providers) { $Providers = '^local-ollama$' }
+            if (-not $Providers) { $Providers = '^(' + (@(if ($Local) { 'local-ollama' }) + @(if ($Remote) { 'remote' }) -join '|') + ')$' }
             if (-not $Prompts) { $Prompts = '^current$' }
         }
-        $providers = if ($Providers) { $Providers } elseif ($Local) { '^(gpt-4\.1-mini|gpt-4o-mini|local-ollama)$' } else { '^(gpt-4\.1-mini|gpt-4o-mini)$' }
+        if ($Remote -and -not $Prompts) { $Prompts = '^current$' }
+        $providers = if ($Providers) { $Providers } else {
+            $p = @('gpt-4\.1-mini') + @(if (-not $Remote) { 'gpt-4o-mini' }) + @(if ($Local) { 'local-ollama' }) + @(if ($Remote) { 'remote' })
+            '^(' + ($p -join '|') + ')$'
+        }
         # 걸러질 제공자·판을 promptfoo와 같은 규칙(id·label, 대소문자 구분)으로 미리 셈 → 키가 필요한가, 기준과 겹치는가 (plan.py)
-        $planOut = & $py -I -X utf8 (Join-Path $here 'plan.py') "--providers=$providers" "--prompts=$Prompts" "--local-model=$LocalModel"
+        $planOut = & $py -I -X utf8 (Join-Path $here 'plan.py') "--providers=$providers" "--prompts=$Prompts" "--local-model=$LocalModel" "--remote-model=$($env:DOCFLOW_REMOTE_MODEL)"
         if ($LASTEXITCODE -ne 0) { throw '후보 거르기 계산(plan.py) 실패' }
         $plan = ($planOut -join "`n") | ConvertFrom-Json
         Write-Output ("후보: {0} · 판: {1}" -f ($plan.providers -join ', '), ($plan.prompts -join ', '))
         if (-not $plan.providers -or -not $plan.prompts) { throw '걸러진 후보나 지시문 판이 없다 — -Providers·-Prompts 정규식 확인' }
         if ($BaselineFrom -and $plan.baseline_overlap) {   # 기준을 다시 부르면 돈을 쓰고 결과는 gate.py가 버린다 → 부르기 전에 멈춤
             throw '-BaselineFrom인데 걸러진 후보·판이 기준(criteria.yaml baseline)과 겹친다 — -Providers·-Prompts에서 기준을 뺀다'
+        }
+        # OpenAI·원격으로 글자를 보내는 후보 → 고른 철이 모두 합성 철이어야 (2026-11-20 #80 결정).
+        # plan.py의 거르기 흉내가 promptfoo와 갈려 external이 거짓으로 나와도, -Remote나 OpenAI 키가 필요한 후보가 있으면 늘 확인한다
+        if ($plan.external -or $Remote -or $plan.need_key) {
+            & $py -I -X utf8 (Join-Path $here 'common.py') --require-synthetic
+            if ($LASTEXITCODE -ne 0) { throw '외부 후보(OpenAI·remote)는 합성 철에만 보낸다 — -Work로 합성 work 폴더를 고르거나 -Local만 쓴다' }
+        }
+        if ($Remote -and ($plan.providers -contains 'remote')) {   # 부르기 전에 서버·모델 확인 (키는 헤더로만, 찍지 않음)
+            $hdr = @{ Authorization = "Bearer $remoteKey" }
+            try { $models = (Invoke-WebRequest "$($env:DOCFLOW_REMOTE_BASE)/models" -Headers $hdr -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json }
+            catch { throw "원격 서버가 응답하지 않는다: $($env:DOCFLOW_REMOTE_BASE)/models ($($_.Exception.Message))" }
+            if ($RemoteModel -notin @($models.data | ForEach-Object { $_.id })) { throw "원격 서버에 모델 $RemoteModel 이 없다 (있는 것: $(@($models.data.id) -join ', '))" }
+            Write-Output "원격: $($env:DOCFLOW_REMOTE_BASE) 모델 $RemoteModel"
         }
         if ($plan.need_key) {   # 키는 OpenAI 후보가 걸러질 때만 (로컬 모델만이면 키를 읽지도 넣지도 않는다)
             $key = if ($prevKey) { $prevKey } else { [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User') }
@@ -182,14 +248,20 @@ try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원�
                '--no-share', '--no-table', '--no-progress-bar')
     if ($Prompts) { $args_ += @('--filter-prompts', $Prompts) }
     if (-not $Cache) { $args_ += '--no-cache' }
-    if ($Local) { $args_ += @('-j', '1') }   # GPU·CPU 한 대에서 도는 로컬 모델은 하나씩 (OpenAI 후보도 같이 느려진다)
+    if ($Concurrency -gt 0) { $args_ += @('-j', "$Concurrency") }
+    elseif ($Local) { $args_ += @('-j', '1') }   # GPU·CPU 한 대에서 도는 로컬 모델은 하나씩 (OpenAI 후보도 같이 느려진다)
     Push-Location $here
     if ($key) { $env:OPENAI_API_KEY = $key }   # promptfoo를 부르는 동안만
+    # 원격 제공자 apiKeyEnvar — -Remote일 때만 실제 키, 아니면 자리 값 'none' (비우면 promptfoo가 OPENAI_API_KEY로 떨어질 수 있다)
+    $env:DOCFLOW_REMOTE_API_KEY = if ($Remote) { $remoteKey } else { 'none' }
+    $t0 = Get-Date
     try {
         Invoke-Promptfoo @args_
         $pcode = $LASTEXITCODE
     } finally {
         Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+        Remove-Item Env:DOCFLOW_REMOTE_API_KEY -ErrorAction SilentlyContinue
+        Write-Output ("promptfoo 실행 시간: {0:N0}초" -f ((Get-Date) - $t0).TotalSeconds)   # 원격 GPU 비용 = 이 시간 × 시간당 가격
         Pop-Location
     }
     # promptfoo는 단언 실패가 있으면 종료 코드 100 — 판정은 gate.py가 한다. 그 밖의 코드는 실행 자체가 실패
@@ -202,10 +274,12 @@ try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원�
     $code = $LASTEXITCODE
     Pop-Location
     Write-Output "결과: $out\gate.md · promptfoo 화면: .\eval\promptfoo\run.ps1 -View"
+    if ($Remote) { Write-Output '원격 GPU: 끝났으면 파드 정지(/moni-pod:gpu-stop)와 볼륨 삭제를 확인하고 #80에 기록한다' }
     exit $code
 } finally {
     # 키를 원래대로 (이 스크립트를 부른 셸에 있던 값이면 되살린다)
     if ($prevKey) { $env:OPENAI_API_KEY = $prevKey } else { Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue }
+    if ($prevRemoteKey) { $env:DOCFLOW_REMOTE_API_KEY = $prevRemoteKey } else { Remove-Item Env:DOCFLOW_REMOTE_API_KEY -ErrorAction SilentlyContinue }
     if ($baseDir) { Remove-Item -LiteralPath $baseDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ($served) {   # 이 스크립트가 켠 Ollama만 끈다 (serve가 띄운 모델 실행 프로세스 = 자식 프로세스도 함께)
         # serve가 죽어도 자식의 ParentProcessId는 남는다 → 남은 것이 없을 때까지 (최대 15초) 다시 찾아 끈다.
@@ -221,4 +295,7 @@ try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원�
         }
         Write-Output ("Ollama: 이 스크립트가 켠 것을 껐다 (남은 프로세스 {0}개)" -f @(& $mine).Count)
     }
+}
+} finally {   # 바꾼 DOCFLOW_* 환경변수를 시작 값으로 (맨 위 try)
+    foreach ($n in $envNames) { [Environment]::SetEnvironmentVariable($n, $envSaved[$n], 'Process') }
 }

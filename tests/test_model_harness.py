@@ -232,7 +232,8 @@ def _plan(plan, providers="", prompts="", model="가상:7b"):
 def test_plan_filters_like_promptfoo(plan):
     """run.ps1이 promptfoo 부르기 전에: 걸러질 후보(id·label, 대소문자 구분), 키 필요 여부, 기준과 겹침"""
     p = _plan(plan, "^local-ollama$", "^current$")
-    assert p == {"providers": ["local-ollama"], "prompts": ["current"], "need_key": False, "baseline_overlap": False}
+    assert p == {"providers": ["local-ollama"], "prompts": ["current"], "need_key": False, "external": False,
+                 "baseline_overlap": False}
     p = _plan(plan, "^openai:chat:가상:7b$")  # id로도 걸린다 (로컬 모델 이름은 채워서 본다)
     assert p["providers"] == ["local-ollama"] and not p["need_key"]
     assert _plan(plan, "GPT-4o")["providers"] == []  # 대소문자 구분 (promptfoo RegExp와 같게)
@@ -243,6 +244,21 @@ def test_plan_filters_like_promptfoo(plan):
     assert not _plan(plan, "mini", "^before_ocr_fix$")["baseline_overlap"]  # 판이 다르면 겹치지 않는다
     assert _plan(plan, "", "")["baseline_overlap"]  # 빈 정규식 = 모두
     assert _plan(plan, "openai:chat:gpt-4\\.1")["providers"] == ["gpt-4.1-mini"]
+
+
+def test_plan_remote_is_external(plan):
+    """원격 OpenAI 호환 후보(#80): 키(OpenAI) 불필요, 외부라 합성 철만 — run.ps1이 common.py --require-synthetic으로 막는다"""
+    read = lambda n: yaml.safe_load((PF / n).read_text(encoding="utf-8"))  # noqa: E731
+    p = plan.plan(read("promptfooconfig.yaml"), read("criteria.yaml"), "^remote$", "^current$", "", "가상:27b")
+    assert p["providers"] == ["remote"] and not p["need_key"] and p["external"] and not p["baseline_overlap"]
+    p = plan.plan(read("promptfooconfig.yaml"), read("criteria.yaml"), "^openai:chat:가상:27b$", "", "", "가상:27b")
+    assert p["providers"] == ["remote"]  # 원격 모델 이름도 채워서 id로 거른다
+    assert _plan(plan, "^gpt-4\\.1-mini$")["external"]  # OpenAI도 외부
+    assert not _plan(plan, "^(local-ollama|replay)$")["external"]
+    # Ollama 클라우드 모델은 local-ollama label이어도 글자가 ollama.com으로 간다 → 외부
+    assert _plan(plan, "^local-ollama$", model="gpt-oss:120b-cloud")["external"]
+    assert _plan(plan, "^local-ollama$", model="가상:cloud")["external"]
+    assert not _plan(plan, "^local-ollama$", model="cloudy:7b")["external"]
 
 
 def test_price_of(gate):
@@ -258,6 +274,18 @@ def test_price_of(gate):
     assert gate.price_of(local, {"내-로컬": {"apiBaseUrl": "https://가상.example/v1"}}) is None
     assert gate.price_of(_row("local-ollama", "current", "d1", pid="openai:chat:qwen2.5:7b")) == (0, 0)
     assert gate.price_of(_row("replay", "current", "d1", pid="file://replay.py")) == (0, 0)
+    # 원격 GPU(label remote, #80)는 런파드 프록시·SSH 터널(127.0.0.1)일 때만 토큰 단가 0 — 비용은 GPU 시간으로 따로
+    rem = _row("remote", "current", "d1", pid="openai:chat:gemma3:27b")
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "https://abc123-11434.proxy.runpod.net/v1"}}) == (0, 0)
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "http://127.0.0.1:18434/v1"}}) == (0, 0)
+    # 그 밖의 https 주소(유료 OpenAI 호환 API일 수 있음)·꼬리만 비슷한 주소는 단가 모름 → gate 종료 코드 2
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "https://api.가상.example/v1"}}) is None
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "https://proxy.runpod.net.가상.example/v1"}}) is None
+    assert gate.unpriced([rem], {"remote": {"apiBaseUrl": "https://api.가상.example/v1"}}) == ["openai:chat:gemma3:27b"]
+    # 옛 결과처럼 provider가 문자열이어도 id를 읽는다 (gate.md 모델 id 줄)
+    assert gate.provider_id({"provider": "openai:chat:gpt-4.1-mini"}) == "openai:chat:gpt-4.1-mini"
+    assert gate.provider_id({"provider": {"id": "openai:chat:가상"}}) == "openai:chat:가상"
+    assert gate.provider_id({}) == "?"
     assert gate.price_of(_row("x", "current", "d1", pid="anthropic:messages:가상")) is None
     assert gate.unpriced([_row("gpt-4o-mini", "current", "d1"), local]) == ["openai:chat:llama3.1:8b"]
     with pytest.raises(ValueError):
@@ -291,12 +319,99 @@ def test_response_kept_when_assertion_fails(gate, monkeypatch):
 def test_config_matrix():
     cfg = yaml.safe_load((PF / "promptfooconfig.yaml").read_text(encoding="utf-8"))
     labels = [p["label"] for p in cfg["providers"]]
-    assert labels == ["gpt-4.1-mini", "gpt-4o-mini", "local-ollama", "replay"]
+    assert labels == ["gpt-4.1-mini", "gpt-4o-mini", "local-ollama", "remote", "replay"]
     assert [p["label"] for p in cfg["prompts"]] == ["current", "before_ocr_fix"]
-    for p in cfg["providers"][:3]:
+    for p in cfg["providers"][:4]:
         assert p["config"]["temperature"] == 0 and p["config"]["response_format"] == {"type": "json_object"}
         assert p["config"]["max_tokens"] == 512  # 건당 출력 상한 (정상 응답 최대 310토큰)
     assert cfg["providers"][2]["config"]["apiBaseUrl"].startswith("http://127.0.0.1:")  # 로컬 모델은 이 PC에서만
+    remote = cfg["providers"][3]["config"]
+    # 원격 키는 환경변수 이름으로만 (값이 설정·결과 파일에 남지 않게), apiKey를 두지 않는다
+    assert remote["apiKeyEnvar"] == "DOCFLOW_REMOTE_API_KEY" and "apiKey" not in remote
+    assert remote["apiBaseUrl"] == "{{ env.DOCFLOW_REMOTE_BASE }}"
+
+
+def _common(monkeypatch, work):
+    monkeypatch.setenv("DOCFLOW_EVAL_WORK", str(work))
+    monkeypatch.delenv("DOCFLOW_EVAL_VOLS", raising=False)
+    before = list(sys.path)
+    c = _load("common")
+    sys.path[:] = before
+    return c
+
+
+def test_common_gt_and_synthetic_guard(monkeypatch, tmp_path):
+    """정답은 work 폴더의 gt/review.csv, 외부 후보는 synth_manifest.json에 있는 철에만 (#80)"""
+    (tmp_path / "platform").mkdir()
+    for v in ("SYNTH0001-1995-0001", "가상-0001"):
+        (tmp_path / "platform" / f"{v}.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "gt").mkdir()
+    (tmp_path / "gt" / "review.csv").write_text(
+        "page,확인,is_start,docno,date,recipient,title,check,note,saved\n"
+        "SYNTH0001-1995-0001-0001,경계,Y,가상 12345-1,1995-01-02,가상수신,가상제목,,합성,\n"
+        "SYNTH0001-1995-0001-0002,경계,N,,,,,,합성,\n", encoding="utf-8-sig")
+    c = _common(monkeypatch, tmp_path)
+    rows, idx, bnd, src = c.load_gt()
+    assert len(rows) == 2 and list(idx) == ["SYNTH0001-1995-0001-0001"] and idx["SYNTH0001-1995-0001-0001"]["date"] == "1995-01-02"
+    assert bnd == {"SYNTH0001-1995-0001-0001": True, "SYNTH0001-1995-0001-0002": False} and set(src.values()) == {"human"}
+    assert c.non_synthetic() == ["SYNTH0001-1995-0001", "가상-0001"]  # 목록이 없으면 모두 합성 아님
+    (tmp_path / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": "SYNTH0001-1995-0001"}]}), encoding="utf-8")
+    assert c.non_synthetic() == ["가상-0001"]
+    assert c.non_synthetic(["SYNTH0001-1995-0001"]) == []
+    # 목록에 있어도 이름이 SYNTH…가 아니면 합성으로 보지 않는다 (손으로 쓴 목록 막기)
+    (tmp_path / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": "SYNTH0001-1995-0001"}, {"vol": "가상-0001"}]}),
+                                                  encoding="utf-8")
+    assert c.non_synthetic() == ["가상-0001"]
+
+
+def test_load_gt_no_silent_poc_fallback(monkeypatch, tmp_path):
+    """기본(PoC) work가 아닌데 정답 파일이 없으면 PoC 정답으로 넘어가지 않고 멈춘다"""
+    c = _common(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit):
+        c.load_gt()
+
+
+def _cli(tmp_path, *args, vols=""):
+    import os
+    import subprocess
+    env = {**os.environ, "DOCFLOW_EVAL_WORK": str(tmp_path), "DOCFLOW_EVAL_VOLS": vols, "PYTHONUTF8": "1"}
+    return subprocess.run([sys.executable, "-I", str(PF / "common.py"), *args], env=env, capture_output=True,  # noqa: S603
+                          check=False).returncode
+
+
+def test_require_synthetic_cli(tmp_path):
+    """run.ps1이 부르는 --require-synthetic: 합성만이면 0, 아니면 2, 모르는 인자·인자 없음·없는 철도 0이 아님 (닫힌 쪽)"""
+    (tmp_path / "platform").mkdir()
+    (tmp_path / "platform" / "SYNTH0001-1995-0001.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": "SYNTH0001-1995-0001"}]}), encoding="utf-8")
+    assert _cli(tmp_path, "--require-synthetic") == 0
+    assert _cli(tmp_path, "--require-synthetic", "--더") != 0
+    assert _cli(tmp_path) != 0
+    assert _cli(tmp_path, "--require-synthetic", vols="SYNTH9999-1990-0001") == 2  # 없는 철
+    (tmp_path / "platform" / "가상-0001.json").write_text("[]", encoding="utf-8")
+    assert _cli(tmp_path, "--require-synthetic") == 2
+    assert _cli(tmp_path, "--require-synthetic", vols="SYNTH0001-1995-0001") == 0
+    empty = tmp_path / "empty"
+    (empty / "platform").mkdir(parents=True)
+    assert _cli(empty, "--require-synthetic") == 2  # 고른 철 0개도 통과시키지 않는다
+
+
+def test_scoring_uses_work_gt(gate, monkeypatch):
+    """check.py·gate.py는 정답을 common.load_gt(work 폴더 기준)에서 읽는다 — rescore.load_gt(PoC 고정)가 아니라"""
+    import ast
+    import types
+    tree = ast.parse((PF / "check.py").read_text(encoding="utf-8"))
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
+    assert "load_gt" not in imported
+    calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert "common.load_gt" in calls
+    seen = {}
+    fake = types.ModuleType("score")
+    fake.metrics = lambda docs, gt=None: seen.setdefault("gt", gt)
+    monkeypatch.setitem(sys.modules, "score", fake)
+    monkeypatch.setattr(gate.common, "load_gt", lambda: "work-gt")
+    gate.metrics({})
+    assert seen["gt"] == "work-gt"
 
 
 def test_prompt_versions_match_app():

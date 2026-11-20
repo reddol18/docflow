@@ -7,7 +7,7 @@
 promptfoo가 문서마다 Python을 새로 띄우므로 openai·DB·그래프 모듈은 불러오지 않는다 (app.fields·app.layout만)."""
 import common
 from prompts import SCHEMA
-from rescore import load_gt, ok_field
+from rescore import ok_field
 from score import FIELDS
 
 from app import fields, layout
@@ -31,7 +31,7 @@ def get_assert(output, context):
         return {"pass": False, "score": 0, "reason": f"JSON 객체 아님: {e}"}
     invalid = f" (추출 실패 칸: {', '.join(b.failed)})" if b.failed else ""
     v = context["vars"]
-    g = load_gt()[1].get(v["doc_id"])
+    g = common.load_gt()[1].get(v["doc_id"])  # 정답은 work 폴더 기준 (합성 work면 합성 정답)
     if g is None:
         return {"pass": True, "score": 1, "reason": "정답 없는 문서 (형식만 확인)" + invalid}
     got = b_values(b, v["vol"], v["doc_id"])
