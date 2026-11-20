@@ -5,6 +5,8 @@ data/
 !eval/data/
 eval/data/*
 !eval/data/search_queries.jsonl
+# 합성 철(eval/synth) 검색어 — 지어낸 내용뿐, 정답 문서 id 없음 (https://github.com/reddol18/docflow/issues/80)
+!eval/data/synth_search_queries.jsonl
 *.jpg
 *.jpeg
 *.tif
