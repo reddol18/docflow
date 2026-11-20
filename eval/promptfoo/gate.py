@@ -15,7 +15,9 @@
                    같은 판 후보의 지시문(prompt.raw)이 문서마다 기준과 다름, 후보 문서 묶음이 기준과 다름.
                    그 밖의 설정 차이(max_tokens 등)는 gate.md에 경고로 남긴다.
 건당 비용: openai:chat:<모델>의 모델이 app/llm.py PRICE에 있으면 그 단가, 로컬 모델(apiBaseUrl이 127.0.0.1·localhost,
-또는 label local-ollama)·replay는 0. 그 밖의 단가 모르는 모델이 있으면 0원으로 치지 않고 종료 코드 2.
+또는 label local-ollama)·원격 GPU(label remote — GPU 시간 비용은 따로)·replay는 0.
+그 밖의 단가 모르는 모델이 있으면 0원으로 치지 않고 종료 코드 2.
+정답은 work 폴더의 gt/review.csv (common.load_gt — 합성 work면 합성 정답, https://github.com/reddol18/docflow/issues/80).
 종료 코드: 0 모두 통과, 1 기준을 어긴 후보가 있음(또는 --expect-stored 불일치), 2 입력 문제(기준 후보 없음·단가 모름 등)
 """
 import argparse
@@ -39,12 +41,13 @@ EMPTY = {f["name"]: {"value": "", "confidence": 0.0} for f in fields.prompt_fiel
 FIELDS = list(fields.editable(SCHEMA))
 OPENAI = "openai:chat:"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+REMOTE = "remote"  # promptfooconfig.yaml 원격 OpenAI 호환 제공자 label (run.ps1 -Remote)
 
 
 def metrics(docs):
     # 채점기(eval/score.py)는 정답·PoC 채점 규칙(records_poc/scripts/rescore.py)을 불러오므로 쓸 때 불러온다
     from score import metrics as m  # noqa: PLC0415
-    return m(docs)
+    return m(docs, common.load_gt())  # 정답은 work 폴더 기준 (합성 work면 합성 정답, #80)
 
 
 def load_results(path):
@@ -78,7 +81,8 @@ def price_of(r, cfg=None):
     if not pid.startswith(OPENAI):
         return None
     base = ((cfg or {}).get(label or pid) or {}).get("apiBaseUrl") or ""
-    if label == "local-ollama" or (base and urlparse(base).hostname in LOCAL_HOSTS):
+    # 원격 GPU(런파드 Ollama·vLLM, #80)는 토큰 단가가 없다 — 비용은 GPU 시간으로 따로 적는다
+    if label in ("local-ollama", REMOTE) or (base and urlparse(base).hostname in LOCAL_HOSTS):
         return (0, 0)
     return llm.PRICE.get(pid[len(OPENAI):])
 
@@ -328,6 +332,9 @@ def main():
     if a.baseline_results:
         md += f"\n\n기준 줄은 지난 결과에서 가져옴 (다시 부르지 않음): {Path(a.baseline_results).name}"
         md += "".join(f"\n\n경고: {w}" for w in warns)
+    # local-ollama·remote는 label만으로 어느 모델인지 모른다 → 실제로 부른 모델 id를 적는다
+    used = {k[0]: sorted({(r.get("provider") or {}).get("id", "?") for r in g.values()}) for k, g in groups.items()}
+    md += "\n\n모델 id: " + ", ".join(f"{p} = {'/'.join(i)}" for p, i in sorted(used.items()))
     ans = (crit.get("answer") or {})
     note = ("\n\n답변 채점(Ragas·쌍별 승률): " + ("기준 " + json.dumps(ans, ensure_ascii=False)
                                            if any(v is not None for v in ans.values()) else

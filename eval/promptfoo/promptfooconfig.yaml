@@ -24,6 +24,13 @@ providers:
     label: local-ollama
     config: {temperature: 0, max_tokens: 512, response_format: {type: json_object}, apiBaseUrl: "http://127.0.0.1:11434/v1",
              apiKey: ollama}
+  # 원격 OpenAI 호환 서버 (런파드 GPU의 Ollama·vLLM, https://github.com/reddol18/docflow/issues/80). run.ps1 -Remote <주소/v1>
+  # -RemoteModel <모델>이 환경변수로 채운다. 키는 DOCFLOW_REMOTE_API_KEY(vLLM --api-key 등)를 run.ps1이 promptfoo 실행 동안만 넣는다
+  # (없으면 'none' — 비우면 promptfoo가 OPENAI_API_KEY로 떨어져 OpenAI 키가 원격 서버로 갈 수 있다). 외부 후보라 합성 철에만 보낸다
+  - id: "openai:chat:{{ env.DOCFLOW_REMOTE_MODEL }}"
+    label: remote
+    config: {temperature: 0, max_tokens: 512, response_format: {type: json_object},
+             apiBaseUrl: "{{ env.DOCFLOW_REMOTE_BASE }}", apiKeyEnvar: DOCFLOW_REMOTE_API_KEY}   # 키 값은 설정·결과 파일에 안 남는다
   - id: file://replay.py              # LLM 호출 없음 — 저장된 추출 값을 돌려준다 (채점 연결 확인, run.ps1 -Replay)
     label: replay
 
