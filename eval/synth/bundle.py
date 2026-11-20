@@ -3,7 +3,8 @@
 출력 (<out>/<철 이름>/)
   <쪽>.jpg          낡게 만든 쪽 (docflow에 그대로 올릴 수 있는 이름: <철>-<4자리 쪽 번호>)
   <쪽>.json         AI Hub 88 라벨과 같은 꼴(images + annotations, bbox [x,y,w,h]). 손글씨는 ttype handwritten,
-                    칸 값 단어에는 annotation.field (docno·date·recipient·title)
+                    칸 값 단어에는 annotation.field (docno·date·recipient·title),
+                    손글씨 칸 단어에는 annotation.cell (render.HAND_CELLS — 같은 칸 단어를 이으면 정답, 상자를 합치면 칸 상자)
   gt.csv            채점 정답 — PoC 확정 정답 파일(eval/score.py가 읽는 것)과 같은 열.
                     모든 쪽 확인='경계'(문서 시작 판별 채점), 시작 쪽만 4칸.
                     note는 '합성; docno:판독 불가(25.3); date:판독 불가(12.0)' 꼴 — 낡아서 사람도 읽기 어려운 칸
@@ -89,7 +90,8 @@ def label(page_id, img_w, img_h, year, ann, boxes):
                     "image.create.time": ""}],
         "annotations": [
             {"id": i, "annotation.type": "rectangle", "annotation.text": a["text"], "annotation.ttype": a["ttype"],
-             "annotation.bbox": [b[0], b[1], b[2] - b[0], b[3] - b[1]], **({"annotation.field": a["field"]} if "field" in a else {})}
+             "annotation.bbox": [b[0], b[1], b[2] - b[0], b[3] - b[1]], **({"annotation.field": a["field"]} if "field" in a else {}),
+             **({"annotation.cell": a["cell"]} if "cell" in a else {})}
             for i, (a, b) in enumerate(zip(ann, boxes))],
     }
 
