@@ -8,6 +8,8 @@
   cont      본문이 이어지는 쪽 (머리 없음, 쪽 번호)
   attach    붙임 서식 쪽 ('[별지 제N호 서식]' 머리 + 표) — docflow 규칙상 문서 시작 쪽이 아니다
 단어 상자는 annotation 하나당 [x0, y0, x1, y1]. 칸 값 단어에는 field(docno·date·recipient·title)를 붙인다.
+손글씨 단어에는 cell(HAND_CELLS — 일련번호·시행일자·접수란·서명란)을 붙인다: 같은 cell 단어를 이으면 그 칸의 정답 글자,
+상자를 합치면 칸 상자 (https://github.com/reddol18/docflow/issues/80 조건 4). 그림·난수 순서는 바꾸지 않는다.
 """
 import functools
 import random
@@ -43,6 +45,10 @@ CASES = [
     ("영업신고 수리", "식품접객업 영업신고 수리 통보", "식품위생법 제22조"),
 ]
 FIELDS = ("docno", "date", "recipient", "title")
+# 손글씨 칸 (annotation.cell): 한 칸 = hand() 한 번. serial·date는 운영 판독 칸(문서번호 일련번호·시행일자)의 손글씨 부분,
+# 나머지는 운영이 읽지 않는 칸 — 접수란 번호·일자, 서명란 이름(기안자·검토자·결재권자), 붙임 서식 검토자 이름
+SIGN_CELLS = ("sign_drafter", "sign_reviewer", "sign_approver")
+HAND_CELLS = ("serial", "date", "recv_no", "recv_date", *SIGN_CELLS, "sign_attach")
 
 
 def person(r):
@@ -60,10 +66,12 @@ class Page:
         self.ink = r.choice([(20, 30, 90), (25, 25, 30), (35, 40, 110)])  # 이 쪽에 쓴 볼펜 색
         self.ann = []
 
-    def _add(self, text, box, ttype, fld):
+    def _add(self, text, box, ttype, fld, cell=None):
         a = {"text": text, "ttype": ttype, "box": [int(v) for v in box]}
         if fld:
             a["field"] = fld
+        if cell:
+            a["cell"] = cell
         self.ann.append(a)
 
     @staticmethod
@@ -115,8 +123,10 @@ class Page:
                   "textType1", None)
         return x
 
-    def hand(self, xy, s, size, fld=None):
-        """손글씨: 글자마다 크기·기울기·위치를 흔든다. 띄어쓰기 단위로 상자."""
+    def hand(self, xy, s, size, fld=None, cell=None):
+        """손글씨: 글자마다 크기·기울기·위치를 흔든다. 띄어쓰기 단위로 상자.
+        cell: 손글씨 칸 이름(HAND_CELLS) — 한 번 부른 글(s)이 칸 하나다.
+        비전 판독 비교(https://github.com/reddol18/docflow/issues/80 조건 4)의 정답 단위"""
         r = self.r
         x, y = xy
         for w in s.split(" "):
@@ -135,7 +145,7 @@ class Page:
                 boxes.append((ox + tb[0], oy + tb[1], ox + tb[2], oy + tb[3]))
                 x = ox + tb[2] + r.uniform(-2, 6)
             self._add(w, (min(b[0] for b in boxes), min(b[1] for b in boxes),
-                          max(b[2] for b in boxes), max(b[3] for b in boxes)), "handwritten", fld)
+                          max(b[2] for b in boxes), max(b[3] for b in boxes)), "handwritten", fld, cell)
             x += size * r.uniform(0.35, 0.6)
         return x
 
@@ -231,9 +241,9 @@ def first_page(c, fonts, r, typewriter=False, cont=False, attach=False):
     lx, vx, y0, step = 170, 470, 450, 95
     p.spaced((lx, y0), "문서번호", 46, letter_gap=4)
     xe = p.text((vx, y0), f"{c.dept[0]} {c.classno}-", 50, fld="docno")
-    p.hand((xe, y0 - 18), c.serial, 78, fld="docno")
+    p.hand((xe, y0 - 18), c.serial, 78, fld="docno", cell="serial")
     p.spaced((lx, y0 + step), "시행일자", 46, letter_gap=4)
-    xe = p.hand((vx, y0 + step - 18), f"{c.year % 100}. {c.month}. {c.day}.", 78, fld="date")
+    xe = p.hand((vx, y0 + step - 18), f"{c.year % 100}. {c.month}. {c.day}.", 78, fld="date", cell="date")
     p.text((xe + 30, y0 + step), "( 보존 : 3년 )", 40)
     p.spaced((lx, y0 + 2 * step), "(경 유)", 46, letter_gap=8)
     p.spaced((lx, y0 + 3 * step), "수 신", 46, letter_gap=30)
@@ -254,8 +264,8 @@ def first_page(c, fonts, r, typewriter=False, cont=False, attach=False):
         p.text((bx0 + 170, yy + 18), lab, 36)
     p.line((bx0 + 400, by0), (bx0 + 400, by1), 2)
     if r.random() < 0.7:  # 받는 쪽이 적는 접수 번호·일자 — 손글씨, 4칸 아님
-        p.hand((bx0 + 440, by0 + 2 * rh + 4), str(r.randint(10, 999)), 60)
-        p.hand((bx0 + 440, by0 + 4), f"{c.month}. {min(c.day + r.randint(1, 3), 28)}.", 60)
+        p.hand((bx0 + 440, by0 + 2 * rh + 4), str(r.randint(10, 999)), 60, cell="recv_no")
+        p.hand((bx0 + 440, by0 + 4), f"{c.month}. {min(c.day + r.randint(1, 3), 28)}.", 60, cell="recv_date")
 
     p.line((150, 960), (W - 150, 960), 5)
     p.spaced((lx, 1000), "제 목", 50, letter_gap=30)
@@ -290,7 +300,7 @@ def sign_block(p, c, r, top=2420):
     for i, role in enumerate(["기안자", "검토자", "결재권자"]):
         x = 200 + i * 720
         p.text((x, fy + 40), role, 38)
-        p.hand((x + 180, fy + 20), person(r), 64)
+        p.hand((x + 180, fy + 20), person(r), 64, cell=SIGN_CELLS[i])
     p.text((200, fy + 160), f"{c.dept[1]}-{c.serial}  ( {c.year}. {c.month}. {c.day}. )   접수   "
                             f"{r.choice(['민원실', '건축과', '종합민원실'])}-{r.randint(1, 999)}", 34)
     p.text((200, fy + 230), f"{c.addr}  /  전화 {r.randint(20, 99)}-{r.randint(1000, 9999)}  /  {r.choice(['공개', '부분공개'])}", 34)
@@ -327,5 +337,5 @@ def attach_page(c, fonts, r, typewriter=False):
         p.text((xm + 40, y + 55), val, 44)
         y += 160
     p.text((x0, y + 80), "검토자", 40)
-    p.hand((x0 + 200, y + 60), person(r), 64)
+    p.hand((x0 + 200, y + 60), person(r), 64, cell="sign_attach")
     return p
