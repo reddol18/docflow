@@ -207,6 +207,88 @@ def test_reader_logprobs_fallback(mods):
     assert rd.read(_cell("date", "1997-05-15"))["ok"] and len(fake.calls) == 3
 
 
+def test_reader_logprobs_fallback_concurrent(mods):
+    """logprobs를 받지 않는 서버를 동시에 부름: 첫 호출들이 함께 실패해도(다른 스레드가 플래그를 먼저 바꿈) 칸마다 빼고 다시 부른다"""
+    import threading
+    n = 4
+    gate = threading.Barrier(n)
+    lock = threading.Lock()
+
+    class Slow(FakeChat):
+        def create(self, **kw):
+            if "logprobs" in kw:
+                with lock:
+                    self.calls.append(kw)
+                gate.wait(timeout=5)  # 넷이 모두 logprobs를 넣어 부른 뒤에 함께 실패
+                raise ValueError("logprobs not supported")
+            with lock:
+                self.calls.append(kw)
+            return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                                   choices=[SimpleNamespace(message=SimpleNamespace(content="97. 5. 15."), logprobs=None)])
+
+    rd = mods.hw.Reader(Slow([]), "qwen2.5vl:7b", False, mods.cc.Budget(0.0))
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(n) as ex:
+        rows = list(ex.map(rd.read, [_cell("date", "1997-05-15")] * n))
+    assert all(r["ok"] and not r["error"] for r in rows)
+    assert rd.logprobs is False
+
+
+def test_reader_retry_latency_is_last_call(mods, monkeypatch):
+    clock = iter([0.0, 10.0, 10.5, 11.0])  # read 시작 0, 첫 호출 10(실패), 다시 부름 10.5, 끝 11 → 0.5초
+    monkeypatch.setattr(mods.hw.time, "perf_counter", lambda: next(clock))
+    rd = mods.hw.Reader(FakeChat(["97. 5. 15."], logprobs_ok=False), "qwen2.5vl:7b", False, mods.cc.Budget(0.0))
+    assert rd.read(_cell("date", "1997-05-15"))["ms"] == 500
+
+
+def test_reader_keeps_cost_when_response_bad(mods):
+    """응답을 받은(과금된) 뒤 모양이 틀려 실패해도 결과 줄에 토큰·비용이 남는다 (예산 정산과 같은 값)"""
+    class Empty(FakeChat):
+        def create(self, **kw):
+            return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=300, completion_tokens=5), choices=[])
+
+    b = mods.cc.Budget(1.0)
+    r = mods.hw.Reader(Empty([]), "gpt-4.1-mini", True, b).read(_cell())
+    assert r["error"] == "IndexError" and r["tin"] == 300 and r["usd"] > 0
+    assert abs(b.spent - r["usd"]) < 1e-15 and b.held == pytest.approx(0.0)
+
+
+def _gt(work):
+    (work / "gt").mkdir(parents=True, exist_ok=True)
+    (work / "gt" / "review.csv").write_text("page,확인,is_start,docno,date,recipient,title,check,note,saved\n", encoding="utf-8-sig")
+
+
+@pytest.mark.parametrize("gen,msg", [("synth-0.1", "생성기 판"), ("synth-0.2", r"정답\(annotation\.cell\)이 없는 철")])
+def test_collect_refuses_bundles_without_cells(mods, tmp_path, gen, msg):
+    """예전 판(칸 이름 없음) 철이 섞이면 기타 칸이 조용히 빠지지 않게 철 단위로 멈춘다"""
+    vol = "SYNTH0001-1995-0001"
+    w = _work(tmp_path, [vol])
+    _gt(w)
+    bd = tmp_path / "bundles" / vol
+    bd.mkdir(parents=True)
+    (bd / "meta.json").write_text(json.dumps({"vol": vol, "synthetic": True, "generator": gen}), encoding="utf-8")
+    with pytest.raises(SystemExit, match=msg):
+        mods.hw.collect(w, tmp_path / "bundles", [vol])
+
+
+def test_bundle_version_marks_cells(mods):
+    sys.path.insert(0, str(EVAL / "synth"))
+    bundle = _load("synth_bundle_v", EVAL / "synth" / "bundle.py")
+    assert bundle.VERSION in mods.hw.CELL_GENERATORS
+
+
+@pytest.mark.parametrize("n,want", [(1, 1), (20, 19), (30, 29), (49, 47), (100, 95)])
+def test_p95_nearest_rank(mods, n, want):
+    assert mods.cc.p95(list(range(1, n + 1))) == want
+
+
+def test_vols_arg_and_disk_check(mods, tmp_path, monkeypatch):
+    assert mods.cc.vols_arg(" A, B ,,") == ["A", "B"]
+    monkeypatch.setattr(mods.cc.shutil, "disk_usage", lambda p: SimpleNamespace(free=1 * 1024**3))
+    with pytest.raises(SystemExit, match="디스크"):
+        mods.cc.out_dir(tmp_path, "hw")
+
+
 def test_summary_and_table(mods):
     rows = [{**_cell(), "text": "", "ok": True, "conf": 0, "tin": 10, "tout": 1, "usd": 0.001, "ms": 100, "error": ""},
             {**_cell(), "hard": True, "text": "", "ok": False, "conf": 0, "tin": 10, "tout": 1, "usd": 0.001, "ms": 300, "error": ""},
@@ -265,6 +347,59 @@ def test_overlap_and_summary(mods):
     s, rel = em.summarize(ranks, qs, docs, base=ranks)
     assert s["전체"]["overlap5_rrf"] == 1.0 and s["주제"]["recall5_rrf"] == 1.0 and s["답 없음"]["recall5_rrf"] is None
     assert rel["q2"] == []
+
+
+@pytest.mark.parametrize("line", [
+    # 실제 자료 질의 세트 형식 (eval/data/search_queries.jsonl): 정답 문서 id·참고 답·근거 칸
+    '{"id": "q01", "type": "정확 조회", "q": "가상 12345-1", "relevant": ["x"], "must_cite": ["x"], "answer": "a"}',
+    '{"id": "s01", "type": "주제", "q": "가", "match": {}, "relevant": ["x"]}',
+    '{"id": "q01", "type": "주제", "q": "가", "match": {}}',  # id 형식
+    '{"id": "s01", "type": "주제", "q": "가", "match": {"body": "x"}}',  # 모르는 규칙 칸
+    'not json',
+])
+def test_queries_must_be_synthetic_format(mods, tmp_path, line):
+    p = tmp_path / "q.jsonl"
+    p.write_text(line + "\n", encoding="utf-8")
+    with pytest.raises(mods.em.NotSyntheticQueries):
+        mods.em.load_queries(p)
+
+
+def test_real_query_set_refused(mods):
+    real = ROOT / "eval" / "data" / "search_queries.jsonl"
+    if real.exists():
+        with pytest.raises(mods.em.NotSyntheticQueries):
+            mods.em.load_queries(real)
+
+
+def _embed_work(tmp_path):
+    vol, page = "SYNTH0001-1995-0001", "SYNTH0001-1995-0001-0001"
+    w = _work(tmp_path, [vol])
+    (w / "platform" / f"{vol}.json").write_text(json.dumps([{"doc_id": page, "pages": [page]}]), encoding="utf-8")
+    (w / "ocr_platform" / vol).mkdir(parents=True)
+    (w / "ocr_platform" / vol / f"{page}.json").write_text(json.dumps({"lines": ["합성"]}), encoding="utf-8")
+    _gt(w)
+    return w
+
+
+def test_baseline_must_match_inputs(mods, tmp_path, monkeypatch):
+    """기준 파일의 검색어·문서 해시가 이번 입력과 다르면 부르기 전에 멈춘다"""
+    w = _embed_work(tmp_path)
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps({"vols": ["SYNTH0001-1995-0001"], "queries_sha256": "x", "docs_sha256": "y", "ranks": {}}),
+                    encoding="utf-8")
+    monkeypatch.setattr(mods.cc, "make_client", lambda *a, **k: pytest.fail("기준이 다른데 클라이언트를 만듦"))
+    with pytest.raises(SystemExit, match="기준 결과"):
+        mods.em.main(["--base-url", "http://127.0.0.1:9/v1", "--model", "m", "--label", "t", "--work", str(w),
+                      "--baseline", str(base)])
+
+
+def test_embed_error_hides_message(mods):
+    class Boom:
+        embeddings = SimpleNamespace(create=lambda **kw: (_ for _ in ()).throw(RuntimeError("Incorrect API key sk-abc...xyz")))
+
+    with pytest.raises(SystemExit) as e:
+        mods.em.embed(Boom(), "text-embedding-3-small", ["가"], True, mods.cc.Budget(1.0))
+    assert "sk-" not in str(e.value) and "RuntimeError" in str(e.value)
 
 
 def test_synth_queries_file(mods):

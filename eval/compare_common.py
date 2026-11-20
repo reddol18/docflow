@@ -1,6 +1,7 @@
 """비전·임베딩 모델 비교(eval/hw_compare.py·eval/embed_compare.py)가 같이 쓰는 것 (https://github.com/reddol18/docflow/issues/80 조건 4·5).
 
-- 합성 철만: 외부(OpenAI·원격 GPU)로 보내는 글자·이미지는 eval/synth 합성 철뿐이다 (2026-11-20 #80 결정). work 폴더의
+- 합성 철만: 외부(OpenAI·원격 GPU)로 보내는 글자·이미지는 eval/synth 합성 철뿐이다
+  (2026-11-20 https://github.com/reddol18/docflow/issues/80 결정). work 폴더의
   synth_manifest.json에 있고 이름이 SYNTH로 시작하는 철만 고르고, 합성 철 폴더(bundle.py 출력)는 meta.json synthetic=true여야 한다.
   PoC work(records_poc/work, AI Hub 결과)는 거부한다. 모델 비교 하네스 `eval/promptfoo/common.py --require-synthetic`과 같은 수준.
 - 서버 주소: OpenAI(--openai) 또는 OpenAI 호환 주소(--base-url) — https, 또는 http면 127.0.0.1·localhost(SSH 터널·이 PC Ollama)만,
@@ -13,6 +14,7 @@
 import csv
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -79,13 +81,29 @@ def synthetic_vols(work, want=None, bundles=None):
     return vols
 
 
-def out_dir(work, sub):
-    """결과 폴더 <work>/<sub> — 저장소 밖이어야 한다 (문서 글자가 든다)"""
+MIN_FREE_GB = 2  # eval/synth/to_work.py와 같다 — 결과 JSON은 수 MB지만 같은 드라이브의 다른 실행 몫까지
+
+
+def out_dir(work, sub, min_free_gb=MIN_FREE_GB):
+    """결과 폴더 <work>/<sub> — 저장소 밖이어야 하고(문서 글자가 든다), 그 드라이브 여유가 min_free_gb 이상이어야 한다
+    (실험 실행 전 디스크 여유 확인 — records_poc/CLAUDE.md)"""
     d = Path(work) / sub
     if d.resolve().is_relative_to(APP_ROOT):
         raise SystemExit("결과는 저장소 밖 work 폴더에 쓴다")
+    probe = d.resolve()
+    while not probe.exists():
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free / 1024**3
+    print(f"디스크 여유: {probe.anchor} {free:.1f}GB (필요 {min_free_gb}GB)", flush=True)
+    if free < min_free_gb:
+        raise SystemExit("결과 폴더 드라이브의 디스크 여유가 모자라 멈춘다")
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def vols_arg(s):
+    """--vols 'A, B' → ['A', 'B'] (앞뒤 공백·빈 값 뺌)"""
+    return [v.strip() for v in (s or "").split(",") if v.strip()]
 
 
 def load_gt(work):
@@ -163,5 +181,6 @@ def label_ok(label):
 
 
 def p95(xs):
+    """nearest-rank p95: 정렬해 ⌈0.95·n⌉번째 값 (n=49 → 47번째, n=30 → 29번째)"""
     xs = sorted(xs)
-    return xs[max(0, int(round(0.95 * len(xs))) - 1)] if xs else 0.0
+    return xs[max(0, -(-95 * len(xs) // 100) - 1)] if xs else 0.0  # 정수 올림 (부동소수 0.95 오차 없이)

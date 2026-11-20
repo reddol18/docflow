@@ -8,7 +8,8 @@ Qdrant(1536 고정, app/store.py)에 넣지 않고 메모리 안에서 같은 �
             칸 값은 합성 정답(gt) — 운영에서는 추출 값이 들어간다 (모든 후보에 같은 글).
   /search   app/main.ranked와 같은 셈: 벡터(코사인, 연도 칸 거르기) 30개 + 낱말(store.keyword_search — search_text에
             질의 낱말이 든 수, 대소문자 무시) 30개 → RRF(1/(60+순위)). 질의 낱말은 main.query_words와 같다.
-  겹침     질의마다 |기준 상위 5 ∩ 후보 상위 5| / 5 의 평균 (/search RRF와 벡터만 각각). 정답(검색어 match 규칙을 합성 정답에
+  겹침     질의마다 |기준 상위 5 ∩ 후보 상위 5| / 5 의 평균 (/search RRF와 벡터만 각각,
+            결과가 5개보다 적으면 그 수로 — overlap). 정답(검색어 match 규칙을 합성 정답에
             맞춘 문서)이 있는 질의는 recall@5도 낸다.
 
 실행 (doc_platform 폴더, 합성 work의 평가 가상환경):
@@ -68,8 +69,41 @@ def load_docs(work, vols):
     return docs
 
 
+QUERY_KEYS = {"id", "type", "q", "year", "match"}  # 합성 검색어 파일 형식 (정답 문서 id·참고 답 칸 없음)
+MATCH_KEYS = {"docno", "date", "recipient", "title", "year"}
+QUERY_ID = re.compile(r"s\d{2,3}")
+
+
+class NotSyntheticQueries(SystemExit):
+    """합성 검색어 파일 형식이 아님 — 실제 자료 질의 세트(eval/data/search_queries.jsonl: relevant·must_cite·answer 칸,
+    실제 철 문서번호)가 외부(OpenAI)로 가지 않게 부르기 전에 멈춘다"""
+
+
 def load_queries(path=QUERIES):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    """합성 검색어만 받는다: 줄마다 칸이 QUERY_KEYS 안(relevant·must_cite·answer 등 없음), id 's숫자', match 칸이 MATCH_KEYS 안.
+    아니면 NotSyntheticQueries"""
+    qs = []
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            q = json.loads(line)
+        except ValueError:
+            raise NotSyntheticQueries(f"검색어 파일 {n}번째 줄이 JSON이 아니다") from None
+        if (not isinstance(q, dict) or set(q) - QUERY_KEYS or not QUERY_ID.fullmatch(str(q.get("id", "")))
+                or not isinstance(q.get("q"), str) or not isinstance(q.get("match"), dict) or set(q["match"]) - MATCH_KEYS):
+            raise NotSyntheticQueries(f"합성 검색어 형식이 아닌 줄 {n} (칸 {sorted(q) if isinstance(q, dict) else '?'}) — "
+                                      "외부 임베딩에는 합성 검색어 파일(eval/data/synth_search_queries.jsonl 형식)만 보낸다")
+        qs.append(q)
+    if not qs or len({q["id"] for q in qs}) != len(qs):
+        raise NotSyntheticQueries("검색어가 없거나 id가 겹친다")
+    return qs
+
+
+def digest(obj):
+    """기준 결과 맞춤 확인용 해시 (검색어 내용·문서 목록)"""
+    import hashlib  # noqa: PLC0415
+    return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def relevant(q, docs):
@@ -127,6 +161,8 @@ def rank_all(queries, docs, dvecs, qvecs):
 
 
 def overlap(a, b, k=5):
+    """상위 k 겹침 = |a[:k] ∩ b[:k]| / min(k, 두 목록 중 긴 쪽 길이). 보통(결과 ≥ k) 분모는 k이고, 연도 칸으로 걸러
+    결과가 k보다 적을 때만 그 수로 나눈다 (둘 다 같은 3건이면 1.0). 둘 다 비면 1.0 — docs/design.md와 같은 정의"""
     a, b = a[:k], b[:k]
     n = max(len(a), len(b))
     return len(set(a) & set(b)) / min(k, n) if n else 1.0
@@ -164,7 +200,10 @@ def embed(client, model, texts, priced, budget):
             raise SystemExit(f"OpenAI 지출 상한 ${budget.cap}을 넘어 멈춤 (쓴 돈 ${budget.spent:.6f})")
         cost = 0.0
         try:
-            r = client.embeddings.create(model=model, input=chunk)
+            try:
+                r = client.embeddings.create(model=model, input=chunk)
+            except Exception as e:  # noqa: BLE001 — SDK 오류 문구(인증 오류는 키 앞뒤 일부를 담는다)는 찍지 않고 종류만
+                raise SystemExit(f"임베딩 호출 실패: {type(e).__name__}") from None
             t = getattr(r.usage, "prompt_tokens", 0) or 0  # 로컬 서버는 usage를 안 줄 수 있다
             tokens += t
             if priced:
@@ -208,14 +247,17 @@ def main(argv=None):
     ap.add_argument("--baseline", default="", help="기준 결과 파일 (지금 임베딩) — 주면 상위 5개 겹침을 낸다")
     a = ap.parse_args(argv)
     label = cc.label_ok(a.label)
-    vols = cc.synthetic_vols(a.work, [v for v in a.vols.split(",") if v.strip()])
+    vols = cc.synthetic_vols(a.work, cc.vols_arg(a.vols))
+    docs, queries = load_docs(a.work, vols), load_queries(a.queries)  # 합성 검색어가 아니면 여기서 멈춘다 (부르기 전)
     out = cc.out_dir(a.work, "embed")
-    docs, queries = load_docs(a.work, vols), load_queries(a.queries)
+    q_hash = digest(queries)
+    d_hash = digest([["/".join(d["key"]), d["text"], d["search_text"], d["year"]] for d in docs])
     base = None
     if a.baseline:
         b = json.loads(Path(a.baseline).read_text(encoding="utf-8"))
-        if sorted(b["vols"]) != sorted(vols) or sorted(b["ranks"]) != sorted(q["id"] for q in queries):
-            raise SystemExit("기준 결과와 철·검색어가 다르다")
+        # 검색어 글자·연도·규칙과 문서 목록·글까지 같아야 겹침이 뜻을 갖는다 (이름만 같은 예전 기준 파일 거부)
+        if b.get("queries_sha256") != q_hash or b.get("docs_sha256") != d_hash or sorted(b["vols"]) != sorted(vols):
+            raise SystemExit("기준 결과와 철·문서·검색어가 다르다 (기준을 같은 입력으로 다시 잰다)")
         base = b["ranks"]
     client, priced = cc.make_client(a.openai, a.base_url)
     budget = cc.Budget(a.max_usd)
@@ -227,7 +269,8 @@ def main(argv=None):
     summary, rel = summarize(ranks, queries, docs, base)
     res = {"label": label, "model": a.model, "where": "OpenAI" if a.openai else cc.check_base_url(a.base_url).split("/v1")[0],
            "vols": vols, "docs": len(docs), "dim": len(dvecs[0]), "tokens": t1 + t2, "usd": round(u1 + u2, 6), "wall_s": wall,
-           "baseline": a.baseline or None, "summary": summary, "relevant": rel, "ranks": ranks}
+           "baseline": a.baseline or None, "queries_sha256": q_hash, "docs_sha256": d_hash,
+           "summary": summary, "relevant": rel, "ranks": ranks}
     p = out / f"{label}.json"
     p.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"합성 철 {len(vols)}개, 문서 {len(docs)}, 검색어 {len(queries)}, 차원 {res['dim']}")

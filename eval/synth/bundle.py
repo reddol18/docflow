@@ -30,7 +30,9 @@ import fonts as font_pins  # noqa: E402
 import render  # noqa: E402
 from PIL import ImageDraw  # noqa: E402
 
-VERSION = "synth-0.1"
+# synth-0.2: 손글씨 칸 이름(annotation.cell)을 라벨에 남긴다 (https://github.com/reddol18/docflow/issues/80).
+# 같은 시드면 쪽 이미지·정답은 0.1과 같다
+VERSION = "synth-0.2"
 GT_COLS = ["page", "확인", "is_start", "docno", "date", "recipient", "title", "check", "note", "saved"]
 
 

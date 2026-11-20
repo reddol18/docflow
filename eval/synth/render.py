@@ -125,7 +125,8 @@ class Page:
 
     def hand(self, xy, s, size, fld=None, cell=None):
         """손글씨: 글자마다 크기·기울기·위치를 흔든다. 띄어쓰기 단위로 상자.
-        cell: 손글씨 칸 이름(HAND_CELLS) — 한 번 부른 글(s)이 칸 하나다. 비전 판독 비교(#80 조건 4)의 정답 단위"""
+        cell: 손글씨 칸 이름(HAND_CELLS) — 한 번 부른 글(s)이 칸 하나다.
+        비전 판독 비교(https://github.com/reddol18/docflow/issues/80 조건 4)의 정답 단위"""
         r = self.r
         x, y = xy
         for w in s.split(" "):

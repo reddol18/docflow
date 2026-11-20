@@ -45,7 +45,8 @@ OTHER_CELLS = ("recv_no", "recv_date", "sign_drafter", "sign_reviewer", "sign_ap
 OTHER_PROMPT = ("1990년대 공문서에서 사람이 손으로 쓴 칸 하나를 잘라낸 이미지다 (접수란의 번호·일자 또는 서명란의 사람 이름). "
                 "손글씨를 보이는 그대로 한 줄로 적어라. 숫자는 아라비아 숫자로, 이름은 한글로 적는다. "
                 "흘려 써서 애매해도 가장 그럴듯한 글자를 적는다. 값만 적고 설명은 쓰지 않는다.")
-PAD = 16  # 기타 칸: 라벨 상자를 사방으로 넓힐 픽셀 (글자 끝이 잘리지 않게)
+CELL_GENERATORS = {"synth-0.2"}  # annotation.cell을 남기는 eval/synth/bundle.py VERSION
+PAD = 16 # 기타 칸: 라벨 상자를 사방으로 넓힐 픽셀 (글자 끝이 잘리지 않게)
 GROUPS = [("serial", "문서번호 칸 (운영)"), ("date", "시행일자 칸 (운영)"), ("recv_no", "접수 번호"),
           ("recv_date", "접수 일자"), ("sign", "서명 이름")]
 
@@ -102,6 +103,10 @@ def collect(work, bundles, vols):
     gt = cc.load_gt(work)
     cells = []
     for vol in vols:
+        gen = json.loads((Path(bundles) / vol / "meta.json").read_text(encoding="utf-8")).get("generator")
+        if gen not in CELL_GENERATORS:  # 예전 판 철은 칸 이름이 없어 기타 칸이 조용히 빠진다 → 철 단위로 멈춘다
+            raise SystemExit(f"손글씨 칸 이름(annotation.cell)이 없는 생성기 판({gen}) 철: {vol} — eval/synth/bundle.py로 다시 만든다")
+        n0 = len(cells)
         for d in cc.stored_docs(work, vol):
             page = d["pages"][0]
             o = cc.page_ocr(work, vol, page)
@@ -132,8 +137,8 @@ def collect(work, bundles, vols):
                     truth, b = pl[cell]
                     cells.append({"vol": vol, "doc_id": d["doc_id"], "page": p, "cell": cell, "kind": "other", "truth": truth,
                                   "hard": False, "box": b, "box_fail": "", "png": png_crop(pimg, b, PAD)})
-    if not any("serial" == c["cell"] for c in cells) or not any(c["kind"] == "other" for c in cells):
-        raise SystemExit("손글씨 칸 정답이 없다 — 합성 철을 annotation.cell이 있는 생성기(eval/synth)로 다시 만든다")
+        if not any(c["kind"] == "other" for c in cells[n0:]):  # 철마다 기타 칸 정답이 있어야 한다
+            raise SystemExit(f"손글씨 칸 정답(annotation.cell)이 없는 철: {vol} — eval/synth/bundle.py로 다시 만든다")
     return cells
 
 
@@ -157,51 +162,60 @@ class Reader:
         return llm.estimate_usd(self.model, llm.tokens_max(prompt) + llm.IMAGE_TOKENS.get(self.model, max(llm.IMAGE_TOKENS.values())),
                                 llm.CELL_MAX_TOKENS)
 
-    def _call(self, prompt, url):
-        kw = {"logprobs": True} if self.logprobs else {}
+    def _call(self, prompt, url, logprobs):
+        kw = {"logprobs": True} if logprobs else {}
         return self.client.chat.completions.create(
             model=self.model, temperature=0, max_tokens=self.llm.CELL_MAX_TOKENS, **kw,
             messages=[{"role": "user", "content": [{"type": "text", "text": prompt},
                                                    {"type": "image_url", "image_url": {"url": url, "detail": "high"}}]}])
 
+    def _call_once_more(self, prompt, url):
+        """→ (응답, 마지막 호출 시작 시각). logprobs를 넣어 불렀다가 logprobs 때문에 실패하면 (다른 스레드가 플래그를
+        먼저 바꿨든 아니든) 이번 호출에서 빼고 한 번 더 — 판단은 이번 호출에 넣은 값으로 한다 (공유 플래그 아님)"""
+        sent = self.logprobs
+        t0 = time.perf_counter()
+        try:
+            return self._call(prompt, url, sent), t0
+        except Exception as e:
+            if not sent or "logprob" not in str(e).lower():
+                raise
+            self.logprobs = False  # 다음 칸부터는 처음부터 뺀다
+        t0 = time.perf_counter()  # 지연은 마지막 호출만
+        return self._call(prompt, url, False), t0
+
     def read(self, c):
         """칸 하나 → 결과 dict (png 제외)"""
         out = {k: v for k, v in c.items() if k != "png"}
+        res = {"text": "", "ok": False, "conf": 0.0, "tin": 0, "tout": 0, "usd": 0.0, "ms": 0, "error": ""}
         if c["png"] is None:
-            return {**out, "text": "", "ok": False, "conf": 0.0, "tin": 0, "tout": 0, "usd": 0.0, "ms": 0, "error": "box_fail"}
+            return {**out, **res, "error": "box_fail"}
         prompt = prompt_of(c["cell"])
         est = self.est(prompt) if self.priced else 0.0
         if self.priced and not self.budget.reserve(est):
-            return {**out, "text": "", "ok": False, "conf": 0.0, "tin": 0, "tout": 0, "usd": 0.0, "ms": 0, "error": "budget"}
+            return {**out, **res, "error": "budget"}
         url = "data:image/png;base64," + base64.b64encode(c["png"]).decode()
         t0 = time.perf_counter()
-        usd = 0.0
         try:
-            try:
-                r = self._call(prompt, url)
-            except Exception as e:  # noqa: BLE001 — logprobs를 받지 않는 서버: 빼고 한 번 더
-                if not self.logprobs or "logprob" not in str(e).lower():
-                    raise
-                self.logprobs = False
-                r = self._call(prompt, url)
-            ms = round((time.perf_counter() - t0) * 1000)
-            tin = getattr(r.usage, "prompt_tokens", 0) or 0
-            tout = getattr(r.usage, "completion_tokens", 0) or 0
-            if self.priced:
+            r, t0 = self._call_once_more(prompt, url)
+            res["ms"] = round((time.perf_counter() - t0) * 1000)
+            res["tin"] = getattr(r.usage, "prompt_tokens", 0) or 0
+            res["tout"] = getattr(r.usage, "completion_tokens", 0) or 0
+            if self.priced:  # 응답을 받았으면 과금됨 — 아래에서 예외가 나도 결과 줄에 비용·토큰을 남긴다
                 pi, po = self.llm.price_of(self.model)
-                usd = (tin * pi + tout * po) / 1e6 if r.usage else est
+                res["usd"] = (res["tin"] * pi + res["tout"] * po) / 1e6 if r.usage else est
             ch = r.choices[0]
             lps = [t.logprob for t in (ch.logprobs.content or [])] if getattr(ch, "logprobs", None) else []
             text = (ch.message.content or "").strip()
-            return {**out, "text": text, "ok": judge(c["cell"], c["truth"], text),
-                    "conf": round(math.exp(sum(lps) / len(lps)), 4) if lps else 0.0,
-                    "tin": tin, "tout": tout, "usd": usd, "ms": ms, "error": ""}
+            res.update(text=text, ok=judge(c["cell"], c["truth"], text),
+                       conf=round(math.exp(sum(lps) / len(lps)), 4) if lps else 0.0)
         except Exception as e:  # noqa: BLE001 — 칸 하나 실패는 틀림으로 세고 이어 간다 (오류 종류만 남김)
-            return {**out, "text": "", "ok": False, "conf": 0.0, "tin": 0, "tout": 0, "usd": 0.0,
-                    "ms": round((time.perf_counter() - t0) * 1000), "error": type(e).__name__}
+            res.update(text="", ok=False, conf=0.0, error=type(e).__name__)
+            if not res["ms"]:
+                res["ms"] = round((time.perf_counter() - t0) * 1000)
         finally:
             if self.priced:
-                self.budget.settle(est, usd)
+                self.budget.settle(est, res["usd"])
+        return {**out, **res}
 
 
 def summarize(rows):
@@ -250,7 +264,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="부르지 않고 잘라낸 칸만 <work>/hw/crops/에")
     a = ap.parse_args(argv)
     label = cc.label_ok(a.label)
-    vols = cc.synthetic_vols(a.work, [v for v in a.vols.split(",") if v.strip()], bundles=a.bundles)
+    vols = cc.synthetic_vols(a.work, cc.vols_arg(a.vols), bundles=a.bundles)
     out = cc.out_dir(a.work, "hw")
     cells = collect(a.work, a.bundles, vols)
     if a.limit:
