@@ -289,6 +289,13 @@ def test_vols_arg_and_disk_check(mods, tmp_path, monkeypatch):
         mods.cc.out_dir(tmp_path, "hw")
 
 
+def test_out_dir_missing_drive(mods, monkeypatch, tmp_path):
+    """없는 드라이브면 상위로 끝없이 올라가지 않고 멈춘다"""
+    monkeypatch.setattr(mods.cc.Path, "exists", lambda self: False)
+    with pytest.raises(SystemExit, match="드라이브가 없다"):
+        mods.cc.out_dir(tmp_path / "nowhere", "hw")
+
+
 def test_summary_and_table(mods):
     rows = [{**_cell(), "text": "", "ok": True, "conf": 0, "tin": 10, "tout": 1, "usd": 0.001, "ms": 100, "error": ""},
             {**_cell(), "hard": True, "text": "", "ok": False, "conf": 0, "tin": 10, "tout": 1, "usd": 0.001, "ms": 300, "error": ""},

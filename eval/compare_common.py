@@ -92,6 +92,8 @@ def out_dir(work, sub, min_free_gb=MIN_FREE_GB):
         raise SystemExit("결과는 저장소 밖 work 폴더에 쓴다")
     probe = d.resolve()
     while not probe.exists():
+        if probe.parent == probe:  # 없는 드라이브(Z:\ 등) — 뿌리의 부모는 자기 자신이라 더 올라가지 않는다
+            raise SystemExit(f"결과 폴더 드라이브가 없다: {probe}")
         probe = probe.parent
     free = shutil.disk_usage(probe).free / 1024**3
     print(f"디스크 여유: {probe.anchor} {free:.1f}GB (필요 {min_free_gb}GB)", flush=True)
