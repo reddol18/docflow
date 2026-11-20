@@ -119,7 +119,14 @@ def sha256(p):
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
-def check_work(work):
+def _gt_only_of(gt_p, allow):
+    """정답 파일의 줄이 모두 이번에 넣을 합성 철(allow, SYNTH…)의 것인가 — 빈 파일은 참"""
+    with gt_p.open(encoding="utf-8-sig", newline="") as f:
+        vols = {r.get("page", "").rsplit("-", 1)[0] for r in csv.DictReader(f)}
+    return all(v in set(allow) and v.startswith(SYNTH_PREFIX) for v in vols)
+
+
+def check_work(work, allow=()):
     """합성 work로 쓸 수 있는 폴더인지 — PoC 확정 정답(records_poc/work) 등 실제 자료 work를 덮어쓰지 않게.
     빈 폴더이거나, synth_manifest.json이 있고 platform/의 철이 모두 그 목록에 있어야 한다. 반환: 지금 manifest (없으면 None)"""
     work = Path(work)
@@ -128,9 +135,12 @@ def check_work(work):
     man_p = work / "synth_manifest.json"
     manifest = json.loads(man_p.read_text(encoding="utf-8")) if man_p.exists() else None
     known = {v["vol"] for v in (manifest or {}).get("vols", [])}
-    if manifest is None and (work / "gt" / "review.csv").exists():
+    gt_p = work / "gt" / "review.csv"
+    if manifest is None and gt_p.exists() and not _gt_only_of(gt_p, allow):  # 이번 철 정답뿐이면 = 죽은 앞 실행이 남긴 것
         raise SystemExit(f"합성 목록(synth_manifest.json) 없이 정답 파일이 있다 — 실제 자료 work일 수 있어 멈춘다: {work}")
-    others = sorted(p.stem for p in (work / "platform").glob("*.json") if p.stem not in known)
+    # allow = 이번에 넣을 합성 철 — 앞 실행이 manifest를 쓰기 전에 죽어 남은 그 철 파일은 다시 만들 것이라 막지 않는다
+    others = sorted(p.stem for p in (work / "platform").glob("*.json")
+                    if p.stem not in known and not (p.stem in set(allow) and p.stem.startswith(SYNTH_PREFIX)))
     if others:
         raise SystemExit(f"합성 목록에 없는 철 {len(others)}개가 platform/에 있다 — 합성 work가 아니면 쓰지 않는다: {work}")
     return manifest
@@ -139,8 +149,8 @@ def check_work(work):
 def run(src, work, ocr_page=None):
     """src의 합성 철을 work에 더한다. 같은 이름의 철은 바꾸고, 앞서 넣은 다른 철(manifest·정답)은 그대로 둔다"""
     work = Path(work)
-    manifest = check_work(work)
     found = bundles(src)  # 합성 아닌 철이 섞였으면 아무것도 쓰기 전에 멈춘다
+    manifest = check_work(work, allow={m["vol"] for _, m in found})
     if ocr_page is None:
         from app.ocr import ocr_page  # noqa: PLC0415 — PaddleOCR는 무겁다 (시험은 가짜 OCR을 넘긴다)
     (work / "platform").mkdir(parents=True, exist_ok=True)
@@ -150,8 +160,10 @@ def run(src, work, ocr_page=None):
     rows = {}  # 철 → 정답 줄
     if manifest is not None and gt_p.exists():
         with gt_p.open(encoding="utf-8-sig", newline="") as f:
-            for r in csv.DictReader(f):
-                rows.setdefault(r["page"].rsplit("-", 1)[0], []).append(r)
+            for r in csv.DictReader(f):  # manifest에 있는 철의 정답만 잇는다 (죽은 실행이 남긴 줄은 버림)
+                v = r["page"].rsplit("-", 1)[0]
+                if v in entries:
+                    rows.setdefault(v, []).append(r)
     for d, meta in found:
         vol = meta["vol"]
         ocrs = ocr_vol(d, vol, work, ocr_page)

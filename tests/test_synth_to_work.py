@@ -134,6 +134,46 @@ def test_reocr_when_image_changes(tw, tmp_path, monkeypatch):
     assert json.loads((o / f"{vol}-0002.json").read_text(encoding="utf-8"))["image_sha256"] == tw.sha256(src / vol / f"{vol}-0002.jpg")
 
 
+def test_rerun_after_crash(tw, tmp_path, monkeypatch):
+    """OCR 중에 죽어 manifest 없이 platform 철 파일(·정답)이 남아도 같은 명령을 다시 돌리면 끝까지 간다"""
+    monkeypatch.setattr(tw.layout, "is_start", lambda d: (True, []))
+    src, work = tmp_path / "src", tmp_path / "work"
+    _bundle(src, "SYNTH0001-1995-0001", 1, {1})
+    _bundle(src, "SYNTH0002-1996-0001", 1, {1})
+
+    def dies_on_second(path):
+        if path.stem.startswith("SYNTH0002"):
+            raise RuntimeError("가상 OCR 실패")
+        return _fake_ocr()(path)
+
+    with pytest.raises(RuntimeError):
+        tw.run(src, work, ocr_page=dies_on_second)
+    assert (work / "platform" / "SYNTH0001-1995-0001.json").exists() and not (work / "synth_manifest.json").exists()
+    (work / "gt" / "review.csv").write_text(  # gt까지 쓰고 manifest 전에 죽은 경우도 같게
+        "page,확인,is_start\nSYNTH0001-1995-0001-0001,경계,Y\n", encoding="utf-8-sig")
+    m = tw.run(src, work, ocr_page=_fake_ocr())
+    assert [v["vol"] for v in m["vols"]] == ["SYNTH0001-1995-0001", "SYNTH0002-1996-0001"]
+    # 이번 src에 없는 철의 남은 파일은 여전히 막는다
+    other = tmp_path / "other"
+    _bundle(other, "SYNTH0003-1997-0001", 1, {1})
+    (work / "platform" / "SYNTH0009-1990-0001.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        tw.run(other, work, ocr_page=_fake_ocr())
+
+
+def test_drops_gt_rows_outside_manifest(tw, tmp_path, monkeypatch):
+    """정답을 다시 쓸 때 manifest에 없는 철의 줄(죽은 실행이 남긴 것)은 버린다"""
+    monkeypatch.setattr(tw.layout, "is_start", lambda d: (True, []))
+    src, work = tmp_path / "src", tmp_path / "work"
+    _bundle(src, "SYNTH0001-1995-0001", 2, {1, 2})
+    tw.run(src, work, ocr_page=_fake_ocr())
+    with (work / "gt" / "review.csv").open("a", encoding="utf-8", newline="") as f:
+        f.write("SYNTH0002-1996-0001-0001,경계,Y,,,,,,합성,\n")
+    tw.run(src, work, ocr_page=_fake_ocr())
+    with (work / "gt" / "review.csv").open(encoding="utf-8-sig") as f:
+        assert sorted(r["page"] for r in csv.DictReader(f)) == ["SYNTH0001-1995-0001-0001", "SYNTH0001-1995-0001-0002"]
+
+
 def test_second_batch_merges(tw, tmp_path, monkeypatch):
     """같은 work에 다른 묶음을 더 넣으면 manifest·정답을 합친다 (앞 묶음이 사라지지 않음)"""
     monkeypatch.setattr(tw.layout, "is_start", lambda d: (True, []))
