@@ -16,7 +16,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parents[1]  # doc_platform
 POC_ROOT = HERE.parents[2]  # records_poc (scripts/rescore.py — 정답·채점 규칙)
-WORK = Path(os.environ.get("DOCFLOW_EVAL_WORK") or POC_ROOT / "work")
+POC_WORK = POC_ROOT / "work"
+WORK = Path(os.environ.get("DOCFLOW_EVAL_WORK") or POC_WORK)
+SYNTH_PREFIX = "SYNTH"  # 합성 철 이름 (eval/synth/bundle.py)
 for p in (APP_ROOT, APP_ROOT / "eval", POC_ROOT / "scripts"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
@@ -35,6 +37,8 @@ def load_gt():
     """rescore.load_gt와 같은 (rows, idx, bnd, src) — 다만 정답 파일은 work 폴더 기준 (gt_path)"""
     p = gt_path()
     if not p.exists():
+        if WORK.resolve() != POC_WORK.resolve():  # 다른 work(합성 등)에 정답이 없으면 PoC 정답으로 조용히 채점하지 않는다
+            raise SystemExit(f"정답 파일이 없다: {p} (합성 work면 eval/synth/to_work.py를 끝까지 돌린다)")
         from rescore import load_gt as poc  # noqa: PLC0415 — 기본 work에 정답이 없을 때만 PoC 고정 위치
         return poc()
     with p.open(encoding="utf-8-sig", newline="") as f:
@@ -46,11 +50,12 @@ def load_gt():
 
 
 def synthetic_vols():
-    """eval/synth/to_work.py가 만든 합성 철 이름 (synth_manifest.json). 없으면 빈 집합"""
+    """eval/synth/to_work.py가 만든 합성 철 이름 (synth_manifest.json, 이름이 SYNTH로 시작하는 것만). 없으면 빈 집합"""
     p = WORK / "synth_manifest.json"
     if not p.exists():
         return set()
-    return {v["vol"] for v in json.loads(p.read_text(encoding="utf-8")).get("vols", [])}
+    return {v["vol"] for v in json.loads(p.read_text(encoding="utf-8")).get("vols", [])
+            if str(v.get("vol", "")).startswith(SYNTH_PREFIX)}
 
 
 def non_synthetic(selected=None):
@@ -89,9 +94,26 @@ def user_text(vol, doc_id):
     return "\n".join(ocr(vol, doc_id)["lines"][:80])
 
 
-if __name__ == "__main__" and sys.argv[1:] == ["--require-synthetic"]:
-    bad = non_synthetic()
-    if bad:  # 철 이름만 (문서 글자 없음)
-        print(f"합성 철이 아닌 철 {len(bad)}개 — 외부 후보(OpenAI·원격)는 합성 철에만 보낸다", file=sys.stderr)
-        sys.exit(2)
-    print(f"합성 철 {len(vols())}개")
+def main(argv=None):
+    """`--require-synthetic`: 고른 철이 모두 합성 철이면 0, 아니면 2. 다른 인자·철 고르기 오류도 0이 아닌 값 (닫힌 쪽으로 실패)"""
+    import argparse  # noqa: PLC0415
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--require-synthetic", action="store_true", required=True)
+    ap.parse_args(argv)  # 모르는 인자 → 종료 코드 2
+    try:
+        selected = vols()
+        bad = non_synthetic(selected)
+    except SystemExit as e:  # 없는 철 등 — 문구는 그대로, 종료 코드는 2
+        print(e, file=sys.stderr)
+        return 2
+    if bad or not selected:  # 철 이름 수만 (문서 글자 없음)
+        print(f"합성 철이 아닌 철 {len(bad)}개 (고른 철 {len(selected)}개) — 외부 후보(OpenAI·원격)는 합성 철에만 보낸다",
+              file=sys.stderr)
+        return 2
+    print(f"합성 철 {len(selected)}개")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

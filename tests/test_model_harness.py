@@ -255,6 +255,10 @@ def test_plan_remote_is_external(plan):
     assert p["providers"] == ["remote"]  # 원격 모델 이름도 채워서 id로 거른다
     assert _plan(plan, "^gpt-4\\.1-mini$")["external"]  # OpenAI도 외부
     assert not _plan(plan, "^(local-ollama|replay)$")["external"]
+    # Ollama 클라우드 모델은 local-ollama label이어도 글자가 ollama.com으로 간다 → 외부
+    assert _plan(plan, "^local-ollama$", model="gpt-oss:120b-cloud")["external"]
+    assert _plan(plan, "^local-ollama$", model="가상:cloud")["external"]
+    assert not _plan(plan, "^local-ollama$", model="cloudy:7b")["external"]
 
 
 def test_price_of(gate):
@@ -270,9 +274,18 @@ def test_price_of(gate):
     assert gate.price_of(local, {"내-로컬": {"apiBaseUrl": "https://가상.example/v1"}}) is None
     assert gate.price_of(_row("local-ollama", "current", "d1", pid="openai:chat:qwen2.5:7b")) == (0, 0)
     assert gate.price_of(_row("replay", "current", "d1", pid="file://replay.py")) == (0, 0)
-    # 원격 GPU(label remote, #80)는 토큰 단가 0 — 비용은 GPU 시간으로 따로
-    assert gate.price_of(_row("remote", "current", "d1", pid="openai:chat:gemma3:27b"),
-                         {"remote": {"apiBaseUrl": "https://가상-11434.proxy.example/v1"}}) == (0, 0)
+    # 원격 GPU(label remote, #80)는 런파드 프록시·SSH 터널(127.0.0.1)일 때만 토큰 단가 0 — 비용은 GPU 시간으로 따로
+    rem = _row("remote", "current", "d1", pid="openai:chat:gemma3:27b")
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "https://abc123-11434.proxy.runpod.net/v1"}}) == (0, 0)
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "http://127.0.0.1:18434/v1"}}) == (0, 0)
+    # 그 밖의 https 주소(유료 OpenAI 호환 API일 수 있음)·꼬리만 비슷한 주소는 단가 모름 → gate 종료 코드 2
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "https://api.가상.example/v1"}}) is None
+    assert gate.price_of(rem, {"remote": {"apiBaseUrl": "https://proxy.runpod.net.가상.example/v1"}}) is None
+    assert gate.unpriced([rem], {"remote": {"apiBaseUrl": "https://api.가상.example/v1"}}) == ["openai:chat:gemma3:27b"]
+    # 옛 결과처럼 provider가 문자열이어도 id를 읽는다 (gate.md 모델 id 줄)
+    assert gate.provider_id({"provider": "openai:chat:gpt-4.1-mini"}) == "openai:chat:gpt-4.1-mini"
+    assert gate.provider_id({"provider": {"id": "openai:chat:가상"}}) == "openai:chat:가상"
+    assert gate.provider_id({}) == "?"
     assert gate.price_of(_row("x", "current", "d1", pid="anthropic:messages:가상")) is None
     assert gate.unpriced([_row("gpt-4o-mini", "current", "d1"), local]) == ["openai:chat:llama3.1:8b"]
     with pytest.raises(ValueError):
@@ -345,6 +358,60 @@ def test_common_gt_and_synthetic_guard(monkeypatch, tmp_path):
     (tmp_path / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": "SYNTH0001-1995-0001"}]}), encoding="utf-8")
     assert c.non_synthetic() == ["가상-0001"]
     assert c.non_synthetic(["SYNTH0001-1995-0001"]) == []
+    # 목록에 있어도 이름이 SYNTH…가 아니면 합성으로 보지 않는다 (손으로 쓴 목록 막기)
+    (tmp_path / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": "SYNTH0001-1995-0001"}, {"vol": "가상-0001"}]}),
+                                                  encoding="utf-8")
+    assert c.non_synthetic() == ["가상-0001"]
+
+
+def test_load_gt_no_silent_poc_fallback(monkeypatch, tmp_path):
+    """기본(PoC) work가 아닌데 정답 파일이 없으면 PoC 정답으로 넘어가지 않고 멈춘다"""
+    c = _common(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit):
+        c.load_gt()
+
+
+def _cli(tmp_path, *args, vols=""):
+    import os
+    import subprocess
+    env = {**os.environ, "DOCFLOW_EVAL_WORK": str(tmp_path), "DOCFLOW_EVAL_VOLS": vols, "PYTHONUTF8": "1"}
+    return subprocess.run([sys.executable, "-I", str(PF / "common.py"), *args], env=env, capture_output=True,  # noqa: S603
+                          check=False).returncode
+
+
+def test_require_synthetic_cli(tmp_path):
+    """run.ps1이 부르는 --require-synthetic: 합성만이면 0, 아니면 2, 모르는 인자·인자 없음·없는 철도 0이 아님 (닫힌 쪽)"""
+    (tmp_path / "platform").mkdir()
+    (tmp_path / "platform" / "SYNTH0001-1995-0001.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": "SYNTH0001-1995-0001"}]}), encoding="utf-8")
+    assert _cli(tmp_path, "--require-synthetic") == 0
+    assert _cli(tmp_path, "--require-synthetic", "--더") != 0
+    assert _cli(tmp_path) != 0
+    assert _cli(tmp_path, "--require-synthetic", vols="SYNTH9999-1990-0001") == 2  # 없는 철
+    (tmp_path / "platform" / "가상-0001.json").write_text("[]", encoding="utf-8")
+    assert _cli(tmp_path, "--require-synthetic") == 2
+    assert _cli(tmp_path, "--require-synthetic", vols="SYNTH0001-1995-0001") == 0
+    empty = tmp_path / "empty"
+    (empty / "platform").mkdir(parents=True)
+    assert _cli(empty, "--require-synthetic") == 2  # 고른 철 0개도 통과시키지 않는다
+
+
+def test_scoring_uses_work_gt(gate, monkeypatch):
+    """check.py·gate.py는 정답을 common.load_gt(work 폴더 기준)에서 읽는다 — rescore.load_gt(PoC 고정)가 아니라"""
+    import ast
+    import types
+    tree = ast.parse((PF / "check.py").read_text(encoding="utf-8"))
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
+    assert "load_gt" not in imported
+    calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    assert "common.load_gt" in calls
+    seen = {}
+    fake = types.ModuleType("score")
+    fake.metrics = lambda docs, gt=None: seen.setdefault("gt", gt)
+    monkeypatch.setitem(sys.modules, "score", fake)
+    monkeypatch.setattr(gate.common, "load_gt", lambda: "work-gt")
+    gate.metrics({})
+    assert seen["gt"] == "work-gt"
 
 
 def test_prompt_versions_match_app():

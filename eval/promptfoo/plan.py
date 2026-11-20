@@ -3,7 +3,8 @@
   python -I -X utf8 eval/promptfoo/plan.py --providers=<정규식> --prompts=<정규식> --local-model=<태그>
   → 표준 출력에 JSON {"providers": [걸러진 label], "prompts": [걸러진 label], "need_key": bool, "external": bool,
                       "baseline_overlap": bool}
-external = 이 PC 밖(OpenAI·원격 GPU)으로 문서 글자를 보내는 후보가 있다 → run.ps1이 합성 철만인지 확인한다 (#80).
+external = 이 PC 밖(OpenAI·원격 GPU·Ollama 클라우드 모델 *-cloud)으로 문서 글자를 보내는 후보가 있다
+→ run.ps1이 합성 철만인지 확인한다 (#80).
 
 거르기는 promptfoo 0.125.0 --filter-providers/--filter-prompts와 같게 한다: 정규식(대소문자 구분)을 제공자 id와 label에 각각 대
 어 하나라도 맞으면 남긴다 (지시문 판도 id·label). 빈 정규식 = 모두. JS RegExp.test = Python re.search.
@@ -27,6 +28,11 @@ def _hit(rx, *names):
 LOCAL_LABELS = {"local-ollama", "replay"}  # 이 PC 안에서 끝나는 후보 — 나머지(OpenAI·remote)는 외부로 글자를 보낸다
 
 
+def is_cloud(pid):
+    """Ollama 클라우드 모델(태그가 -cloud·cloud로 끝남, 예: gpt-oss:120b-cloud) — 로컬 Ollama로 불러도 글자가 ollama.com으로 간다"""
+    return bool(re.search(r"[:-]cloud$", pid))
+
+
 def plan(config, criteria, providers_rx="", prompts_rx="", local_model="", remote_model=""):
     """config·criteria = 읽은 YAML(dict). 반환은 모듈 설명의 JSON과 같다"""
     provs = []
@@ -43,7 +49,7 @@ def plan(config, criteria, providers_rx="", prompts_rx="", local_model="", remot
     return {"providers": [p["label"] or p["id"] for p in chosen],
             "prompts": [p.get("label") or p.get("id") for p in prompts],
             "need_key": any(p["id"].startswith("openai:") and not p["config"].get("apiBaseUrl") for p in chosen),
-            "external": any(p["label"] not in LOCAL_LABELS for p in chosen),
+            "external": any(p["label"] not in LOCAL_LABELS or is_cloud(p["id"]) for p in chosen),
             "baseline_overlap": base_prov and base_prompt}
 
 
