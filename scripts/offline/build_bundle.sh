@@ -1,6 +1,6 @@
 #!/bin/bash
 # 폐쇄망 설치 묶음 만들기 (https://github.com/reddol18/docflow/issues/81). 인터넷이 되는 리눅스(이 PC는 WSL 배포판 docflow81)에서
-# root로 돌린다. 필요한 것: docker(앱 이미지 빌드), k3s(같은 판 — 레지스트리 이미지를 다이제스트 그대로 받아 내보낸다), git, zstd, jq, python3.
+# root로 돌린다. 필요한 것: docker + buildx(앱 이미지 빌드), k3s(같은 판 — 레지스트리 이미지를 다이제스트 그대로 받아 내보낸다), git, zstd, jq, python3.
 #
 #   sudo bash scripts/offline/build_bundle.sh <저장소 폴더> <Ollama 모델 폴더(읽기만)> <묶음 만들 폴더>
 #   예) bash scripts/offline/build_bundle.sh /mnt/e/claude-dev/base/records_poc/doc_platform /mnt/e/dev/models /mnt/f/docflow81/bundle
@@ -55,10 +55,15 @@ curl -fsSL -o "$B/k3s/install.sh" https://get.k3s.io
 chmod +x "$B/k3s/k3s" "$B/k3s/install.sh"
 
 # ---- 앱 이미지 (docker 빌드 → save) ----
-say "docflow:dev 빌드"
-docker build -q --build-arg "APT_REFRESH=$(date +%G-W%V)" -t docflow:dev "$SRC" >/dev/null
-say "docflow-web:dev 빌드"
-docker build -q -t docflow-web:dev "$SRC/frontend" >/dev/null
+# BuildKit(docker buildx) 필요 — 예전 빌더는 쓰지 않는 단계(lock-resolve)까지 빌드한다. 빌드 기록은 /root/docflow-build-*.log
+docker buildx version >/dev/null 2>&1 || { echo "docker buildx 없음 (apt install docker-buildx)" >&2; exit 1; }
+say "docflow:dev 빌드 (/root/docflow-build-api.log)"
+DOCKER_BUILDKIT=1 docker build --progress=plain --build-arg "APT_REFRESH=$(date +%G-W%V)" -t docflow:dev "$SRC" \
+  > /root/docflow-build-api.log 2>&1 || { tail -40 /root/docflow-build-api.log; exit 1; }
+grep -oE 'lock 일치: 이미지 패키지 [0-9]+개 = requirements\.lock' /root/docflow-build-api.log | tail -1 || true
+say "docflow-web:dev 빌드 (/root/docflow-build-web.log)"
+DOCKER_BUILDKIT=1 docker build --progress=plain -t docflow-web:dev "$SRC/frontend" \
+  > /root/docflow-build-web.log 2>&1 || { tail -40 /root/docflow-build-web.log; exit 1; }
 for img in docflow:dev docflow-web:dev; do
   n=${img%%:*}
   docker save "$img" | zstd -q -T0 -10 -o "$B/images/$n.tar.zst"
