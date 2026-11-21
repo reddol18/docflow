@@ -27,7 +27,8 @@ def test_local_bge_m3_gets_own_collection():
 
 
 @pytest.mark.parametrize("model,dim,name", [
-    ("bge-m3:latest", 1024, "documents_bge-m3-latest_1024"),
+    ("bge-m3:latest", 1024, "documents_bge-m3_1024"),  # :latest는 떼어 같은 모델·같은 모음
+    (" bge-m3 ", 1024, "documents_bge-m3_1024"),
     ("qwen3-embedding:0.6b", 1024, "documents_qwen3-embedding-0-6b_1024"),
     ("org/model.v2", 768, "documents_org-model-v2_768"),
     ("text-embedding-3-small", 512, "documents_text-embedding-3-small_512"),  # 같은 모델이라도 차원이 다르면 다른 모음
@@ -44,6 +45,8 @@ def test_collection_name(model, dim, name):
     ({"EMBED_DIM": "abc"}, "양의 정수"),
     ({"EMBED_DIM": "0"}, "양의 정수"),
     ({"EMBED_DIM": "-5"}, "양의 정수"),
+    ({"EMBED_DIM": "512"}, "1536차원만"),  # 기본 모델은 1536만 (dimensions=를 보내지 않는다)
+    ({"EMBED_MODEL": "text-embedding-3-small", "EMBED_DIM": "3072"}, "1536차원만"),
 ])
 def test_bad_config_stops(env, msg):
     with pytest.raises(store.EmbedConfigError, match=msg):
@@ -106,3 +109,75 @@ def test_offline_settings_import(tmp_path):
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr[-2000:]
     assert r.stdout.split() == ["local", "900.0", "documents_bge-m3_1024", "1024"]
+
+
+def test_latest_tag_is_same_model():
+    a = store.embed_config({"LLM_PROVIDER": "local", "EMBED_MODEL": "bge-m3:latest", "EMBED_DIM": "1024"})
+    b = store.embed_config({"LLM_PROVIDER": "local", "EMBED_MODEL": "bge-m3", "EMBED_DIM": "1024"})
+    assert a == b == ("bge-m3", 1024, "documents_bge-m3_1024")
+
+
+def test_new_collection_records_model():
+    q = QdrantClient(":memory:")
+    store.ensure_collection(q, "documents_bge-m3_1024", 1024, "bge-m3:latest")
+    assert store.collection_model(q, "documents_bge-m3_1024") == "bge-m3"
+    assert q.get_collection("documents_bge-m3_1024").config.metadata["embed_dim"] == 1024
+    assert store.ensure_collection(q, "documents_bge-m3_1024", 1024, "bge-m3") is False  # 같은 모델(정규화)이면 그대로
+
+
+def test_slug_collision_other_model_stops():
+    """'org/model.v2'와 'org-model-v2'는 같은 모음 이름이 된다 — 적어 둔 모델 이름이 달라 멈춘다"""
+    q = QdrantClient(":memory:")
+    name = store.collection_name("org/model.v2", 768)
+    assert name == store.collection_name("org-model-v2", 768)
+    store.ensure_collection(q, name, 768, "org/model.v2")
+    with pytest.raises(store.EmbedConfigError, match="다른 모델"):
+        store.ensure_collection(q, name, 768, "org-model-v2")
+
+
+def test_legacy_documents_without_metadata_still_works(capsys):
+    """예전 운영 모음 'documents'(메타데이터 없음)는 기본 설정에서 차원만 보고 그대로 쓴다 — 경고도 없다"""
+    q = QdrantClient(":memory:")
+    q.create_collection("documents", vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
+    assert store.collection_model(q, "documents") is None
+    assert store.ensure_collection(q, "documents", 1536, "text-embedding-3-small") is False
+    assert "메타데이터가 없다" not in capsys.readouterr().out
+
+
+def test_non_default_without_metadata_warns(capsys):
+    q = QdrantClient(":memory:")
+    q.create_collection("documents_bge-m3_1024", vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
+    assert store.ensure_collection(q, "documents_bge-m3_1024", 1024, "bge-m3") is False
+    assert "메타데이터가 없다" in capsys.readouterr().out
+
+
+def test_off_mode_warns_about_other_collections():
+    q = QdrantClient(":memory:")
+    q.create_collection("documents", vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
+    assert store.off_mode_warning(q, {"LLM_PROVIDER": "off"}) is None  # 기본 아닌 모음 없음
+    q.create_collection("documents_bge-m3_1024", vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
+    w = store.off_mode_warning(q, {"LLM_PROVIDER": "off"})
+    assert w and "documents_bge-m3_1024" in w
+    assert store.off_mode_warning(q, {"LLM_PROVIDER": "openai"}) is None
+    assert store.off_mode_warning(q, {"LLM_PROVIDER": "off", "EMBED_MODEL": "bge-m3", "EMBED_DIM": "1024"}) is None
+
+
+def test_embedding_length_must_match(monkeypatch):
+    """모델이 돌려준 벡터 길이가 EMBED_DIM과 다르면 멈춘다 (예: 설정 1536인데 모델은 1024)"""
+    from types import SimpleNamespace
+
+    from app import llm
+    monkeypatch.setattr(llm, "EMBED_DIM_CHECK", True)
+    monkeypatch.setattr(store, "EMBED_DIM", 4)
+    monkeypatch.setattr(store, "add_usage", lambda *a, **k: None)
+    monkeypatch.setattr(llm, "PROVIDER", llm.load_provider({
+        "LLM_PROVIDER": "local", "LLM_BASE_URL": "http://127.0.0.1:11434/v1", "EMBED_MODEL": "가상-임베딩"}))
+
+    def client(n):
+        return SimpleNamespace(embeddings=SimpleNamespace(create=lambda **a: SimpleNamespace(
+            usage=None, data=[SimpleNamespace(embedding=[0.0] * n) for _ in a["input"]])))
+    monkeypatch.setattr(llm, "client", lambda: client(4))
+    assert llm.embed("v", ["가"]) == [[0.0] * 4]
+    monkeypatch.setattr(llm, "client", lambda: client(3))
+    with pytest.raises(store.EmbedConfigError, match=r"\[3\]차원"):
+        llm.embed("v", ["가"])

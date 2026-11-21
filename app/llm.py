@@ -403,7 +403,25 @@ def embed(vol, texts, scope="index", user_id=None):
     with _metered(vol, "embed", model, scope, tokens_max(*texts, messages=len(texts)), 0, user_id) as m:
         r = client().embeddings.create(model=model, input=texts)
         m.usage = r.usage
-    return [d.embedding for d in r.data]
+    vecs = [d.embedding for d in r.data]
+    check_embed_dim(vecs, model)
+    return vecs
+
+
+# 벡터 길이 확인 (https://github.com/reddol18/docflow/issues/81 리뷰): 모델이 돌려준 길이가 EMBED_DIM(app/store.py)과 다르면
+# 멈춘다 — 그대로 두면 Qdrant가 색인마다 거절하고 검색은 늘 실패한다. 시험(tests/conftest.py)은 길이가 1인 가짜 벡터를 많이 써서
+# 기본으로 끄고, 이 확인을 보는 시험(tests/test_embed_config.py)만 켠다
+EMBED_DIM_CHECK = True
+
+
+def check_embed_dim(vecs, model):
+    if not EMBED_DIM_CHECK:
+        return
+    bad = sorted({len(v) for v in vecs} - {store.EMBED_DIM})
+    if bad:
+        raise store.EmbedConfigError(
+            f"임베딩 모델 {model}이 {bad}차원 벡터를 돌려줬는데 EMBED_DIM={store.EMBED_DIM} — 모델에 맞는 EMBED_DIM으로 "
+            "설정을 고친다 (모음 이름도 달라진다, docs/offline_install.md '임베딩 모델 바꾸기')")
 
 
 ANSWER_PROMPT = """너는 1990년대 공문서 기록물 검색 도우미다. 첫 user 메시지의 [문서] 목록만 근거로, 그 뒤 user 메시지의 [질문]에 답한다.

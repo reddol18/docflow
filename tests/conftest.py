@@ -30,6 +30,8 @@ def llm_provider_default(monkeypatch):
     from app import llm
     monkeypatch.setattr(llm, "PROVIDER", llm.load_provider({}))
     monkeypatch.setattr(llm, "_client", None)
+    # 벡터 길이 확인(llm.check_embed_dim)은 끈다 — 시험의 가짜 임베딩은 길이 1·2. 확인 자체는 tests/test_embed_config.py가 켜고 본다
+    monkeypatch.setattr(llm, "EMBED_DIM_CHECK", False)
 
 
 @pytest.fixture(autouse=True)
