@@ -1,0 +1,74 @@
+# 폐쇄망 LLM 서버: llm 네임스페이스의 Ollama 하나 (https://github.com/reddol18/docflow/issues/81). OpenAI 호환 /v1 — app/llm.py local 제공자.
+# 모델(qwen2.5:7b·qwen2.5vl:7b·bge-m3)은 설치 묶음에서 노드의 /var/lib/docflow/ollama 에 풀어 둔다 (scripts/offline/install.sh).
+# 받기(pull)는 하지 않는다 — 바깥으로 나가는 길이 없다: egress 전부 막음(DNS도 필요 없음), 들어오는 것은 docs의 API·워커 11434만.
+# GPU 없이 CPU로 돈다 (2026-11-21 결정). GPU를 쓰려면 nvidia 런타임·runtimeClassName을 더한다 — 이 파일은 CPU 기준.
+# 이미지: ollama/ollama 0.40.16 다이제스트 고정 (런파드 #80 측정과 같은 판). 파일 시스템 읽기 전용, root 아님(1000), 홈·임시는 emptyDir.
+apiVersion: v1
+kind: Namespace
+metadata: {name: llm, labels: {purpose: doc-platform-llm}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: llm}
+spec: {podSelector: {}, policyTypes: [Ingress, Egress]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ollama-from-docflow, namespace: llm}
+spec:
+  podSelector: {matchLabels: {app: ollama}}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: docs}},
+            podSelector: {matchExpressions: [{key: app, operator: In, values: [docflow, docflow-worker]}]}}]
+    ports: [{protocol: TCP, port: 11434}]
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: llm-quota, namespace: llm}
+spec:
+  hard: {requests.cpu: "4", requests.memory: 16Gi, limits.memory: 24Gi, persistentvolumeclaims: "0"}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ollama, namespace: llm}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: ollama}}
+  template:
+    metadata: {labels: {app: ollama}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+      - name: ollama
+        image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+        imagePullPolicy: IfNotPresent  # 묶음에서 넣은 이미지 (k3s agent/images) — 없으면 받으려다 실패한다(바깥 길 없음)
+        args: [serve]
+        env:
+        - {name: OLLAMA_HOST, value: "0.0.0.0:11434"}
+        - {name: OLLAMA_MODELS, value: /models}
+        - {name: OLLAMA_NOPRUNE, value: "1"}          # 모델 폴더는 읽기 전용 — 시작할 때 지우기를 하지 않는다
+        - {name: OLLAMA_NUM_PARALLEL, value: "1"}      # CPU라 동시 1 (메모리도 모델당 하나)
+        - {name: OLLAMA_MAX_LOADED_MODELS, value: "3"} # 추출·판독·임베딩 모델을 번갈아 내리지 않게 (약 12GB)
+        - {name: OLLAMA_KEEP_ALIVE, value: "30m"}
+        - {name: HOME, value: /home/ollama}
+        ports: [{containerPort: 11434}]
+        resources: {requests: {cpu: "2", memory: 12Gi}, limits: {memory: 20Gi}}
+        readinessProbe: {httpGet: {path: /api/version, port: 11434}, periodSeconds: 10}
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        volumeMounts:
+        - {name: models, mountPath: /models, readOnly: true}
+        - {name: home, mountPath: /home/ollama}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - {name: models, hostPath: {path: /var/lib/docflow/ollama, type: Directory}}
+      - {name: home, emptyDir: {sizeLimit: 64Mi}}
+      - {name: tmp, emptyDir: {sizeLimit: 1Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ollama, namespace: llm}
+spec: {selector: {app: ollama}, ports: [{port: 11434}]}
