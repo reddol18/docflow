@@ -5,6 +5,7 @@ app.store는 불러올 때 PG_URL로 연결 풀을 만든다 → 어떤 시험 �
 """
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,14 @@ if PG:
     os.environ["PG_URL"] = PG
 # LLM 제공자는 openai 기본값으로 고정 — 셸의 LLM_PROVIDER·LLM_BASE_URL에 시험 결과가 흔들리지 않게 (app.llm은 불러올 때 읽는다)
 os.environ["LLM_PROVIDER"] = "openai"
+# 임베딩 모음도 기본값(text-embedding-3-small, 1536 → 'documents')으로 — app.store가 불러올 때 읽는다 (https://github.com/reddol18/docflow/issues/81)
+for _k in ("EMBED_MODEL", "EMBED_DIM"):
+    os.environ.pop(_k, None)
+
+
+def fake_collection(dim):
+    """가짜 Qdrant get_collection 결과 (store.collection_dim이 읽는 모양만)"""
+    return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=dim))))
 
 
 @pytest.fixture(autouse=True)
@@ -100,6 +109,7 @@ def pg_store():
     if os.environ.get("TEST_PG_NO_PREPARE"):  # PGlite 소켓 서버처럼 prepared statement에 약한 시험 서버용
         store.pool.kwargs["prepare_threshold"] = None
     store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True,
+                                          "get_collection": lambda self, n: fake_collection(store.EMBED_DIM),
                                           "scroll": lambda self, *a, **k: ([], None)})()
     store.init()
     yield store

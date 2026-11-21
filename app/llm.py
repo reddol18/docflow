@@ -8,8 +8,9 @@
           모델 기본값이 없다 — 쓰는 기능의 모델 이름이 비면 시작할 때 멈춘다 (graph가 require_models로 확인)
   off     LLM·임베딩을 부르지 않는다. 부르면 LLMOff — graph는 그 단계를 건너뛰고 검토 표시로, API는 503으로 (main)
 기능별 모델: EXTRACT_MODEL(4칸 추출)·CELL_MODEL(손글씨 칸 판독)·EMBED_MODEL(임베딩)·CHAT_MODEL(검색 답변).
-임베딩 차원: Qdrant 모음은 1536차원 고정(app/store.py init). local 임베딩 모델의 차원이 다르면 넣을 때 Qdrant가 거절해
-색인이 실패한다(조용히 섞이지 않음). 로컬 임베딩 교체는 #13 완료 조건 4에서 다룬다.
+임베딩 차원: EMBED_DIM (https://github.com/reddol18/docflow/issues/81, app/store.py embed_config). 기본 모델
+text-embedding-3-small이면 1536·모음 'documents'(지금 그대로), 다른 모델(예: local bge-m3)이면 EMBED_DIM이 꼭 있어야 하고
+모음은 'documents_<모델>_<차원>'. 있는 모음의 차원이 EMBED_DIM과 다르면 시작할 때 멈춘다.
 
 모든 호출은 store.usage 표에 토큰·비용을 남긴다 (local은 0원).
 비용 한도 (https://github.com/reddol18/docflow/issues/7) — openai 제공자만. local(내부 주소만)은 돈이 들지 않아 보지 않는다:
@@ -167,6 +168,7 @@ def load_provider(env=None):
     key_file = (env.get("LLM_API_KEY_FILE") or "").strip() or None
     if key_file and not Path(key_file).is_file():
         raise ProviderConfigError("LLM_API_KEY_FILE을 줬는데 파일이 없음")
+    local_timeout(env)  # 틀린 값이면 부를 때가 아니라 시작할 때 멈춘다
     return Provider("local", base, {k: (env.get(e) or "").strip() or None for k, e in MODEL_ENV.items()}, key_file)
 
 
@@ -194,12 +196,26 @@ def _key():
 _client = None
 
 
+def local_timeout(env=None):
+    """local 서버 호출 한 번의 시간 제한(초): LLM_TIMEOUT_SECONDS, 기본 120. GPU 없이 CPU로 7B 모델을 돌리는 폐쇄망
+    설치는 추출 한 번이 1~3분 걸려 늘려 준다 (https://github.com/reddol18/docflow/issues/81, k8s/offline/). 양수가 아니면 멈춤"""
+    env = os.environ if env is None else env
+    raw = (env.get("LLM_TIMEOUT_SECONDS") or "120").strip()
+    try:
+        t = float(raw)
+    except ValueError:
+        raise ProviderConfigError(f"LLM_TIMEOUT_SECONDS는 양수 (받은 값: {raw!r})") from None
+    if not t > 0 or math.isinf(t):
+        raise ProviderConfigError(f"LLM_TIMEOUT_SECONDS는 양수 (받은 값: {raw!r})")
+    return t
+
+
 def make_client(p):
     """제공자(openai·local) → OpenAI SDK 클라이언트 (local도 OpenAI 호환 API라 같은 SDK, 주소만 다름).
     local 키가 없으면 자리 채움 값 (SDK가 빈 키를 받지 않는다)"""
     if p.name == "local":
         key = Path(p.key_file).read_text().strip() if p.key_file else "unused"
-        return OpenAI(api_key=key, base_url=p.base_url, timeout=120, max_retries=2)
+        return OpenAI(api_key=key, base_url=p.base_url, timeout=local_timeout(), max_retries=2)
     return OpenAI(api_key=_key(), timeout=60, max_retries=4)
 
 
