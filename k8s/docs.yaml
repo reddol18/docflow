@@ -397,8 +397,8 @@ spec:
         # LLM·임베딩 제공자 (app/llm.py 머리말, https://github.com/reddol18/docflow/issues/13): openai / local / off
         # local = 현장 내부 서버 전용 (Ollama·vLLM 등 OpenAI 호환). LLM_BASE_URL 호스트는 루프백·사설 IP·클러스터 내부 이름만
         #   (공인 주소면 시작할 때 멈춤). 모델 이름 4개(EXTRACT_MODEL·CELL_MODEL·EMBED_MODEL·CHAT_MODEL)도 필수 — 빠지면 시작할 때 멈춤.
-        #   임베딩 모델은 Qdrant 모음 차원(1536)과 같아야 한다. 다르면 넣을 때 Qdrant가 거절해 색인이 실패한다
-        #   (로컬 임베딩 교체는 완료 조건 4에서).
+        #   임베딩: 기본 모델(text-embedding-3-small)이 아니면 EMBED_DIM(벡터 차원)도 필수 — 모음은 documents_<모델>_<차원>
+        #   (app/store.py embed_config, https://github.com/reddol18/docflow/issues/81). 폐쇄망 설치 예: k8s/offline/
         #   주의: 위 docflow-egress는 사설 IP로 나가는 것을 막아서 local 서버 주소도 막힌다. 열 때는 그 서버만 좁게:
         #     - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: llm}}, podSelector: {matchLabels: {app: ollama}}}]
         #       ports: [{protocol: TCP, port: 11434}]

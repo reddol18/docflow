@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 
@@ -37,7 +38,9 @@ from app import auth, store  # noqa: E402
 
 store.pool.kwargs["prepare_threshold"] = None
 store.lock_pool.kwargs["prepare_threshold"] = None
-store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True, "scroll": lambda self, *a, **k: ([], None)})()
+_coll = SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=store.EMBED_DIM))))
+store.qdrant = lambda: type("Q", (), {"collection_exists": lambda self, n: True, "get_collection": lambda self, n: _coll,
+                                      "scroll": lambda self, *a, **k: ([], None)})()
 auth.MODES = frozenset({"local"})
 auth.session_user = lambda t: auth.User(1, "a", "a", "admin")
 from app import main  # noqa: E402

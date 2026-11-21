@@ -1,0 +1,24 @@
+# 폐쇄망 CoreDNS 설정 (https://github.com/reddol18/docflow/issues/81). k3s 기본 Corefile에서 'forward . /etc/resolv.conf'만 뺐다:
+# 클러스터 이름(cluster.local)·노드 이름(NodeHosts)만 답하고, 그 밖의 이름은 위쪽 DNS로 넘기지 않는다(REFUSED).
+# 파드 NetworkPolicy는 kube-dns 53만 열어 두는데, CoreDNS가 바깥 이름을 대신 물으면 노드에서 바깥으로 DNS가 나간다 — 그 길을 막는다.
+# scripts/offline/install.sh가 kube-system/coredns ConfigMap의 Corefile 칸만 이것으로 바꾸고, k3s가 되돌리지 않게
+# /var/lib/rancher/k3s/server/manifests/coredns.yaml.skip 을 둔다 (k3s 기본 설정 파일 건너뛰기).
+.:53 {
+    errors
+    health
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      pods insecure
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    hosts /etc/coredns/NodeHosts {
+      ttl 60
+      reload 15s
+      fallthrough
+    }
+    prometheus :9153
+    cache 30
+    loop
+    reload
+    loadbalance
+}
