@@ -107,7 +107,7 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 
 | 증거 | 0이어야 하는 것 |
 |---|---|
-| (b) `egress_guard.sh status` | 시험 동안 `pod-egress`·`node-egress`·`v6-egress` 패킷. 이미 맺어진 연결의 응답(예: 들어온 ssh)은 `established` 규칙이 먼저 통과시켜 세지 않는다 |
+| (b) `egress_guard.sh status` | 시험 동안 `pod-egress`·`node-egress`·`v6-egress` 패킷. 이미 맺어진 연결의 응답(예: 들어온 ssh)은 `established` 규칙이 먼저 통과시켜 세지 않는다. 링크 로컬 멀티캐스트(224.0.0.0/24, ff02::/16)는 `link-local-mcast`로 따로 센다 |
 | (c) `c_conntrack_external.txt` | 노드·파드가 연 연결 중 클러스터·루프백·링크 로컬 멀티캐스트 밖 목적지 |
 | (d) `cni0.count`·`eth0.count`·`nflog.count` | 패킷. eth0은 나가는 방향만 세고 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND처럼 같은 링크에서 끝남)는 뺀다 |
 | Ollama `ollama.ollama_com.count` | ollama.com 접속 시도 줄(주소가 든 실패 로그). 시작 때 설정 출력의 `OLLAMA_REMOTES:[ollama.com]`은 시도가 아니다 |

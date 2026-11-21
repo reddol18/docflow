@@ -24,6 +24,8 @@ case "$CMD" in
     ipt -N $CH 2>/dev/null || ipt -F $CH
     # NFLOG 그룹 5: 버리는 패킷 사본 — evidence.sh capture-start가 tcpdump -i nflog:5로 받아 무엇이 나가려 했는지(DNS 이름 등) 남긴다
     ipt -A $CH -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment established -j RETURN
+    # 링크 로컬 멀티캐스트(224.0.0.0/24)는 같은 링크에서 끝나 바깥 송신이 아니다 — 세지 않고 통과 (카운터는 따로 보인다)
+    ipt -A $CH -d 224.0.0.0/24 -m comment --comment link-local-mcast -j RETURN
     ipt -A $CH -j NFLOG --nflog-group 5
     ipt -A $CH -s "$POD_CIDR" -j LOG --log-prefix "DOCFLOW-POD-EGRESS " --log-level 4
     ipt -A $CH -s "$POD_CIDR" -m comment --comment pod-egress -j DROP
@@ -32,6 +34,10 @@ case "$CMD" in
     ipt -C POSTROUTING -o "$IF" -j $CH 2>/dev/null || ipt -I POSTROUTING 1 -o "$IF" -j $CH
     ip6 -N $CH 2>/dev/null || ip6 -F $CH
     ip6 -A $CH -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment established -j RETURN
+    # IPv6도 같게: 링크 로컬 멀티캐스트(ff02::/16 — 이웃 찾기·라우터 요청·MLD)는 통과, 나머지는 NFLOG 사본을 남기고 버린다.
+    # (2026-11-22 재시험: v6-egress 1개·56바이트가 잡혔는데 사본이 없어 무엇인지 못 봤다 — 크기로는 라우터 요청으로 보인다)
+    ip6 -A $CH -d ff02::/16 -m comment --comment link-local-mcast -j RETURN
+    ip6 -A $CH -j NFLOG --nflog-group 5
     ip6 -A $CH -m comment --comment v6-egress -j DROP
     ip6 -C POSTROUTING -o "$IF" -j $CH 2>/dev/null || ip6 -I POSTROUTING 1 -o "$IF" -j $CH
     ipt -Z $CH; ip6 -Z $CH
