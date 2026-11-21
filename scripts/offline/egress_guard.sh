@@ -18,6 +18,8 @@ ip6() { ip6tables -w -t mangle "$@"; }
 case "$CMD" in
   on)
     ipt -N $CH 2>/dev/null || ipt -F $CH
+    # NFLOG 그룹 5: 버리는 패킷 사본 — evidence.sh capture-start가 tcpdump -i nflog:5로 받아 무엇이 나가려 했는지(DNS 이름 등) 남긴다
+    ipt -A $CH -j NFLOG --nflog-group 5
     ipt -A $CH -s "$POD_CIDR" -j LOG --log-prefix "DOCFLOW-POD-EGRESS " --log-level 4
     ipt -A $CH -s "$POD_CIDR" -m comment --comment pod-egress -j DROP
     ipt -A $CH -j LOG --log-prefix "DOCFLOW-NODE-EGRESS " --log-level 4

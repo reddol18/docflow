@@ -42,7 +42,8 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 `/` 여유 45GB 이상. 묶음 폴더를 설치 노드에 옮긴 뒤:
 
 ```sh
-sudo bash <묶음>/scripts/install.sh --tools-only         # 묶음의 .deb로 iptables·conntrack·tcpdump만 먼저 (받기 없음)
+sudo OS_QUIET=1 bash <묶음>/scripts/install.sh --tools-only   # 묶음의 .deb로 iptables·conntrack·tcpdump만 먼저 (받기 없음)
+                                                         # OS_QUIET=1: OS가 스스로 바깥에 묻는 서비스(timesyncd·apt·motd 타이머)를 끔
 sudo bash <묶음>/scripts/egress_guard.sh on              # 시험할 때: 노드 바깥 송신을 막고 센다 (현장에서는 망이 이미 막혀 있다)
 sudo REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
 ```
@@ -84,6 +85,16 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 | (c) `c_conntrack_external.txt` | 클러스터·루프백 밖 목적지 |
 | (d) `cni0.count`·`eth0.count` | 패킷 |
 | (e) `e_probe.txt` | 바깥 연결이 모두 실패하고, 정책 없는 네임스페이스 파드의 시도만 `pod-egress` 카운터를 올린다 (카운터가 실제로 센다는 증거) |
+
+`node-egress`가 0이 아니면 노드의 어떤 프로세스가 바깥에 묻는 것이다. 무엇을 묻는지는 NFLOG로 본다:
+
+```sh
+iptables -t mangle -I DOCFLOW-EGRESS 1 -j NFLOG --nflog-group 5
+timeout 60 tcpdump -n -i nflog:5 -vv
+iptables -t mangle -D DOCFLOW-EGRESS -j NFLOG --nflog-group 5
+```
+
+2026-11-21 시험에서는 Ubuntu 기본 `systemd-timesyncd`가 `ntp.ubuntu.com`을 물었다. 그래서 `OS_QUIET=1`을 둔다.
 
 WSL에서 시험할 때: 배포판들은 네트워크를 함께 쓴다. `egress_guard.sh on` 동안에는 같은 VM의 다른 배포판도 바깥에 못 나간다.
 

@@ -1,7 +1,8 @@
 #!/bin/bash
 # 외부 송신 0 증거 모으기 (https://github.com/reddol18/docflow/issues/81). root로, 설치한 노드에서. 결과는 <출력 폴더>에만 쓴다
 # (문서 글·값은 남기지 않는다 — 정책·카운터·연결 목록·패킷 머리만).
-#   evidence.sh capture-start <출력>   tcpdump 둘을 뒤에서 띄운다: cni0(파드 쪽, 클러스터 밖으로 가려는 것) · eth0(실제로 나간 것)
+#   evidence.sh capture-start <출력>   tcpdump를 뒤에서 띄운다: cni0(파드 쪽, 클러스터 밖으로 가려는 것) · eth0(실제로 나간 것) ·
+#                                      nflog:5(egress_guard가 버린 것 — 무엇을 보내려 했는지)
 #   evidence.sh capture-stop  <출력>   멈추고 패킷 수를 센다
 #   evidence.sh snapshot <출력> <이름> (a) 정책·CoreDNS·LLM 설정 (b) 카운터 (c) conntrack — 시험 전·후에 한 번씩
 #   evidence.sh probe <출력>           (e) 대조 시험: 일부러 바깥으로 나가 보고 막히는지·카운터가 오르는지
@@ -16,21 +17,31 @@ INTERNAL='not (dst net 10.42.0.0/16 or dst net 10.43.0.0/16 or dst net 127.0.0.0
 
 case "$CMD" in
   capture-start)
+    # 이미 도는 것은 그대로, 아직 없는 인터페이스(cni0는 k3s가 뜬 뒤 생김)는 건너뛴다 — 설치 전·후에 한 번씩 불러도 된다
+    cap() { # 이름 인터페이스 필터
+      if [ -f "$OUT/$1.pid" ] && kill -0 "$(cat "$OUT/$1.pid")" 2>/dev/null; then echo "capture $1: 이미 도는 중"; return; fi
+      case "$2" in nflog:*) ;; *) ip link show "$2" >/dev/null 2>&1 || { echo "capture $1: $2 아직 없음 — 건너뜀"; return; } ;; esac
+      nohup tcpdump -n -i "$2" -w "$OUT/$1.pcap" $3 >/dev/null 2>"$OUT/$1.tcpdump.log" &
+      echo $! > "$OUT/$1.pid"; echo "capture $1: $2 pid $!"
+    }
     # cni0: 파드가 클러스터 밖 주소로 보낸 패킷 (막히기 전에 보인다 — 시도까지 센다)
-    nohup tcpdump -n -i cni0 -w "$OUT/cni0.pcap" "ip and $INTERNAL and not dst host $NODE_IP" >/dev/null 2>"$OUT/cni0.tcpdump.log" &
-    echo $! > "$OUT/cni0.pid"
+    cap cni0 cni0 "ip and $INTERNAL and not dst host $NODE_IP"
     # eth0: 실제로 노드 밖으로 나간 패킷 (막힌 것은 보이지 않는다). ARP 등 IP 아닌 것은 뺀다
-    nohup tcpdump -n -i eth0 -w "$OUT/eth0.pcap" "(ip and src host $NODE_IP) or ip6" >/dev/null 2>"$OUT/eth0.tcpdump.log" &
-    echo $! > "$OUT/eth0.pid"
-    sleep 2; echo "capture: cni0 pid $(cat "$OUT/cni0.pid"), eth0 pid $(cat "$OUT/eth0.pid") (노드 $NODE_IP)"
+    cap eth0 eth0 "(ip and src host $NODE_IP) or ip6"
+    # nflog:5: egress_guard가 버린 패킷 사본 (노드·파드가 바깥으로 보내려 한 것 전부 — 무엇을 물었는지까지)
+    cap nflog nflog:5 ""
+    sleep 2
     ;;
   capture-stop)
-    for i in cni0 eth0; do
+    for i in cni0 eth0 nflog; do
       [ -f "$OUT/$i.pid" ] && kill -INT "$(cat "$OUT/$i.pid")" 2>/dev/null; sleep 1
       n=$(tcpdump -n -r "$OUT/$i.pcap" 2>/dev/null | wc -l)
       echo "$i: 패킷 $n개" | tee "$OUT/$i.count"
       tcpdump -n -r "$OUT/$i.pcap" 2>/dev/null | head -50 > "$OUT/$i.head.txt"
     done
+    # 버린 패킷의 목적지·포트·DNS 질의 이름 요약
+    tcpdump -n -vv -r "$OUT/nflog.pcap" 2>/dev/null | grep -oE '(A|AAAA|PTR|SRV|HTTPS)\? [^ ]+' | sort | uniq -c > "$OUT/nflog.dns.txt"
+    tcpdump -n -r "$OUT/nflog.pcap" 2>/dev/null | awk '{print $3, $4, $5}' | sed -E 's/\.[0-9]+ >/ >/' | sort | uniq -c | sort -rn | head -20 > "$OUT/nflog.flows.txt"
     ;;
   snapshot)
     L=${3:?이름}; D="$OUT/$L"; mkdir -p "$D"
@@ -48,10 +59,14 @@ case "$CMD" in
     dmesg 2>/dev/null | grep -E 'DOCFLOW-(POD|NODE)-EGRESS' > "$D/b_kernel_log.txt" || true
     # (c) conntrack: 클러스터 밖·루프백 밖으로 가는 연결 (지금 있는 것 + 최근 기록)
     conntrack -L 2>/dev/null > "$D/c_conntrack_all.txt"
-    awk '{for(i=1;i<=NF;i++) if($i ~ /^dst=/){split($i,a,"="); print a[2]; break}}' "$D/c_conntrack_all.txt" \
-      | grep -vE '^(10\.42\.|10\.43\.|127\.)' | grep -vx "$NODE_IP" | sort | uniq -c > "$D/c_conntrack_external.txt"
-    echo "[$L] conntrack 전체 $(wc -l < "$D/c_conntrack_all.txt")줄, 바깥 목적지 $(wc -l < "$D/c_conntrack_external.txt")곳"
-    grep -E 'pod-egress|node-egress|v6-egress' "$D/b_egress_guard.txt" | awk -v l="$L" '{print "[" l "] " $NF, "pkts", $1, "bytes", $2}'
+    # 노드·파드가 시작한 연결(처음 src가 노드 주소나 10.42/16)만 보고, 목적지가 클러스터·루프백·노드 자신이 아닌 것을 센다.
+    # 바깥(Windows 쪽)에서 들어온 방송(예: 172.31.255.255)·멀티캐스트는 송신이 아니라 뺀다
+    awk -v node="$NODE_IP" '{s="";d=""; for(i=1;i<=NF;i++){ if(s=="" && $i ~ /^src=/) s=substr($i,5); else if(d=="" && $i ~ /^dst=/) d=substr($i,5) }
+         if ((s==node || s ~ /^10\.42\./) && d !~ /^(10\.42\.|10\.43\.|127\.|22[4-9]\.|23[0-9]\.)/ && d!=node) print $1, s, "->", d}' \
+      "$D/c_conntrack_all.txt" | sort | uniq -c > "$D/c_conntrack_external.txt"
+    echo "[$L] conntrack 전체 $(wc -l < "$D/c_conntrack_all.txt")줄, 노드·파드가 바깥으로 연 연결 $(wc -l < "$D/c_conntrack_external.txt")종"
+    grep -E 'pod-egress|node-egress|v6-egress' "$D/b_egress_guard.txt" \
+      | awk -v l="$L" '{n=""; for(i=1;i<=NF;i++) if($i ~ /-egress$/) n=$i; print "[" l "] " n, "pkts", $1, "bytes", $2}'
     ;;
   probe)
     # (e) 대조: 막는 장치가 실제로 일하는지. ① docs 네임스페이스에 docflow와 같은 레이블의 파드 — NetworkPolicy가 막는다

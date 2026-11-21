@@ -4,6 +4,7 @@
 #   sudo bash <묶음>/scripts/install.sh
 # 환경변수:
 #   REQUIRE_EGRESS_GUARD=1  바깥 송신 막기(scripts/egress_guard.sh on)가 걸려 있지 않으면 시작하지 않는다 (시험용)
+#   OS_QUIET=1              OS가 스스로 바깥에 묻는 서비스(시간 동기화·apt·motd 타이머)를 끈다 (아래 2단계 설명)
 #   NEED_ROOT_GB            / 여유 하한 (기본 45GB: 이미지 풀기·모델·데이터)
 #   ADMIN_USER              첫 관리자 이름 (기본 admin). 비밀번호는 무작위로 만들어 /root/docflow-admin-password(0600)에만 둔다
 # 절차·되돌리기: docs/offline_install.md
@@ -32,6 +33,14 @@ for d in "$B"/debs/*.deb; do
     || dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$d")
 done
 if [ ${#missing[@]} -gt 0 ]; then dpkg -i "${missing[@]}" >/dev/null; say "  넣음: ${#missing[@]}개"; else say "  모두 있음"; fi
+# OS_QUIET=1: 운영체제가 스스로 바깥에 묻는 서비스를 끈다 — 2026-11-21 WSL 시험에서 Ubuntu 24.04 기본 systemd-timesyncd가
+# ntp.ubuntu.com을 계속 물었다(노드 DNS, 막기에서 버려짐). 현장에 내부 NTP가 있으면 끄는 대신 /etc/systemd/timesyncd.conf NTP=를 그 주소로.
+# apt·motd·ua 타이머도 바깥(archive.ubuntu.com 등)에 묻는다. 기본은 건드리지 않는다 (설치 노드의 OS 설정은 현장 정책)
+if [ "${OS_QUIET:-0}" = 1 ]; then
+  for u in systemd-timesyncd.service motd-news.timer apt-daily.timer apt-daily-upgrade.timer ua-timer.timer snapd.snap-repair.timer; do
+    systemctl disable --now "$u" >/dev/null 2>&1 && say "  끔: $u" || true
+  done
+fi
 # --tools-only: 여기까지만 (iptables가 없는 새 노드에서 egress_guard.sh on을 먼저 걸 때)
 [ "${1:-}" != "--tools-only" ] || { say "도구만 넣고 끝"; exit 0; }
 
