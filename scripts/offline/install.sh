@@ -8,7 +8,7 @@
 #   ADMIN_USER              첫 관리자 이름 (기본 admin). 비밀번호는 무작위로 만들어 /root/docflow-admin-password(0600)에만 둔다
 # 절차·되돌리기: docs/offline_install.md
 set -euo pipefail
-B=$(cd "$(dirname "$0")/.." && pwd)
+B=${BUNDLE:-$(cd "$(dirname "$0")/.." && pwd)}
 NEED_ROOT_GB=${NEED_ROOT_GB:-45}
 ADMIN_USER=${ADMIN_USER:-admin}
 MODEL_DIR=/var/lib/docflow/ollama
@@ -52,7 +52,8 @@ cp "$B/k3s/k3s-airgap-images-amd64.tar.zst" "$B"/images/*.tar.zst /var/lib/ranch
   if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then echo "kubelet-arg: [\"fail-cgroupv1=false\"]"; fi
 } > /etc/rancher/k3s/config.yaml
 INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_SKIP_SELINUX_RPM=true sh "$B/k3s/install.sh" >/dev/null
-for i in $(seq 1 90); do $K get nodes 2>/dev/null | grep -q ' Ready' && break; sleep 2; done
+# 처음 기동은 airgap 이미지(약 4GB) 가져오기 때문에 몇 분 NotReady일 수 있다
+for i in $(seq 1 300); do $K get nodes --no-headers 2>/dev/null | awk '{print $2}' | grep -qx Ready && break; sleep 2; done
 $K get nodes -o wide
 
 say "4/9 CoreDNS: 바깥 이름을 위쪽 DNS로 넘기지 않게"
@@ -74,7 +75,7 @@ say "6/9 내부 CA·서버 인증서·비밀값 (값은 찍지 않는다)"
 $K get ns docs >/dev/null 2>&1 || $K create namespace docs >/dev/null
 CA=/root/docflow-ca; umask 077; mkdir -p "$CA"
 names=(web:docflow.localhost postgres:postgres.docs.svc.cluster.local qdrant:qdrant.docs.svc.cluster.local redis:redis.docs.svc.cluster.local)
-if [ ! -f "$CA/ca.key" ]; then
+if [ ! -f "$CA/ca.crt" ]; then
   # scripts/ca.py와 같은 모양: CA EC P-384·5년·이름 제약(위 이름만, IP 막음)·EKU serverAuth, 서버 EC P-256·397일
   perm=$(for n in "${names[@]}"; do printf 'permitted;DNS:%s,' "${n#*:}"; done)
   cat > "$CA/ca.cnf" <<EOF
@@ -88,7 +89,7 @@ CN=docflow internal demo CA (offline)
 basicConstraints=critical,CA:TRUE,pathlen:0
 keyUsage=critical,keyCertSign,cRLSign,digitalSignature
 extendedKeyUsage=serverAuth
-nameConstraints=critical,${perm}excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:::/0
+nameConstraints=critical,${perm}excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:::/::
 subjectKeyIdentifier=hash
 EOF
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$CA/ca.key" 2>/dev/null

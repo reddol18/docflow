@@ -33,6 +33,9 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 - 레지스트리 이미지(postgres·qdrant·redis·ollama)는 매니페스트의 다이제스트 그대로 `k3s ctr pull → export`로 넣는다.
   docker save로 넣으면 다이제스트가 바뀌어 kubelet이 받으러 나간다.
 - 결과: `<묶음 폴더>/docflow-offline-<커밋>/`. 내용은 `CONTENTS.txt`, 해시는 `SHA256SUMS`.
+- 스크립트·매니페스트만 고쳤으면 `build_bundle.sh --refresh <저장소> <있는 묶음 폴더>`로 그 부분만 지금 커밋으로 바꾼다.
+  - 이미지·모델은 그대로 두고 해시를 다시 만든다.
+  - 이미지에 드는 파일(app·Dockerfile·frontend·requirements·이미지 다이제스트)이 바뀌었으면 거절한다. 그때는 처음부터 다시 만든다.
 
 ## 2. 설치 (폐쇄망)
 

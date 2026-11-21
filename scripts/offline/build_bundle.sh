@@ -4,6 +4,7 @@
 #
 #   sudo bash scripts/offline/build_bundle.sh <저장소 폴더> <Ollama 모델 폴더(읽기만)> <묶음 만들 폴더>
 #   예) bash scripts/offline/build_bundle.sh /mnt/e/claude-dev/base/records_poc/doc_platform /mnt/e/dev/models /mnt/f/docflow81/bundle
+#   sudo bash scripts/offline/build_bundle.sh --refresh <저장소> <있는 묶음 폴더>   스크립트·매니페스트만 지금 커밋으로 (아래 설명)
 #
 # 묶음 = <묶음 폴더>/docflow-offline-<커밋>/ (설치 절차: docs/offline_install.md)
 #   k3s/       k3s 바이너리·airgap 이미지·설치 스크립트 (K3S_VERSION, 내려받은 sha256sum 파일로 확인)
@@ -30,7 +31,41 @@ free_gb() { df -P -BG "$1" | awk 'NR==2 {gsub("G","",$4); print $4}'; }
 need() { local d=$1 want=$2 have; have=$(free_gb "$d"); say "디스크 $d 여유 ${have}GB (필요 ${want}GB)";
          [ "$have" -ge "$want" ] || { echo "디스크 모자람: $d 여유 ${have}GB < ${want}GB — 멈춤" >&2; exit 1; }; }
 
+put_scripts() { # 소스 폴더 → 묶음: 풀어 둔 매니페스트·Corefile·스크립트·설치 문서
+  k3s kubectl kustomize --load-restrictor LoadRestrictionsNone "$1/k8s/offline" > "$2/manifests/docflow-offline.yaml"
+  tr -d '\r' < "$1/k8s/offline/Corefile" > "$2/manifests/Corefile"
+  for s in install.sh egress_guard.sh evidence.sh smoke_test.sh; do tr -d '\r' < "$1/scripts/offline/$s" > "$2/scripts/$s"; chmod +x "$2/scripts/$s"; done
+  cp "$1/docs/offline_install.md" "$2/"
+}
+write_index() { # 묶음 폴더, 머리 글(표준 입력) → CONTENTS.txt·SHA256SUMS
+  { cat; echo; echo "파일 (바이트):"
+    (cd "$1" && find . -type f ! -name SHA256SUMS ! -name CONTENTS.txt -printf '%s\t%P\n' | sort -k2)
+    echo; echo "합계: $(du -sb "$1" | cut -f1) 바이트 ($(du -sh "$1" | cut -f1))"; } > "$1/CONTENTS.txt.new"
+  mv "$1/CONTENTS.txt.new" "$1/CONTENTS.txt"
+  (cd "$1" && find . -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs -d '\n' sha256sum > SHA256SUMS)
+}
+
 [ "$(id -u)" = 0 ] || { echo "root로 돌린다" >&2; exit 1; }
+
+# --refresh <저장소> <있는 묶음 폴더>: 스크립트·매니페스트·문서만 지금 커밋으로 바꾸고 해시를 다시 만든다 (이미지·모델은 그대로).
+# 묶음을 만든 커밋과 지금 커밋 사이에 이미지에 드는 파일(app·Dockerfile·frontend·requirements·이미지 다이제스트가 든 매니페스트)이
+# 바뀌었으면 거절한다 — 그때는 처음부터 다시 만든다. 폴더 이름은 docflow-offline-<지금 커밋>으로 바뀐다
+if [ "$REPO" = --refresh ]; then
+  REPO=$MODELS; OLD_B=${OUTROOT%/}
+  OLD=$(basename "$OLD_B" | sed 's/^docflow-offline-//')
+  NEW=$(git -C "$REPO" rev-parse --short=12 HEAD)
+  git -C "$REPO" diff --quiet "$OLD" HEAD -- app Dockerfile .dockerignore frontend requirements.txt requirements.lock k8s/docs.yaml k8s/offline/llm.yaml \
+    || { echo "커밋 $OLD → $NEW 사이에 이미지에 드는 파일이 바뀜 — --refresh 말고 처음부터 다시 만든다" >&2; exit 1; }
+  SRC=$(mktemp -d /root/docflow-src.XXXXXX); trap 'rm -rf "$SRC"' EXIT
+  git -C "$REPO" archive --format=tar HEAD | tar -x -C "$SRC"
+  put_scripts "$SRC" "$OLD_B"
+  NB="$(dirname "$OLD_B")/docflow-offline-$NEW"
+  [ "$OLD_B" = "$NB" ] || mv "$OLD_B" "$NB"
+  { sed -n '1,/^파일 (바이트):/p' "$NB/CONTENTS.txt" | sed '$d' | sed '/^$/d' | grep -v '^스크립트·매니페스트:'
+    echo "스크립트·매니페스트: 커밋 $NEW (이미지·모델은 커밋 $OLD — 그 사이 이미지에 드는 파일 변경 없음, $(date -Iseconds) 갱신)"; } > "$SRC/head.txt"
+  write_index "$NB" < "$SRC/head.txt"
+  say "갱신 끝: $NB"; exit 0
+fi
 for c in docker k3s git zstd jq python3 sha256sum; do command -v $c >/dev/null || { echo "$c 없음" >&2; exit 1; }; done
 mkdir -p "$OUTROOT"
 need "$OUTROOT" "$NEED_OUT_GB"
@@ -106,10 +141,7 @@ mapfile -t DEBS < <(apt-cache depends --recurse --no-recommends --no-suggests --
 ( cd "$B/debs" && for p in "${DEBS[@]}"; do apt-get download "$p" >/dev/null 2>&1 || say "  .deb 없음(가상 꾸러미?): $p"; done )
 
 # ---- 매니페스트·스크립트 ----
-k3s kubectl kustomize --load-restrictor LoadRestrictionsNone "$SRC/k8s/offline" > "$B/manifests/docflow-offline.yaml"
-tr -d '\r' < "$SRC/k8s/offline/Corefile" > "$B/manifests/Corefile"
-for s in install.sh egress_guard.sh evidence.sh smoke_test.sh; do tr -d '\r' < "$SRC/scripts/offline/$s" > "$B/scripts/$s"; chmod +x "$B/scripts/$s"; done
-cp "$SRC/docs/offline_install.md" "$B/"
+put_scripts "$SRC" "$B"
 
 # ---- 목록·해시 ----
 {
@@ -117,9 +149,5 @@ cp "$SRC/docs/offline_install.md" "$B/"
   echo "모델: $OLLAMA_MODELS_WANT"
   echo "레지스트리 이미지:"; printf '  %s\n' "${REFS[@]}"
   echo "앱 이미지: docflow:dev $(docker image inspect -f '{{.Id}}' docflow:dev), docflow-web:dev $(docker image inspect -f '{{.Id}}' docflow-web:dev)"
-  echo; echo "파일 (바이트):"
-  (cd "$B" && find . -type f ! -name SHA256SUMS ! -name CONTENTS.txt -printf '%s\t%P\n' | sort -k2)
-  echo; echo "합계: $(du -sb "$B" | cut -f1) 바이트 ($(du -sh "$B" | cut -f1))"
-} > "$B/CONTENTS.txt"
-(cd "$B" && find . -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs -d '\n' sha256sum > SHA256SUMS)
+} | write_index "$B"
 say "끝: $B ($(du -sh "$B" | cut -f1))"

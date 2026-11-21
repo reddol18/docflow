@@ -87,3 +87,22 @@ def test_named_vectors_collection_stops():
     q.create_collection("documents", vectors_config={"a": VectorParams(size=4, distance=Distance.COSINE)})
     with pytest.raises(store.EmbedConfigError, match="벡터 설정"):
         store.ensure_collection(q, "documents", 4)
+
+
+def test_offline_settings_import(tmp_path):
+    """k8s/offline 값(LLM_PROVIDER=local·bge-m3 1024·LLM_TIMEOUT_SECONDS)으로 app.llm·app.store를 새 프로세스에서 불러온다 —
+    불러올 때(모듈 맨 위 load_provider·embed_config) 멈추지 않는지. 2026-11-21 WSL 시험에서 local_timeout이 load_provider보다
+    뒤에 정의돼 NameError로 파드가 뜨지 않은 것을 막는다. 호출·연결 없음"""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    env = {**os.environ, "LLM_PROVIDER": "local", "LLM_BASE_URL": "http://ollama.llm.svc.cluster.local:11434/v1",
+           "EXTRACT_MODEL": "qwen2.5:7b", "CHAT_MODEL": "qwen2.5:7b", "CELL_MODEL": "qwen2.5vl:7b",
+           "EMBED_MODEL": "bge-m3", "EMBED_DIM": "1024", "LLM_TIMEOUT_SECONDS": "900", "DATA_DIR": str(tmp_path)}
+    code = ("from app import llm, store; "
+            "print(llm.PROVIDER.name, llm.local_timeout(), store.COLLECTION, store.EMBED_DIM)")
+    r = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout.split() == ["local", "900.0", "documents_bge-m3_1024", "1024"]

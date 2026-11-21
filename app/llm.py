@@ -147,6 +147,20 @@ def check_local_url(url):
                                   "루프백·사설 IP·클러스터 내부 이름이 아님")
 
 
+def local_timeout(env=None):
+    """local 서버 호출 한 번의 시간 제한(초): LLM_TIMEOUT_SECONDS, 기본 120. GPU 없이 CPU로 7B 모델을 돌리는 폐쇄망
+    설치는 추출 한 번이 1~3분 걸려 늘려 준다 (https://github.com/reddol18/docflow/issues/81, k8s/offline/). 양수가 아니면 멈춤"""
+    env = os.environ if env is None else env
+    raw = (env.get("LLM_TIMEOUT_SECONDS") or "120").strip()
+    try:
+        t = float(raw)
+    except ValueError:
+        raise ProviderConfigError(f"LLM_TIMEOUT_SECONDS는 양수 (받은 값: {raw!r})") from None
+    if not t > 0 or math.isinf(t):
+        raise ProviderConfigError(f"LLM_TIMEOUT_SECONDS는 양수 (받은 값: {raw!r})")
+    return t
+
+
 def load_provider(env=None):
     """환경변수 → Provider. 모르는 제공자, local인데 주소 없음·내부 주소 아님·키 파일 없음은 시작할 때 멈춘다"""
     env = os.environ if env is None else env
@@ -194,20 +208,6 @@ def _key():
 
 
 _client = None
-
-
-def local_timeout(env=None):
-    """local 서버 호출 한 번의 시간 제한(초): LLM_TIMEOUT_SECONDS, 기본 120. GPU 없이 CPU로 7B 모델을 돌리는 폐쇄망
-    설치는 추출 한 번이 1~3분 걸려 늘려 준다 (https://github.com/reddol18/docflow/issues/81, k8s/offline/). 양수가 아니면 멈춤"""
-    env = os.environ if env is None else env
-    raw = (env.get("LLM_TIMEOUT_SECONDS") or "120").strip()
-    try:
-        t = float(raw)
-    except ValueError:
-        raise ProviderConfigError(f"LLM_TIMEOUT_SECONDS는 양수 (받은 값: {raw!r})") from None
-    if not t > 0 or math.isinf(t):
-        raise ProviderConfigError(f"LLM_TIMEOUT_SECONDS는 양수 (받은 값: {raw!r})")
-    return t
 
 
 def make_client(p):
