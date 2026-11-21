@@ -126,6 +126,7 @@ for ref in "${REFS[@]}"; do
 done
 
 # ---- 이미지 취약점 스캔 (trivy image) — 레지스트리 이미지(ollama 포함)·k3s airgap 이미지 ----
+# --timeout 45m: ollama 이미지(CUDA 라이브러리 포함 약 3.4GB)는 기본 5분 안에 분석이 끝나지 않는다 (2026-11-22 빌드).
 # 결과는 묶음 밖에 둔다: /root/docflow-trivy-<커밋>/(JSON)·<묶음 폴더>/../trivy-<커밋>.txt(요약). HIGH·CRITICAL이 있어도 멈추지 않고 수를 보고한다.
 # trivy는 scripts/tool_pins.txt의 linux-x86_64 줄(판·자산·실행 파일 해시)로 받고 확인한다. 취약점 DB는 이때 받는다(빌드는 온라인)
 trivy_bin() {
@@ -151,7 +152,7 @@ mapfile -t SCAN < <( { printf '%s\n' "${REFS[@]}"; tr -d '\r' < "$SRC/k3s-images
 for ref in "${SCAN[@]}"; do
   out="$TD/$(echo "$ref" | tr '/:@' '___').json"
   say "trivy 스캔 $ref"
-  if "$TRIVY" image --quiet --platform linux/amd64 --scanners vuln --severity HIGH,CRITICAL --format json -o "$out" "$ref" >> /root/docflow-build-trivy.log 2>&1; then
+  if "$TRIVY" image --quiet --timeout 45m --platform linux/amd64 --scanners vuln --severity HIGH,CRITICAL --format json -o "$out" "$ref" >> /root/docflow-build-trivy.log 2>&1; then
     printf '%s\t%s\t%s\n' "$ref" \
       "$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$out")" \
       "$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$out")" >> "$TSUM"
