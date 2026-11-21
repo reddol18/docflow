@@ -21,14 +21,11 @@ K="k3s kubectl"
 say() { printf '[install %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 free_gb() { df -P -BG "$1" | awk 'NR==2 {gsub("G","",$4); print $4}'; }
 
-[ "$(id -u)" = 0 ] || { echo "root로 돌린다" >&2; exit 1; }
-have=$(free_gb /); say "디스크 / 여유 ${have}GB (필요 ${NEED_ROOT_GB}GB)"
-[ "$have" -ge "$NEED_ROOT_GB" ] || { echo "디스크 모자람 — 멈춤" >&2; exit 1; }
-
+# root·디스크 확인은 묶음 확인 뒤에 — --verify-only(묶음 확인만)는 둘 다 필요 없다 (읽기만 하므로)
 say "1/9 묶음 확인 (SHA256SUMS 자체 → 목록 밖 파일 없음 → sha256sum -c)"
 # 심볼릭 링크가 하나라도 있으면 멈춘다 — 목록에 있는 이름이라도 링크면 묶음 밖 파일을 가리킬 수 있다 (SHA256SUMS 자신 포함)
 links=$(cd "$B" && find . -type l -printf '%P\n')
-[ -z "$links" ] || { echo "묶음에 심볼릭 링크가 있음 — 멈춤:" >&2; printf '  %s\n' $links >&2; exit 1; }
+[ -z "$links" ] || { echo "묶음에 심볼릭 링크가 있음 — 멈춤:" >&2; printf '%s\n' "$links" | sed 's/^/  /' >&2; exit 1; }
 [ -f "$B/SHA256SUMS" ] || { echo "SHA256SUMS 없음 — 멈춤" >&2; exit 1; }
 sums=$(sha256sum "$B/SHA256SUMS" | cut -d' ' -f1)
 if [ -n "${SUMS_SHA256:-}" ]; then
@@ -44,10 +41,14 @@ fi
 # 목록에 없는 것이 끼어 있으면 멈춘다 — 파일뿐 아니라 폴더가 아닌 모든 것(장치·소켓·FIFO 등)을 본다.
 # debs/*.deb·images/*.tar.zst를 glob으로 읽으므로 끼워 넣은 파일이 root로 설치될 수 있다
 extra=$(cd "$B" && comm -13 <(sed -E 's/^[0-9a-f]{64} [ *]//' SHA256SUMS | sort) <(find . ! -type d ! -path ./SHA256SUMS -printf '%P\n' | sort))
-[ -z "$extra" ] || { echo "SHA256SUMS에 없는 것이 묶음에 있음 — 멈춤:" >&2; printf '  %s\n' $extra >&2; exit 1; }
+[ -z "$extra" ] || { echo "SHA256SUMS에 없는 것이 묶음에 있음 — 멈춤:" >&2; printf '%s\n' "$extra" | sed 's/^/  /' >&2; exit 1; }
 (cd "$B" && sha256sum --quiet --strict -c SHA256SUMS)
 say "  목록 밖·링크 없음, 해시 모두 일치"
 [ "${1:-}" != "--verify-only" ] || { say "묶음 확인만 하고 끝"; exit 0; }
+
+[ "$(id -u)" = 0 ] || { echo "root로 돌린다" >&2; exit 1; }
+have=$(free_gb /); say "디스크 / 여유 ${have}GB (필요 ${NEED_ROOT_GB}GB)"
+[ "$have" -ge "$NEED_ROOT_GB" ] || { echo "디스크 모자람 — 멈춤" >&2; exit 1; }
 
 say "2/9 도구 .deb (없는 것만)"
 missing=()
@@ -93,11 +94,11 @@ cp "$B/k3s/k3s-airgap-images-amd64.tar.zst" "$B"/images/*.tar.zst /var/lib/ranch
 } > /etc/rancher/k3s/config.yaml
 INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_SKIP_SELINUX_RPM=true sh "$B/k3s/install.sh" >/dev/null
 # 처음 기동은 airgap 이미지(약 4GB) 가져오기 때문에 몇 분 NotReady일 수 있다
-for i in $(seq 1 300); do $K get nodes --no-headers 2>/dev/null | awk '{print $2}' | grep -qx Ready && break; sleep 2; done
+for _ in $(seq 1 300); do $K get nodes --no-headers 2>/dev/null | awk '{print $2}' | grep -qx Ready && break; sleep 2; done
 $K get nodes -o wide
 
 say "4/9 CoreDNS: 바깥 이름을 위쪽 DNS로 넘기지 않게"
-for i in $(seq 1 90); do $K -n kube-system get cm coredns >/dev/null 2>&1 && $K -n kube-system get deploy coredns >/dev/null 2>&1 && break; sleep 2; done
+for _ in $(seq 1 90); do $K -n kube-system get cm coredns >/dev/null 2>&1 && $K -n kube-system get deploy coredns >/dev/null 2>&1 && break; sleep 2; done
 touch /var/lib/rancher/k3s/server/manifests/coredns.yaml.skip   # k3s가 기본 Corefile로 되돌리지 않게
 P=$(mktemp); trap 'rm -f "$P"' EXIT   # 고정 이름(/tmp/…)을 쓰지 않는다 — 다른 사용자가 먼저 만들거나 링크를 걸 수 없게
 python3 -I -c 'import json,sys; print(json.dumps({"data": {"Corefile": open(sys.argv[1]).read()}}))' "$B/manifests/Corefile" > "$P"

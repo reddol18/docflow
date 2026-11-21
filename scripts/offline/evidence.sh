@@ -2,7 +2,7 @@
 # 외부 송신 0 증거 모으기 (https://github.com/reddol18/docflow/issues/81). root로, 설치한 노드에서. 결과는 <출력 폴더>에만 쓴다
 # (문서 글·값은 남기지 않는다 — 정책·카운터·연결 목록·패킷 머리만).
 #   evidence.sh capture-start <출력>   tcpdump를 뒤에서 띄운다: cni0(파드 쪽, 클러스터 밖으로 가려는 것) · eth0(실제로 나간 것) ·
-#                                      nflog:5(egress_guard가 버린 것 — 무엇을 보내려 했는지)
+#                                      nflog:5(egress_guard가 버린 것, 머리 128바이트) · nflog:6(버린 DNS, 512바이트 — 질의 이름)
 #   evidence.sh capture-stop  <출력>   멈추고 패킷 수를 센다
 #   evidence.sh snapshot <출력> <이름> (a) 정책·CoreDNS·LLM 설정 (b) 카운터 (c) conntrack — 시험 전·후에 한 번씩
 #   evidence.sh probe <출력>           (e) 대조 시험: 일부러 바깥으로 나가 보고 막히는지·카운터가 오르는지
@@ -10,7 +10,7 @@
 # 클러스터 안 주소: 파드 10.42/16, 서비스 10.43/16. 그 밖으로 가는 연결·패킷이 '외부 송신'이다.
 # 바깥 인터페이스는 egress_guard.sh와 같은 방법으로 고른다: EGRESS_IF, 없으면 IPv4 기본 경로의 인터페이스. 노드 주소는 그 인터페이스의 IPv4.
 # tcpdump는 -Z root: 0700 폴더에 쓰려고 (Ubuntu tcpdump는 기본으로 tcpdump 사용자로 내려가 쓰기를 못 한다).
-# pcap은 머리만(-s 128: IP·TCP/UDP 머리와 DNS 이름 정도) — 바깥으로 나가려던 본문(문서 값)을 남기지 않는다. 출력 폴더는 0700
+# pcap은 머리만(-s 128: IP·TCP/UDP 머리) — 바깥으로 나가려던 본문(문서 값)을 남기지 않는다. 버린 DNS(nflog:6)만 512바이트(질의 이름). 출력 폴더는 0700
 # (리눅스 파일 시스템일 때. WSL의 /mnt/<드라이브>(drvfs)는 chmod가 듣지 않고 Windows 권한을 따른다 — 증거는 리눅스 쪽 폴더에 두는 것이 낫다)
 set -uo pipefail
 CMD=${1:?capture-start|capture-stop|snapshot|probe|ollama-log}
@@ -43,15 +43,17 @@ case "$CMD" in
     # (2026-11-21 시험: 방향을 안 가렸더니 Windows 쪽에서 들어온 IPv6 mDNS 18개가 섞였다 — 출발 주소가 Windows의 fe80)
     # 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND 등 같은 링크 안에서 끝남)는 바깥 송신이 아니라 뺀다
     cap eth0 "$IF" "-Q out (ip or ip6) and not dst net ff02::/16 and not dst net 224.0.0.0/24"
-    # nflog:5: egress_guard가 버린 패킷 사본 (노드·파드가 바깥으로 보내려 한 것 전부 — 무엇을 물었는지까지)
-    # snaplen 512: nflog 패킷에는 NFLOG 머리(TLV)가 앞에 붙어 128이면 DNS 질의 이름이 잘린다(IPv6는 이름이 아예 안 보였다).
-    # 버린 패킷(바깥으로 나가려던 것)만 담기는 곳이라 이름까지 남긴다 — 무엇이 나가려 했는지가 이 캡처의 목적
+    # nflog:5: egress_guard가 버린 패킷 사본 — DNS 말고 전부. 패킷은 커널이 128바이트(머리)까지만 넘긴다(--nflog-size 128) —
+    #   guard 전에 열어 둔 연결로 보내려던 본문(문서 값)이 남지 않게. tcpdump snaplen은 512: NFLOG 레코드는 패킷 앞에 TLV 머리
+    #   (약 50바이트)가 붙어 128로 자르면 패킷 머리까지 잘려 '[|nflog]'로만 보인다 (2026-11-22 시험)
+    # nflog:6: 버린 DNS(포트 53)만 — 커널이 512바이트까지 넘긴다(질의 이름이 잘리지 않게)
     cap nflog nflog:5 "" 512
+    cap nflogdns nflog:6 "" 768
     exit $fail
     ;;
   capture-stop)
     fail=0
-    for i in cni0 eth0 nflog; do
+    for i in cni0 eth0 nflog nflogdns; do
       [ -f "$OUT/$i.pid" ] && kill -INT "$(cat "$OUT/$i.pid")" 2>/dev/null; sleep 1
       # pcap이 없거나 읽지 못하면 오류 (0개로 적지 않는다)
       if [ ! -s "$OUT/$i.pcap" ] || ! tcpdump -n -r "$OUT/$i.pcap" > "$OUT/$i.txt" 2>"$OUT/$i.read.log"; then
@@ -61,8 +63,9 @@ case "$CMD" in
       head -50 "$OUT/$i.txt" > "$OUT/$i.head.txt"; rm -f "$OUT/$i.txt"
     done
     # 버린 패킷의 목적지·포트·DNS 질의 이름 요약
-    tcpdump -n -vv -r "$OUT/nflog.pcap" 2>/dev/null | grep -oE '(A|AAAA|PTR|SRV|HTTPS)\? [^ ]+' | sort | uniq -c > "$OUT/nflog.dns.txt"
-    tcpdump -n -r "$OUT/nflog.pcap" 2>/dev/null | awk '{print $3, $4, $5}' | sed -E 's/\.[0-9]+ >/ >/' | sort | uniq -c | sort -rn | head -20 > "$OUT/nflog.flows.txt"
+    tcpdump -n -vv -r "$OUT/nflogdns.pcap" 2>/dev/null | grep -oE '(A|AAAA|PTR|SRV|HTTPS)\? [^ ]+' | sort | uniq -c > "$OUT/nflog.dns.txt"
+    { tcpdump -n -r "$OUT/nflog.pcap" 2>/dev/null; tcpdump -n -r "$OUT/nflogdns.pcap" 2>/dev/null; } \
+      | sed -E 's/truncated-ip - [0-9]+ bytes missing! //' | awk '{print $3, $4, $5}' | sed -E 's/\.[0-9]+ >/ >/' | sort | uniq -c | sort -rn | head -20 > "$OUT/nflog.flows.txt"
     exit $fail
     ;;
   snapshot)

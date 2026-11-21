@@ -22,7 +22,7 @@ say() { printf '[smoke %s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 J=$(mktemp -d); trap 'kill $PF 2>/dev/null; rm -rf "$J"' EXIT
 
 $K -n docs port-forward svc/docflow $PORT:8000 >/dev/null 2>&1 & PF=$!
-for i in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/healthz" >/dev/null && break; sleep 1; done
+for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/healthz" >/dev/null && break; sleep 1; done
 H=(-H "x-docflow-csrf: 1" -b "$J/c" -c "$J/c")
 api() { curl -sS -o "$J/body" -w '%{http_code}' "${H[@]}" "$@"; }
 
@@ -53,7 +53,7 @@ done
 say "실행 끝: stage=$1, 문서 $4건, 색인 $5건, 검토 표시 $6건, 걸린 시간 $(( $(date +%s) - t0 ))초"
 api "http://127.0.0.1:$PORT/volumes/$VOL" >/dev/null
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print("사용량(모델별 호출·토큰·비용):", json.dumps(d.get("usage"), ensure_ascii=False))' "$J/body" | tee -a "$LOG"
-[ "$1" = done ] || { say "끝 단계가 done이 아님"; exit 1; }
+[ "$1" = "done" ] || { say "끝 단계가 done이 아님"; exit 1; }
 
 code=$(api -G --data-urlencode "q=$Q" --data-urlencode "k=5" "http://127.0.0.1:$PORT/search")
 say "검색: 검색어 '$Q', 기대 1위 $VOL/$EXPECT → HTTP $code"

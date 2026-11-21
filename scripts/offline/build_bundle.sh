@@ -5,6 +5,8 @@
 #   sudo bash scripts/offline/build_bundle.sh <저장소 폴더> <Ollama 모델 폴더(읽기만)> <묶음 만들 폴더>
 #   예) bash scripts/offline/build_bundle.sh /mnt/e/claude-dev/base/records_poc/doc_platform /mnt/e/dev/models /mnt/f/docflow81/bundle
 #   sudo bash scripts/offline/build_bundle.sh --refresh <저장소> <있는 묶음 폴더>   스크립트·매니페스트만 지금 커밋으로 (아래 설명)
+#   sudo bash scripts/offline/build_bundle.sh --scan <저장소> <있는 묶음 폴더>      trivy 스캔만 다시 (실패면 3)
+# 끝 상태: 0 = 묶음·스캔 모두 됨, 3 = 묶음은 만들어졌지만 스캔 실패, 그 밖 = 묶음 만들기 실패
 #
 # 묶음 = <묶음 폴더>/docflow-offline-<커밋>/ (설치 절차: docs/offline_install.md)
 #   k3s/       k3s 바이너리·airgap 이미지·설치 스크립트 (K3S_VERSION, 내려받은 sha256sum 파일로 확인)
@@ -52,7 +54,28 @@ write_index() { # 묶음 폴더, 머리 글(표준 입력) → CONTENTS.txt·SHA
   (cd "$1" && find . -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs -d '\n' sha256sum > SHA256SUMS)
 }
 
+# 묶음 안 tar 그대로 trivy 스캔 (scripts/offline/scan_bundle.sh). 레지스트리에서 태그로 다시 받지 않는다.
+# 결과는 묶음 밖: /root/docflow-trivy-<이름>/(JSON), <묶음 폴더>/../trivy-<이름>.tsv(요약). HIGH·CRITICAL이 있어도 멈추지 않지만,
+# 스캔 실패(trivy 해시 불일치·디스크 모자람·이미지 스캔 실패)나 요약이 없으면 1을 돌려준다
+scan_step() { # 묶음 폴더, 소스(저장소) 폴더, 이름
+  local b=$1 src=$2 name=$3 out=/root/docflow-trivy-$3 tsv
+  tsv="$(dirname "$b")/trivy-$name.tsv"
+  say "trivy 스캔 (묶음 tar) → $out"
+  rm -f "$tsv"
+  if ! bash "$src/scripts/offline/scan_bundle.sh" "$b" "$src" "$out" > /root/docflow-build-trivy.log 2>&1; then
+    tail -5 /root/docflow-build-trivy.log >&2; return 1
+  fi
+  [ -s "$out/summary.tsv" ] || { echo "스캔 요약(summary.tsv)이 없음" >&2; return 1; }
+  cp "$out/summary.tsv" "$tsv"; cat "$tsv"
+}
+
 [ "$(id -u)" = 0 ] || { echo "root로 돌린다" >&2; exit 1; }
+
+# --scan <저장소(또는 scripts/offline/scan_bundle.sh·scripts/tool_pins.txt가 있는 폴더)> <있는 묶음 폴더>: 스캔만 다시 한다
+if [ "$REPO" = --scan ]; then
+  scan_step "${OUTROOT%/}" "$MODELS" "$(basename "${OUTROOT%/}" | sed 's/^docflow-offline-//')" && exit 0
+  echo "trivy 스캔 실패" >&2; exit 3
+fi
 
 # --refresh <저장소> <있는 묶음 폴더>: 스크립트·매니페스트·문서만 지금 커밋으로 바꾸고 해시를 다시 만든다 (이미지·모델은 그대로).
 # 묶음을 만든 커밋과 지금 커밋 사이에 이미지에 드는 파일(app·Dockerfile·frontend·requirements·이미지 다이제스트가 든 매니페스트)이
@@ -163,12 +186,10 @@ put_scripts "$SRC" "$B"
 } | write_index "$B"
 say "끝: $B ($(du -sh "$B" | cut -f1))"
 
-# ---- 이미지 취약점 스캔: 묶음 안 tar 그대로 (scripts/offline/scan_bundle.sh) ----
-# 레지스트리에서 태그로 다시 받지 않는다 — 묶음에 든 것(앱 이미지·레지스트리 이미지·k3s airgap 이미지)을 trivy --input으로 본다.
-# 결과는 묶음 밖: /root/docflow-trivy-<커밋>/(JSON), <묶음 폴더>/../trivy-<커밋>.tsv(요약). HIGH·CRITICAL이 있어도 멈추지 않는다
-say "trivy 스캔 (묶음 tar)"
-if bash "$SRC/scripts/offline/scan_bundle.sh" "$B" "$SRC" "/root/docflow-trivy-$COMMIT" > /root/docflow-build-trivy.log 2>&1; then
-  cp "/root/docflow-trivy-$COMMIT/summary.tsv" "$OUTROOT/trivy-$COMMIT.tsv"; cat "$OUTROOT/trivy-$COMMIT.tsv"
+# ---- 이미지 취약점 스캔: 묶음 안 tar 그대로 (scripts/offline/scan_bundle.sh, 함수 scan_step) ----
+if scan_step "$B" "$SRC" "$COMMIT"; then
+  say "끝: 묶음·스캔 모두 됨"
 else
-  say "!! trivy 스캔 실패 — /root/docflow-build-trivy.log (묶음은 만들어졌다)"
+  say "!! 묶음은 만들어졌지만 trivy 스캔이 실패했다 — /root/docflow-build-trivy.log. 0이 아닌 값으로 끝낸다"
+  exit 3
 fi

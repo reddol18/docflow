@@ -41,7 +41,10 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
   - trivy는 `scripts/tool_pins.txt` linux-x86_64 줄로 확인한다.
   - 결과는 묶음 밖에 남는다: 요약 `<묶음 폴더>/trivy-<커밋>.tsv`(HIGH·CRITICAL·그중 고친 판 있음), JSON `/root/docflow-trivy-<커밋>/`.
   - HIGH·CRITICAL이 있어도 멈추지 않고 수를 적는다.
-  - 있는 묶음만 다시 볼 때: `sudo bash scripts/offline/scan_bundle.sh <묶음> <저장소> [결과 폴더]`- 결과: `<묶음 폴더>/docflow-offline-<커밋>/`. 내용은 `CONTENTS.txt`, 해시는 `SHA256SUMS`.
+  - 있는 묶음만 다시 볼 때: `sudo bash scripts/offline/build_bundle.sh --scan <저장소> <묶음>` (또는 `scan_bundle.sh <묶음> <저장소> [결과 폴더]`)
+  - 스캔이 실패하면(trivy 해시 불일치·디스크 모자람·이미지 스캔 실패·요약 없음) 묶음은 남기고 `build_bundle.sh`는 3으로 끝난다.
+  - 층은 풀지 않고(`--no-unpack`) 넣고, 시작 전에 디스크 여유를 어림해 모자라면 멈춘다. 끝나면 이미지·내용·스냅숏·임시 tar가 남지 않았는지 적는다.
+- 결과: `<묶음 폴더>/docflow-offline-<커밋>/`. 내용은 `CONTENTS.txt`, 해시는 `SHA256SUMS`.
   - `sha256sum <묶음>/SHA256SUMS` 값을 묶음과 **다른 길**(문서·별도 매체)로 현장에 전한다. 아래 '묶음 확인'에서 쓴다.
 - 스크립트·매니페스트만 고쳤으면 `build_bundle.sh --refresh <저장소> <있는 묶음 폴더>`로 그 부분만 지금 커밋으로 바꾼다.
   - 이미지·모델은 그대로 두고 해시를 다시 만든다.
@@ -66,7 +69,7 @@ sudo SUMS_SHA256=<따로 받은 값> REQUIRE_EGRESS_GUARD=1 bash <묶음>/script
 - 묶음에 심볼릭 링크가 하나라도 있으면 멈춘다. 목록에 있는 이름이라도 링크면 묶음 밖 파일을 가리킬 수 있다.
 - `SHA256SUMS`에 없는 것(파일·장치·FIFO 등 폴더가 아닌 모든 것)이 묶음에 있으면 멈춘다.
   `.deb`·이미지 tar는 폴더째 읽으므로, 끼워 넣은 파일이 root로 설치되지 않게 한다.
-- 옮긴 묶음을 미리 확인만 하려면 `install.sh --verify-only` (1단계까지만).
+- 옮긴 묶음을 미리 확인만 하려면 `install.sh --verify-only` (1단계까지만, root·디스크 확인 없음 — 읽기만 한다).
 
 ```sh
 sudo SUMS_SHA256=<값> REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
@@ -108,7 +111,7 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 
 - 바깥 인터페이스는 `EGRESS_IF`, 없으면 IPv4 기본 경로의 인터페이스다 (`egress_guard.sh`와 같은 방법).
 - tcpdump가 뜨지 못하거나 pcap을 읽지 못하면 '0개'로 적지 않고 오류로 끝난다.
-- pcap은 머리만 담는다(`-s 128`). 증거 폴더는 0700이다. 단 WSL의 `/mnt/<드라이브>`(drvfs)는 chmod가 듣지 않고 Windows 권한을 따르므로, 증거는 리눅스 쪽 폴더에 둔다.
+- pcap은 머리만 담는다(`-s 128`). 버린 DNS만 512바이트(질의 이름). 증거 폴더는 0700이다. 단 WSL의 `/mnt/<드라이브>`(drvfs)는 chmod가 듣지 않고 Windows 권한을 따르므로, 증거는 리눅스 쪽 폴더에 둔다.
 
 증거별로 0이어야 하는 것:
 
@@ -116,17 +119,17 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 |---|---|
 | (b) `egress_guard.sh status` | 시험 동안 `pod-egress`·`node-egress`·`v6-egress` 패킷. 바깥에서 시작된 연결의 응답(conntrack 방향 REPLY, 예: 들어온 ssh)만 `established` 규칙이 먼저 통과시켜 세지 않는다. 노드·파드가 연 연결은 guard를 켜기 전에 맺었더라도 막고 센다. 링크 로컬 멀티캐스트(224.0.0.0/24, ff02::/16)는 `link-local-mcast`로 따로 센다 |
 | (c) `c_conntrack_external.txt` | 노드·파드가 연 연결 중 클러스터·루프백·링크 로컬 멀티캐스트 밖 목적지 |
-| (d) `cni0.count`·`eth0.count`·`nflog.count` | 패킷. eth0은 나가는 방향만 세고 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND처럼 같은 링크에서 끝남)는 뺀다 |
+| (d) `cni0.count`·`eth0.count`·`nflog.count`·`nflogdns.count` | 패킷. eth0은 나가는 방향만 세고 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND처럼 같은 링크에서 끝남)는 뺀다 |
 | Ollama `ollama.ollama_com.count` | ollama.com 접속 시도 줄(주소가 든 실패 로그). 시작 때 설정 출력의 `OLLAMA_REMOTES:[ollama.com]`은 시도가 아니다 |
 | (e) `e_probe.txt` | 바깥 연결이 모두 실패하고, 정책 없는 네임스페이스 파드의 시도만 `pod-egress` 카운터를 올린다 (카운터가 실제로 센다는 증거) |
 
-`node-egress`가 0이 아니면 노드의 어떤 프로세스가 바깥에 묻는 것이다. 무엇을 묻는지는 NFLOG로 본다:
+`node-egress`가 0이 아니면 노드의 어떤 프로세스가 바깥에 묻는 것이다.
+무엇을 보내려 했는지는 `egress_guard.sh`가 버리기 전에 남긴 사본으로 본다 (`evidence.sh capture-start`가 받는다).
 
-```sh
-iptables -t mangle -I DOCFLOW-EGRESS 1 -j NFLOG --nflog-group 5
-timeout 60 tcpdump -n -i nflog:5 -vv
-iptables -t mangle -D DOCFLOW-EGRESS -j NFLOG --nflog-group 5
-```
+- `nflog.flows.txt`: 출발·목적지.
+- `nflog.dns.txt`: DNS 질의 이름.
+- 사본은 커널이 자른다. DNS(포트 53)는 512바이트까지(이름이 잘리지 않게, NFLOG 그룹 6), 그 밖은 128바이트까지(머리만, 그룹 5)다.
+  guard 전에 열어 둔 연결로 보내려던 본문이 증거에 남지 않게 한다.
 
 2026-11-21 시험에서는 Ubuntu 기본 `systemd-timesyncd`가 `ntp.ubuntu.com`을 물었다. 그래서 `OS_QUIET=1`을 둔다.
 
