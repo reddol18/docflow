@@ -1,0 +1,86 @@
+# 폐쇄망(인터넷 없음) 설치용 덧씌움 (https://github.com/reddol18/docflow/issues/81). 기본은 k8s/docs.yaml 그대로 두고 바꿀 곳만:
+#   - LLM·임베딩: LLM_PROVIDER=local → 같은 클러스터 llm 네임스페이스의 Ollama (llm.yaml). 모델 4가지 모두 로컬
+#       추출·답변 qwen2.5:7b, 손글씨 칸 qwen2.5vl:7b, 임베딩 bge-m3(1024차원 → Qdrant 모음 documents_bge-m3_1024, app/store.py)
+#   - 바깥 송신: docflow-egress의 공인 IP 443 규칙을 빼고 Ollama 11434만 연다. 데모 Keycloak 규칙·hostAliases·OIDC 설정을 뺀다
+#     (로그인은 local만)
+#   - CoreDNS: 클러스터 바깥 이름을 위쪽 DNS로 넘기지 않는다 (coredns.yaml — 설치 스크립트가 kube-system에 따로 넣는다)
+# k8s/docs.yaml이 이 폴더 밖에 있어 kustomize 기본 제한에 걸린다 → 묶음 만들 때 한 번 풀어 둔다:
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/offline > docflow-offline.yaml   (scripts/offline/build_bundle.sh)
+# 설치 절차: docs/offline_install.md
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../docs.yaml
+  - llm.yaml
+patches:
+  # API·워커 LLM 설정을 폐쇄망 값으로 — 두 곳이 같아야 한다 (k8s/docs.yaml 주석과 같음).
+  # LLM_TIMEOUT_SECONDS: GPU 없이 CPU로 7B를 돌리면 추출 한 번이 1~3분 걸린다 (app/llm.py local_timeout).
+  # 패치를 따로 파일로 두면 trivy가 낱개 Deployment로 읽어 보안 설정 없음(KSV-0118)으로 잡는다 — 여기 글로 둔다
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: docflow, namespace: docs}
+      spec:
+        template:
+          spec:
+            containers:
+            - name: docflow
+              env:
+              - {name: LLM_PROVIDER, value: "local"}
+              - {name: LLM_BASE_URL, value: "http://ollama.llm.svc.cluster.local:11434/v1"}
+              - {name: EXTRACT_MODEL, value: "qwen2.5:7b"}
+              - {name: CHAT_MODEL, value: "qwen2.5:7b"}
+              - {name: CELL_MODEL, value: "qwen2.5vl:7b"}
+              - {name: EMBED_MODEL, value: "bge-m3"}
+              - {name: EMBED_DIM, value: "1024"}
+              - {name: LLM_TIMEOUT_SECONDS, value: "900"}
+              - {name: AUTH_MODES, value: "local"}
+              - {name: OIDC_ISSUER, $patch: delete}
+              - {name: OIDC_ALLOW_HTTP, $patch: delete}
+              - {name: OIDC_CLIENT_ID, $patch: delete}
+              - {name: OIDC_CLIENT_SECRET_FILE, $patch: delete}
+              - {name: OIDC_REDIRECT_URI, $patch: delete}
+              - {name: OIDC_ROLE_CLAIM, $patch: delete}
+              - {name: OIDC_ROLE_MAP, $patch: delete}
+              - {name: OIDC_DEFAULT_ROLE, $patch: delete}
+              - {name: OIDC_LABEL, $patch: delete}
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: docflow-worker, namespace: docs}
+      spec:
+        template:
+          spec:
+            containers:
+            - name: worker
+              env:
+              - {name: LLM_PROVIDER, value: "local"}
+              - {name: LLM_BASE_URL, value: "http://ollama.llm.svc.cluster.local:11434/v1"}
+              - {name: EXTRACT_MODEL, value: "qwen2.5:7b"}
+              - {name: CHAT_MODEL, value: "qwen2.5:7b"}
+              - {name: CELL_MODEL, value: "qwen2.5vl:7b"}
+              - {name: EMBED_MODEL, value: "bge-m3"}
+              - {name: EMBED_DIM, value: "1024"}
+              - {name: LLM_TIMEOUT_SECONDS, value: "900"}
+  # 바깥 443 규칙(egress 4번째 칸)을 Ollama로 바꾼다. 다른 칸(postgres·qdrant·redis)은 그대로
+  - target: {kind: NetworkPolicy, name: docflow-egress, namespace: docs}
+    patch: |-
+      - op: test
+        path: /spec/egress/3/ports/0/port
+        value: 443
+      - op: replace
+        path: /spec/egress/3
+        value:
+          to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: llm}}, podSelector: {matchLabels: {app: ollama}}}]
+          ports: [{protocol: TCP, port: 11434}]
+  # 데모 Keycloak 없음 (AUTH_MODES=local)
+  - target: {kind: NetworkPolicy, name: docflow-to-keycloak, namespace: docs}
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata: {name: docflow-to-keycloak, namespace: docs}
+  - target: {kind: Deployment, name: docflow, namespace: docs}
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/hostAliases

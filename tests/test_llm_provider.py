@@ -560,3 +560,20 @@ def test_off_search_and_ask_unavailable(monkeypatch, fake_openai, ask_inline):
     req = SimpleNamespace(method="GET", url=SimpleNamespace(path="/search"))
     r = asyncio.run(main.llm_off(req, llm.LLMOff("LLM_PROVIDER=off")))
     assert r.status_code == 503 and b"LLM_PROVIDER" not in r.body and errors.MESSAGES["llm_off"].encode() in r.body
+
+
+# ---------- local 시간 제한 (https://github.com/reddol18/docflow/issues/81 — CPU만으로 도는 폐쇄망 설치) ----------
+
+def test_local_timeout_default_and_env(monkeypatch, fake_openai):
+    assert llm.local_timeout({}) == 120
+    assert llm.local_timeout({"LLM_TIMEOUT_SECONDS": "600"}) == 600
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "900")
+    use(monkeypatch, LOCAL)
+    llm.client()
+    assert fake_openai.made[-1]["timeout"] == 900 and fake_openai.made[-1]["base_url"] == LOCAL["LLM_BASE_URL"]
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "inf", "nan"])
+def test_local_timeout_bad_stops_at_start(bad):
+    with pytest.raises(llm.ProviderConfigError, match="LLM_TIMEOUT_SECONDS"):
+        llm.load_provider({**LOCAL, "LLM_TIMEOUT_SECONDS": bad})

@@ -3,6 +3,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -20,7 +21,71 @@ from app.workflow import CONFIRMED
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 PG_URL = os.environ.get("PG_URL", "postgresql://docflow@postgres:5432/docflow")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-COLLECTION = "documents"
+
+# ---------- 임베딩 모델·차원 → Qdrant 모음 (https://github.com/reddol18/docflow/issues/81, docs/design.md '임베딩 비교') ----------
+# EMBED_MODEL(app/llm.py와 같은 환경변수)과 EMBED_DIM(벡터 차원)으로 모음을 고른다.
+#   기본(openai text-embedding-3-small, 1536)  → 지금 이름 'documents' 그대로 — 지금 배포는 설정을 바꾸지 않아도 같은 모음을 쓴다
+#   그 밖(예: local bge-m3, 1024)            → 'documents_<모델>_<차원>' (예: documents_bge-m3_1024). 새 모음이라 비어서 시작한다
+# 모델 이름은 정규화한다: 앞뒤 빈칸·끝의 ':latest'를 뗀다 (Ollama에서 bge-m3와 bge-m3:latest는 같은 모델 — 다른 모음이 생기지 않게).
+# 기본 모델이 아니면 EMBED_DIM이 꼭 있어야 한다 (모르는 차원을 1536으로 짐작하지 않는다). 기본 모델은 1536만 받는다 —
+# OpenAI에 dimensions=를 보내지 않으므로 다른 값이면 벡터 길이가 맞지 않는다.
+# 시작할 때(init → ensure_collection) 모음이 이미 있으면 차원과 모음에 적어 둔 모델 이름(metadata embed_model)이 설정과 같은지 보고,
+# 다르면 멈춘다 (모델 이름을 이름 조각(slug)으로 바꾸면 다른 모델이 같은 이름이 될 수 있어서). 예전 운영 모음 'documents'는
+# 메타데이터가 없어 차원만 본다(그대로 동작). 실제 벡터 길이는 app/llm.py embed가 EMBED_DIM과 견준다(다르면 멈춤).
+# 모델을 바꾸면 예전 모음은 지우지 않고 남긴다(되돌리기용). 새 모음은 철을 다시 돌려 채운다 — docs/offline_install.md '임베딩 모델 바꾸기'
+DEFAULT_EMBED_MODEL, DEFAULT_EMBED_DIM = "text-embedding-3-small", 1536
+LEGACY_COLLECTION = "documents"
+
+
+class EmbedConfigError(RuntimeError):
+    """임베딩 모델·차원 설정이 틀렸거나 Qdrant 모음·실제 벡터와 맞지 않음 — 시작(또는 그 작업)을 멈춘다"""
+
+
+def normalize_model(model):
+    """모델 이름 정규화: 앞뒤 빈칸, 끝의 ':latest'를 뗀다 (bge-m3:latest → bge-m3)"""
+    m = (model or "").strip()
+    return m[:-len(":latest")] if m.endswith(":latest") else m
+
+
+def embed_config(env=os.environ):
+    """환경변수 → (임베딩 모델(정규화), 차원, 모음 이름). 모델은 EMBED_MODEL, 없으면 openai·off 제공자의 기본 모델.
+    local 제공자는 EMBED_MODEL이 꼭 있어야 하고(app/llm.py require_models와 같은 조건), 기본 모델이 아니면 EMBED_DIM도 꼭.
+    기본 모델은 1536만"""
+    provider = (env.get("LLM_PROVIDER") or "openai").strip().lower()
+    model = normalize_model(env.get("EMBED_MODEL"))
+    if not model:
+        if provider == "local":
+            raise EmbedConfigError("LLM_PROVIDER=local이면 EMBED_MODEL 필요")
+        model = DEFAULT_EMBED_MODEL
+    raw = (env.get("EMBED_DIM") or "").strip()
+    if raw:
+        try:
+            dim = int(raw)
+        except ValueError:
+            raise EmbedConfigError(f"EMBED_DIM은 양의 정수 (받은 값: {raw!r})") from None
+        if dim <= 0:
+            raise EmbedConfigError(f"EMBED_DIM은 양의 정수 (받은 값: {raw!r})")
+        if model == DEFAULT_EMBED_MODEL and dim != DEFAULT_EMBED_DIM:
+            raise EmbedConfigError(f"EMBED_MODEL={model}은 {DEFAULT_EMBED_DIM}차원만 (받은 EMBED_DIM={dim}) — "
+                                   "dimensions=로 줄이는 설정은 지원하지 않는다")
+    elif model == DEFAULT_EMBED_MODEL:
+        dim = DEFAULT_EMBED_DIM
+    else:
+        raise EmbedConfigError(f"EMBED_MODEL={model}이면 EMBED_DIM(벡터 차원, 예: bge-m3 1024) 필요")
+    return model, dim, collection_name(model, dim)
+
+
+def collection_name(model, dim):
+    """기본(text-embedding-3-small, 1536)은 'documents'(지금 이름), 그 밖은 'documents_<모델>_<차원>'.
+    모델 이름은 정규화한 뒤, 영숫자·'-'·'_' 밖의 글자(':', '/', '.')는 '-'로 바꾼다 (예: qwen3-embedding:0.6b → qwen3-embedding-0-6b).
+    이렇게 바꾼 이름은 다른 모델과 겹칠 수 있어 모음 메타데이터(embed_model)에 원래 이름을 적고 시작할 때 견준다"""
+    model = normalize_model(model)
+    if (model, dim) == (DEFAULT_EMBED_MODEL, DEFAULT_EMBED_DIM):
+        return LEGACY_COLLECTION
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", model).strip("-") or "model"
+    return f"{LEGACY_COLLECTION}_{slug}_{dim}"
+
+EMBED_MODEL, EMBED_DIM, COLLECTION = embed_config()
 KST = dt.timezone(dt.timedelta(hours=9))
 PG_TLS_MODES = ("require", "verify-ca", "verify-full")
 
@@ -370,17 +435,79 @@ def prune_audit():
         return c.execute("DELETE FROM audit WHERE ts < now() - %s::interval", (AUDIT_KEEP,)).rowcount
 
 
+def collection_dim(q, name):
+    """있는 모음의 벡터 차원. 이름 붙은 벡터 여러 개(dict) 모음은 우리가 만든 모양이 아니라 멈춘다"""
+    vectors = q.get_collection(name).config.params.vectors
+    size = getattr(vectors, "size", None)
+    if size is None:
+        raise EmbedConfigError(f"Qdrant 모음 '{name}'의 벡터 설정을 읽을 수 없음 (이름 붙은 벡터 모음?) — 시작을 멈춘다")
+    return size
+
+
+def collection_model(q, name):
+    """모음 메타데이터에 적어 둔 임베딩 모델 이름 (없으면 None — 예전 운영 모음 'documents'처럼 이 기능 전에 만든 모음)"""
+    meta = getattr(q.get_collection(name).config, "metadata", None) or {}
+    return meta.get("embed_model")
+
+
+def ensure_collection(q, name=None, dim=None, model=None):
+    """모음이 없으면 dim 차원으로 만들고(메타데이터에 모델 이름·차원) True. 있으면 차원과 적어 둔 모델 이름이 설정과 같은지 보고
+    (다르면 EmbedConfigError) False. 메타데이터가 없는 모음은 차원만 본다 (예전 운영 'documents'는 그대로 동작).
+    새로 만들 때 예전 기본 모음('documents')이 따로 남아 있으면 알린다 — 그 벡터는 새 모음에 옮겨지지 않는다"""
+    name = name or COLLECTION
+    dim = dim or EMBED_DIM
+    model = normalize_model(model or EMBED_MODEL)
+    if q.collection_exists(name):
+        have = collection_dim(q, name)
+        if have != dim:
+            raise EmbedConfigError(
+                f"Qdrant 모음 '{name}'은 {have}차원인데 설정(EMBED_MODEL={model}, EMBED_DIM={dim})은 {dim}차원 — "
+                "시작을 멈춘다. 모델에 맞는 EMBED_DIM을 주거나, 모델을 바꿨다면 모음 이름이 달라지므로 EMBED_MODEL을 확인한다 "
+                "(docs/offline_install.md '임베딩 모델 바꾸기')")
+        written = collection_model(q, name)
+        if written is not None and normalize_model(written) != model:
+            raise EmbedConfigError(
+                f"Qdrant 모음 '{name}'은 모델 {written!r}로 만든 것인데 설정은 EMBED_MODEL={model!r} — 이름 조각이 겹친 다른 모델이라 "
+                "섞지 않고 시작을 멈춘다 (docs/offline_install.md '임베딩 모델 바꾸기')")
+        if written is None and name != LEGACY_COLLECTION:
+            print(f"qdrant: 모음 '{name}'에 모델 이름 메타데이터가 없다 (이 기능 전에 만든 모음) — 차원만 확인했다", flush=True)
+        return False
+    from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
+    q.create_collection(name, vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                        metadata={"embed_model": model, "embed_dim": dim})
+    q.create_payload_index(name, "year", PayloadSchemaType.INTEGER)
+    q.create_payload_index(name, "vol", PayloadSchemaType.KEYWORD)
+    if name != LEGACY_COLLECTION and q.collection_exists(LEGACY_COLLECTION):
+        print(f"qdrant: 새 모음 '{name}'({dim}차원)을 만들었다. 예전 모음 '{LEGACY_COLLECTION}'은 그대로 둔다 — "
+              "검색은 새 모음만 보므로 철을 다시 돌려 채운다 (docs/offline_install.md '임베딩 모델 바꾸기')", flush=True)
+    return True
+
+
+def off_mode_warning(q, env=os.environ):
+    """LLM_PROVIDER=off인데 EMBED_MODEL·EMBED_DIM이 비어 기본 모음('documents')을 보고 있고, 기본 아닌 모음
+    (documents_<모델>_<차원>)이 따로 있으면 경고 글. off 모드는 다시 색인·수정한 문서의 벡터를 지금 모음에서만 지우므로
+    local에서 off로 바꾸며 EMBED_*를 지우면 기본 아닌 모음에 옛 벡터가 남는다 (docs/offline_install.md '임베딩 모델 바꾸기')"""
+    if (env.get("LLM_PROVIDER") or "").strip().lower() != "off" or COLLECTION != LEGACY_COLLECTION:
+        return None
+    if (env.get("EMBED_MODEL") or "").strip() or (env.get("EMBED_DIM") or "").strip():
+        return None
+    others = sorted(c.name for c in q.get_collections().collections if c.name.startswith(LEGACY_COLLECTION + "_"))
+    if not others:
+        return None
+    return (f"qdrant: LLM_PROVIDER=off인데 EMBED_MODEL·EMBED_DIM이 비어 기본 모음 '{LEGACY_COLLECTION}'을 본다. 기본 아닌 모음 "
+            f"{others}이 남아 있다 — off에서 지우는 벡터는 '{LEGACY_COLLECTION}'에서만 지워진다. 그 모음을 쓰던 설치면 "
+            "EMBED_MODEL·EMBED_DIM을 그대로 두고 LLM_PROVIDER만 off로 바꾼다")
+
+
 def init():
     init_db()
     q = qdrant()
-    if not q.collection_exists(COLLECTION):
-        from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
-        q.create_collection(COLLECTION, vectors_config=VectorParams(size=1536, distance=Distance.COSINE))
-        q.create_payload_index(COLLECTION, "year", PayloadSchemaType.INTEGER)
-        q.create_payload_index(COLLECTION, "vol", PayloadSchemaType.KEYWORD)
-    elif not migration_done(DOC_KEY_MIGRATION):
+    print(f"qdrant: 모음 '{COLLECTION}' (임베딩 {EMBED_MODEL}, {EMBED_DIM}차원)", flush=True)
+    warn = off_mode_warning(q)
+    if warn:
+        print(warn, file=sys.stderr, flush=True)
+    if not ensure_collection(q) and not migration_done(DOC_KEY_MIGRATION):
         migrate_vectors()  # 예전 키(doc_id)의 점을 (vol, doc_id)로. 완료 표시는 main.startup_migrate가 행 바로잡기 뒤에 남긴다
-
 
 _USAGE_INSERT = "INSERT INTO usage (vol, kind, model, tin, tout, usd, scope, user_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)"
 

@@ -34,6 +34,7 @@ def env(pg_store, monkeypatch, tmp_path):
     q = QdrantClient(":memory:")
     q.create_collection(store.COLLECTION, vectors_config=VectorParams(size=2, distance=Distance.COSINE))
     monkeypatch.setattr(store, "qdrant", lambda: q)
+    monkeypatch.setattr(store, "EMBED_DIM", 2)  # 위 2차원 모음 — store.init()의 차원 확인(issues/81)이 이 값과 견준다
     with store.pool.connection() as c:
         for t in TABLES:
             c.execute(f"DELETE FROM {t}")  # noqa: S608 — 고정된 표 이름

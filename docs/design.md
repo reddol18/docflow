@@ -294,7 +294,7 @@ AI Hub 자료는 이 PC 밖으로 보내지 않으므로 OpenAI 기준은 합성
 - qwen3-embedding은 질의 앞에 지시문(`Instruct: … Query:`)을 붙이라고 권하는데 운영과 같게 붙이지 않고 쟀다 — 8b의 낮은 점수는 그 영향일 수 있다.
 - **한계:** 합성 문서는 사건 종류 5가지·회사 6곳뿐이라 쉽고, 질의도 같은 사람이 생성기 낱말을 보고 지었다. 실제 기록물 비교는 AI Hub 7철 질의 세트(`eval/data/search_queries.jsonl`)로 이 PC 안에서만 한다(후속).
 - **파드가 필요한 임베딩 후보는 없다.** 셋 다 이 PC GPU에서 돌았다(8b도 4.7GB). multilingual-e5-large 등 Ollama 공식 목록에 없는 모델은 OpenAI 호환 서버(TEI 등)를 띄워 같은 스크립트(`--base-url`)로 잰다.
-- **Qdrant 차원 처리 방안 (채택할 때):** 모음 이름에 모델·차원을 넣어 새로 만든다(예: `documents_bge-m3_1024`, 차원은 설정값 `EMBED_DIM`). 시작할 때 모음 차원과 설정 차원이 다르면 멈춘다(지금은 넣을 때 Qdrant가 거절).
+- **Qdrant 차원 처리 (https://github.com/reddol18/docflow/issues/81에서 구현, `app/store.py` `embed_config`·`ensure_collection`):** 모음 이름에 모델·차원을 넣어 새로 만든다(예: `documents_bge-m3_1024`, 차원은 설정값 `EMBED_DIM`). 기본 설정(text-embedding-3-small, 1536)만 지금 이름 `documents`를 그대로 써서 지금 배포는 설정을 바꾸지 않아도 같은 모음을 쓴다. 기본 모델이 아니면 `EMBED_DIM`이 꼭 있어야 하고, 시작할 때 모음 차원과 설정 차원이 다르면 멈춘다. 모델을 바꾸면 예전 모음은 남기고 새 모음은 철을 다시 돌려 채운다(`docs/offline_install.md` '임베딩 모델 바꾸기'). 아래 별칭 전환은 아직 구현하지 않았다.
   새 모음은 Postgres 색인(`documents`)에서 다시 임베딩해 채운 뒤 별칭(`documents` alias)을 새 모음으로 바꾸고, 예전 모음은 되돌리기용으로 두었다가 지운다.
   1536으로 0을 채워 맞추는 방법은 코사인 값은 같지만 모델이 섞여도 막지 못하고 공간만 늘어 쓰지 않는다. 측정은 지금처럼 메모리 안에서 해 운영 모음을 건드리지 않는다.
 - **비용:** OpenAI $0.00047 (문서 49건 + 질의 20개, 23,634토큰).
