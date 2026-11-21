@@ -7,6 +7,8 @@
 #   OS_QUIET=1              OS가 스스로 바깥에 묻는 서비스(시간 동기화·apt·motd 타이머)를 끈다 (아래 2단계 설명)
 #   NEED_ROOT_GB            / 여유 하한 (기본 45GB: 이미지 풀기·모델·데이터)
 #   ADMIN_USER              첫 관리자 이름 (기본 admin). 비밀번호는 무작위로 만들어 /root/docflow-admin-password(0600)에만 둔다
+#   SUMS_SHA256             (선택) SHA256SUMS 파일 자체의 sha256. 묶음과 다른 길(문서·전화·별도 매체)로 받은 값을 주면
+#                           설치 전에 견주고 다르면 멈춘다 — 묶음 안의 SHA256SUMS까지 함께 바꿔치기한 경우를 막는다
 # 절차·되돌리기: docs/offline_install.md
 set -euo pipefail
 B=${BUNDLE:-$(cd "$(dirname "$0")/.." && pwd)}
@@ -21,8 +23,19 @@ free_gb() { df -P -BG "$1" | awk 'NR==2 {gsub("G","",$4); print $4}'; }
 have=$(free_gb /); say "디스크 / 여유 ${have}GB (필요 ${NEED_ROOT_GB}GB)"
 [ "$have" -ge "$NEED_ROOT_GB" ] || { echo "디스크 모자람 — 멈춤" >&2; exit 1; }
 
-say "1/9 묶음 확인 (sha256sum -c)"
-(cd "$B" && sha256sum --quiet -c SHA256SUMS)
+say "1/9 묶음 확인 (SHA256SUMS 자체 → 목록 밖 파일 없음 → sha256sum -c)"
+sums=$(sha256sum "$B/SHA256SUMS" | cut -d' ' -f1)
+if [ -n "${SUMS_SHA256:-}" ]; then
+  [ "$sums" = "$(printf '%s' "$SUMS_SHA256" | tr 'A-F' 'a-f')" ] \
+    || { echo "SHA256SUMS 해시가 따로 받은 값(SUMS_SHA256)과 다름 — 묶음이 바뀌었다, 멈춤" >&2; exit 1; }
+  say "  SHA256SUMS 해시 = SUMS_SHA256 (일치)"
+else
+  say "  SHA256SUMS 해시 $sums (SUMS_SHA256를 주지 않아 견주지 않음 — docs/offline_install.md '묶음 확인')"
+fi
+# 목록에 없는 파일이 끼어 있으면 멈춘다 — debs/*.deb·images/*.tar.zst를 glob으로 읽으므로 끼워 넣은 파일이 root로 설치될 수 있다
+extra=$(cd "$B" && comm -13 <(sed -E 's/^[0-9a-f]{64} [ *]//' SHA256SUMS | sort) <(find . -type f ! -name SHA256SUMS -printf '%P\n' | sort))
+[ -z "$extra" ] || { echo "SHA256SUMS에 없는 파일이 묶음에 있음 — 멈춤:" >&2; printf '  %s\n' $extra >&2; exit 1; }
+(cd "$B" && sha256sum --quiet --strict -c SHA256SUMS)
 
 say "2/9 도구 .deb (없는 것만)"
 missing=()
@@ -55,7 +68,7 @@ install -m 0755 "$B/k3s/k3s" /usr/local/bin/k3s
 mkdir -p /var/lib/rancher/k3s/agent/images /etc/rancher/k3s
 cp "$B/k3s/k3s-airgap-images-amd64.tar.zst" "$B"/images/*.tar.zst /var/lib/rancher/k3s/agent/images/
 {
-  echo "write-kubeconfig-mode: \"644\""
+  # kubeconfig(/etc/rancher/k3s/k3s.yaml, cluster-admin)는 k3s 기본 0600 그대로 — 노드의 다른 사용자가 읽지 못하게 (root로 쓴다)
   echo "disable: [traefik]"
   # cgroup v1만 있는 커널(예: WSL 기본 5.15)은 kubelet이 거부한다 — 그때만 허용 (2026-11-21 결정: 이 우회를 유지)
   if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then echo "kubelet-arg: [\"fail-cgroupv1=false\"]"; fi
@@ -68,15 +81,17 @@ $K get nodes -o wide
 say "4/9 CoreDNS: 바깥 이름을 위쪽 DNS로 넘기지 않게"
 for i in $(seq 1 90); do $K -n kube-system get cm coredns >/dev/null 2>&1 && $K -n kube-system get deploy coredns >/dev/null 2>&1 && break; sleep 2; done
 touch /var/lib/rancher/k3s/server/manifests/coredns.yaml.skip   # k3s가 기본 Corefile로 되돌리지 않게
-python3 -c 'import json,sys; print(json.dumps({"data": {"Corefile": open(sys.argv[1]).read()}}))' "$B/manifests/Corefile" > /tmp/corefile-patch.json
-$K -n kube-system patch configmap coredns --type merge --patch-file /tmp/corefile-patch.json >/dev/null
-rm -f /tmp/corefile-patch.json
+P=$(mktemp); trap 'rm -f "$P"' EXIT   # 고정 이름(/tmp/…)을 쓰지 않는다 — 다른 사용자가 먼저 만들거나 링크를 걸 수 없게
+python3 -I -c 'import json,sys; print(json.dumps({"data": {"Corefile": open(sys.argv[1]).read()}}))' "$B/manifests/Corefile" > "$P"
+$K -n kube-system patch configmap coredns --type merge --patch-file "$P" >/dev/null
+rm -f "$P"
 $K -n kube-system rollout restart deploy/coredns >/dev/null
 $K -n kube-system rollout status deploy/coredns --timeout=300s
 
 say "5/9 모델 풀기 → $MODEL_DIR"
 mkdir -p "$MODEL_DIR"
 tar -C "$MODEL_DIR" -xf "$B/models/ollama-models.tar"
+mkdir -p "$MODEL_DIR/manifests-v2" "$MODEL_DIR/metadata"   # k8s/offline/llm.yaml이 emptyDir로 덮는 마운트 지점 (모델 폴더는 읽기 전용)
 chown -R 1000:1000 "$MODEL_DIR"; chmod -R a+rX "$MODEL_DIR"
 du -sh "$MODEL_DIR"
 

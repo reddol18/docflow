@@ -25,6 +25,10 @@ OLLAMA_MODELS_WANT=${OLLAMA_MODELS_WANT:-"library/qwen2.5:7b library/qwen2.5vl:7
 NEED_OUT_GB=${NEED_OUT_GB:-30}   # 묶음 약 20GB + 여유
 NEED_ROOT_GB=${NEED_ROOT_GB:-25} # docker 빌드 층·k3s containerd 내용·임시 파일
 DEB_PKGS=${DEB_PKGS:-"iptables conntrack tcpdump"}
+# k3s 설치 스크립트: get.k3s.io(받을 때마다 바뀜)가 아니라 그 판의 태그에 있는 install.sh를 받아 고정 해시와 견준다.
+# K3S_VERSION을 바꾸면 이 해시도 함께 바꾼다 (raw.githubusercontent.com/k3s-io/k3s/<판>/install.sh를 받아 sha256)
+K3S_INSTALL_SHA256_DEFAULT_FOR="v1.37.2+k3s1"
+K3S_INSTALL_SHA256=${K3S_INSTALL_SHA256:-$([ "$K3S_VERSION" = "$K3S_INSTALL_SHA256_DEFAULT_FOR" ] && echo ed01f89fd977bf20ac1516bbebf8370bf3ddbaa55dac8aba610956a4c78cc00b || true)}
 
 say() { printf '[build %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 free_gb() { df -P -BG "$1" | awk 'NR==2 {gsub("G","",$4); print $4}'; }
@@ -38,10 +42,12 @@ put_scripts() { # 소스 폴더 → 묶음: 풀어 둔 매니페스트·Corefile
   cp "$1/docs/offline_install.md" "$2/"
 }
 write_index() { # 묶음 폴더, 머리 글(표준 입력) → CONTENTS.txt·SHA256SUMS
+  # 목록은 묶음 밖 임시 파일에 만든 뒤 옮긴다 (묶음 안에 만들면 그 임시 파일 자신이 목록·합계에 들어간다)
+  local tmp; tmp=$(mktemp)
   { cat; echo; echo "파일 (바이트):"
     (cd "$1" && find . -type f ! -name SHA256SUMS ! -name CONTENTS.txt -printf '%s\t%P\n' | sort -k2)
-    echo; echo "합계: $(du -sb "$1" | cut -f1) 바이트 ($(du -sh "$1" | cut -f1))"; } > "$1/CONTENTS.txt.new"
-  mv "$1/CONTENTS.txt.new" "$1/CONTENTS.txt"
+    echo; echo "합계(CONTENTS.txt·SHA256SUMS 빼고): $(cd "$1" && find . -type f ! -name SHA256SUMS ! -name CONTENTS.txt -printf '%s\n' | awk '{s+=$1} END {print s}') 바이트"; } > "$tmp"
+  mv "$tmp" "$1/CONTENTS.txt"; chmod 0644 "$1/CONTENTS.txt"
   (cd "$1" && find . -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs -d '\n' sha256sum > SHA256SUMS)
 }
 
@@ -86,7 +92,12 @@ say "k3s $K3S_VERSION 받기"
 u="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION//+/%2B}"
 for f in k3s k3s-airgap-images-amd64.tar.zst sha256sum-amd64.txt; do curl -fsSL -o "$B/k3s/$f" "$u/$f"; done
 ( cd "$B/k3s" && grep -E ' (k3s|k3s-airgap-images-amd64\.tar\.zst)$' sha256sum-amd64.txt | sha256sum -c - )
-curl -fsSL -o "$B/k3s/install.sh" https://get.k3s.io
+[ -n "$K3S_INSTALL_SHA256" ] || { echo "K3S_VERSION=$K3S_VERSION의 install.sh 해시(K3S_INSTALL_SHA256)를 준다" >&2; exit 1; }
+curl -fsSL -o "$B/k3s/install.sh" "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION//+/%2B}/install.sh"
+echo "$K3S_INSTALL_SHA256  $B/k3s/install.sh" | sha256sum -c - >/dev/null \
+  || { echo "k3s install.sh 해시가 고정값과 다름 — 멈춤" >&2; exit 1; }
+say "k3s install.sh: 태그 $K3S_VERSION, sha256 일치"
+curl -fsSL -o "$SRC/k3s-images.txt" "$u/k3s-images.txt"   # airgap 이미지 목록 (아래 trivy 스캔용, 묶음에는 넣지 않음)
 chmod +x "$B/k3s/k3s" "$B/k3s/install.sh"
 
 # ---- 앱 이미지 (docker 빌드 → save) ----
@@ -113,6 +124,42 @@ for ref in "${REFS[@]}"; do
   k3s ctr -n k8s.io images pull --platform linux/amd64 "$full" >/dev/null
   k3s ctr -n k8s.io images export --platform linux/amd64 - "$full" | zstd -q -T0 -10 -o "$B/images/$name.tar.zst"
 done
+
+# ---- 이미지 취약점 스캔 (trivy image) — 레지스트리 이미지(ollama 포함)·k3s airgap 이미지 ----
+# 결과는 묶음 밖에 둔다: /root/docflow-trivy-<커밋>/(JSON)·<묶음 폴더>/../trivy-<커밋>.txt(요약). HIGH·CRITICAL이 있어도 멈추지 않고 수를 보고한다.
+# trivy는 scripts/tool_pins.txt의 linux-x86_64 줄(판·자산·실행 파일 해시)로 받고 확인한다. 취약점 DB는 이때 받는다(빌드는 온라인)
+trivy_bin() {
+  local pin ver asset asha exe esha dir
+  pin=$(tr -d '\r' < "$SRC/scripts/tool_pins.txt" | awk '$1 == "trivy" && $3 == "linux-x86_64"')
+  [ "$(printf '%s\n' "$pin" | grep -c .)" = 1 ] || { echo "tool_pins.txt에 trivy linux-x86_64 줄이 하나여야 함" >&2; return 1; }
+  read -r _ ver _ _ asset asha exe esha <<< "$pin"
+  dir=/root/.cache/docflow-tools/trivy-$ver; mkdir -p "$dir"
+  if ! echo "$esha  $dir/$exe" | sha256sum -c - >/dev/null 2>&1; then
+    curl -fsSL -o "$dir/$asset" "https://github.com/aquasecurity/trivy/releases/download/v$ver/$asset"
+    echo "$asha  $dir/$asset" | sha256sum -c - >/dev/null || { echo "trivy 자산 해시 다름 — 실행하지 않음" >&2; return 1; }
+    tar -xzf "$dir/$asset" -C "$dir" "$exe"
+  fi
+  echo "$esha  $dir/$exe" | sha256sum -c - >/dev/null || { echo "trivy 실행 파일 해시 다름 — 실행하지 않음" >&2; return 1; }
+  echo "$dir/$exe"
+}
+TRIVY=$(trivy_bin)
+TD=/root/docflow-trivy-$COMMIT; mkdir -p "$TD"
+TSUM="$OUTROOT/trivy-$COMMIT.txt"
+{ echo "trivy image 스캔 — 묶음 커밋 $COMMIT, $(date -Iseconds), $("$TRIVY" --version | head -1)"
+  echo "이미지	HIGH	CRITICAL"; } > "$TSUM"
+mapfile -t SCAN < <( { printf '%s\n' "${REFS[@]}"; tr -d '\r' < "$SRC/k3s-images.txt"; } | grep -v '^$' )
+for ref in "${SCAN[@]}"; do
+  out="$TD/$(echo "$ref" | tr '/:@' '___').json"
+  say "trivy 스캔 $ref"
+  if "$TRIVY" image --quiet --platform linux/amd64 --scanners vuln --severity HIGH,CRITICAL --format json -o "$out" "$ref" >> /root/docflow-build-trivy.log 2>&1; then
+    printf '%s\t%s\t%s\n' "$ref" \
+      "$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$out")" \
+      "$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$out")" >> "$TSUM"
+  else
+    printf '%s\t스캔 실패\t(/root/docflow-build-trivy.log)\n' "$ref" >> "$TSUM"
+  fi
+done
+say "trivy 요약: $TSUM"; cat "$TSUM"
 
 # ---- Ollama 모델 (읽기만) ----
 say "모델: $OLLAMA_MODELS_WANT"

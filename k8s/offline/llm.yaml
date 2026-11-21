@@ -64,13 +64,19 @@ spec:
         readinessProbe: {httpGet: {path: /api/version, port: 11434}, periodSeconds: 10}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
-        # 쓰기 가능: Ollama 0.40은 시작·목록 때 manifests-v2 폴더를 만든다 (읽기 전용이면 'mkdir /models/manifests-v2: read-only
-        # file system'으로 모델을 못 읽음 — 2026-11-21 WSL 시험). 받기는 바깥 길이 없어 어차피 실패한다
-        - {name: models, mountPath: /models}
+        # 모델(blobs·manifests)은 읽기 전용 — Ollama가 뚫려도 모델 파일을 바꾸지 못하게 (보안 리뷰 #11).
+        # Ollama 0.40이 쓰는 두 곳만 emptyDir로 덮는다: manifests-v2(시작·목록 때 만듦 — 없으면 'mkdir /models/manifests-v2:
+        # read-only file system'으로 모델을 못 읽음)와 metadata(모델 정보 캐시). 둘 다 다시 만들 수 있다.
+        # 마운트 지점 폴더는 install.sh가 노드에 미리 만든다 (읽기 전용 hostPath 안이라 kubelet이 만들 수 없다)
+        - {name: models, mountPath: /models, readOnly: true}
+        - {name: manifests-v2, mountPath: /models/manifests-v2}
+        - {name: metadata, mountPath: /models/metadata}
         - {name: home, mountPath: /home/ollama}
         - {name: tmp, mountPath: /tmp}
       volumes:
       - {name: models, hostPath: {path: /var/lib/docflow/ollama, type: Directory}}
+      - {name: manifests-v2, emptyDir: {sizeLimit: 16Mi}}
+      - {name: metadata, emptyDir: {sizeLimit: 16Mi}}
       - {name: home, emptyDir: {sizeLimit: 64Mi}}
       - {name: tmp, emptyDir: {sizeLimit: 1Gi}}
 ---
