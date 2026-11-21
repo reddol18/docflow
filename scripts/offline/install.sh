@@ -7,8 +7,10 @@
 #   OS_QUIET=1              OS가 스스로 바깥에 묻는 서비스(시간 동기화·apt·motd 타이머)를 끈다 (아래 2단계 설명)
 #   NEED_ROOT_GB            / 여유 하한 (기본 45GB: 이미지 풀기·모델·데이터)
 #   ADMIN_USER              첫 관리자 이름 (기본 admin). 비밀번호는 무작위로 만들어 /root/docflow-admin-password(0600)에만 둔다
-#   SUMS_SHA256             (선택) SHA256SUMS 파일 자체의 sha256. 묶음과 다른 길(문서·전화·별도 매체)로 받은 값을 주면
-#                           설치 전에 견주고 다르면 멈춘다 — 묶음 안의 SHA256SUMS까지 함께 바꿔치기한 경우를 막는다
+#   SUMS_SHA256             (필수) SHA256SUMS 파일 자체의 sha256 — 묶음과 다른 길(문서·전화·별도 매체)로 받은 값.
+#                           설치 전에 견주고 다르면 멈춘다 (묶음 안의 SHA256SUMS까지 함께 바꿔치기한 경우를 막는다). 없으면 멈춘다
+#   ALLOW_NO_SUMS=1         SUMS_SHA256 없이 진행 (따로 받은 값이 없을 때 위험을 알고 명시적으로만)
+# 인자: --tools-only (도구 .deb까지만), --verify-only (1단계 묶음 확인까지만 — 옮긴 묶음을 미리 확인할 때)
 # 절차·되돌리기: docs/offline_install.md
 set -euo pipefail
 B=${BUNDLE:-$(cd "$(dirname "$0")/.." && pwd)}
@@ -24,18 +26,28 @@ have=$(free_gb /); say "디스크 / 여유 ${have}GB (필요 ${NEED_ROOT_GB}GB)"
 [ "$have" -ge "$NEED_ROOT_GB" ] || { echo "디스크 모자람 — 멈춤" >&2; exit 1; }
 
 say "1/9 묶음 확인 (SHA256SUMS 자체 → 목록 밖 파일 없음 → sha256sum -c)"
+# 심볼릭 링크가 하나라도 있으면 멈춘다 — 목록에 있는 이름이라도 링크면 묶음 밖 파일을 가리킬 수 있다 (SHA256SUMS 자신 포함)
+links=$(cd "$B" && find . -type l -printf '%P\n')
+[ -z "$links" ] || { echo "묶음에 심볼릭 링크가 있음 — 멈춤:" >&2; printf '  %s\n' $links >&2; exit 1; }
+[ -f "$B/SHA256SUMS" ] || { echo "SHA256SUMS 없음 — 멈춤" >&2; exit 1; }
 sums=$(sha256sum "$B/SHA256SUMS" | cut -d' ' -f1)
 if [ -n "${SUMS_SHA256:-}" ]; then
   [ "$sums" = "$(printf '%s' "$SUMS_SHA256" | tr 'A-F' 'a-f')" ] \
     || { echo "SHA256SUMS 해시가 따로 받은 값(SUMS_SHA256)과 다름 — 묶음이 바뀌었다, 멈춤" >&2; exit 1; }
   say "  SHA256SUMS 해시 = SUMS_SHA256 (일치)"
+elif [ "${ALLOW_NO_SUMS:-0}" = 1 ]; then
+  say "  !! SUMS_SHA256 없이 진행 (ALLOW_NO_SUMS=1) — SHA256SUMS 해시 $sums 를 따로 받은 값과 손으로 견줄 것"
 else
-  say "  SHA256SUMS 해시 $sums (SUMS_SHA256를 주지 않아 견주지 않음 — docs/offline_install.md '묶음 확인')"
+  echo "SUMS_SHA256(따로 받은 SHA256SUMS의 sha256)이 필요함 — 멈춤. 없이 하려면 ALLOW_NO_SUMS=1 (docs/offline_install.md '묶음 확인')" >&2
+  exit 1
 fi
-# 목록에 없는 파일이 끼어 있으면 멈춘다 — debs/*.deb·images/*.tar.zst를 glob으로 읽으므로 끼워 넣은 파일이 root로 설치될 수 있다
-extra=$(cd "$B" && comm -13 <(sed -E 's/^[0-9a-f]{64} [ *]//' SHA256SUMS | sort) <(find . -type f ! -name SHA256SUMS -printf '%P\n' | sort))
-[ -z "$extra" ] || { echo "SHA256SUMS에 없는 파일이 묶음에 있음 — 멈춤:" >&2; printf '  %s\n' $extra >&2; exit 1; }
+# 목록에 없는 것이 끼어 있으면 멈춘다 — 파일뿐 아니라 폴더가 아닌 모든 것(장치·소켓·FIFO 등)을 본다.
+# debs/*.deb·images/*.tar.zst를 glob으로 읽으므로 끼워 넣은 파일이 root로 설치될 수 있다
+extra=$(cd "$B" && comm -13 <(sed -E 's/^[0-9a-f]{64} [ *]//' SHA256SUMS | sort) <(find . ! -type d ! -path ./SHA256SUMS -printf '%P\n' | sort))
+[ -z "$extra" ] || { echo "SHA256SUMS에 없는 것이 묶음에 있음 — 멈춤:" >&2; printf '  %s\n' $extra >&2; exit 1; }
 (cd "$B" && sha256sum --quiet --strict -c SHA256SUMS)
+say "  목록 밖·링크 없음, 해시 모두 일치"
+[ "${1:-}" != "--verify-only" ] || { say "묶음 확인만 하고 끝"; exit 0; }
 
 say "2/9 도구 .deb (없는 것만)"
 missing=()
@@ -167,4 +179,4 @@ $K get pods -A -o wide
 if $K get events -A 2>/dev/null | grep -iE 'Pulling|ErrImagePull|ImagePullBackOff'; then
   echo "!! 이미지 받기 시도가 있었다 — 묶음에 빠진 이미지" >&2; exit 1
 fi
-say "끝. 접속: k3s kubectl -n docs port-forward svc/docflow 8000:8000 (API) / svc/web 8443:8443 (화면)"
+say "끝. 접속(root로 — kubeconfig 0600): sudo k3s kubectl -n docs port-forward svc/docflow 8000:8000 (API) / svc/web 8443:8443 (화면)"

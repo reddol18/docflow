@@ -15,6 +15,7 @@
 #   manifests/ docflow-offline.yaml(k8s/offline 덧씌움을 푼 것)·Corefile
 #   scripts/   install.sh·egress_guard.sh·evidence.sh·smoke_test.sh (이 폴더 그대로)
 #   CONTENTS.txt(내용·크기), SHA256SUMS(설치할 때 sha256sum -c)
+#   끝에 묶음 tar를 trivy로 스캔한다 (scripts/offline/scan_bundle.sh, 결과는 묶음 밖)
 # 디스크: 시작 전에 묶음 폴더와 / 여유를 확인하고 모자라면 멈춘다 (records_poc/CLAUDE.md '디스크 여유 확인').
 set -euo pipefail
 REPO=${1:?저장소 폴더}
@@ -97,7 +98,6 @@ curl -fsSL -o "$B/k3s/install.sh" "https://raw.githubusercontent.com/k3s-io/k3s/
 echo "$K3S_INSTALL_SHA256  $B/k3s/install.sh" | sha256sum -c - >/dev/null \
   || { echo "k3s install.sh 해시가 고정값과 다름 — 멈춤" >&2; exit 1; }
 say "k3s install.sh: 태그 $K3S_VERSION, sha256 일치"
-curl -fsSL -o "$SRC/k3s-images.txt" "$u/k3s-images.txt"   # airgap 이미지 목록 (아래 trivy 스캔용, 묶음에는 넣지 않음)
 chmod +x "$B/k3s/k3s" "$B/k3s/install.sh"
 
 # ---- 앱 이미지 (docker 빌드 → save) ----
@@ -124,43 +124,6 @@ for ref in "${REFS[@]}"; do
   k3s ctr -n k8s.io images pull --platform linux/amd64 "$full" >/dev/null
   k3s ctr -n k8s.io images export --platform linux/amd64 - "$full" | zstd -q -T0 -10 -o "$B/images/$name.tar.zst"
 done
-
-# ---- 이미지 취약점 스캔 (trivy image) — 레지스트리 이미지(ollama 포함)·k3s airgap 이미지 ----
-# --timeout 45m: ollama 이미지(CUDA 라이브러리 포함 약 3.4GB)는 기본 5분 안에 분석이 끝나지 않는다 (2026-11-22 빌드).
-# 결과는 묶음 밖에 둔다: /root/docflow-trivy-<커밋>/(JSON)·<묶음 폴더>/../trivy-<커밋>.txt(요약). HIGH·CRITICAL이 있어도 멈추지 않고 수를 보고한다.
-# trivy는 scripts/tool_pins.txt의 linux-x86_64 줄(판·자산·실행 파일 해시)로 받고 확인한다. 취약점 DB는 이때 받는다(빌드는 온라인)
-trivy_bin() {
-  local pin ver asset asha exe esha dir
-  pin=$(tr -d '\r' < "$SRC/scripts/tool_pins.txt" | awk '$1 == "trivy" && $3 == "linux-x86_64"')
-  [ "$(printf '%s\n' "$pin" | grep -c .)" = 1 ] || { echo "tool_pins.txt에 trivy linux-x86_64 줄이 하나여야 함" >&2; return 1; }
-  read -r _ ver _ _ asset asha exe esha <<< "$pin"
-  dir=/root/.cache/docflow-tools/trivy-$ver; mkdir -p "$dir"
-  if ! echo "$esha  $dir/$exe" | sha256sum -c - >/dev/null 2>&1; then
-    curl -fsSL -o "$dir/$asset" "https://github.com/aquasecurity/trivy/releases/download/v$ver/$asset"
-    echo "$asha  $dir/$asset" | sha256sum -c - >/dev/null || { echo "trivy 자산 해시 다름 — 실행하지 않음" >&2; return 1; }
-    tar -xzf "$dir/$asset" -C "$dir" "$exe"
-  fi
-  echo "$esha  $dir/$exe" | sha256sum -c - >/dev/null || { echo "trivy 실행 파일 해시 다름 — 실행하지 않음" >&2; return 1; }
-  echo "$dir/$exe"
-}
-TRIVY=$(trivy_bin)
-TD=/root/docflow-trivy-$COMMIT; mkdir -p "$TD"
-TSUM="$OUTROOT/trivy-$COMMIT.txt"
-{ echo "trivy image 스캔 — 묶음 커밋 $COMMIT, $(date -Iseconds), $("$TRIVY" --version | head -1)"
-  echo "이미지	HIGH	CRITICAL"; } > "$TSUM"
-mapfile -t SCAN < <( { printf '%s\n' "${REFS[@]}"; tr -d '\r' < "$SRC/k3s-images.txt"; } | grep -v '^$' )
-for ref in "${SCAN[@]}"; do
-  out="$TD/$(echo "$ref" | tr '/:@' '___').json"
-  say "trivy 스캔 $ref"
-  if "$TRIVY" image --quiet --timeout 45m --platform linux/amd64 --scanners vuln --severity HIGH,CRITICAL --format json -o "$out" "$ref" >> /root/docflow-build-trivy.log 2>&1; then
-    printf '%s\t%s\t%s\n' "$ref" \
-      "$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$out")" \
-      "$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$out")" >> "$TSUM"
-  else
-    printf '%s\t스캔 실패\t(/root/docflow-build-trivy.log)\n' "$ref" >> "$TSUM"
-  fi
-done
-say "trivy 요약: $TSUM"; cat "$TSUM"
 
 # ---- Ollama 모델 (읽기만) ----
 say "모델: $OLLAMA_MODELS_WANT"
@@ -199,3 +162,13 @@ put_scripts "$SRC" "$B"
   echo "앱 이미지: docflow:dev $(docker image inspect -f '{{.Id}}' docflow:dev), docflow-web:dev $(docker image inspect -f '{{.Id}}' docflow-web:dev)"
 } | write_index "$B"
 say "끝: $B ($(du -sh "$B" | cut -f1))"
+
+# ---- 이미지 취약점 스캔: 묶음 안 tar 그대로 (scripts/offline/scan_bundle.sh) ----
+# 레지스트리에서 태그로 다시 받지 않는다 — 묶음에 든 것(앱 이미지·레지스트리 이미지·k3s airgap 이미지)을 trivy --input으로 본다.
+# 결과는 묶음 밖: /root/docflow-trivy-<커밋>/(JSON), <묶음 폴더>/../trivy-<커밋>.tsv(요약). HIGH·CRITICAL이 있어도 멈추지 않는다
+say "trivy 스캔 (묶음 tar)"
+if bash "$SRC/scripts/offline/scan_bundle.sh" "$B" "$SRC" "/root/docflow-trivy-$COMMIT" > /root/docflow-build-trivy.log 2>&1; then
+  cp "/root/docflow-trivy-$COMMIT/summary.tsv" "$OUTROOT/trivy-$COMMIT.tsv"; cat "$OUTROOT/trivy-$COMMIT.tsv"
+else
+  say "!! trivy 스캔 실패 — /root/docflow-build-trivy.log (묶음은 만들어졌다)"
+fi

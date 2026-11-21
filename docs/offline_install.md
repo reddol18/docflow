@@ -34,11 +34,14 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 - 레지스트리 이미지(postgres·qdrant·redis·ollama)는 매니페스트의 다이제스트 그대로 `k3s ctr pull → export`로 넣는다.
   docker save로 넣으면 다이제스트가 바뀌어 kubelet이 받으러 나간다.
 - k3s 설치 스크립트는 그 판의 태그에서 받아(`raw.githubusercontent.com/k3s-io/k3s/<판>/install.sh`) 고정 해시와 견준다. 판을 바꾸면 해시도 바꾼다.
-- 이미지 취약점: ollama·postgres·qdrant·redis와 k3s airgap 이미지(`k3s-images.txt`)를 trivy image로 스캔한다.
+- 이미지 취약점: 묶음을 다 만든 뒤 **묶음 안 tar 그대로** trivy로 스캔한다 (`scripts/offline/scan_bundle.sh`).
+  - 대상: `images/*.tar.zst`(앱 이미지 docflow·docflow-web, ollama·postgres·qdrant·redis)와 `k3s/k3s-airgap-images-amd64.tar.zst`(k3s 시스템 이미지).
+  - 레지스트리에서 태그로 다시 받지 않는다. 묶음에 든 것과 다를 수 있어서다.
+  - tar를 따로 만든 containerd 네임스페이스에 잠깐 넣어 이미지 하나씩 나눈 뒤 `trivy image --input`으로 본다. 끝나면 지운다.
   - trivy는 `scripts/tool_pins.txt` linux-x86_64 줄로 확인한다.
-  - 결과는 묶음 밖에 남는다: 요약 `<묶음 폴더>/trivy-<커밋>.txt`, JSON `/root/docflow-trivy-<커밋>/`.
+  - 결과는 묶음 밖에 남는다: 요약 `<묶음 폴더>/trivy-<커밋>.tsv`(HIGH·CRITICAL·그중 고친 판 있음), JSON `/root/docflow-trivy-<커밋>/`.
   - HIGH·CRITICAL이 있어도 멈추지 않고 수를 적는다.
-- 결과: `<묶음 폴더>/docflow-offline-<커밋>/`. 내용은 `CONTENTS.txt`, 해시는 `SHA256SUMS`.
+  - 있는 묶음만 다시 볼 때: `sudo bash scripts/offline/scan_bundle.sh <묶음> <저장소> [결과 폴더]`- 결과: `<묶음 폴더>/docflow-offline-<커밋>/`. 내용은 `CONTENTS.txt`, 해시는 `SHA256SUMS`.
   - `sha256sum <묶음>/SHA256SUMS` 값을 묶음과 **다른 길**(문서·별도 매체)로 현장에 전한다. 아래 '묶음 확인'에서 쓴다.
 - 스크립트·매니페스트만 고쳤으면 `build_bundle.sh --refresh <저장소> <있는 묶음 폴더>`로 그 부분만 지금 커밋으로 바꾼다.
   - 이미지·모델은 그대로 두고 해시를 다시 만든다.
@@ -52,14 +55,18 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 sudo OS_QUIET=1 bash <묶음>/scripts/install.sh --tools-only   # 묶음의 .deb로 iptables·conntrack·tcpdump만 먼저 (받기 없음)
                                                          # OS_QUIET=1: OS가 스스로 바깥에 묻는 서비스(timesyncd·apt·motd 타이머·snapd)를 끔
 sudo bash <묶음>/scripts/egress_guard.sh on              # 시험할 때: 노드 바깥 송신을 막고 센다 (현장에서는 망이 이미 막혀 있다)
-sudo REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
+sudo SUMS_SHA256=<따로 받은 값> REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
 ```
 
 ### 묶음 확인
 
-- `SUMS_SHA256=<따로 받은 값>`을 주면 설치 전에 `SHA256SUMS` 자체의 해시를 견준다. 다르면 멈춘다.
-  묶음 안의 `SHA256SUMS`까지 함께 바꿔치기한 경우를 막는다. 주지 않으면 견주지 않고 해시를 출력만 한다.
-- `SHA256SUMS`에 없는 파일이 묶음에 있으면 멈춘다. `.deb`·이미지 tar는 폴더째 읽으므로, 끼워 넣은 파일이 root로 설치되지 않게 한다.
+- `SUMS_SHA256=<따로 받은 값>`은 **필수**다. 설치 전에 `SHA256SUMS` 자체의 해시를 견주고, 다르면 멈춘다.
+  묶음 안의 `SHA256SUMS`까지 함께 바꿔치기한 경우를 막는다.
+  - 값이 없으면 멈춘다. 따로 받은 값이 없는데 진행해야 하면 `ALLOW_NO_SUMS=1`을 명시한다 (해시를 출력하니 손으로 견준다).
+- 묶음에 심볼릭 링크가 하나라도 있으면 멈춘다. 목록에 있는 이름이라도 링크면 묶음 밖 파일을 가리킬 수 있다.
+- `SHA256SUMS`에 없는 것(파일·장치·FIFO 등 폴더가 아닌 모든 것)이 묶음에 있으면 멈춘다.
+  `.deb`·이미지 tar는 폴더째 읽으므로, 끼워 넣은 파일이 root로 설치되지 않게 한다.
+- 옮긴 묶음을 미리 확인만 하려면 `install.sh --verify-only` (1단계까지만).
 
 ```sh
 sudo SUMS_SHA256=<값> REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
@@ -81,7 +88,7 @@ sudo SUMS_SHA256=<값> REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
 
 접속:
 
-- API: `k3s kubectl -n docs port-forward svc/docflow 8000:8000`
+- API: `sudo k3s kubectl -n docs port-forward svc/docflow 8000:8000` (kubeconfig가 0600이라 root로)
 - 화면: `svc/web 8443:8443`, 주소는 `https://docflow.localhost:8443`. 내부 CA `/root/docflow-ca/ca.crt`를 신뢰해야 한다.
 
 ## 3. 확인 시험과 외부 송신 0 증거
@@ -107,7 +114,7 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 
 | 증거 | 0이어야 하는 것 |
 |---|---|
-| (b) `egress_guard.sh status` | 시험 동안 `pod-egress`·`node-egress`·`v6-egress` 패킷. 이미 맺어진 연결의 응답(예: 들어온 ssh)은 `established` 규칙이 먼저 통과시켜 세지 않는다. 링크 로컬 멀티캐스트(224.0.0.0/24, ff02::/16)는 `link-local-mcast`로 따로 센다 |
+| (b) `egress_guard.sh status` | 시험 동안 `pod-egress`·`node-egress`·`v6-egress` 패킷. 바깥에서 시작된 연결의 응답(conntrack 방향 REPLY, 예: 들어온 ssh)만 `established` 규칙이 먼저 통과시켜 세지 않는다. 노드·파드가 연 연결은 guard를 켜기 전에 맺었더라도 막고 센다. 링크 로컬 멀티캐스트(224.0.0.0/24, ff02::/16)는 `link-local-mcast`로 따로 센다 |
 | (c) `c_conntrack_external.txt` | 노드·파드가 연 연결 중 클러스터·루프백·링크 로컬 멀티캐스트 밖 목적지 |
 | (d) `cni0.count`·`eth0.count`·`nflog.count` | 패킷. eth0은 나가는 방향만 세고 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND처럼 같은 링크에서 끝남)는 뺀다 |
 | Ollama `ollama.ollama_com.count` | ollama.com 접속 시도 줄(주소가 든 실패 로그). 시작 때 설정 출력의 `OLLAMA_REMOTES:[ollama.com]`은 시도가 아니다 |

@@ -27,10 +27,10 @@ INTERNAL='not (dst net 10.42.0.0/16 or dst net 10.43.0.0/16 or dst net 127.0.0.0
 case "$CMD" in
   capture-start)
     # 이미 도는 것은 그대로, 아직 없는 인터페이스(cni0는 k3s가 뜬 뒤 생김)는 건너뛴다 — 설치 전·후에 한 번씩 불러도 된다
-    cap() { # 이름 인터페이스 필터
+    cap() { # 이름 인터페이스 필터 [snaplen]
       if [ -f "$OUT/$1.pid" ] && kill -0 "$(cat "$OUT/$1.pid")" 2>/dev/null; then echo "capture $1: 이미 도는 중"; return; fi
       case "$2" in nflog:*) ;; *) ip link show "$2" >/dev/null 2>&1 || { echo "capture $1: $2 아직 없음 — 건너뜀"; return; } ;; esac
-      nohup tcpdump -n -Z root -s $SNAP -i "$2" -w "$OUT/$1.pcap" $3 >/dev/null 2>"$OUT/$1.tcpdump.log" &
+      nohup tcpdump -n -Z root -s "${4:-$SNAP}" -i "$2" -w "$OUT/$1.pcap" $3 >/dev/null 2>"$OUT/$1.tcpdump.log" &
       local pid=$!; echo $pid > "$OUT/$1.pid"; sleep 2
       # 떴는지 확인 — 못 뜨면(인터페이스·필터 오류) pcap이 없어 나중에 '0개'로 보이는 거짓 0을 막는다
       kill -0 $pid 2>/dev/null || { echo "capture $1: tcpdump가 뜨지 못함 — $(tail -2 "$OUT/$1.tcpdump.log")" >&2; rm -f "$OUT/$1.pid"; fail=1; return; }
@@ -44,7 +44,9 @@ case "$CMD" in
     # 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND 등 같은 링크 안에서 끝남)는 바깥 송신이 아니라 뺀다
     cap eth0 "$IF" "-Q out (ip or ip6) and not dst net ff02::/16 and not dst net 224.0.0.0/24"
     # nflog:5: egress_guard가 버린 패킷 사본 (노드·파드가 바깥으로 보내려 한 것 전부 — 무엇을 물었는지까지)
-    cap nflog nflog:5 ""
+    # snaplen 512: nflog 패킷에는 NFLOG 머리(TLV)가 앞에 붙어 128이면 DNS 질의 이름이 잘린다(IPv6는 이름이 아예 안 보였다).
+    # 버린 패킷(바깥으로 나가려던 것)만 담기는 곳이라 이름까지 남긴다 — 무엇이 나가려 했는지가 이 캡처의 목적
+    cap nflog nflog:5 "" 512
     exit $fail
     ;;
   capture-stop)
@@ -92,7 +94,8 @@ case "$CMD" in
       | awk -v l="$L" '{n=""; for(i=1;i<=NF;i++) if($i ~ /-egress$/) n=$i; print "[" l "] " n, "pkts", $1, "bytes", $2}'
     ;;
   probe)
-    # (e) 대조: 막는 장치가 실제로 일하는지. ① docs 네임스페이스에 docflow와 같은 레이블의 파드 — NetworkPolicy가 막는다
+    # (e) 대조: 막는 장치가 실제로 일하는지. ① docs 네임스페이스에 docflow-egress 정책을 받는 레이블(app=docflow-worker)의 파드
+    #     — 그 NetworkPolicy가 막는다 (DNS는 CoreDNS까지만, 443 규칙 없음)
     #     ② 정책 없는 임시 네임스페이스의 파드 — 노드 막기(egress_guard)가 막고 pod-egress 카운터가 오른다
     #     ③ 바깥 이름 DNS — CoreDNS가 위쪽으로 넘기지 않는다
     PY='import socket,sys
