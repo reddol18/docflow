@@ -192,7 +192,7 @@ try {
         # eval/synth/requirements.txt: 합성 기록물 생성기(개발 PC 전용)의 직접 의존성만 — augraphy 간접 의존성은 고정 안 됨 (https://github.com/reddol18/docflow/issues/139)
         & $osv scan source --no-resolve --config osv-scanner.toml --lockfile requirements.txt:requirements.lock `
             --lockfile requirements.txt:requirements.txt --lockfile requirements.txt:requirements-test.txt `
-            --lockfile requirements.txt:eval/synth/requirements.txt `
+            --lockfile requirements.txt:eval/synth/requirements.txt --lockfile requirements.txt:eval/answer/requirements.lock `
             --lockfile frontend/package-lock.json --lockfile eval/promptfoo/package-lock.json   # 평가 하네스(개발 PC 전용) 의존성
     }
 
