@@ -17,7 +17,7 @@ https://github.com/reddol18/docflow/issues/81. 인터넷이 없는 현장에 묶
 | Ollama | `llm` 네임스페이스, egress 전부 차단, docs의 API·워커에서 11434만 받음 | `k8s/offline/llm.yaml` |
 | CoreDNS | 클러스터 바깥 이름을 위쪽 DNS로 넘기지 않음 (`forward` 삭제) | `k8s/offline/Corefile` |
 
-GPU는 쓰지 않는다 (2026-11-21 결정, CPU만). 모델 3개는 묶음에 들어 있고 설치 노드의 `/var/lib/docflow/ollama`에 풀린다(읽기 전용 마운트).
+GPU는 쓰지 않는다 (2026-11-21 결정, CPU만). 모델 3개는 묶음에 들어 있고 설치 노드의 `/var/lib/docflow/ollama`에 풀린다(쓰기 가능 마운트 — Ollama 0.40이 시작할 때 manifests-v2 폴더를 만든다).
 
 ## 1. 묶음 만들기 (인터넷 되는 곳)
 

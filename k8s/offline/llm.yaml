@@ -50,17 +50,23 @@ spec:
         env:
         - {name: OLLAMA_HOST, value: "0.0.0.0:11434"}
         - {name: OLLAMA_MODELS, value: /models}
-        - {name: OLLAMA_NOPRUNE, value: "1"}          # 모델 폴더는 읽기 전용 — 시작할 때 지우기를 하지 않는다
+        - {name: OLLAMA_NOPRUNE, value: "1"}          # 묶음에서 푼 모델을 시작할 때 지우지 않게
         - {name: OLLAMA_NUM_PARALLEL, value: "1"}      # CPU라 동시 1 (메모리도 모델당 하나)
         - {name: OLLAMA_MAX_LOADED_MODELS, value: "3"} # 추출·판독·임베딩 모델을 번갈아 내리지 않게 (약 12GB)
         - {name: OLLAMA_KEEP_ALIVE, value: "30m"}
+        # 바깥(ollama.com)에 묻는 기능을 끈다: 0.40은 기본으로 시작할 때 모델 추천·클라우드 모델 목록을 ollama.com:443에 묻는다
+        # (2026-11-21 WSL 시험 로그 — NetworkPolicy가 막아 'context deadline exceeded'). 막히더라도 시도 자체를 없앤다.
+        # 켠 뒤 로그: "Ollama cloud disabled: true", 모델 추천 새로 고침은 시작 때 하지 않고 약 4~5시간 뒤로 미뤄진다(그때 시도하면 정책이 막는다)
+        - {name: OLLAMA_NO_CLOUD, value: "1"}
         - {name: HOME, value: /home/ollama}
         ports: [{containerPort: 11434}]
         resources: {requests: {cpu: "2", memory: 12Gi}, limits: {memory: 20Gi}}
         readinessProbe: {httpGet: {path: /api/version, port: 11434}, periodSeconds: 10}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts:
-        - {name: models, mountPath: /models, readOnly: true}
+        # 쓰기 가능: Ollama 0.40은 시작·목록 때 manifests-v2 폴더를 만든다 (읽기 전용이면 'mkdir /models/manifests-v2: read-only
+        # file system'으로 모델을 못 읽음 — 2026-11-21 WSL 시험). 받기는 바깥 길이 없어 어차피 실패한다
+        - {name: models, mountPath: /models}
         - {name: home, mountPath: /home/ollama}
         - {name: tmp, mountPath: /tmp}
       volumes:
