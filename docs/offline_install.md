@@ -71,6 +71,7 @@ sudo SUMS_SHA256=<값> REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
 2. 없는 도구만 `.deb` 넣기
 3. k3s airgap 설치 — 이미지 tar를 `agent/images`에 둔다. cgroup v1 커널이면 `fail-cgroupv1=false`.
    kubeconfig(`/etc/rancher/k3s/k3s.yaml`, cluster-admin)는 k3s 기본 0600이라 root만 읽는다
+   kubelet `runtime-request-timeout=10m` — 큰 이미지(ollama)의 첫 컨테이너 만들기가 기본 2분을 넘어 kubelet이 한 번 더 만들던 것(restartCount 1)을 막는다
 4. CoreDNS Corefile을 바꾼다 (`coredns.yaml.skip`으로 k3s가 되돌리지 않게)
 5. 모델 풀기
 6. 내부 CA·서버 인증서·비밀값 만들기

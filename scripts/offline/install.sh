@@ -71,7 +71,12 @@ cp "$B/k3s/k3s-airgap-images-amd64.tar.zst" "$B"/images/*.tar.zst /var/lib/ranch
   # kubeconfig(/etc/rancher/k3s/k3s.yaml, cluster-admin)는 k3s 기본 0600 그대로 — 노드의 다른 사용자가 읽지 못하게 (root로 쓴다)
   echo "disable: [traefik]"
   # cgroup v1만 있는 커널(예: WSL 기본 5.15)은 kubelet이 거부한다 — 그때만 허용 (2026-11-21 결정: 이 우회를 유지)
-  if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then echo "kubelet-arg: [\"fail-cgroupv1=false\"]"; fi
+  # runtime-request-timeout 10m: 묶음에서 막 가져온 큰 이미지(ollama 약 3.4GB)는 첫 컨테이너 만들기(스냅숏 풀기)가 kubelet 기본 2분을 넘는다.
+  # 2026-11-21 시험: 23:40:25 CreateContainer 시작 → 23:42:25 kubelet이 2분에 끊음(RST_STREAM CANCEL) → containerd는 23:42:27에
+  # 끝냈지만 이미 버려짐 → attempt:1로 다시 만들어 23:43:39 시작. 프로세스가 죽은 적은 없는데 restartCount가 1이 됐다
+  ka='"runtime-request-timeout=10m"'
+  if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then ka="$ka, \"fail-cgroupv1=false\""; fi
+  echo "kubelet-arg: [$ka]"
 } > /etc/rancher/k3s/config.yaml
 INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_SKIP_SELINUX_RPM=true sh "$B/k3s/install.sh" >/dev/null
 # 처음 기동은 airgap 이미지(약 4GB) 가져오기 때문에 몇 분 NotReady일 수 있다

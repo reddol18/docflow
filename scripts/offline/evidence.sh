@@ -69,6 +69,9 @@ case "$CMD" in
     $K get networkpolicy -A -o yaml > "$D/a_netpol.yaml" 2>&1
     $K -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' > "$D/a_coredns_Corefile.txt" 2>&1
     ls -l /var/lib/rancher/k3s/server/manifests/ > "$D/a_k3s_manifests.txt" 2>&1
+    # 모든 파드의 재시작 수·직전 상태(lastState: 종료 코드·까닭·끝난 때) — 재시작이 있으면 까닭을 남긴다
+    $K get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{range .status.containerStatuses[*]} {.name} restarts={.restartCount} last={.lastState}{end}{"\n"}{end}' > "$D/a_pods_restarts.txt" 2>&1
+    $K -n llm logs deploy/ollama --previous > "$D/a_ollama_previous.log" 2>&1 || true
     for d in docflow docflow-worker; do
       $K -n docs get deploy $d -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
         | grep -E '^(LLM_|EXTRACT_MODEL|CELL_MODEL|EMBED_|CHAT_MODEL|AUTH_MODES)' > "$D/a_env_$d.txt"
