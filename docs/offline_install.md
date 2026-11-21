@@ -39,6 +39,7 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 `/` 여유 45GB 이상. 묶음 폴더를 설치 노드에 옮긴 뒤:
 
 ```sh
+sudo bash <묶음>/scripts/install.sh --tools-only         # 묶음의 .deb로 iptables·conntrack·tcpdump만 먼저 (받기 없음)
 sudo bash <묶음>/scripts/egress_guard.sh on              # 시험할 때: 노드 바깥 송신을 막고 센다 (현장에서는 망이 이미 막혀 있다)
 sudo REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
 ```

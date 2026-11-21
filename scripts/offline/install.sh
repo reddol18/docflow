@@ -32,6 +32,8 @@ for d in "$B"/debs/*.deb; do
     || dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$d")
 done
 if [ ${#missing[@]} -gt 0 ]; then dpkg -i "${missing[@]}" >/dev/null; say "  넣음: ${#missing[@]}개"; else say "  모두 있음"; fi
+# --tools-only: 여기까지만 (iptables가 없는 새 노드에서 egress_guard.sh on을 먼저 걸 때)
+[ "${1:-}" != "--tools-only" ] || { say "도구만 넣고 끝"; exit 0; }
 
 if [ "${REQUIRE_EGRESS_GUARD:-0}" = 1 ]; then
   iptables -w -t mangle -S POSTROUTING | grep -q -- '-j DOCFLOW-EGRESS' \
