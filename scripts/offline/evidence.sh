@@ -26,8 +26,9 @@ case "$CMD" in
     }
     # cni0: 파드가 클러스터 밖 주소로 보낸 패킷 (막히기 전에 보인다 — 시도까지 센다)
     cap cni0 cni0 "ip and $INTERNAL and not dst host $NODE_IP"
-    # eth0: 실제로 노드 밖으로 나간 패킷 (막힌 것은 보이지 않는다). ARP 등 IP 아닌 것은 뺀다
-    cap eth0 eth0 "(ip and src host $NODE_IP) or ip6"
+    # eth0: 실제로 노드 밖으로 나간 패킷 (막힌 것은 보이지 않는다). 나가는 방향만(-Q out), ARP 등 IP 아닌 것은 뺀다.
+    # (2026-11-21 시험: 방향을 안 가렸더니 Windows 쪽에서 들어온 IPv6 mDNS 18개가 섞였다 — 출발 주소가 Windows의 fe80)
+    cap eth0 eth0 "-Q out ip or ip6"
     # nflog:5: egress_guard가 버린 패킷 사본 (노드·파드가 바깥으로 보내려 한 것 전부 — 무엇을 물었는지까지)
     cap nflog nflog:5 ""
     sleep 2
