@@ -48,9 +48,10 @@ done
 if [ ${#missing[@]} -gt 0 ]; then dpkg -i "${missing[@]}" >/dev/null; say "  넣음: ${#missing[@]}개"; else say "  모두 있음"; fi
 # OS_QUIET=1: 운영체제가 스스로 바깥에 묻는 서비스를 끈다 — 2026-11-21 WSL 시험에서 Ubuntu 24.04 기본 systemd-timesyncd가
 # ntp.ubuntu.com을 계속 물었다(노드 DNS, 막기에서 버려짐). 현장에 내부 NTP가 있으면 끄는 대신 /etc/systemd/timesyncd.conf NTP=를 그 주소로.
-# apt·motd·ua 타이머도 바깥(archive.ubuntu.com 등)에 묻는다. 기본은 건드리지 않는다 (설치 노드의 OS 설정은 현장 정책)
+# apt·motd·ua 타이머와 snapd도 바깥(archive.ubuntu.com·api.snapcraft.io 등)에 묻는다. 기본은 건드리지 않는다 (설치 노드의 OS 설정은 현장 정책)
 if [ "${OS_QUIET:-0}" = 1 ]; then
-  for u in systemd-timesyncd.service motd-news.timer apt-daily.timer apt-daily-upgrade.timer ua-timer.timer snapd.snap-repair.timer; do
+  # snapd: 부팅할 때마다 api.snapcraft.io를 묻는다 (2026-11-22 시험 — 배포판을 다시 켠 뒤 노드 DNS 24개가 버려짐, nflog로 확인)
+  for u in systemd-timesyncd.service motd-news.timer apt-daily.timer apt-daily-upgrade.timer ua-timer.timer snapd.snap-repair.timer snapd.service snapd.socket snapd.seeded.service; do
     systemctl disable --now "$u" >/dev/null 2>&1 && say "  끔: $u" || true
   done
 fi

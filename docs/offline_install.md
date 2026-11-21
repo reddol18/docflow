@@ -50,7 +50,7 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 
 ```sh
 sudo OS_QUIET=1 bash <묶음>/scripts/install.sh --tools-only   # 묶음의 .deb로 iptables·conntrack·tcpdump만 먼저 (받기 없음)
-                                                         # OS_QUIET=1: OS가 스스로 바깥에 묻는 서비스(timesyncd·apt·motd 타이머)를 끔
+                                                         # OS_QUIET=1: OS가 스스로 바깥에 묻는 서비스(timesyncd·apt·motd 타이머·snapd)를 끔
 sudo bash <묶음>/scripts/egress_guard.sh on              # 시험할 때: 노드 바깥 송신을 막고 센다 (현장에서는 망이 이미 막혀 있다)
 sudo REQUIRE_EGRESS_GUARD=1 bash <묶음>/scripts/install.sh
 ```
@@ -101,7 +101,7 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 
 - 바깥 인터페이스는 `EGRESS_IF`, 없으면 IPv4 기본 경로의 인터페이스다 (`egress_guard.sh`와 같은 방법).
 - tcpdump가 뜨지 못하거나 pcap을 읽지 못하면 '0개'로 적지 않고 오류로 끝난다.
-- pcap은 머리만 담는다(`-s 128`). 증거 폴더는 0700이다.
+- pcap은 머리만 담는다(`-s 128`). 증거 폴더는 0700이다. 단 WSL의 `/mnt/<드라이브>`(drvfs)는 chmod가 듣지 않고 Windows 권한을 따르므로, 증거는 리눅스 쪽 폴더에 둔다.
 
 증거별로 0이어야 하는 것:
 
@@ -110,7 +110,7 @@ sudo bash $S/evidence.sh probe $E                # (e) 대조: 일부러 바깥�
 | (b) `egress_guard.sh status` | 시험 동안 `pod-egress`·`node-egress`·`v6-egress` 패킷. 이미 맺어진 연결의 응답(예: 들어온 ssh)은 `established` 규칙이 먼저 통과시켜 세지 않는다 |
 | (c) `c_conntrack_external.txt` | 노드·파드가 연 연결 중 클러스터·루프백·링크 로컬 멀티캐스트 밖 목적지 |
 | (d) `cni0.count`·`eth0.count`·`nflog.count` | 패킷. eth0은 나가는 방향만 세고 링크 로컬 멀티캐스트(ff02::/16, 224.0.0.0/24 — mDNS·ND처럼 같은 링크에서 끝남)는 뺀다 |
-| Ollama `ollama.ollama_com.count` | ollama.com 언급 줄 |
+| Ollama `ollama.ollama_com.count` | ollama.com 접속 시도 줄(주소가 든 실패 로그). 시작 때 설정 출력의 `OLLAMA_REMOTES:[ollama.com]`은 시도가 아니다 |
 | (e) `e_probe.txt` | 바깥 연결이 모두 실패하고, 정책 없는 네임스페이스 파드의 시도만 `pod-egress` 카운터를 올린다 (카운터가 실제로 센다는 증거) |
 
 `node-egress`가 0이 아니면 노드의 어떤 프로세스가 바깥에 묻는 것이다. 무엇을 묻는지는 NFLOG로 본다:

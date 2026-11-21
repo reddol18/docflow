@@ -11,6 +11,7 @@
 # 바깥 인터페이스는 egress_guard.sh와 같은 방법으로 고른다: EGRESS_IF, 없으면 IPv4 기본 경로의 인터페이스. 노드 주소는 그 인터페이스의 IPv4.
 # tcpdump는 -Z root: 0700 폴더에 쓰려고 (Ubuntu tcpdump는 기본으로 tcpdump 사용자로 내려가 쓰기를 못 한다).
 # pcap은 머리만(-s 128: IP·TCP/UDP 머리와 DNS 이름 정도) — 바깥으로 나가려던 본문(문서 값)을 남기지 않는다. 출력 폴더는 0700
+# (리눅스 파일 시스템일 때. WSL의 /mnt/<드라이브>(drvfs)는 chmod가 듣지 않고 Windows 권한을 따른다 — 증거는 리눅스 쪽 폴더에 두는 것이 낫다)
 set -uo pipefail
 CMD=${1:?capture-start|capture-stop|snapshot|probe|ollama-log}
 OUT=${2:?출력 폴더}
@@ -132,8 +133,11 @@ print("; ".join(r))'
     $K -n llm logs deploy/ollama --timestamps --previous > "$OUT/ollama.previous.log" 2>&1 || true
     $K -n llm get pod -l app=ollama -o jsonpath='{range .items[*]}{.metadata.name} restarts={.status.containerStatuses[0].restartCount} last={.status.containerStatuses[0].lastState}{"\n"}{end}' > "$OUT/ollama.restarts.txt"
     $K -n llm get events --sort-by=.lastTimestamp > "$OUT/ollama.events.txt" 2>&1
-    n=$(cat "$OUT/ollama.log" "$OUT/ollama.previous.log" | grep -ciE 'ollama\.com' || true)
-    echo "ollama.com 언급 줄 수: $n" | tee "$OUT/ollama.ollama_com.count"
+    # 접속 시도 = ollama.com 주소(URL)가 든 줄 ('Get "https://ollama.com/…": …' 같은 실패 로그). 시작 때 설정 출력의
+    # OLLAMA_REMOTES:[ollama.com]은 설정값일 뿐이라 따로 센다
+    n=$(cat "$OUT/ollama.log" "$OUT/ollama.previous.log" | grep -cE 'https?://[^ "]*ollama\.com' || true)
+    m=$(cat "$OUT/ollama.log" "$OUT/ollama.previous.log" | grep -ciE 'ollama\.com' || true)
+    echo "ollama.com 접속 시도 줄 수: $n (ollama.com이 든 줄 전체 $m — 설정 출력 포함)" | tee "$OUT/ollama.ollama_com.count"
     grep -E 'cloud disabled' "$OUT/ollama.log" | tail -1
     cat "$OUT/ollama.restarts.txt"
     ;;
