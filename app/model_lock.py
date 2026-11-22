@@ -1,7 +1,7 @@
 """OCR 모델 파일을 목록·sha256으로 고정한다 (https://github.com/reddol18/docflow/issues/102).
 
 이미지 빌드는 `python -m app.warm`으로 PaddleOCR 모델을 받는다(PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True, 받는 쪽은 해시를 안 본다).
-그래서 받은 뒤 모델 폴더(PADDLE_PDX_CACHE_HOME) 아래 파일 전부를 app/models.lock과 견준다 — 빠진 파일·남는 파일·해시가 다른
+그래서 받은 뒤 모델 폴더(PADDLE_PDX_CACHE_HOME) 아래 파일 전부(받기 도구의 `.cache` 기록 폴더는 빼고, scan 참고)를 app/models.lock과 견준다 — 빠진 파일·남는 파일·해시가 다른
 파일이 하나라도 있으면 0이 아닌 값으로 끝나 빌드가 멈춘다.
 
   python -m app.model_lock verify <모델 폴더> <lock>   # Dockerfile 모델 층 (보통 빌드)
@@ -21,6 +21,7 @@ HEADER = (
     "# 이미지 빌드(Dockerfile 모델 층)가 받은 모델 폴더(PADDLE_PDX_CACHE_HOME) 아래 파일 전부와 견준다 — 다르면 빌드 실패\n"
     "# (https://github.com/reddol18/docflow/issues/102). 폐쇄망 묶음(scripts/offline/build_bundle.sh)도 같은 빌드라 같은 목록이다.\n"
 )
+SKIP_DIRS = frozenset({".cache"})
 _LINE = re.compile(r"^([0-9a-f]{64}) {2}(\S(?:.*\S)?)$")
 
 
@@ -33,13 +34,17 @@ def sha256_file(path):
 
 
 def scan(root):
-    """모델 폴더 아래 일반 파일 전부 → {상대 경로(/ 구분): sha256}. 심볼릭 링크·특수 파일이 있으면 멈춘다."""
+    """모델 폴더 아래 일반 파일 전부 → {상대 경로(/ 구분): sha256}. 심볼릭 링크·특수 파일이 있으면 멈춘다.
+
+    `.cache` 폴더(SKIP_DIRS)는 뺀다: 모델을 받은 도구(huggingface_hub)의 내려받기 기록(`download/*.metadata`에 받은 시각,
+    빈 `*.lock`)이라 빌드마다 바뀐다. 모델이 읽는 파일이 아니다 (2026-11-23 실제 빌드에서 확인).
+    """
     root = Path(root)
     if not root.is_dir():
         raise SystemExit(f"모델 폴더 없음: {root}")
     out = {}
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort()
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for name in dirnames:
             if (Path(dirpath) / name).is_symlink():
                 raise SystemExit(f"모델 폴더에 심볼릭 링크(폴더): {Path(dirpath) / name}")

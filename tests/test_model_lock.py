@@ -32,6 +32,17 @@ def test_scan_lists_every_file_with_sha256(tmp_path):
     }
 
 
+def test_scan_skips_download_cache_records(tmp_path):
+    """huggingface_hub의 .cache 기록(받은 시각이 든 .metadata)은 빌드마다 바뀌므로 목록에서 뺀다."""
+    root = _tree(tmp_path)
+    cache = root / "official_models" / "det" / ".cache" / "huggingface" / "download"
+    cache.mkdir(parents=True)
+    (cache / "inference.pdiparams.metadata").write_bytes(b"rev\netag\n1763856000.123\n")
+    have = ml.scan(root)
+    assert not any(".cache" in p.split("/") for p in have)
+    assert len(have) == 3
+
+
 def test_render_parse_roundtrip_sorted(tmp_path):
     have = ml.scan(_tree(tmp_path))
     text = ml.render(have)

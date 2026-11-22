@@ -1,0 +1,15 @@
+# 자동 생성 — 손으로 고치지 않는다. OCR 모델 판을 올릴 때만 다시 만든다: .\scripts\model_lock_refresh.ps1
+# 이미지 빌드(Dockerfile 모델 층)가 받은 모델 폴더(PADDLE_PDX_CACHE_HOME) 아래 파일 전부와 견준다 — 다르면 빌드 실패
+# (https://github.com/reddol18/docflow/issues/102). 폐쇄망 묶음(scripts/offline/build_bundle.sh)도 같은 빌드라 같은 목록이다.
+a3a43406012ee8c7b9b38dfab1b11610f33e8245cd864a9a9302d042616a859e  official_models/PP-OCRv5_server_det/.gitattributes
+4fd4cf7c6fc3239ede7274c3877e7a0c4424ffa7f56b2775e4e7961c24b1f107  official_models/PP-OCRv5_server_det/README.md
+436bf19010fe3879477e8599a870a0ec8ccd14ca39056805ec4ed20ab318ec04  official_models/PP-OCRv5_server_det/config.json
+af5876933d8806a1b50d895867e0781e135cd92ff37381992828fc8d1b842d28  official_models/PP-OCRv5_server_det/inference.json
+183146fe9d9910352f68482f623bcbbb9fa7b9e8fa1463b9ad288cef00524d2d  official_models/PP-OCRv5_server_det/inference.pdiparams
+28fb721efc3634fc8aa677e474b9602cb815a91cf569ef357a7a553d7b3ce685  official_models/PP-OCRv5_server_det/inference.yml
+a3a43406012ee8c7b9b38dfab1b11610f33e8245cd864a9a9302d042616a859e  official_models/korean_PP-OCRv5_mobile_rec/.gitattributes
+0524f6bd8681b9b37f817a11a0bdd8cc99d5a4968b65b693baf532fb73f8a99b  official_models/korean_PP-OCRv5_mobile_rec/README.md
+c86a49d6301e6c4ff3398a87a2a1926b3521a46e90042833e18bbfa8ba6165c2  official_models/korean_PP-OCRv5_mobile_rec/config.json
+562404e3c590c50c93778d5f0a94df21b47b5ab8f3ea6d47c7f8a7930c3bc844  official_models/korean_PP-OCRv5_mobile_rec/inference.json
+cac3e5f12cf04aaa77f6a5bc704e4e736ef2908476551891d84b41b4e9090462  official_models/korean_PP-OCRv5_mobile_rec/inference.pdiparams
+f757fa1c40e99edcf27e9cce879b93eb2a51fa46f5ef39095689b8c37dd75998  official_models/korean_PP-OCRv5_mobile_rec/inference.yml

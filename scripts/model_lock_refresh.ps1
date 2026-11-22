@@ -26,7 +26,8 @@ try {
     uv run --quiet --no-project python -I -c "import sys; sys.path.insert(0, '.'); from app import model_lock as m; from pathlib import Path; print('파일', len(m.parse(Path('app/models.lock').read_text(encoding='utf-8'))), '개')"
     if ($LASTEXITCODE) { throw "app/models.lock 형식 확인 실패" }
     $diff = git diff --numstat -- app/models.lock
-    if (-not $diff) { Write-Host "== 바뀐 것 없음 (지금 배포처의 모델 = 고정된 목록)" }
+    if (-not (git ls-files -- app/models.lock)) { Write-Host "== 새로 만듦 (아직 커밋 안 된 파일) — 확인 뒤 커밋" }
+    elseif (-not $diff) { Write-Host "== 바뀐 것 없음 (지금 배포처의 모델 = 고정된 목록)" }
     else { Write-Host "== 바뀜 (더한 줄·뺀 줄): $diff — 확인 뒤 판 변경과 함께 커밋"; git diff --stat -- app/models.lock }
 } finally {
     Pop-Location
