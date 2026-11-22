@@ -1,0 +1,118 @@
+"""app/model_lock.py — OCR 모델 파일 목록·sha256 대조 (https://github.com/reddol18/docflow/issues/102). 네트워크 없음."""
+import hashlib
+import os
+from pathlib import Path
+
+import pytest
+
+from app import model_lock as ml
+
+LOCK = Path(__file__).parent.parent / "app" / "models.lock"
+
+
+def _tree(root):
+    (root / "official_models" / "det").mkdir(parents=True)
+    (root / "official_models" / "det" / "inference.pdiparams").write_bytes(b"weights-det")
+    (root / "official_models" / "det" / "config.yml").write_bytes(b"a: 1\n")
+    (root / "fonts").mkdir()
+    (root / "fonts" / "korean.ttf").write_bytes(b"font")
+    return root
+
+
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def test_scan_lists_every_file_with_sha256(tmp_path):
+    have = ml.scan(_tree(tmp_path))
+    assert have == {
+        "fonts/korean.ttf": _sha(b"font"),
+        "official_models/det/config.yml": _sha(b"a: 1\n"),
+        "official_models/det/inference.pdiparams": _sha(b"weights-det"),
+    }
+
+
+def test_render_parse_roundtrip_sorted(tmp_path):
+    have = ml.scan(_tree(tmp_path))
+    text = ml.render(have)
+    assert text.startswith("#")
+    body = [ln for ln in text.splitlines() if not ln.startswith("#")]
+    assert [ln.split("  ", 1)[1] for ln in body] == sorted(have)
+    assert ml.parse(text) == have
+
+
+def test_verify_passes_on_same_tree(tmp_path, capsys):
+    root = _tree(tmp_path / "m")
+    lock = tmp_path / "models.lock"
+    assert ml.write(root, lock) == 0
+    assert ml.verify(root, lock) == 0
+    assert "모델 일치: OCR 모델 파일 3개" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("change, label", [
+    (lambda r: (r / "official_models/det/inference.pdiparams").write_bytes(b"tampered"), "해시 다름"),
+    (lambda r: (r / "fonts/korean.ttf").unlink(), "빠짐"),
+    (lambda r: (r / "official_models/det/extra.bin").write_bytes(b"x"), "남음"),
+])
+def test_verify_fails_on_any_difference(tmp_path, capsys, change, label):
+    root = _tree(tmp_path / "m")
+    lock = tmp_path / "models.lock"
+    ml.write(root, lock)
+    capsys.readouterr()
+    change(root)
+    assert ml.verify(root, lock) == 1
+    err = capsys.readouterr().err
+    assert f"!! 모델 {label}" in err and "!! 모델 불일치" in err
+
+
+def test_verify_fails_on_one_wrong_hash_in_lock(tmp_path):
+    root = _tree(tmp_path / "m")
+    lock = tmp_path / "models.lock"
+    ml.write(root, lock)
+    text = lock.read_text(encoding="utf-8").replace(_sha(b"font"), "0" * 64)
+    lock.write_text(text, encoding="utf-8")
+    assert ml.verify(root, lock) == 1
+
+
+def test_compare_reports_each_kind():
+    want = {"a": "1", "b": "2", "c": "3"}
+    have = {"a": "1", "b": "X", "d": "4"}
+    assert ml.compare(want, have) == (["c"], ["d"], ["b"])
+
+
+@pytest.mark.parametrize("text", [
+    "",                                       # 빈 lock
+    "# 머리말만\n",
+    "abc  x\n",                               # 해시 길이
+    ("A" * 64) + "  x\n",                     # 대문자
+    ("a" * 64) + " x\n",                      # 칸 하나
+    ("a" * 64) + "  /etc/passwd\n",           # 절대 경로
+    ("a" * 64) + "  ../x\n",                  # 폴더 밖
+    ("a" * 64) + "  x\n" + ("b" * 64) + "  x\n",  # 겹침
+])
+def test_parse_rejects_bad_lock(text):
+    with pytest.raises(ValueError):
+        ml.parse(text)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink 없음")
+def test_scan_rejects_symlink(tmp_path):
+    root = _tree(tmp_path / "m")
+    try:
+        os.symlink(root / "fonts" / "korean.ttf", root / "link.ttf")
+    except OSError:
+        pytest.skip("이 PC에서 symlink를 만들 권한 없음")
+    with pytest.raises(SystemExit):
+        ml.scan(root)
+
+
+def test_main_usage_error():
+    assert ml.main([]) == 2
+    assert ml.main(["check", "a", "b"]) == 2
+
+
+def test_committed_lock_is_well_formed():
+    """저장소의 app/models.lock — 형식이 맞고 PaddleOCR 모델(official_models)을 담는다."""
+    entries = ml.parse(LOCK.read_text(encoding="utf-8"))
+    assert any(p.startswith("official_models/") for p in entries)
+    assert LOCK.read_bytes() == ml.render(entries).encode("utf-8")  # 손으로 고치지 않은 그대로(정렬·머리말·LF)

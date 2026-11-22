@@ -31,6 +31,10 @@ sudo bash scripts/offline/build_bundle.sh <저장소> /mnt/e/dev/models /mnt/f/d
 
 - 시작 전에 묶음 폴더 여유 30GB·`/` 여유 25GB를 확인하고, 모자라면 멈춘다.
 - 앱 이미지는 지금 커밋을 `git archive`로 꺼내 빌드한다 (커밋 안 된 변경은 들어가지 않는다).
+  - OCR 모델(PaddleOCR, 이미지 안 `/opt/paddlex`)은 운영 이미지와 **같은 목록** `app/models.lock`(파일 목록·sha256)을 쓴다 (https://github.com/reddol18/docflow/issues/102).
+    묶음은 OCR 모델을 따로 싣지 않는다. 같은 `Dockerfile` 모델 층이 받은 뒤 대조하고, 하나라도 다르면(빠짐·남음·해시) 빌드가 멈춰 묶음도 만들어지지 않는다.
+  - 빌드 출력에 `모델 일치: OCR 모델 파일 N개 = app/models.lock`(캐시면 `모델 층 캐시 사용`), `CONTENTS.txt`에 그 lock의 파일 수·sha256을 적는다.
+  - 모델 판을 올리면 `.\scripts\model_lock_refresh.ps1`로 lock을 다시 만들어 커밋한 뒤 묶음을 처음부터 다시 만든다 (`app/` 변경이라 `--refresh`는 거절한다).
 - 레지스트리 이미지(postgres·qdrant·redis·ollama)는 매니페스트의 다이제스트 그대로 `k3s ctr pull → export`로 넣는다.
   docker save로 넣으면 다이제스트가 바뀌어 kubelet이 받으러 나간다.
 - k3s 설치 스크립트는 그 판의 태그에서 받아(`raw.githubusercontent.com/k3s-io/k3s/<판>/install.sh`) 고정 해시와 견준다. 판을 바꾸면 해시도 바꾼다.

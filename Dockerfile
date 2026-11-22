@@ -29,8 +29,8 @@ RUN pip install --no-cache-dir pip==26.3 && pip install --no-cache-dir --only-bi
 FROM scratch AS lock-out
 COPY --from=lock-resolve /requirements.freeze /
 
-# ---- 앱 이미지 (기본 대상: 마지막 단계)
-FROM base
+# ---- 앱 패키지 층 (앱 이미지와 model-lock 단계가 함께 쓴다)
+FROM base AS deps
 # 잠금 파일 그대로 설치한다 — 같은 커밋이면 몇 번 빌드해도 같은 패키지 (https://github.com/reddol18/docflow/issues/33)
 #  --require-hashes: lock에 없는 판·해시면 실패. --no-deps: lock에 없는 전이 의존성을 몰래 받지 않는다 → 빠지면 pip check가 실패
 #  --only-binary: 휠만. sdist를 빌드하면 그 빌드 의존성(setuptools 등)은 해시 확인 없이 받기 때문
@@ -48,8 +48,21 @@ RUN grep -E '^pip==' requirements.lock > /tmp/pip.lock \
     && rm /tmp/pip.lock /tmp/want
 # 모델은 빌드 때 받아 이미지에 넣는다 (실행 중 Pod는 외부 통신이 OpenAI 443뿐)
 ENV PADDLE_PDX_CACHE_HOME=/opt/paddlex PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
-COPY app/__init__.py app/ocr.py app/warm.py app/
-RUN python -m app.warm && chown -R app /opt/paddlex
+
+# ---- 모델 lock 갱신 전용 (scripts/model_lock_refresh.ps1이 --target model-lock-out으로만 부른다, 모델 판을 올릴 때만)
+# 아래 앱 이미지와 같은 명령으로 모델을 받고 그 폴더의 목록·sha256을 /models.lock으로 남긴다. 보통 빌드는 이 단계를 건너뛴다
+FROM deps AS model-lock
+COPY app/__init__.py app/ocr.py app/warm.py app/model_lock.py app/
+RUN python -m app.warm && python -m app.model_lock write /opt/paddlex /models.lock
+FROM scratch AS model-lock-out
+COPY --from=model-lock /models.lock /
+
+# ---- 앱 이미지 (기본 대상: 마지막 단계)
+FROM deps
+# 받은 모델 파일이 app/models.lock(목록·sha256)과 하나라도 다르면(빠짐·남음·해시) 빌드 실패 (https://github.com/reddol18/docflow/issues/102).
+# "모델 일치" 줄은 scripts/mac/build_image.sh·scripts/offline/build_bundle.sh가 빌드 로그에서 찾아 보인다
+COPY app/__init__.py app/ocr.py app/warm.py app/model_lock.py app/models.lock app/
+RUN python -m app.warm && python -m app.model_lock verify /opt/paddlex app/models.lock && chown -R app /opt/paddlex
 COPY app/ app/
 # Windows에서 scp로 올린 새 폴더는 700이라 app 사용자가 못 읽는다 (export_templates, https://github.com/reddol18/docflow/issues/12 배포 실패)
 RUN chmod -R a+rX app
