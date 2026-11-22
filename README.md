@@ -188,7 +188,13 @@ OCR 텍스트·색인 값에 심어진 문장이 추출과 검색 답변을 조�
 - `count_unconfirmed: true`면 출력 전 검증(`/export/check`)이 마지막 단계 승인 전 건을 `unconfirmed`로 센다(다른 문제 칸과 같이 경고만 — 출력을 막지 않고, 일괄 삭제는 `allow_problems` 규칙 그대로). 기본 흐름도 센다(사용자 결정 2026-11-09): 확정은 표본 검사를 마친 문서와, 검사 목록이 만들어지고 그 철의 검사가 모두 끝난 뒤의 검사 제외 문서. 검사 목록이 없거나 검사가 남아 있으면 나머지는 미확정.
 - 문서 잠금은 `DOC_LOCK_WAIT_SEC`(기본 10초)까지 기다리고, 넘기면 409 "다른 사람이 처리 중". 그래프 상태 읽기→쓰기는 철 잠금 안에서(잠금 순서 문서 → 철).
 - 작업자 ≠ 검수자의 입력 판단(철 검토 제출·입력 경로 수정, `store.entered`)은 실행 세대로 거르지 않는다(의도 — 다시 돌리기 전 입력자도 계속 입력자로 보아 넓게 막는다). 단계 승인·반려·검수 수정 기록만 세대로 거른다.
-- 예전 판에서 끝나지 않은 검사 차지(`inspection.inspected_at`만 있고 `fixed_fields`가 비어 있음 — 요청이 죽은 경우)는 그대로 두면 그 문서를 검사할 수 없다. 관리자가 확인한 뒤 DB에서 푼다: `UPDATE inspection SET inspected_by = NULL, inspected_at = NULL WHERE vol = '<철>' AND doc_id = '<문서>' AND fixed_fields IS NULL;` (지금 판은 검사를 문서 잠금 안에서 하고 실패하면 차지를 풀어 새로 생기지 않는다)
+- 끝나지 않은 검사 차지(`inspection.inspected_at`만 있고 `fixed_fields`가 비어 있음 — 차지와 끝냄 사이에 파드가 죽은 경우, 또는 예전 판에서 남은 것)는 검사 화면에서 푼다 (https://github.com/reddol18/docflow/issues/100): 검사 탭 → '검사 중' 문서 → **차지 풀기**. 그 뒤 다시 검사할 수 있다. DB를 직접 고치지 않는다.
+  - 경로 `POST /inspection/{vol}/{doc_id}/release` (표본 단계 역할, 기본 inspector 이상). 관리자는 늘, 차지한 본인은 바로, 다른 검사자는 차지한 뒤 `INSPECT_CLAIM_STALE_MIN`분(기본 15)이 지나야 푼다. 사용자를 모르면(인증 끈 개발 모드) 관리자만. 서버가 판단하고, 화면은 `GET /volumes/{vol}/inspection`의 문서별 `can_release`로 버튼을 보인다.
+  - 문서 잠금 안에서 푼다 — 검사 요청이 살아 있으면 잠금을 쥐고 있어 `DOC_LOCK_WAIT_SEC` 뒤 409이므로, 처리 중인 검사의 차지는 시간과 상관없이 풀리지 않는다. 끝난 검사·차지 없는 문서는 409.
+  - 검사 끝냄(`fixed_fields`)·확정 이동·승인 기록은 한 트랜잭션(`store.confirm_sample`)이라, 그 사이에 파드가 죽어도 '검사함인데 미확정'이 남지 않고 차지만 남는다 — 그 차지를 이 경로로 푼다.
+  - 화면은 문서별 `release_denied`(`role`·`user`·`recent`)로 까닭을 보이고, `recent`면 `releasable_at` 시각을 보여 주며 그때 목록을 다시 읽는다.
+  - 감사 로그 `inspect_release`: 차지한 사람 id(`claimed_by`)·본인 차지 여부(`own`)·차지한 뒤 지난 초(`age_sec`). 거절도 `rejected_403` 등으로 남는다.
+- 검사에서 고친 칸(`fixed_fields`, 표본 오류율·'합격 (검수 수정)' 판단의 근거)은 지금 실행 세대(`stage_gen.since` 뒤)의 검사 수정만 센다 — 다시 돌린 뒤 새 목록에서 다시 검사할 때 예전 세대 수정이 섞이지 않는다. 수정 이력(`edits`)에는 예전 세대 수정도 그대로 남는다.
 
 ### 검수 오류목록 (https://github.com/reddol18/docflow/issues/88)
 

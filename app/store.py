@@ -783,8 +783,10 @@ def add_review_submitter(vol, user_id):
 
 
 def inspection_rows(vol):
+    """검사 목록 행. owner_id·claim_age(차지한 뒤 지난 초, DB 시계)는 차지 풀기 판단용 — 화면에 내보내지 않는다"""
     with pool.connection() as c:
-        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, u.username AS inspected_by "
+        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, u.username AS inspected_by, "
+                         "i.inspected_by AS owner_id, extract(epoch FROM now() - i.inspected_at)::float AS claim_age "
                          "FROM inspection i LEFT JOIN users u ON u.id = i.inspected_by WHERE i.vol = %s ORDER BY i.doc_id",
                          (vol,)).fetchall()
 
@@ -823,10 +825,12 @@ def claim_inspection(vol, doc_id, user_id):
 
 
 def inspected_fields(vol, doc_id):
-    """검사 단계에서 고친 칸 (이력 기준)"""
+    """검사 단계에서 고친 칸 (이력 기준). 지금 실행 세대(stage_gen.since 뒤)의 검사 수정만 — 철을 다시 돌린(/run) 뒤
+    새 목록에서 다시 검사할 때 예전 세대 검사 수정까지 세어 오류율이 부풀지 않게 (https://github.com/reddol18/docflow/issues/100)"""
     with pool.connection() as c:
         return sorted(r["field"] for r in c.execute(
-            "SELECT DISTINCT field FROM edits WHERE vol = %s AND doc_id = %s AND source = 'inspect'", (vol, doc_id)).fetchall())
+            "SELECT DISTINCT field FROM edits WHERE vol = %(v)s AND doc_id = %(d)s AND source = 'inspect' "  # noqa: S608
+            f"AND ts >= {_SINCE}", {"v": vol, "d": doc_id}).fetchall())
 
 
 def reset_inspection(vol):
@@ -836,16 +840,28 @@ def reset_inspection(vol):
         return c.execute("DELETE FROM inspection_plan WHERE vol = %s", (vol,)).rowcount > 0
 
 
-def finish_inspection(vol, doc_id, fixed_fields):
-    with pool.connection() as c:
-        c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s", (fixed_fields, vol, doc_id))
-
-
 def release_inspection(vol, doc_id, user_id):
     """검사하다 실패하면(고치기·끝내기·확정) 이 사용자의 차지를 푼다"""
     with pool.connection() as c:
         c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
                   "WHERE vol = %s AND doc_id = %s AND inspected_by IS NOT DISTINCT FROM %s", (vol, doc_id, user_id))
+
+
+def claim_row(vol, doc_id):
+    """차지 풀기 판단용: 차지한 사람 id·시각·끝남 여부와 차지한 뒤 지난 초(DB 시계). 목록에 없으면 None"""
+    with pool.connection() as c:
+        return c.execute("SELECT inspected_by AS owner_id, inspected_at, fixed_fields, "
+                         "extract(epoch FROM now() - inspected_at)::float AS claim_age "
+                         "FROM inspection WHERE vol = %s AND doc_id = %s", (vol, doc_id)).fetchone()
+
+
+def release_claim(vol, doc_id, inspected_at):
+    """끝나지 않은 검사 차지를 푼다 (https://github.com/reddol18/docflow/issues/100). 확인 때 읽은 차지(inspected_at)가
+    그대로이고 아직 끝나지 않았을 때만 — 그 사이 끝났거나 다른 차지로 바뀌었으면 건드리지 않는다. 풀었으면 True"""
+    with pool.connection() as c:
+        return c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
+                         "WHERE vol = %s AND doc_id = %s AND inspected_at = %s AND fixed_fields IS NULL",
+                         (vol, doc_id, inspected_at)).rowcount == 1
 
 
 def inspection_stats(start=None, end=None):
@@ -1057,13 +1073,16 @@ class _Rollback(Exception):
 
 
 def confirm_sample(vol, doc_id, stage, rnd, user_id, fixed, gen):
-    """표본 검사가 끝난 문서를 확정으로 옮기고 기록한다 (한 트랜잭션). 행이 없던 문서(기본 흐름)는 만든다.
-    세대가 바뀌었거나(/run) 이 사용자의 검사 차지가 없어졌으면 쓰지 않고 False"""
+    """표본 검사를 끝내고(inspection.fixed_fields) 문서를 확정으로 옮기고 기록한다 — 셋을 한 트랜잭션으로.
+    끝냄과 확정 사이에 파드가 죽으면 '검사함'인데 확정되지 않은 문서가 남아 다시 검사도 차지 풀기도 못 했다
+    (https://github.com/reddol18/docflow/issues/100) — 이제는 둘 다 쓰이거나 둘 다 안 쓰여 차지만 남고, 차지는 화면에서 푼다.
+    행이 없던 문서(기본 흐름)는 만든다. 세대가 바뀌었거나(/run) 이 사용자의 끝나지 않은 검사 차지가 없으면 쓰지 않고 False"""
     with pool.connection() as c, c.transaction():
         if not _same_gen(c, vol, gen):
             return False
-        if not c.execute("SELECT 1 FROM inspection WHERE vol = %s AND doc_id = %s AND inspected_at IS NOT NULL "
-                         "AND inspected_by IS NOT DISTINCT FROM %s", (vol, doc_id, user_id)).fetchone():
+        if c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s AND inspected_at IS NOT NULL "
+                     "AND fixed_fields IS NULL AND inspected_by IS NOT DISTINCT FROM %s",
+                     (fixed, vol, doc_id, user_id)).rowcount != 1:
             return False
         c.execute("INSERT INTO doc_stage (vol, doc_id, stage, round) VALUES (%(v)s, %(d)s, %(fin)s, %(r)s) "
                   "ON CONFLICT (vol, doc_id) DO UPDATE SET stage = %(fin)s, last_reason = NULL, rejected_from = NULL, "
