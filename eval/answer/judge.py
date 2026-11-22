@@ -327,12 +327,18 @@ def build(a, prompts):
     return llm, metrics, {"Refusal": Refusal, "Support": Support}, jm, em, base, ebase
 
 
-async def run_all(rows, metrics, llm, prompts, models):
+async def run_all(rows, metrics, llm, prompts, models, deadline=None, save=None):
+    """질의마다 채점하고 save(out, 끝났나)로 그때까지의 결과를 쓴다. deadline(epoch 초)을 넘기면 새 질의를 시작하지 않는다"""
     out = []
     for r in rows:
+        if deadline and time.time() >= deadline:
+            print(f"마감 시각을 넘겨 멈춤 — {len(out)}/{len(rows)}건 저장", flush=True)
+            break
         res = await judge_row(r, metrics, llm, prompts, models)
         out.append({"id": r["id"], "type": r["type"], "answerable": r["answerable"], **res})
         print(f"{r['id']} {res['seconds']}s {res['binary']} 오류 {list(res['errors'])}", flush=True)
+        if save:
+            save(out, len(out) == len(rows))
     return out
 
 
@@ -350,6 +356,7 @@ def main(argv=None):
     ap.add_argument("--embed-model", default="text-embedding-3-small")
     ap.add_argument("--embed-base-url", default=OPENAI_BASE, help="질문 적합도 임베딩 주소 (기본 OpenAI)")
     ap.add_argument("--out", default="")
+    ap.add_argument("--deadline-utc", default="", help="이 시각(예: 2026-11-22T00:40:00Z)이 지나면 새 질의를 시작하지 않고 그때까지를 저장")
     a = ap.parse_args(argv)
     if not all(c.isalnum() or c in "._-" for c in a.label):
         raise SystemExit("--label은 영문·숫자·_.-만")
@@ -363,23 +370,41 @@ def main(argv=None):
     p = out_path(a.answers, a.label, a.out)
     llm, metrics, models, jm, em, base, ebase = build(a, prompts)
     import ragas  # noqa: PLC0415
+    digest = ollama_digest(base, a.model)  # 시작할 때 (마감·끊김 뒤에는 못 읽을 수 있다)
+    deadline = None
+    if a.deadline_utc:
+        import datetime as dt  # noqa: PLC0415
+        deadline = dt.datetime.fromisoformat(a.deadline_utc.replace("Z", "+00:00")).timestamp()
     t0 = time.time()
-    out = asyncio.run(run_all(rows, metrics, llm, prompts, models))
-    wall = round(time.time() - t0, 1)
-    edump = em.dump()
-    e_usd = edump["prompt_tokens"] * EMBED_PRICE.get(a.embed_model, 0.0) / 1e6 if ebase == OPENAI_BASE else 0.0
-    res = {"label": a.label, "issue": "https://github.com/reddol18/docflow/issues/21", "answers_file": Path(a.answers).name,
-           "answers_label": ans.get("label"), "answer_model": sorted({r.get("model") for r in rows if r.get("model")}),
-           "judge": {"base_url": base, "model": a.model, "response_models": jm.dump()["models"],
-                     "ollama_digest": ollama_digest(base, a.model), "system_prompt": a.system_prompt or None,
-                     "max_tokens": a.max_tokens, "temperature": 0.0},
-           "embedding": {"base_url": ebase, "model": a.embed_model, "usd": round(e_usd, 6), **edump},
-           "prompts": {"file": Path(a.prompts).name, "version": prompts["version"], "sha256": p_hash},
-           "ragas_version": ragas.__version__, "thresholds": prompts["thresholds"],
-           "tokens": {"judge": jm.dump()}, "wall_s": wall,
-           "seconds_per_question": round(wall / len(out), 1) if out else None,
-           "summary": summarize(out, prompts["thresholds"]), "rows": out}
-    p.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    holder = {}
+
+    def save(out, done):
+        wall = round(time.time() - t0, 1)
+        edump = em.dump()
+        e_usd = edump["prompt_tokens"] * EMBED_PRICE.get(a.embed_model, 0.0) / 1e6 if ebase == OPENAI_BASE else 0.0
+        res = {"label": a.label, "issue": "https://github.com/reddol18/docflow/issues/21", "answers_file": Path(a.answers).name,
+               "answers_label": ans.get("label"), "answer_model": sorted({r.get("model") for r in rows if r.get("model")}),
+               "complete": done, "judged": len(out), "planned": len(rows),
+               "judge": {"base_url": base, "model": a.model, "response_models": jm.dump()["models"],
+                         "ollama_digest": digest, "system_prompt": a.system_prompt or None,
+                         "max_tokens": a.max_tokens, "temperature": 0.0},
+               "embedding": {"base_url": ebase, "model": a.embed_model, "usd": round(e_usd, 6), **edump},
+               "prompts": {"file": Path(a.prompts).name, "version": prompts["version"], "sha256": p_hash},
+               "ragas_version": ragas.__version__, "thresholds": prompts["thresholds"],
+               "tokens": {"judge": jm.dump()}, "wall_s": wall,
+               "seconds_per_question": round(wall / len(out), 1) if out else None,
+               "summary": summarize(out, prompts["thresholds"]), "rows": out}
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+        holder["res"] = res
+
+    out = asyncio.run(run_all(rows, metrics, llm, prompts, models, deadline, save))
+    if not out:
+        raise SystemExit("채점한 질의가 없다")
+    if not holder["res"]["complete"]:
+        save(out, False)
+    res = holder["res"]
     print(json.dumps({k: res[k] for k in ("judge", "embedding", "tokens", "wall_s", "seconds_per_question")}, ensure_ascii=False))
     print(json.dumps(res["summary"], ensure_ascii=False))
     print(f"결과: {p}")

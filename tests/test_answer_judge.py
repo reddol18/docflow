@@ -213,6 +213,18 @@ def test_judge_row_with_fake_llm(jd):
     assert res["binary"]["refusal"] == "P" and set(res["scores"]) == {"refusal"}
 
 
+def test_run_all_saves_each_row_and_stops_at_deadline(jd, monkeypatch):
+    async def fake_row(row, *a):
+        return {"scores": {}, "binary": {}, "reasons": {}, "errors": {}, "seconds": 0}
+    monkeypatch.setattr(jd, "judge_row", fake_row)
+    rows = answers()["rows"]
+    saved = []
+    out = asyncio.run(jd.run_all(rows, {}, None, {}, {}, None, lambda o, done: saved.append((len(o), done))))
+    assert len(out) == 3 and saved == [(1, False), (2, False), (3, True)]
+    out = asyncio.run(jd.run_all(rows, {}, None, {}, {}, 1.0, lambda o, done: None))  # 마감이 이미 지남
+    assert out == []
+
+
 # ---------- 사람 채점표 ----------
 
 def test_sheet_has_no_judge_scores_and_na_cells(hs, tmp_path):
