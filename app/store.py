@@ -783,8 +783,10 @@ def add_review_submitter(vol, user_id):
 
 
 def inspection_rows(vol):
+    """검사 목록 행. owner_id·claim_age(차지한 뒤 지난 초, DB 시계)는 차지 풀기 판단용 — 화면에 내보내지 않는다"""
     with pool.connection() as c:
-        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, u.username AS inspected_by "
+        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, u.username AS inspected_by, "
+                         "i.inspected_by AS owner_id, extract(epoch FROM now() - i.inspected_at)::float AS claim_age "
                          "FROM inspection i LEFT JOIN users u ON u.id = i.inspected_by WHERE i.vol = %s ORDER BY i.doc_id",
                          (vol,)).fetchall()
 
@@ -823,10 +825,12 @@ def claim_inspection(vol, doc_id, user_id):
 
 
 def inspected_fields(vol, doc_id):
-    """검사 단계에서 고친 칸 (이력 기준)"""
+    """검사 단계에서 고친 칸 (이력 기준). 지금 실행 세대(stage_gen.since 뒤)의 검사 수정만 — 철을 다시 돌린(/run) 뒤
+    새 목록에서 다시 검사할 때 예전 세대 검사 수정까지 세어 오류율이 부풀지 않게 (https://github.com/reddol18/docflow/issues/100)"""
     with pool.connection() as c:
         return sorted(r["field"] for r in c.execute(
-            "SELECT DISTINCT field FROM edits WHERE vol = %s AND doc_id = %s AND source = 'inspect'", (vol, doc_id)).fetchall())
+            "SELECT DISTINCT field FROM edits WHERE vol = %(v)s AND doc_id = %(d)s AND source = 'inspect' "  # noqa: S608
+            f"AND ts >= {_SINCE}", {"v": vol, "d": doc_id}).fetchall())
 
 
 def reset_inspection(vol):
@@ -846,6 +850,23 @@ def release_inspection(vol, doc_id, user_id):
     with pool.connection() as c:
         c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
                   "WHERE vol = %s AND doc_id = %s AND inspected_by IS NOT DISTINCT FROM %s", (vol, doc_id, user_id))
+
+
+def claim_row(vol, doc_id):
+    """차지 풀기 판단용: 차지한 사람 id·시각·끝남 여부와 차지한 뒤 지난 초(DB 시계). 목록에 없으면 None"""
+    with pool.connection() as c:
+        return c.execute("SELECT inspected_by AS owner_id, inspected_at, fixed_fields, "
+                         "extract(epoch FROM now() - inspected_at)::float AS claim_age "
+                         "FROM inspection WHERE vol = %s AND doc_id = %s", (vol, doc_id)).fetchone()
+
+
+def release_claim(vol, doc_id, inspected_at):
+    """끝나지 않은 검사 차지를 푼다 (https://github.com/reddol18/docflow/issues/100). 확인 때 읽은 차지(inspected_at)가
+    그대로이고 아직 끝나지 않았을 때만 — 그 사이 끝났거나 다른 차지로 바뀌었으면 건드리지 않는다. 풀었으면 True"""
+    with pool.connection() as c:
+        return c.execute("UPDATE inspection SET inspected_by = NULL, inspected_at = NULL, fixed_fields = NULL "
+                         "WHERE vol = %s AND doc_id = %s AND inspected_at = %s AND fixed_fields IS NULL",
+                         (vol, doc_id, inspected_at)).rowcount == 1
 
 
 def inspection_stats(start=None, end=None):

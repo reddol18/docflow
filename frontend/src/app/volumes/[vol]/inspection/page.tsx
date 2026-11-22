@@ -166,6 +166,22 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
     }
   };
 
+  // 끝나지 않은 검사 차지 풀기 (https://github.com/reddol18/docflow/issues/100) — 차지와 끝냄 사이에 요청이 죽어 남은 '검사 중'
+  const release = async (d: InspectionDoc) => {
+    if (!window.confirm(`${d.doc_id}의 '검사 중' 차지를 풀까요? 검사 요청이 끝나지 않고 남은 경우에만 푸세요.`)) return;
+    setBusy(true);
+    setNote(null);
+    try {
+      await api.releaseInspection(vol, d.doc_id);
+      setNote(`${d.doc_id} 차지를 풂 — 다시 검사할 수 있습니다`);
+    } catch (e) {
+      setNote(`실패: ${errMsg(e)}`);
+    } finally {
+      setBusy(false);
+      reload();
+    }
+  };
+
   const dirty = cur ? Object.keys(fixes[cur.doc_id] ?? {}).length : 0;
   const checks = new Set(cur?.check_fields ?? []);
   const roleLabel = stage ? ROLE_LABEL[stage.role] : "";
@@ -412,6 +428,24 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                             <span className="ml-1 text-slate-500">
                               · {cur.fixed_fields.length ? `고친 칸: ${cur.fixed_fields.map(label).join(", ")}` : "이상 없음"}
                             </span>
+                          )}
+                          {inProgress(cur) && inspector && (
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                              {cur.can_release && (
+                                <button
+                                  onClick={() => release(cur)}
+                                  disabled={busy}
+                                  className="rounded-md border border-rose-300 bg-white px-3 py-1 text-sm font-medium text-rose-700 disabled:opacity-30"
+                                >
+                                  차지 풀기
+                                </button>
+                              )}
+                              <span>
+                                {cur.can_release
+                                  ? "검사 요청이 끝나지 않고 남은 차지면 풀어서 다시 검사합니다 (감사 로그에 남음)"
+                                  : `남의 차지는 ${view?.claim_stale_min ?? ""}분이 지나야 풀 수 있음 (관리 역할은 바로)`}
+                              </span>
+                            </div>
                           )}
                         </div>
                       )

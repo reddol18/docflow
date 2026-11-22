@@ -12,8 +12,9 @@
   PATCH /documents/{vol}/{doc_id}      완료된 문서의 색인 칸 고치기 (재색인)
   GET   /documents/{vol}/{doc_id}/edits  수정 이력 (칸·이전 값·새 값·사용자·시각·단계 입력/검사)
   POST  /volumes/{vol}/inspection      검사 목록 만들기 (표시 문서 전부 + 표본 + 100% 검수 칸) — 검사자
-  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부·막힌 까닭 block)
+  GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부·막힌 까닭 block·차지 풀기 can_release)
   POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
+  POST  /inspection/{vol}/{doc_id}/release  끝나지 않은 검사 차지 풀기 — 관리자·본인은 바로, 남의 차지는 INSPECT_CLAIM_STALE_MIN분 뒤
   GET   /workflow                      검토 흐름 설정 (단계·맡는 역할·전수/표본·반려 규칙 — app/workflows/*.yaml)
   GET   /volumes/{vol}/workflow        문서마다 지금 단계·차례(재검수)·반려 사유·내가 승인/반려할 수 있나
   POST  /workflow/{vol}/{doc_id}/approve  단계 승인 (고친 칸 함께). 마지막 단계면 확정
@@ -854,7 +855,22 @@ def _entry_edit_allowed(vol, doc_id, user):
             raise HTTPException(403, f"같은 문서의 검수 단계({', '.join(sorted(other))})를 맡은 사람은 입력을 고칠 수 없음")
 
 
+def _claim_stale_min():
+    raw = os.environ.get("INSPECT_CLAIM_STALE_MIN", "15")
+    try:
+        minutes = float(raw)
+    except ValueError:
+        raise RuntimeError(f"INSPECT_CLAIM_STALE_MIN은 0보다 큰 분 (예: 15): {raw!r}") from None
+    if not minutes > 0:
+        raise RuntimeError(f"INSPECT_CLAIM_STALE_MIN은 0보다 큰 분 (예: 15): {raw!r}")
+    return minutes
+
+
 INSPECT_RATE = _inspect_rate()  # 표시 없는 문서 표본 비율 — 기본값이자 하한 (관리자만 낮출 수 있다)
+# 끝나지 않은 검사 차지를 검사자(관리자 아님)가 남의 차지라도 풀 수 있게 되는 시간(분) (https://github.com/reddol18/docflow/issues/100).
+# 풀기는 문서 잠금 안에서 하므로 살아 있는 검사 요청의 차지는 시간과 상관없이 풀리지 않는다(잠금이 바쁘면 409) — 이 시간은
+# 방금 생긴 남의 차지를 다른 검사자가 바로 건드리지 않게 하는 운영 규칙. 관리자와 차지한 본인은 바로 풀 수 있다
+CLAIM_STALE_MIN = _claim_stale_min()
 if SAMPLE and SAMPLE["rate"] is not None:
     INSPECT_RATE = SAMPLE["rate"]  # 흐름 설정에 적은 비율이 환경변수보다 먼저
 FIELD = Literal[EDITABLE]
@@ -924,13 +940,31 @@ def inspection_view(vol: str, user: Viewer):
     pos = positions(vol, ids, listed=set(ids))  # 목록은 이미 읽었다 — positions가 다시 읽지 않게
     out = []
     for r in rows:
+        owner, age = r.pop("owner_id"), r.pop("claim_age")  # 풀기 판단용 — 응답에는 싣지 않는다
         d = docs.get(r["doc_id"], {})
         mine = WORKFLOW["distinct_actors"] and other_stages(whole, acts, r["doc_id"], SAMPLE["name"])
         block = _inspect_block(r, inspector, user, whole, mine, pos[r["doc_id"]]["stage"])
+        release = (_release_denied(owner, age, user) if inspector else "role") if block == "in_progress" else None
         out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
                     "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
-                    "can_inspect": block is None, "block": block})
-    return {"plan": plan, "docs": out}
+                    "can_inspect": block is None, "block": block,
+                    "can_release": block == "in_progress" and release is None})
+    return {"plan": plan, "docs": out, "claim_stale_min": CLAIM_STALE_MIN}
+
+
+def _release_denied(owner, age, user):
+    """끝나지 않은 검사 차지를 이 사용자가 풀 수 없는 까닭 (None이면 풀 수 있음). 역할(표본 단계 역할)은 경로가 본다.
+    관리자는 늘, 차지한 본인은 바로, 다른 검사자는 차지한 뒤 CLAIM_STALE_MIN분이 지나면. 사용자를 모르면(인증 끈 개발
+    모드) 관리자가 아닌 한 막는다 — 본인 차지인지 알 수 없다"""
+    if auth.role_at_least(user.role, "admin"):
+        return None
+    if user.id is None:
+        return "user"
+    if owner is not None and owner == user.id:
+        return None
+    if age is None or age < CLAIM_STALE_MIN * 60:
+        return "young"
+    return None
 
 
 def _inspect_block(row, inspector, user, whole, mine, stage):
@@ -993,6 +1027,34 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
             raise
         info.update(fields=fixed, stage=SAMPLE["name"], to=CONFIRMED)
     return {"doc_id": doc_id, "fixed_fields": fixed}
+
+
+@app.post("/inspection/{vol}/{doc_id}/release")
+@audit_as("inspect_release")
+def inspection_release(vol: str, doc_id: str, user: SampleUser):
+    """끝나지 않은 검사 차지('검사 중')를 푼다 (https://github.com/reddol18/docflow/issues/100) — 차지와 끝냄 사이에 파드가
+    죽어 남은 차지. 풀면 그 문서를 다시 검사할 수 있다. 검사 경로처럼 문서 잠금 안에서: 검사 요청이 살아 있으면 잠금을
+    쥐고 있어 기다리다 409가 되므로, 처리 중인 검사의 차지는 풀리지 않는다. 누가 풀 수 있나는 _release_denied.
+    감사 로그 inspect_release: 차지한 사람 id(claimed_by)·본인 차지 여부(own)·차지한 뒤 지난 초(age_sec)"""
+    with audited(user, "inspect_release", vol, doc_id) as info, store.doc_lock(vol, doc_id):
+        _need_sample()
+        row = store.claim_row(vol, doc_id)
+        if not row:
+            raise HTTPException(404, "검사 목록에 없는 문서")
+        if row["inspected_at"] is None:
+            raise HTTPException(409, "검사 중인 차지가 없음")
+        if row["fixed_fields"] is not None:
+            raise HTTPException(409, "이미 끝난 검사는 풀 수 없음")
+        info.update(claimed_by=row["owner_id"], own=row["owner_id"] is not None and row["owner_id"] == user.id,
+                    age_sec=int(row["claim_age"] or 0))
+        why = _release_denied(row["owner_id"], row["claim_age"], user)
+        if why == "user":
+            raise HTTPException(403, "사용자를 알 수 없어 차지를 풀 수 없음 (관리자만)")
+        if why == "young":
+            raise HTTPException(403, f"남의 차지는 {CLAIM_STALE_MIN:g}분이 지나야 풀 수 있음 (관리자는 바로)")
+        if not store.release_claim(vol, doc_id, row["inspected_at"]):
+            raise HTTPException(409, "그 사이 차지가 바뀜 — 새로 고친 뒤 다시")
+    return {"doc_id": doc_id, "released": True}
 
 
 # ---------- 설정 흐름의 단계 승인·반려 (https://github.com/reddol18/docflow/issues/86) ----------
