@@ -43,6 +43,74 @@ def test_scan_skips_download_cache_records(tmp_path):
     assert len(have) == 3
 
 
+def _meta(root):
+    """받기 부산물: 모델 저장소 README·.gitattributes와 huggingface .cache 기록."""
+    det = root / "official_models" / "det"
+    (det / "README.md").write_bytes(b"# model card\n")
+    (det / ".gitattributes").write_bytes(b"*.pdiparams filter=lfs\n")
+    (det / ".cache" / "huggingface").mkdir(parents=True)
+    (det / ".cache" / "huggingface" / "CACHEDIR.TAG").write_bytes(b"tag")
+    return det
+
+
+def test_scan_skips_readme_and_gitattributes(tmp_path):
+    root = _tree(tmp_path)
+    _meta(root)
+    have = ml.scan(root)
+    assert sorted(have) == ["fonts/korean.ttf", "official_models/det/config.yml", "official_models/det/inference.pdiparams"]
+    assert len(ml.scan(root, skip=False)) == 6
+
+
+def test_upstream_readme_edit_does_not_break_verify(tmp_path):
+    """배포처가 모델 설명(README)만 고쳐도 빌드는 통과한다 — 대조 대상이 아니다."""
+    root = _tree(tmp_path / "m")
+    det = _meta(root)
+    lock = tmp_path / "models.lock"
+    ml.write(root, lock)
+    (det / "README.md").write_bytes(b"# model card v2\n")
+    (det / ".gitattributes").write_bytes(b"changed\n")
+    assert ml.verify(root, lock) == 0
+
+
+def test_unknown_new_file_still_fails(tmp_path):
+    """빼는 것은 이름을 적은 것뿐 — 그 밖의 새 파일(예: 새 가중치)은 '남음'으로 실패한다."""
+    root = _tree(tmp_path / "m")
+    lock = tmp_path / "models.lock"
+    ml.write(root, lock)
+    (root / "official_models" / "det" / "README.txt").write_bytes(b"x")
+    assert ml.verify(root, lock) == 1
+
+
+def test_prune_removes_skipped_and_leaves_only_locked(tmp_path, capsys):
+    root = _tree(tmp_path / "m")
+    det = _meta(root)
+    lock = tmp_path / "models.lock"
+    ml.write(root, lock)
+    capsys.readouterr()
+    assert ml.prune(root, lock) == 0
+    assert "대조 안 한 것 3개 지움" in capsys.readouterr().out
+    assert not (det / "README.md").exists() and not (det / ".gitattributes").exists() and not (det / ".cache").exists()
+    assert ml.scan(root, skip=False) == ml.parse(lock.read_text(encoding="utf-8"))
+
+
+def test_prune_fails_when_unlisted_file_remains(tmp_path):
+    root = _tree(tmp_path / "m")
+    lock = tmp_path / "models.lock"
+    ml.write(root, lock)
+    (root / "fonts" / "other.ttf").write_bytes(b"x")
+    assert ml.prune(root, lock) == 1
+
+
+def test_scan_checks_symlink_before_skipping_dirs(tmp_path, monkeypatch):
+    """심볼릭 링크 확인은 SKIP_DIRS로 빼기 전에 — .cache라는 이름의 링크도 멈춘다."""
+    root = _tree(tmp_path)
+    (root / "official_models" / "det" / ".cache").mkdir()
+    real = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda self: self.name == ".cache" or real(self))
+    with pytest.raises(SystemExit, match="심볼릭 링크"):
+        ml.scan(root)
+
+
 def test_render_parse_roundtrip_sorted(tmp_path):
     have = ml.scan(_tree(tmp_path))
     text = ml.render(have)
@@ -126,4 +194,6 @@ def test_committed_lock_is_well_formed():
     """저장소의 app/models.lock — 형식이 맞고 PaddleOCR 모델(official_models)을 담는다."""
     entries = ml.parse(LOCK.read_text(encoding="utf-8"))
     assert any(p.startswith("official_models/") for p in entries)
+    names = {p.rsplit("/", 1)[-1] for p in entries}
+    assert not names & ml.SKIP_NAMES and not any(set(p.split("/")) & ml.SKIP_DIRS for p in entries)
     assert LOCK.read_bytes() == ml.render(entries).encode("utf-8")  # 손으로 고치지 않은 그대로(정렬·머리말·LF)

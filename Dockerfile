@@ -62,7 +62,9 @@ FROM deps
 # 받은 모델 파일이 app/models.lock(목록·sha256)과 하나라도 다르면(빠짐·남음·해시) 빌드 실패 (https://github.com/reddol18/docflow/issues/102).
 # "모델 일치" 줄은 scripts/mac/build_image.sh·scripts/offline/build_bundle.sh가 빌드 로그에서 찾아 보인다
 COPY app/__init__.py app/ocr.py app/warm.py app/model_lock.py app/models.lock app/
-RUN python -m app.warm && python -m app.model_lock verify /opt/paddlex app/models.lock && chown -R app /opt/paddlex
+# prune: 대조하지 않은 받기 부산물(.cache·README.md·.gitattributes, app/model_lock.py)을 지우고 남은 파일 전부가 lock 그대로인지 다시 본다
+RUN python -m app.warm && python -m app.model_lock verify /opt/paddlex app/models.lock \
+    && python -m app.model_lock prune /opt/paddlex app/models.lock && chown -R app /opt/paddlex
 COPY app/ app/
 # Windows에서 scp로 올린 새 폴더는 700이라 app 사용자가 못 읽는다 (export_templates, https://github.com/reddol18/docflow/issues/12 배포 실패)
 RUN chmod -R a+rX app
