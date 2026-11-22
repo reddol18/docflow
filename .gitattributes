@@ -5,6 +5,8 @@ Dockerfile text eol=lf
 scripts/tool_pins.txt text eol=lf
 # 잠금 파일(scripts/lock_hashes.py가 LF로 씀): 체크아웃 줄바꿈이 바뀌어 diff가 생기지 않게
 requirements.lock text eol=lf
+# OCR 모델 lock(app/model_lock.py가 LF로 씀, https://github.com/reddol18/docflow/issues/102): 시험이 바이트 그대로 견준다
+app/models.lock text eol=lf
 # 평가 세트 diff: CRLF로 바뀌면 git apply가 깨진다
 evals/**/*.patch text eol=lf
 # 시험용 가짜 colima·kubectl (sh 스크립트, 확장자 없음): WSL·sh가 읽도록 LF

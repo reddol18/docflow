@@ -130,6 +130,10 @@ say "docflow:dev 빌드 (/root/docflow-build-api.log)"
 DOCKER_BUILDKIT=1 docker build --progress=plain --build-arg "APT_REFRESH=$(date +%G-W%V)" -t docflow:dev "$SRC" \
   > /root/docflow-build-api.log 2>&1 || { tail -40 /root/docflow-build-api.log; exit 1; }
 grep -oE 'lock 일치: 이미지 패키지 [0-9]+개 = requirements\.lock' /root/docflow-build-api.log | tail -1 || true
+# OCR 모델: 묶음의 docflow:dev도 같은 Dockerfile 빌드라 모델 층이 app/models.lock(목록·sha256)과 다르면 위 빌드가 이미 멈췄다
+# (https://github.com/reddol18/docflow/issues/102). 묶음은 모델을 따로 싣지 않는다 — 이미지 안 /opt/paddlex가 그 목록 그대로다
+MODEL_LINE=$(grep -oE '모델 일치: OCR 모델 파일 [0-9]+개 = app/models\.lock' /root/docflow-build-api.log | tail -1 || true)
+echo "${MODEL_LINE:-모델 일치: 모델 층 캐시 사용 (그 층을 만든 빌드에서 확인됨)}"
 say "docflow-web:dev 빌드 (/root/docflow-build-web.log)"
 DOCKER_BUILDKIT=1 docker build --progress=plain -t docflow-web:dev "$SRC/frontend" \
   > /root/docflow-build-web.log 2>&1 || { tail -40 /root/docflow-build-web.log; exit 1; }
@@ -181,6 +185,7 @@ put_scripts "$SRC" "$B"
 {
   echo "docflow 폐쇄망 설치 묶음 — 커밋 $COMMIT, 만든 때 $(date -Iseconds), k3s $K3S_VERSION"
   echo "모델: $OLLAMA_MODELS_WANT"
+  echo "OCR 모델(docflow:dev 안 /opt/paddlex): app/models.lock $(grep -vc '^#' "$SRC/app/models.lock")개 파일, lock sha256 $(sha256sum "$SRC/app/models.lock" | cut -d' ' -f1) — 빌드가 대조함"
   echo "레지스트리 이미지:"; printf '  %s\n' "${REFS[@]}"
   echo "앱 이미지: docflow:dev $(docker image inspect -f '{{.Id}}' docflow:dev), docflow-web:dev $(docker image inspect -f '{{.Id}}' docflow-web:dev)"
 } | write_index "$B"
