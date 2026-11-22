@@ -1,8 +1,8 @@
 """OCR 모델 파일을 목록·sha256으로 고정한다 (https://github.com/reddol18/docflow/issues/102).
 
 이미지 빌드는 `python -m app.warm`으로 PaddleOCR 모델을 받는다(PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True, 받는 쪽은 해시를 안 본다).
-그래서 받은 뒤 모델 폴더(PADDLE_PDX_CACHE_HOME) 아래 파일 전부(받기 도구의 `.cache` 기록 폴더는 빼고, scan 참고)를 app/models.lock과 견준다 — 빠진 파일·남는 파일·해시가 다른
-파일이 하나라도 있으면 0이 아닌 값으로 끝나 빌드가 멈춘다.
+그래서 받은 뒤 모델 폴더(PADDLE_PDX_CACHE_HOME) 아래 파일 전부(받기 도구의 `.cache` 기록 폴더는 빼고, scan 참고)를
+app/models.lock과 견준다 — 빠진 파일·남는 파일·해시가 다른 파일이 하나라도 있으면 0이 아닌 값으로 끝나 빌드가 멈춘다.
 
   python -m app.model_lock verify <모델 폴더> <lock>   # Dockerfile 모델 층 (보통 빌드)
   python -m app.model_lock write  <모델 폴더> <lock>   # Dockerfile model-lock 단계 (scripts/model_lock_refresh.ps1, 모델 판을 올릴 때만)
