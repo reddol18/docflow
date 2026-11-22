@@ -53,6 +53,23 @@ function blockText(b: InspectBlock, d: InspectionDoc, role: string) {
   }
 }
 
+// 끝나지 않은 차지 풀기 안내 — 까닭은 서버(release_denied)가 정한다
+function releaseText(d: InspectionDoc) {
+  if (d.can_release) return "검사 요청이 끝나지 않고 남은 차지면 풀어서 다시 검사합니다 (감사 로그에 남음)";
+  switch (d.release_denied) {
+    case "recent": {
+      const at = d.releasable_at
+        ? new Date(d.releasable_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false })
+        : "";
+      return `남의 차지는 ${at ? `${at}부터` : "시간이 지나야"} 풀 수 있음 (관리 역할은 바로)`;
+    }
+    case "user":
+      return "사용자를 알 수 없어 차지를 풀 수 없음 (관리 역할만)";
+    default:
+      return "";
+  }
+}
+
 export default function InspectionPage({ params }: { params: Promise<{ vol: string }> }) {
   const vol = decodeURIComponent(use(params).vol);
   const { data: s } = usePoll(() => api.volume(vol), 5000, [vol]);
@@ -181,6 +198,15 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
       reload();
     }
   };
+
+  // 남의 차지가 풀 수 있게 되는 시각에 목록을 다시 읽어 버튼이 나타나게 한다 (서버가 다시 판단)
+  const releasableAt = cur?.release_denied === "recent" ? cur.releasable_at : null;
+  useEffect(() => {
+    if (!releasableAt) return;
+    const wait = Math.max(0, new Date(releasableAt).getTime() - Date.now()) + 1000;
+    const t = window.setTimeout(reload, Math.min(wait, 2 ** 31 - 1));
+    return () => window.clearTimeout(t);
+  }, [releasableAt, reload]);
 
   const dirty = cur ? Object.keys(fixes[cur.doc_id] ?? {}).length : 0;
   const checks = new Set(cur?.check_fields ?? []);
@@ -429,7 +455,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                               · {cur.fixed_fields.length ? `고친 칸: ${cur.fixed_fields.map(label).join(", ")}` : "이상 없음"}
                             </span>
                           )}
-                          {inProgress(cur) && inspector && (
+                          {inProgress(cur) && (cur.can_release || cur.release_denied !== "role") && (
                             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
                               {cur.can_release && (
                                 <button
@@ -440,11 +466,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                                   차지 풀기
                                 </button>
                               )}
-                              <span>
-                                {cur.can_release
-                                  ? "검사 요청이 끝나지 않고 남은 차지면 풀어서 다시 검사합니다 (감사 로그에 남음)"
-                                  : `남의 차지는 ${view?.claim_stale_min ?? ""}분이 지나야 풀 수 있음 (관리 역할은 바로)`}
-                              </span>
+                              <span>{releaseText(cur)}</span>
                             </div>
                           )}
                         </div>

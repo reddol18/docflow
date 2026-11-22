@@ -944,11 +944,15 @@ def inspection_view(vol: str, user: Viewer):
         d = docs.get(r["doc_id"], {})
         mine = WORKFLOW["distinct_actors"] and other_stages(whole, acts, r["doc_id"], SAMPLE["name"])
         block = _inspect_block(r, inspector, user, whole, mine, pos[r["doc_id"]]["stage"])
+        # 끝나지 않은 차지를 풀 수 없는 까닭: role 역할 아님 / user 사용자 불명 / recent 남의 차지가 아직 덜 됨
+        # (releasable_at에 풀 수 있게 되는 시각). 차지가 없거나 끝난 문서는 None·can_release false
         release = (_release_denied(owner, age, user) if inspector else "role") if block == "in_progress" else None
         out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
                     "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
                     "can_inspect": block is None, "block": block,
-                    "can_release": block == "in_progress" and release is None})
+                    "can_release": block == "in_progress" and release is None, "release_denied": release,
+                    "releasable_at": r["inspected_at"] + dt.timedelta(minutes=CLAIM_STALE_MIN)
+                    if release == "recent" else None})
     return {"plan": plan, "docs": out, "claim_stale_min": CLAIM_STALE_MIN}
 
 
@@ -963,7 +967,7 @@ def _release_denied(owner, age, user):
     if owner is not None and owner == user.id:
         return None
     if age is None or age < CLAIM_STALE_MIN * 60:
-        return "young"
+        return "recent"
     return None
 
 
@@ -1012,14 +1016,14 @@ def inspect_document(vol: str, doc_id: str, body: InspectIn, user: SampleUser):
             raise HTTPException(409, "아직 검사 단계에 오지 않은 문서")
         if not store.claim_inspection(vol, doc_id, user.id):
             raise HTTPException(409, "이미 검사함")
-        # 고치기·끝내기·확정 중 어디서 실패해도(확정의 세대 확인 409 포함) 차지를 풀어 다시 검사할 수 있게 한다.
+        # 고치기·끝내기+확정 중 어디서 실패해도(확정의 세대 확인 409 포함) 차지를 풀어 다시 검사할 수 있게 한다.
         # 푸는 것은 이 사용자의 차지일 때만 — 그 사이 목록이 새로 만들어졌으면 남의 행을 건드리지 않는다
         try:
             _, changed, _ = _edit_document(vol, doc_id, body.fields, user, source="inspect")
             # 고친 칸은 이력에서 센다 — 앞선 시도가 저장 뒤(임베딩 등)에서 실패해 이번 제출에 차이가 없어도 빠지지 않게
             fixed = store.inspected_fields(vol, doc_id)
-            store.finish_inspection(vol, doc_id, fixed)
-            # 표본 단계는 마지막 단계라 검사가 끝나면 위치를 확정으로 옮기고 기록한다 (오류목록 내보내기가 같은 표에서 읽는다)
+            # 표본 단계는 마지막 단계라 검사 끝냄(fixed_fields)·확정 이동·기록을 한 트랜잭션으로 쓴다 — 중간에 파드가 죽어도
+            # '검사함인데 미확정'이 남지 않고 차지만 남는다(화면에서 풂, https://github.com/reddol18/docflow/issues/100)
             if not store.confirm_sample(vol, doc_id, SAMPLE["name"], pos["round"], user.id, fixed, gen):
                 raise HTTPException(409, "철을 다시 돌려 검사 목록이 바뀜")
         except BaseException:
@@ -1050,7 +1054,7 @@ def inspection_release(vol: str, doc_id: str, user: SampleUser):
         why = _release_denied(row["owner_id"], row["claim_age"], user)
         if why == "user":
             raise HTTPException(403, "사용자를 알 수 없어 차지를 풀 수 없음 (관리자만)")
-        if why == "young":
+        if why == "recent":
             raise HTTPException(403, f"남의 차지는 {CLAIM_STALE_MIN:g}분이 지나야 풀 수 있음 (관리자는 바로)")
         if not store.release_claim(vol, doc_id, row["inspected_at"]):
             raise HTTPException(409, "그 사이 차지가 바뀜 — 새로 고친 뒤 다시")

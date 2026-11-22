@@ -220,6 +220,9 @@ export type InspectionDoc = {
   block: InspectBlock | null;
   // 끝나지 않은 검사 차지('검사 중')를 내가 풀 수 있나 (서버 main._release_denied — https://github.com/reddol18/docflow/issues/100)
   can_release: boolean;
+  // 풀 수 없는 까닭 (차지가 '검사 중'일 때만): role 역할 아님 / user 사용자 불명(관리자만) / recent 남의 차지가 아직 덜 됨
+  release_denied: "role" | "user" | "recent" | null;
+  releasable_at: string | null; // recent일 때 풀 수 있게 되는 시각 (서버 시계)
 };
 // claim_stale_min: 남의 차지를 검사자가 풀 수 있게 되는 시간(분, 서버 INSPECT_CLAIM_STALE_MIN). 관리자·본인은 바로
 export type InspectionView = { plan: InspectionPlan; docs: InspectionDoc[]; claim_stale_min: number };

@@ -191,6 +191,8 @@ OCR 텍스트·색인 값에 심어진 문장이 추출과 검색 답변을 조�
 - 끝나지 않은 검사 차지(`inspection.inspected_at`만 있고 `fixed_fields`가 비어 있음 — 차지와 끝냄 사이에 파드가 죽은 경우, 또는 예전 판에서 남은 것)는 검사 화면에서 푼다 (https://github.com/reddol18/docflow/issues/100): 검사 탭 → '검사 중' 문서 → **차지 풀기**. 그 뒤 다시 검사할 수 있다. DB를 직접 고치지 않는다.
   - 경로 `POST /inspection/{vol}/{doc_id}/release` (표본 단계 역할, 기본 inspector 이상). 관리자는 늘, 차지한 본인은 바로, 다른 검사자는 차지한 뒤 `INSPECT_CLAIM_STALE_MIN`분(기본 15)이 지나야 푼다. 사용자를 모르면(인증 끈 개발 모드) 관리자만. 서버가 판단하고, 화면은 `GET /volumes/{vol}/inspection`의 문서별 `can_release`로 버튼을 보인다.
   - 문서 잠금 안에서 푼다 — 검사 요청이 살아 있으면 잠금을 쥐고 있어 `DOC_LOCK_WAIT_SEC` 뒤 409이므로, 처리 중인 검사의 차지는 시간과 상관없이 풀리지 않는다. 끝난 검사·차지 없는 문서는 409.
+  - 검사 끝냄(`fixed_fields`)·확정 이동·승인 기록은 한 트랜잭션(`store.confirm_sample`)이라, 그 사이에 파드가 죽어도 '검사함인데 미확정'이 남지 않고 차지만 남는다 — 그 차지를 이 경로로 푼다.
+  - 화면은 문서별 `release_denied`(`role`·`user`·`recent`)로 까닭을 보이고, `recent`면 `releasable_at` 시각을 보여 주며 그때 목록을 다시 읽는다.
   - 감사 로그 `inspect_release`: 차지한 사람 id(`claimed_by`)·본인 차지 여부(`own`)·차지한 뒤 지난 초(`age_sec`). 거절도 `rejected_403` 등으로 남는다.
 - 검사에서 고친 칸(`fixed_fields`, 표본 오류율·'합격 (검수 수정)' 판단의 근거)은 지금 실행 세대(`stage_gen.since` 뒤)의 검사 수정만 센다 — 다시 돌린 뒤 새 목록에서 다시 검사할 때 예전 세대 수정이 섞이지 않는다. 수정 이력(`edits`)에는 예전 세대 수정도 그대로 남는다.
 

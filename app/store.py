@@ -840,11 +840,6 @@ def reset_inspection(vol):
         return c.execute("DELETE FROM inspection_plan WHERE vol = %s", (vol,)).rowcount > 0
 
 
-def finish_inspection(vol, doc_id, fixed_fields):
-    with pool.connection() as c:
-        c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s", (fixed_fields, vol, doc_id))
-
-
 def release_inspection(vol, doc_id, user_id):
     """검사하다 실패하면(고치기·끝내기·확정) 이 사용자의 차지를 푼다"""
     with pool.connection() as c:
@@ -1078,13 +1073,16 @@ class _Rollback(Exception):
 
 
 def confirm_sample(vol, doc_id, stage, rnd, user_id, fixed, gen):
-    """표본 검사가 끝난 문서를 확정으로 옮기고 기록한다 (한 트랜잭션). 행이 없던 문서(기본 흐름)는 만든다.
-    세대가 바뀌었거나(/run) 이 사용자의 검사 차지가 없어졌으면 쓰지 않고 False"""
+    """표본 검사를 끝내고(inspection.fixed_fields) 문서를 확정으로 옮기고 기록한다 — 셋을 한 트랜잭션으로.
+    끝냄과 확정 사이에 파드가 죽으면 '검사함'인데 확정되지 않은 문서가 남아 다시 검사도 차지 풀기도 못 했다
+    (https://github.com/reddol18/docflow/issues/100) — 이제는 둘 다 쓰이거나 둘 다 안 쓰여 차지만 남고, 차지는 화면에서 푼다.
+    행이 없던 문서(기본 흐름)는 만든다. 세대가 바뀌었거나(/run) 이 사용자의 끝나지 않은 검사 차지가 없으면 쓰지 않고 False"""
     with pool.connection() as c, c.transaction():
         if not _same_gen(c, vol, gen):
             return False
-        if not c.execute("SELECT 1 FROM inspection WHERE vol = %s AND doc_id = %s AND inspected_at IS NOT NULL "
-                         "AND inspected_by IS NOT DISTINCT FROM %s", (vol, doc_id, user_id)).fetchone():
+        if c.execute("UPDATE inspection SET fixed_fields = %s WHERE vol = %s AND doc_id = %s AND inspected_at IS NOT NULL "
+                     "AND fixed_fields IS NULL AND inspected_by IS NOT DISTINCT FROM %s",
+                     (fixed, vol, doc_id, user_id)).rowcount != 1:
             return False
         c.execute("INSERT INTO doc_stage (vol, doc_id, stage, round) VALUES (%(v)s, %(d)s, %(fin)s, %(r)s) "
                   "ON CONFLICT (vol, doc_id) DO UPDATE SET stage = %(fin)s, last_reason = NULL, rejected_from = NULL, "

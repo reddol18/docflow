@@ -139,17 +139,18 @@ def test_confirm_conflict_releases_claim(main, monkeypatch):
     """검사와 확정 사이에 실행 세대가 바뀌어 확정이 409로 실패하면 차지를 풀어 다시 검사할 수 있다"""
     c = TestClient(main.app)
     plan(c)
-    finish = store.finish_inspection
+    count = store.inspected_fields
 
-    def finish_then_rerun(vol, doc_id, fixed):
-        finish(vol, doc_id, fixed)
+    def count_then_rerun(vol, doc_id):
+        out = count(vol, doc_id)
         store.reset_stages(vol)  # 그 사이 /run이 세대를 올림 (검사 목록은 남은 채로)
+        return out
 
-    monkeypatch.setattr(store, "finish_inspection", finish_then_rerun)
+    monkeypatch.setattr(store, "inspected_fields", count_then_rerun)
     assert c.post("/inspection/v1/d01", headers=h("i"), json={}).status_code == 409
     row = store.inspection_row("v1", "d01")
     assert row["inspected_at"] is None and row["inspected_by"] is None and row["fixed_fields"] is None
-    monkeypatch.setattr(store, "finish_inspection", finish)
+    monkeypatch.setattr(store, "inspected_fields", count)
     assert c.post("/inspection/v1/d01", headers=h("i"), json={}).status_code == 200  # 다시 검사할 수 있다
 
 
@@ -199,13 +200,21 @@ def test_release_rules_owner_age_and_role(main, monkeypatch):
     def can_release(who):
         return {d["doc_id"]: d["can_release"] for d in c.get("/volumes/v1/inspection", headers=h(who)).json()["docs"]}
 
+    def denied(who):
+        return {d["doc_id"]: (d["release_denied"], d["releasable_at"] is not None)
+                for d in c.get("/volumes/v1/inspection", headers=h(who)).json()["docs"]}
+
     assert can_release("j")["d01"] is False and can_release("r")["d01"] is False
+    assert denied("j")["d01"] == ("recent", True) and denied("r")["d01"] == ("role", False)  # 까닭·풀 수 있게 되는 시각
+    assert denied("i")["d01"] == (None, False)  # 본인 차지
+    assert {v for k, v in denied("j").items() if k not in ("d01", "d02")} == {(None, False)}  # 차지 없는 문서
     assert c.post("/inspection/v1/d01/release", headers=h("j")).status_code == 403  # 남의 차지, 시간 전
     assert c.post("/inspection/v1/d01/release", headers=h("r")).status_code == 403  # 입력 역할
     anon = auth.User(None, "anon", "anon", "inspector")
     real = auth.session_user
     monkeypatch.setattr(auth, "session_user", lambda t: anon if t == "anon" else real(t))
     _age_claim("d02", main.CLAIM_STALE_MIN + 1)
+    assert denied("anon")["d02"] == ("user", False)
     assert c.post("/inspection/v1/d02/release", headers=h("anon")).status_code == 403  # 본인인지 알 수 없음
     assert store.inspection_row("v1", "d01")["inspected_by"] == 3  # 거절은 차지를 건드리지 않는다
 
@@ -217,6 +226,31 @@ def test_release_rules_owner_age_and_role(main, monkeypatch):
     got = [(x["username"], x["doc_id"], x["result"], (x["info"] or {}).get("own")) for x in _release_audit()]
     assert got == [("j", "d01", "rejected_403", False), ("r", "d01", "rejected_403", None),
                    ("anon", "d02", "rejected_403", False), ("i", "d01", "ok", True), ("j", "d02", "ok", False)]
+
+
+def test_crash_between_finish_and_confirm_is_recoverable(main, monkeypatch):
+    """검사 끝냄(fixed_fields)과 확정 사이에 파드가 죽는 경우: 둘은 한 트랜잭션이라 끝냄도 되돌려지고 차지만 남는다
+    → 화면 경로로 풀고 다시 검사하면 200, 확정까지 간다 (https://github.com/reddol18/docflow/issues/100)"""
+    c = TestClient(main.app, raise_server_exceptions=False)
+    plan(c)
+    log = store.add_stage_log
+
+    def die(*a, **k):  # 확정 기록을 쓰는 중에 죽음 (끝냄·확정 이동은 같은 트랜잭션 안에서 이미 씀)
+        raise RuntimeError("pod killed")
+
+    monkeypatch.setattr(store, "add_stage_log", die)
+    monkeypatch.setattr(store, "release_inspection", lambda *a: None)  # 죽은 파드는 실패 처리(차지 풀기)를 못 한다
+    c.post("/inspection/v1/d01", headers=h("i"), json={"fields": {"title": "고친 제목"}})
+    row = store.inspection_row("v1", "d01")
+    assert row["inspected_by"] == 3 and row["fixed_fields"] is None  # '검사함·미확정'이 아니라 차지만 남음
+    assert "d01" not in store.stage_rows("v1")  # 확정 이동도 되돌려짐
+    view = {d["doc_id"]: d for d in c.get("/volumes/v1/inspection", headers=h("a")).json()["docs"]}
+    assert (view["d01"]["block"], view["d01"]["can_release"]) == ("in_progress", True)
+    monkeypatch.setattr(store, "add_stage_log", log)
+    assert c.post("/inspection/v1/d01/release", headers=h("a")).status_code == 200
+    r = c.post("/inspection/v1/d01", headers=h("i"), json={})
+    assert r.status_code == 200 and r.json()["fixed_fields"] == ["title"]  # 죽기 전 고친 칸은 이력에서 센다
+    assert store.stage_rows("v1")["d01"]["stage"] == main.CONFIRMED
 
 
 def test_release_refused_while_inspection_running(main, monkeypatch):
