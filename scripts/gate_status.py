@@ -75,12 +75,16 @@ def decide(results, *, start_sha, head_sha, start_dirty, end_dirty, no_code, ski
     if missing:
         return False, f"검사 결과 없음: {', '.join(missing)}"
     allowed = mg.NO_CODE_SKIP if no_code else set()
-    skipped = [n for n, s in results if s == "skip" and n not in allowed] + [f"{o}(옵션)" for o in skip_opts]
+    # 보고만(REPORT_ONLY) 검사는 건너뛰어도 막지 않는다
+    skipped = ([n for n, s in results if s == "skip" and n not in allowed and n not in mg.REPORT_ONLY]
+               + [f"{o}(옵션)" for o in skip_opts])
     if skipped:
         tail = "" if no_code else " — 코드 없는 PR만 osv·semgrep·trivy 건너뜀 허용"
         return False, f"건너뜀: {', '.join(skipped)}{tail}"
-    quick = sorted(n for n, s in results if s == "skip")
-    return True, "막는 검사 모두 통과" + (f" (코드 없는 PR, 건너뜀 {'·'.join(quick)})" if quick else "")
+    quick = sorted(n for n, s in results if s == "skip" and n in allowed)
+    report = sorted(n for n, s in results if s == "fail" and n in mg.REPORT_ONLY)
+    return True, ("막는 검사 모두 통과" + (f" (코드 없는 PR, 건너뜀 {'·'.join(quick)})" if quick else "")
+                  + (f" (보고만 실패 {'·'.join(report)})" if report else ""))
 
 
 def changed_files():

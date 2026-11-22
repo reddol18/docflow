@@ -71,7 +71,7 @@ class FakeGh:
         if args[0] == "api" and args[1].endswith("/status"):
             return json.dumps({"statuses": [{"context": k, "state": v} for k, v in self.pr["statuses"].items()]})
         if args[0] == "api" and "/pulls/" in args[1]:
-            return self.pr["bodyAuthorAssociation"] + "\n"
+            return (self.pr["bodyAuthorAssociation"] or "") + "\n"  # 모르면 빈 값
         if args[0] == "api":
             n = int(args[1].rsplit("/", 1)[1])
             if n not in self.issues:
@@ -330,7 +330,7 @@ def test_outsider_evidence_is_ignored(who):
     assert missing(make_pr(comments=(), reviews=(SPEC, CODE), who=who)) == ["계약 리뷰", "버그 리뷰"]
     assert missing(make_pr(comments=(SPEC,)), inline=[{"body": CODE, "authorAssociation": who}]) == ["버그 리뷰"]
     # 외부인이 연 PR 본문의 요약도 세지 않는다
-    assert missing(make_pr(body_who=who)) == ["로컬 검사"]
+    assert missing(make_pr(body_who=who)) == ["로컬 검사", "보안 리뷰"]  # 외부인 PR은 보안 리뷰도 (issues/106)
 
 
 @pytest.mark.parametrize("who", ["OWNER", "MEMBER", "COLLABORATOR"])
@@ -475,3 +475,44 @@ def test_cover_failure_is_reported_and_still_exit_2(monkeypatch, capsys):
     monkeypatch.setattr(mg, "gh", fake)
     assert mg.main(["90", "--merge"]) == 2
     assert "success가 남아 있음" in capsys.readouterr().out
+
+
+# ---- PR #151 리뷰 반영 (https://github.com/reddol18/docflow/issues/106)
+
+@pytest.mark.parametrize("who", ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None])
+def test_outsider_pr_requires_security_review_without_issue_refs(monkeypatch, capsys, who):
+    """S1: 외부인 PR은 이슈 번호를 빼 보안 리뷰를 피할 수 있다 → 연결 이슈와 상관없이 보안 리뷰 요구"""
+    assert "보안 리뷰" in missing(make_pr(body_who=who))  # 연결 이슈 없음
+    assert "보안 리뷰" not in missing(make_pr(body_who=who, comments=(SPEC, CODE, SEC)))
+    assert "보안 리뷰" in missing(make_pr(body_who=who, comments=(), files=DOCS))  # 코드 없는 PR도
+    pr = make_pr(title="기능", body_who=who)
+    pr["body"] = CHECK_OK  # 이슈 번호를 모두 뺌
+    code, fake = run(monkeypatch, pr, {}, "--merge")
+    out = capsys.readouterr().out
+    assert code == 1 and not fake.merges
+    assert "X 보안 리뷰" in out and "PR 글쓴이" in out
+
+
+@pytest.mark.parametrize("who", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_trusted_pr_without_refs_needs_no_security_review(who):
+    pr = make_pr(title="기능", body_who=who)
+    assert missing(pr) == []
+
+
+REPORT_ROW = "| trivy | 통과 | 9 |\n| extra | {} | 1 |"
+
+
+def test_report_only_failure_in_summary_does_not_block(monkeypatch):
+    """C1: check.ps1이 '실패 (보고만)'으로 적은 REPORT_ONLY 검사 실패는 막지 않는다"""
+    body = CHECK_OK.replace("| trivy | 통과 | 9 |", REPORT_ROW.format("실패 (보고만)"))
+    monkeypatch.setattr(mg, "REPORT_ONLY", frozenset({"extra"}))
+    assert missing(make_pr(body=body)) == []
+    skipped = CHECK_OK.replace("| trivy | 통과 | 9 |", REPORT_ROW.format("건너뜀"))
+    assert missing(make_pr(body=skipped)) == []
+
+
+@pytest.mark.parametrize("v", ["실패 (보고만)", "**실패**"])
+def test_unknown_check_failure_in_summary_blocks(v):
+    """C1: CHECKS·REPORT_ONLY에 없는 검사가 실패면 표시가 어떻든 거부"""
+    body = CHECK_OK.replace("| trivy | 통과 | 9 |", REPORT_ROW.format(v))
+    assert missing(make_pr(body=body)) == ["로컬 검사"]

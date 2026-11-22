@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _p = Path(__file__).parent.parent / "scripts" / "gate_ruleset.py"
 _spec = importlib.util.spec_from_file_location("gate_ruleset", _p)
 gr = importlib.util.module_from_spec(_spec)
@@ -94,8 +96,10 @@ class FakeGh:
         if args[1].endswith("/rulesets"):
             return json.dumps([{"id": self.current["id"], "name": self.current["name"], "target": "branch"}])
         self.reads += 1
-        if self.reread_fails and self.reads > 1:
+        if self.reread_fails is True and self.reads > 1:
             raise SystemExit("gh api repos/x/rulesets/1 실패: HTTP 502")
+        if isinstance(self.reread_fails, str) and self.reads > 1:  # gh는 됐는데 응답이 이상함
+            return self.reread_fails
         return json.dumps(self.current)
 
     @property
@@ -152,3 +156,12 @@ def test_put_failure_is_failure(monkeypatch, capsys):
     monkeypatch.setattr(gr, "gh", gh)
     assert gr.main([]) == 2
     assert "실패:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("reply", ["not json", "{}", '{"name": "Protect Main"}', "[]"])
+def test_reread_bad_response_after_put_is_warning(monkeypatch, capsys, reply):
+    """C3: PUT 뒤 다시 읽은 응답이 JSON이 아니거나 모양이 달라도(ValueError·KeyError·…) 경고하고 0"""
+    fake = FakeGh(copy.deepcopy(CURRENT), reread_fails=reply)
+    monkeypatch.setattr(gr, "gh", fake)
+    assert gr.main([]) == 0 and len(fake.puts) == 1
+    assert "PUT 성공" in capsys.readouterr().out

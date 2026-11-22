@@ -16,7 +16,8 @@
   보안 리뷰   닫거나 가리키는 이슈(닫는 이슈·제목의 #N·본문 줄 머리 Refs #N/이 저장소 이슈 URL)의 '보안 영향' 칸에
               체크가 있으면 같은 방식으로 "security-reviewer". 그 이슈 글쓴이(author_association)가 OWNER/MEMBER/
               COLLABORATOR가 아니면 칸과 상관없이 요구한다 — 외부인이 연 이슈는 외부인이 본문을 고쳐 체크를 지울 수 있다
-              (https://github.com/reddol18/docflow/issues/106)
+              (https://github.com/reddol18/docflow/issues/106). PR 글쓴이가 그렇지 않을 때도 요구한다 — 외부인 PR은
+              이슈 번호를 빼서 피할 수 있다
   local-check status   head 커밋의 commit status `docflow/local-check`가 success (`scripts/gate_status.py`가 조건이 맞을 때만
               올린다 — 글자 요약은 누구나 붙일 수 있으므로 이것으로 실제 통과를 확인한다)
   리뷰는 PR 본문에서 찾지 않는다 (템플릿을 채운 글과 구별할 수 없다).
@@ -57,13 +58,15 @@ ADDED_LATER = {"lock"}
 # 그 전 요약의 'trivy | 보고만'은 받지 않는다 — 옛 check.ps1(--exit-code 0)은 trivy 지적이 있어도 보고만 해서 통과인지
 # 알 수 없다. main을 받아 다시 돌린다. (lock은 줄이 없던 요약만 넘겼다 — trivy는 줄이 늘 있었으므로 그런 예외가 없다)
 NO_CODE_SKIP = {"osv", "semgrep", "trivy"}  # 코드 없는 PR이 건너뛰어도 되는 검사 (check.ps1 -Quick)
-# 막지 않는('보고만') 검사 이름. 지금은 없다. CHECKS에도 여기에도 없는 이름이 실패면 `scripts/gate_status.py`가 거부한다
+# 막지 않는('보고만') 검사 이름. 지금은 없다. check.ps1에서 `Step 이름 $false`인 단계와 같아야 한다(시험이 확인).
+# 이 검사는 실패·건너뜀이어도 막지 않는다 — check.ps1 요약은 '실패 (보고만)'으로 적어 '**실패**'(block_failed)에 걸리지 않는다.
+# CHECKS에도 여기에도 없는 이름이 실패면 이 파일과 `scripts/gate_status.py`가 거부한다
 # (check.ps1에 새 막는 단계가 생기고 CHECKS에 빠뜨려도 그 실패가 묻히지 않게, https://github.com/reddol18/docflow/issues/106)
 REPORT_ONLY = frozenset()
 # main ruleset이 요구하는 commit status (https://github.com/reddol18/docflow/issues/85, `scripts/protect_main.ps1`)
 CONTEXT_CHECK = "docflow/local-check"  # `scripts/gate_status.py`가 `scripts/check.ps1` 끝에서 올린다
 CONTEXT_REVIEW = "docflow/review-gate"  # 이 파일이 --merge 판정 통과일 때 올린다
-TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # 흔적으로 세는 글쓴이 (authorAssociation)
+TRUSTED = wm.TRUSTED  # 흔적으로 세는 글쓴이 (authorAssociation OWNER/MEMBER/COLLABORATOR, weekly_metrics와 한 곳)
 MERGE_TRIES = 3
 sleep = time.sleep  # 시험에서 바꾼다
 
@@ -134,6 +137,10 @@ def _check_ok(block, no_code):
                 bad.append(f"{c} 건너뜀")
         elif not v.startswith("통과"):
             bad.append(f"{c} {v}")
+    # CHECKS에 없는 줄: 보고만(REPORT_ONLY)이면 결과를 보지 않고, 모르는 검사는 실패면 거부 (gate_status와 같은 규칙)
+    for c, v in rows.items():
+        if c and c not in CHECKS and c not in REPORT_ONLY and "실패" in v:
+            bad.append(f"모르는 검사 {c} {v}")
     return bad
 
 
@@ -181,11 +188,15 @@ def judge(pr, inline, issues):
     # issues: {번호: {"body", "author_association"}}. 글쓴이를 모르거나 저장소 사람이 아니면 칸을 믿지 않는다 (fail-closed)
     outsider = sorted(i for i, v in issues.items() if v.get("author_association") not in TRUSTED)
     sec = sorted(i for i, v in issues.items() if i not in outsider and wm.needs_security(v.get("body") or ""))
-    if not sec and not outsider:
+    # PR 글쓴이도 같다: 외부인 PR은 제목·본문에서 이슈 번호를 빼 보안 리뷰를 피할 수 있다 (V4.1.5)
+    pr_who = pr.get("bodyAuthorAssociation")
+    pr_outsider = pr_who not in TRUSTED
+    if not sec and not outsider and not pr_outsider:
         rows.append(("보안 리뷰", None, "관련 이슈의 보안 영향 칸에 체크 없음"))
     else:
         got = has_review(comments, "보안 리뷰")
-        why = [f"{', '.join(f'#{i}' for i in sec)} 보안 영향 체크"] if sec else []
+        why = [f"PR 글쓴이 {pr_who or '알 수 없음'}(저장소 주인·멤버·협업자 아님)"] if pr_outsider else []
+        why += [f"{', '.join(f'#{i}' for i in sec)} 보안 영향 체크"] if sec else []
         why += [f"#{i} 글쓴이 {issues[i].get('author_association') or '알 수 없음'}(저장소 주인·멤버·협업자 아님 — "
                 "보안 영향 칸을 믿지 않음)" for i in outsider]
         rows.append(("보안 리뷰", got, f"{'; '.join(why)} — " + ("결과 댓글 있음" if got else

@@ -141,15 +141,17 @@ def main(argv=None):
     except SystemExit as e:
         print(f"실패: {e}")
         return 2
-    try:  # PUT은 성공했다 — 다시 읽기 실패는 '실패'가 아니다 (issues/106)
+    try:  # PUT은 성공했다 — 다시 읽기 실패(gh 오류·JSON·모양)는 '실패'가 아니다 (issues/106)
         got = find(a.name)
-    except SystemExit as e:
-        print(f"바꿈 (PUT 성공). 다시 읽어 확인하지 못함: {e} — `--dry-run`으로 다시 확인한다")
+        changed = bool(diff({k: got.get(k) for k in PUT_KEYS}, new))
+        now = summary(got)
+    except (SystemExit, ValueError, KeyError, TypeError, AttributeError) as e:
+        print(f"바꿈 (PUT 성공). 다시 읽어 확인하지 못함: {e!r} — `--dry-run`으로 다시 확인한다")
         return 0
-    if diff({k: got.get(k) for k in PUT_KEYS}, new):
-        print("PUT은 성공했지만 다시 읽은 ruleset이 바꿀 것과 다름: " + summary(got))
+    if changed:
+        print("PUT은 성공했지만 다시 읽은 ruleset이 바꿀 것과 다름: " + now)
         return 2
-    print("바꿈. 지금: " + summary(got))
+    print("바꿈. 지금: " + now)
     return 0
 
 
