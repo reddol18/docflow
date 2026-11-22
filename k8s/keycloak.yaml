@@ -97,13 +97,13 @@ spec:
       # 공식 이미지는 미리 빌드돼 있지 않다 — 첫 시작에 --optimized를 쓰면 거부된다. 루트 FS를 읽기 전용으로 둔 채 빌드하려고
       # 이미지의 lib/quarkus를 emptyDir로 복사(①)하고, 그 자리에 붙여 kc.sh build(②). 본 컨테이너는 그 결과로 start --optimized
       - name: copy-quarkus
-        image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+        image: quay.io/keycloak/keycloak:26.8.2@sha256:7e66a96e4739239070aeaf72e4c5decf0f7f682cfc725b9f7ea2b336eaba38b3
         command: [/bin/sh, -c, 'cp -R /opt/keycloak/lib/quarkus/. /qk/']
         resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 128Mi}}
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
         volumeMounts: [{name: quarkus, mountPath: /qk}]
       - name: build
-        image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+        image: quay.io/keycloak/keycloak:26.8.2@sha256:7e66a96e4739239070aeaf72e4c5decf0f7f682cfc725b9f7ea2b336eaba38b3
         args: [build, --db=dev-file]
         env: [{name: JAVA_OPTS_KC_HEAP, value: "-XX:MaxRAMPercentage=50 -XX:MaxMetaspaceSize=256m"}]
         resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {memory: 1Gi}}
@@ -113,7 +113,7 @@ spec:
         - {name: tmp, mountPath: /tmp}
       containers:
       - name: keycloak
-        image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332  # 다이제스트 고정 (https://github.com/reddol18/docflow/issues/46). 판을 올리면 다이제스트도 (sh scripts/mac/image_tags.sh)
+        image: quay.io/keycloak/keycloak:26.8.2@sha256:7e66a96e4739239070aeaf72e4c5decf0f7f682cfc725b9f7ea2b336eaba38b3  # 다이제스트 고정 (https://github.com/reddol18/docflow/issues/46). 판을 올리면 다이제스트도 (sh scripts/mac/image_tags.sh)
         args: [start, --optimized, --import-realm, --cache=local]  # 복제본 하나 — 클러스터 캐시(JGroups) 불필요. cache는 실행 옵션(빌드에 주면 무시됨, 맥 확인)
         env:
         - {name: KC_HOSTNAME, value: "http://keycloak.localhost:8180"}  # issuer의 앞부분 — docs.yaml OIDC_ISSUER와 같게
