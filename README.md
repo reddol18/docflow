@@ -477,7 +477,7 @@ ssh user@mac "PATH=/usr/local/bin:`$PATH kubectl get secret keycloak-realm-secre
 
   | status | 올리는 것 | 올리는 조건 |
   |---|---|---|
-  | `docflow/local-check` | `scripts/check.ps1` 끝 (`scripts/gate_status.py`) | 막는 검사(`merge_gate.CHECKS`) 모두 통과, 건너뜀 없음(코드 없는 PR만 osv·semgrep·trivy 허용, `-Skip pg`도 건너뜀), 시작·끝 모두 커밋 안 된 변경 없음(`git status` 실패도 변경으로 봄), 검사 중 HEAD 그대로, HEAD가 push돼 있음. 아니면 아무것도 올리지 않는다 |
+  | `docflow/local-check` | `scripts/check.ps1` 끝 (`scripts/gate_status.py`) | 막는 검사(`merge_gate.CHECKS`) 모두 통과, `CHECKS`에도 `merge_gate.REPORT_ONLY`(보고만)에도 없는 검사가 실패면 거부(check.ps1에 새 단계가 생기고 CHECKS에 빠뜨려도 실패가 묻히지 않게, https://github.com/reddol18/docflow/issues/106), 건너뜀 없음(코드 없는 PR만 osv·semgrep·trivy 허용, `-Skip pg`도 건너뜀), 시작·끝 모두 커밋 안 된 변경 없음(`git status` 실패도 변경으로 봄), 검사 중 HEAD 그대로, HEAD가 push돼 있음. 아니면 아무것도 올리지 않는다 |
   | `docflow/review-gate` | `scripts/merge.ps1`의 실제 병합 호출(묻고 y 또는 `-Yes`, 즉 사용자 승인 뒤) | 위 병합 판정 통과 + 열린 PR일 때 병합 직전에 success. `-DryRun`·처음 판정·취소에서는 올리지 않는다. 판정이 거부인데 전의 success가 있으면 failure로 덮는다 |
 
   병합 판정은 저장소 주인·멤버·협업자(authorAssociation)의 글만 흔적으로 세고(공개 저장소), head의 `docflow/local-check` success도 확인한다.
