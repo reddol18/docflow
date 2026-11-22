@@ -178,3 +178,42 @@ def test_duplicate_result_rejected(monkeypatch, capsys):
 def test_bad_result_argument_rejected(bad):
     with pytest.raises(SystemExit):
         gs.main(["local-check", "--start-sha", SHA, "--at", "x", "--result", bad])
+
+
+# ---- 병합 게이트 보강 (https://github.com/reddol18/docflow/issues/106)
+
+@pytest.mark.parametrize("msg", ["gh api 실패: Validation Failed (HTTP 422)",
+                                 "gh api 실패: This SHA and context has reached the maximum number of statuses. (HTTP 422)"])
+def test_other_422_is_post_failure_not_unpushed(monkeypatch, capsys, msg):
+    """5: 422 전부가 'push 안 됨'은 아니다 — No commit found만 그렇고 나머지는 올리기 실패(2)"""
+    f = Fake()
+    monkeypatch.setattr(gs, "git", f.git)
+
+    def gh(*a):
+        f.gh_calls.append(a)
+        raise SystemExit(msg)
+    monkeypatch.setattr(gs.mg, "gh", gh)
+    assert gs.main(args(ALL)) == 2
+    out = capsys.readouterr().out
+    assert "올리기 실패" in out and "GitHub에 없음" not in out
+
+
+@pytest.mark.parametrize("state, posted", [("fail", False), ("pass", True)])
+def test_unknown_check_failure_blocks(monkeypatch, capsys, state, posted):
+    """6: CHECKS·REPORT_ONLY에 없는 이름(check.ps1에 새로 생긴 단계)이 실패면 거부, 통과면 그대로"""
+    code, f = run(monkeypatch, args(ALL + [("newcheck", state)]))
+    assert (code == 0) is posted and (len(f.posts) == 1) is posted
+    if not posted:
+        assert f.gh_calls == []
+        assert "모르는 검사 실패: newcheck" in capsys.readouterr().out
+
+
+def test_report_only_failure_does_not_block(monkeypatch):
+    """6: REPORT_ONLY에 넣은 검사의 실패는 막지 않는다"""
+    monkeypatch.setattr(gs.mg, "REPORT_ONLY", frozenset({"newcheck"}))
+    code, f = run(monkeypatch, args(ALL + [("newcheck", "fail")]))
+    assert code == 0 and len(f.posts) == 1
+
+
+def test_report_only_is_disjoint_from_checks():
+    assert not set(gs.mg.REPORT_ONLY) & set(gs.mg.CHECKS)

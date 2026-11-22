@@ -2,6 +2,7 @@
 ruleset은 지금 저장소의 "Protect Main"을 본뜬 것, 네트워크·gh 없음."""
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 _p = Path(__file__).parent.parent / "scripts" / "gate_ruleset.py"
@@ -59,3 +60,95 @@ def test_emergency_switches_and_restore():
     other = {"actor_id": 9, "actor_type": "Team", "bypass_mode": "pull_request"}
     back = gr.desired({**applied, "bypass_actors": [gr.ADMIN_BYPASS, other], "rules": removed["rules"]})
     assert back["bypass_actors"] == [other] and "required_status_checks" in types(back)
+
+
+# ---- 병합 게이트 보강 (https://github.com/reddol18/docflow/issues/106)
+
+def github_shape(body):
+    """GitHub이 돌려주는 모양: 빈 parameters, status 규칙 기본값 빠짐·순서 다름·integration_id null, actor_name"""
+    b = copy.deepcopy(body)
+    for r in b["rules"]:
+        if r["type"] == "deletion":
+            r["parameters"] = {}
+        if r["type"] == "required_status_checks":
+            p = r["parameters"]
+            p.pop("do_not_enforce_on_create")
+            p["required_status_checks"] = [{"context": c["context"], "integration_id": None}
+                                           for c in reversed(p["required_status_checks"])]
+    b["rules"] = list(reversed(b["rules"]))
+    b["bypass_actors"] = [{**a, "actor_name": "admin"} for a in b["bypass_actors"]]
+    return b
+
+
+class FakeGh:
+    """gh api 대역 — 실제 ruleset을 바꾸지 않는다"""
+
+    def __init__(self, current, after=None, reread_fails=False):
+        self.current, self.after, self.reread_fails, self.calls, self.reads = current, after, reread_fails, [], 0
+
+    def __call__(self, *args, stdin=None):
+        self.calls.append(args)
+        if args[1:3] == ("-X", "PUT"):
+            self.current = self.after if self.after is not None else {**self.current, **json.loads(stdin)}
+            return "{}"
+        if args[1].endswith("/rulesets"):
+            return json.dumps([{"id": self.current["id"], "name": self.current["name"], "target": "branch"}])
+        self.reads += 1
+        if self.reread_fails and self.reads > 1:
+            raise SystemExit("gh api repos/x/rulesets/1 실패: HTTP 502")
+        return json.dumps(self.current)
+
+    @property
+    def puts(self):
+        return [c for c in self.calls if c[1:3] == ("-X", "PUT")]
+
+
+def test_github_response_shape_does_not_reput(monkeypatch, capsys):
+    """7: 이미 적용된 ruleset을 GitHub 모양으로 읽어도 바뀔 것 없음 — 다시 PUT하지 않는다"""
+    applied = {**CURRENT, **gr.desired({**CURRENT, "bypass_actors": [gr.ADMIN_BYPASS]}, allow_admin_bypass=True)}
+    shaped = github_shape(applied)
+    assert gr.diff({k: shaped.get(k) for k in gr.PUT_KEYS}, gr.desired(shaped, allow_admin_bypass=True)) == []
+    fake = FakeGh(shaped)
+    monkeypatch.setattr(gr, "gh", fake)
+    assert gr.main(["--allow-admin-bypass"]) == 0 and fake.puts == []
+    assert "바뀔 것 없음" in capsys.readouterr().out
+
+
+def test_real_change_still_detected_after_norm():
+    shaped = github_shape({**CURRENT, **gr.desired(CURRENT)})
+    assert gr.diff({k: shaped.get(k) for k in gr.PUT_KEYS}, gr.desired(shaped, strict=True)) != []
+
+
+def test_reread_failure_after_put_is_not_failure(monkeypatch, capsys):
+    """7: PUT은 성공, 다시 읽기만 실패 → 경고하고 0"""
+    fake = FakeGh(copy.deepcopy(CURRENT), reread_fails=True)
+    monkeypatch.setattr(gr, "gh", fake)
+    assert gr.main([]) == 0 and len(fake.puts) == 1
+    out = capsys.readouterr().out
+    assert "PUT 성공" in out and not any(ln.startswith("실패:") for ln in out.splitlines())
+
+
+def test_reread_after_put_differs_is_failure(monkeypatch, capsys):
+    fake = FakeGh(copy.deepcopy(CURRENT), after=copy.deepcopy(CURRENT))  # PUT이 먹지 않음
+    monkeypatch.setattr(gr, "gh", fake)
+    assert gr.main([]) == 2 and len(fake.puts) == 1
+    assert "다시 읽은 ruleset이 바꿀 것과 다름" in capsys.readouterr().out
+
+
+def test_put_then_reread_ok(monkeypatch, capsys):
+    fake = FakeGh(copy.deepcopy(CURRENT))
+    monkeypatch.setattr(gr, "gh", fake)
+    assert gr.main([]) == 0 and len(fake.puts) == 1
+    assert "바꿈. 지금:" in capsys.readouterr().out
+
+
+def test_put_failure_is_failure(monkeypatch, capsys):
+    fake = FakeGh(copy.deepcopy(CURRENT))
+
+    def gh(*args, stdin=None):
+        if args[1:3] == ("-X", "PUT"):
+            raise SystemExit("gh api -X PUT 실패: HTTP 403")
+        return fake(*args, stdin=stdin)
+    monkeypatch.setattr(gr, "gh", gh)
+    assert gr.main([]) == 2
+    assert "실패:" in capsys.readouterr().out

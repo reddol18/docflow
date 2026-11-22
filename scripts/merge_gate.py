@@ -14,21 +14,25 @@
   계약 리뷰   댓글·리뷰 본문·줄 댓글 중 한 글 안에 "spec-review"와 '| 지적 | 반영 |' 표 (코드 없는 PR은 면제)
   버그 리뷰   같은 방식으로 "code-review" (코드 없는 PR은 면제)
   보안 리뷰   닫거나 가리키는 이슈(닫는 이슈·제목의 #N·본문 줄 머리 Refs #N/이 저장소 이슈 URL)의 '보안 영향' 칸에
-              체크가 있으면 같은 방식으로 "security-reviewer"
+              체크가 있으면 같은 방식으로 "security-reviewer". 그 이슈 글쓴이(author_association)가 OWNER/MEMBER/
+              COLLABORATOR가 아니면 칸과 상관없이 요구한다 — 외부인이 연 이슈는 외부인이 본문을 고쳐 체크를 지울 수 있다
+              (https://github.com/reddol18/docflow/issues/106)
   local-check status   head 커밋의 commit status `docflow/local-check`가 success (`scripts/gate_status.py`가 조건이 맞을 때만
               올린다 — 글자 요약은 누구나 붙일 수 있으므로 이것으로 실제 통과를 확인한다)
   리뷰는 PR 본문에서 찾지 않는다 (템플릿을 채운 글과 구별할 수 없다).
 `scripts/weekly_metrics.py`와 함수를 공유한다(evidence·check_blocks·block_failed·_tables·issue_refs·is_no_code·needs_security·
 MARKS). 주간 지표는 흔적이 있는지만 세고, 이 검사가 더 엄격하다(head 기준, 표 필요, 건너뜀 거부, 리뷰는 본문 제외).
 병합: squash, 제목은 PR 제목 + " (#N)", 판정한 head 커밋 그대로만(`--match-head-commit`).
-  병합 실패(status 반영 지연 등)면 3초 뒤 head를 다시 확인하고 두 번까지 다시 시도한다.
+  병합 실패(status 반영 지연 등)면 3초 뒤 PR을 다시 읽는다: 판정한 head로 이미 병합돼 있으면(오류를 돌려줬지만 서버에선
+  병합됨) 병합함으로 본다. 아직 열려 있고 head가 같으면 두 번까지 다시 시도한다. 다시 읽기 실패도 종료 코드 2.
 commit status `docflow/review-gate` (https://github.com/reddol18/docflow/issues/85): main ruleset(`scripts/protect_main.ps1`)이
   이것과 `docflow/local-check`를 요구한다. success는 --merge(사용자 승인 뒤)에서 판정 통과일 때만, 병합 직전에 올린다 —
   판정만 하는 호출에서는 올리지 않으므로 웹 화면·`gh pr merge`로 승인 없이 병합할 수 없다.
   판정이 거부인데 head에 이미 success가 있으면(그 뒤 근거가 바뀜) 같은 context에 failure를 올려 덮는다.
+  success를 올린 뒤 병합하지 못하고 끝나면(종료 코드 2) failure로 덮는다 — 남은 success로 웹 화면 병합이 열리지 않게.
 한계: 흔적의 내용이 참인지는 모른다 (weekly_metrics와 같음).
 종료 코드: 0 통과(--merge면 병합함), 1 빠진 흔적,
-           2 병합할 수 없음(이미 병합·닫힘·초안, --expect-head와 head 다름, 가리킨 이슈가 없음 등 — 메시지를 본다).
+           2 병합할 수 없음(이미 병합·닫힘·초안, --expect-head와 head 다름, 가리킨 이슈가 없음, gh 오류 등 — 메시지를 본다).
 """
 import argparse
 import datetime as dt
@@ -53,6 +57,9 @@ ADDED_LATER = {"lock"}
 # 그 전 요약의 'trivy | 보고만'은 받지 않는다 — 옛 check.ps1(--exit-code 0)은 trivy 지적이 있어도 보고만 해서 통과인지
 # 알 수 없다. main을 받아 다시 돌린다. (lock은 줄이 없던 요약만 넘겼다 — trivy는 줄이 늘 있었으므로 그런 예외가 없다)
 NO_CODE_SKIP = {"osv", "semgrep", "trivy"}  # 코드 없는 PR이 건너뛰어도 되는 검사 (check.ps1 -Quick)
+# 막지 않는('보고만') 검사 이름. 지금은 없다. CHECKS에도 여기에도 없는 이름이 실패면 `scripts/gate_status.py`가 거부한다
+# (check.ps1에 새 막는 단계가 생기고 CHECKS에 빠뜨려도 그 실패가 묻히지 않게, https://github.com/reddol18/docflow/issues/106)
+REPORT_ONLY = frozenset()
 # main ruleset이 요구하는 commit status (https://github.com/reddol18/docflow/issues/85, `scripts/protect_main.ps1`)
 CONTEXT_CHECK = "docflow/local-check"  # `scripts/gate_status.py`가 `scripts/check.ps1` 끝에서 올린다
 CONTEXT_REVIEW = "docflow/review-gate"  # 이 파일이 --merge 판정 통과일 때 올린다
@@ -107,7 +114,8 @@ def fetch(n):
                 raise Stop(f"PR이 가리키는 #{i}가 이 저장소에 없습니다 (제목·본문의 번호를 확인)") from None
             raise Stop(f"#{i} 이슈를 읽지 못함: {e}") from None
         if "pull_request" not in got:  # "PR #38"의 38처럼 PR 번호는 이슈가 아니다
-            issues[i] = got.get("body") or ""
+            # 글쓴이도 본다: 외부인이 연 이슈의 '보안 영향' 칸은 외부인이 고칠 수 있다 (issues/106)
+            issues[i] = {"body": got.get("body") or "", "author_association": got.get("author_association")}
     return pr, inline, issues
 
 
@@ -170,13 +178,17 @@ def judge(pr, inline, issues):
         else:
             got = has_review(comments, k)
             rows.append((k, got, "결과 댓글 있음" if got else hint.format(wm.MARKS[k].pattern)))
-    sec = sorted(i for i, b in issues.items() if wm.needs_security(b))
-    if not sec:
+    # issues: {번호: {"body", "author_association"}}. 글쓴이를 모르거나 저장소 사람이 아니면 칸을 믿지 않는다 (fail-closed)
+    outsider = sorted(i for i, v in issues.items() if v.get("author_association") not in TRUSTED)
+    sec = sorted(i for i, v in issues.items() if i not in outsider and wm.needs_security(v.get("body") or ""))
+    if not sec and not outsider:
         rows.append(("보안 리뷰", None, "관련 이슈의 보안 영향 칸에 체크 없음"))
     else:
         got = has_review(comments, "보안 리뷰")
-        where = ", ".join(f"#{i}" for i in sec)
-        rows.append(("보안 리뷰", got, f"{where} 보안 영향 체크 — " + ("결과 댓글 있음" if got else
+        why = [f"{', '.join(f'#{i}' for i in sec)} 보안 영향 체크"] if sec else []
+        why += [f"#{i} 글쓴이 {issues[i].get('author_association') or '알 수 없음'}(저장소 주인·멤버·협업자 아님 — "
+                "보안 영향 칸을 믿지 않음)" for i in outsider]
+        rows.append(("보안 리뷰", got, f"{'; '.join(why)} — " + ("결과 댓글 있음" if got else
                      hint.format("security-reviewer"))))
     return rows
 
@@ -194,14 +206,22 @@ def _merge(pr, head):
             gh("pr", "merge", str(pr["number"]), "--repo", REPO, "--squash", "--subject", s, "--match-head-commit", head)
             return s
         except SystemExit as e:
-            if i == MERGE_TRIES:
-                raise Stop(f"병합 실패 ({MERGE_TRIES}번 시도): {e}") from None
-            print(f"병합 실패 — 3초 뒤 다시 시도 ({i + 1}/{MERGE_TRIES}): {e}")
+            err = e
+            print(f"병합 명령 오류 ({i}/{MERGE_TRIES}): {e} — 3초 뒤 PR 상태를 다시 읽는다")
         sleep(3)
-        now = json.loads(gh("pr", "view", str(pr["number"]), "--repo", REPO, "--json", "headRefOid,state,mergeStateStatus"))
-        if now["headRefOid"] != head or now["state"] != "OPEN":
-            raise Stop(f"다시 시도하지 않음: head {now['headRefOid'][:7]}, 상태 {now['state']}")
-        print(f"  병합 상태 {now.get('mergeStateStatus', '?')}")
+        try:  # 실패는 종료 코드 2 (빠진 흔적 1이 아니다)
+            now = json.loads(gh("pr", "view", str(pr["number"]), "--repo", REPO, "--json", "headRefOid,state,mergeStateStatus"))
+            got_head, state = now["headRefOid"], now["state"]
+        except (SystemExit, ValueError, KeyError, TypeError) as e:
+            raise Stop(f"병합 실패 뒤 PR 상태를 읽지 못함: {e}") from None
+        if state == "MERGED" and got_head == head:  # 오류를 돌려줬지만 서버에선 병합됨
+            print(f"병합 명령은 오류였지만 PR이 판정한 head {head[:7]}로 병합돼 있음")
+            return s
+        if got_head != head or state != "OPEN":
+            raise Stop(f"다시 시도하지 않음: head {got_head[:7]}, 상태 {state}")
+        if i == MERGE_TRIES:
+            raise Stop(f"병합 실패 ({MERGE_TRIES}번 시도): {err}")
+        print(f"  병합 상태 {now.get('mergeStateStatus', '?')} — 다시 시도 ({i + 1}/{MERGE_TRIES})")
     raise Stop("병합 실패")  # 닿지 않음
 
 
@@ -238,7 +258,15 @@ def run(n, merge=False, expect_head=None):
     except SystemExit as e:
         raise Stop(f"commit status {CONTEXT_REVIEW}를 올리지 못함: {e}") from None
     print(f"commit status {CONTEXT_REVIEW} = success 올림 ({head[:7]})")
-    s = _merge(pr, head)
+    try:
+        s = _merge(pr, head)
+    except BaseException:  # 병합 못 하고 끝나면 남은 success를 덮는다 (issues/106)
+        try:
+            post_status(head, CONTEXT_REVIEW, f"merge_gate 병합 실패 — 다시 판정해야 함 · {now}", "failure", pr.get("url"))
+            print(f"commit status {CONTEXT_REVIEW}: 병합하지 못해 success를 failure로 덮음 ({head[:7]})")
+        except SystemExit as e:
+            print(f"commit status {CONTEXT_REVIEW} failure를 올리지 못함 — success가 남아 있음, 직접 확인: {e}")
+        raise
     print(f"병합함: {s} (head {head[:7]})")
     return 0
 

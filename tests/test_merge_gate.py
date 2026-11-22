@@ -47,9 +47,15 @@ class FakeGh:
         self.pr, self.issues, self.inline, self.calls = pr, issues or {}, owned(inline), []
         self.status_fails = False
         self.merge_fails = 0  # 앞에서부터 이만큼 병합 실패
+        self.reread = None  # 병합 실패 뒤 다시 읽기: None 판정 때와 같음 / "fail" gh 오류 / dict 그 응답
+        self.post_fails_after = None  # 이만큼 status를 올린 뒤부터 POST 실패
 
     def __call__(self, *args):
         self.calls.append(args)
+        if args[:2] == ("pr", "view") and "mergeStateStatus" in args[-1] and self.reread is not None:
+            if self.reread == "fail":
+                raise SystemExit("gh pr view 실패: HTTP 502")
+            return json.dumps(self.reread)
         if args[:2] == ("pr", "view"):
             return json.dumps(self.pr)
         if args[:2] == ("pr", "merge"):
@@ -57,7 +63,7 @@ class FakeGh:
                 raise SystemExit("gh pr merge 실패: Required status check \"docflow/review-gate\" is expected.")
             return ""
         if args[:3] == ("api", "-X", "POST"):  # commit status
-            if self.status_fails:
+            if self.status_fails or (self.post_fails_after is not None and len(self.statuses) > self.post_fails_after):
                 raise SystemExit("gh api 실패: HTTP 403")
             return "{}"
         if args[0] == "api" and "--paginate" in args:
@@ -81,7 +87,13 @@ class FakeGh:
     def statuses(self):
         return [c for c in self.calls if c[:3] == ("api", "-X", "POST")]
 
-PLAIN = {7: {"body": ISSUE_PLAIN}}
+
+def iss(body, who="OWNER"):
+    """gh api repos/../issues/N 응답 (글쓴이 포함)"""
+    return {"body": body, "author_association": who}
+
+
+PLAIN = {7: iss(ISSUE_PLAIN)}
 
 
 def run(monkeypatch, pr, issues=PLAIN, *flags, inline=()):
@@ -214,10 +226,10 @@ def test_reviews_from_comment_review_body_and_each_inline_comment(monkeypatch):
 
 
 def test_security_review_needed_when_issue_box_checked(monkeypatch, capsys):
-    code, fake = run(monkeypatch, make_pr(), {7: {"body": ISSUE_SEC}}, "--merge")
+    code, fake = run(monkeypatch, make_pr(), {7: iss(ISSUE_SEC)}, "--merge")
     assert code == 1 and not fake.merges
     assert "X 보안 리뷰" in capsys.readouterr().out
-    code, fake = run(monkeypatch, make_pr(comments=(SPEC, CODE, SEC)), {7: {"body": ISSUE_SEC}}, "--merge")
+    code, fake = run(monkeypatch, make_pr(comments=(SPEC, CODE, SEC)), {7: iss(ISSUE_SEC)}, "--merge")
     assert code == 0 and len(fake.merges) == 1
 
 
@@ -225,8 +237,8 @@ def test_security_from_title_refs_and_urls_but_not_pr_numbers(monkeypatch):
     pr = make_pr(title="PR #38 리뷰 반영 (#12)")
     pr["body"] = ("Refs #13, #14\nRefs: https://github.com/reddol18/docflow/issues/15\n"
                   "Refs https://github.com/other/repo/issues/16\n" + CHECK_OK)
-    issues = {12: {"body": ISSUE_PLAIN}, 13: {"body": ISSUE_PLAIN}, 14: {"body": ISSUE_PLAIN},
-              15: {"body": ISSUE_SEC}, 38: {"number": 38, "pull_request": {}}}
+    issues = {12: iss(ISSUE_PLAIN), 13: iss(ISSUE_PLAIN), 14: iss(ISSUE_PLAIN),
+              15: iss(ISSUE_SEC), 38: {"number": 38, "pull_request": {}}}
     monkeypatch.setattr(mg, "gh", FakeGh(pr, issues))
     got, _, found = mg.fetch(90)
     assert sorted(found) == [12, 13, 14, 15]  # 38은 PR, 16은 다른 저장소
@@ -245,7 +257,7 @@ def test_no_code_pr_skips_reviews_but_not_local_check():
     # 절차를 바꾸는 .md(템플릿)는 코드로 본다
     assert missing(make_pr(comments=(), files=DOCS + (".github/pull_request_template.md",))) == ["계약 리뷰", "버그 리뷰"]
     # 코드 없는 PR이어도 보안 영향 체크가 있으면 보안 리뷰는 요구 (weekly_metrics와 같은 규칙)
-    assert missing(make_pr(comments=(), files=DOCS), {7: ISSUE_SEC}) == ["보안 리뷰"]
+    assert missing(make_pr(comments=(), files=DOCS), {7: iss(ISSUE_SEC)}) == ["보안 리뷰"]
 
 
 def test_merged_or_draft_pr_is_not_merged(monkeypatch):
@@ -360,3 +372,106 @@ def test_merge_retry_stops_if_head_moved(monkeypatch, capsys):
     monkeypatch.setattr(mg, "gh", moved)
     assert mg.main(["90", "--merge"]) == 2 and len(fake.merges) == 1
     assert "다시 시도하지 않음" in capsys.readouterr().out
+
+
+# ---- 병합 게이트 보강 (https://github.com/reddol18/docflow/issues/106)
+
+@pytest.mark.parametrize("who", ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None])
+def test_outsider_issue_requires_security_review_even_without_box(monkeypatch, capsys, who):
+    """1: 외부인이 연 이슈는 본문을 고쳐 보안 영향 체크를 지울 수 있다 → 칸과 상관없이 보안 리뷰 요구"""
+    issues = {7: iss(ISSUE_PLAIN, who)}
+    assert missing(make_pr(), issues) == ["보안 리뷰"]
+    assert missing(make_pr(comments=(SPEC, CODE, SEC)), issues) == []
+    assert missing(make_pr(comments=(), files=DOCS), issues) == ["보안 리뷰"]  # 코드 없는 PR도
+    code, fake = run(monkeypatch, make_pr(), issues, "--merge")
+    assert code == 1 and not fake.merges and fake.statuses == []
+    assert "X 보안 리뷰" in capsys.readouterr().out
+    # fetch가 이슈 글쓴이를 넘긴다
+    monkeypatch.setattr(mg, "gh", FakeGh(make_pr(), issues))
+    _, _, found = mg.fetch(90)
+    assert found[7]["author_association"] == who
+
+
+@pytest.mark.parametrize("who", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_trusted_issue_author_box_decides(who):
+    assert missing(make_pr(), {7: iss(ISSUE_PLAIN, who)}) == []
+    assert missing(make_pr(), {7: iss(ISSUE_SEC, who)}) == ["보안 리뷰"]
+
+
+def test_issue_without_author_counts_as_outsider():
+    """글쓴이를 모르면(응답에 없음) 믿지 않는다 (fail-closed)"""
+    assert missing(make_pr(), {7: {"body": ISSUE_PLAIN}}) == ["보안 리뷰"]
+
+
+def test_reread_failure_during_retry_is_exit_2(monkeypatch, capsys):
+    """2: 병합 재시도 중 gh pr view 실패는 종료 코드 2 (1 = 빠진 흔적이 아니다)"""
+    monkeypatch.setattr(mg, "sleep", lambda s: None)
+    fake = FakeGh(make_pr(), PLAIN)
+    fake.merge_fails, fake.reread = 1, "fail"
+    monkeypatch.setattr(mg, "gh", fake)
+    assert mg.main(["90", "--merge"]) == 2 and len(fake.merges) == 1
+    assert "PR 상태를 읽지 못함" in capsys.readouterr().out
+
+
+def test_merge_error_but_merged_on_server_is_success(monkeypatch, capsys):
+    """3: gh pr merge가 오류를 돌려줬지만 서버에선 판정한 head로 병합됨 → 병합함(0), 다시 시도·status 덮기 없음"""
+    monkeypatch.setattr(mg, "sleep", lambda s: None)
+    fake = FakeGh(make_pr(), PLAIN)
+    fake.merge_fails, fake.reread = 1, {"headRefOid": HEAD, "state": "MERGED", "mergeStateStatus": "UNKNOWN"}
+    monkeypatch.setattr(mg, "gh", fake)
+    assert mg.main(["90", "--merge"]) == 0 and len(fake.merges) == 1
+    assert [s for s in fake.statuses if "state=failure" in s] == []
+    out = capsys.readouterr().out
+    assert "병합돼 있음" in out and "병합함:" in out
+
+
+def test_merged_with_other_head_is_not_success(monkeypatch):
+    monkeypatch.setattr(mg, "sleep", lambda s: None)
+    fake = FakeGh(make_pr(), PLAIN)
+    fake.merge_fails, fake.reread = 1, {"headRefOid": "f" * 40, "state": "MERGED"}
+    monkeypatch.setattr(mg, "gh", fake)
+    assert mg.main(["90", "--merge"]) == 2
+
+
+def test_last_failed_try_also_checks_merged(monkeypatch):
+    """마지막 시도가 오류여도 서버에서 병합됐으면 병합함"""
+    monkeypatch.setattr(mg, "sleep", lambda s: None)
+    fake = FakeGh(make_pr(), PLAIN)
+    fake.merge_fails = 9
+    real = fake.__call__
+
+    def view(*args):
+        if args[:2] == ("pr", "view") and "mergeStateStatus" in args[-1]:
+            fake.calls.append(args)
+            done = len(fake.merges) == mg.MERGE_TRIES
+            return json.dumps({"headRefOid": HEAD, "state": "MERGED" if done else "OPEN"})
+        return real(*args)
+    monkeypatch.setattr(mg, "gh", view)
+    assert mg.main(["90", "--merge"]) == 0 and len(fake.merges) == mg.MERGE_TRIES
+
+
+@pytest.mark.parametrize("setup", ["gives_up", "reread_fails", "head_moved"])
+def test_review_gate_success_covered_when_merge_fails(monkeypatch, capsys, setup):
+    """4: success를 올린 뒤 병합하지 못하고 끝나면 같은 context에 failure를 올려 덮는다"""
+    monkeypatch.setattr(mg, "sleep", lambda s: None)
+    pr = make_pr()
+    pr["url"] = "https://github.com/reddol18/docflow/pull/90"
+    fake = FakeGh(pr, PLAIN)
+    fake.merge_fails = 9
+    fake.reread = {"gives_up": None, "reread_fails": "fail", "head_moved": {"headRefOid": "f" * 40, "state": "OPEN"}}[setup]
+    monkeypatch.setattr(mg, "gh", fake)
+    assert mg.main(["90", "--merge"]) == 2
+    states = [next(x for x in s if x.startswith("state=")) for s in fake.statuses]
+    assert states == ["state=success", "state=failure"]
+    last = fake.statuses[-1]
+    assert "context=docflow/review-gate" in last and last[3] == f"repos/{mg.REPO}/statuses/{HEAD}"
+    assert "success를 failure로 덮음" in capsys.readouterr().out
+
+
+def test_cover_failure_is_reported_and_still_exit_2(monkeypatch, capsys):
+    monkeypatch.setattr(mg, "sleep", lambda s: None)
+    fake = FakeGh(make_pr(), PLAIN)
+    fake.merge_fails, fake.post_fails_after = 9, 1  # success는 올라가고 덮는 failure는 실패
+    monkeypatch.setattr(mg, "gh", fake)
+    assert mg.main(["90", "--merge"]) == 2
+    assert "success가 남아 있음" in capsys.readouterr().out

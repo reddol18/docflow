@@ -10,9 +10,12 @@ docflow/local-check를 올리는 조건 (하나라도 아니면 올리지 않는
     `git status`가 실패하면 변경이 있는 것으로 본다
   - 막는 검사(`merge_gate.CHECKS` — check.ps1이 넘기는 값이 아니라 이 목록으로 정한다. trivy는 issues/29부터 포함)가
     모두 돌았고 통과. 같은 검사 이름이 두 번 오면 거부
+  - `merge_gate.CHECKS`에도 `merge_gate.REPORT_ONLY`(보고만)에도 없는 이름이 실패면 거부 — check.ps1에 새 막는 단계가
+    생기고 CHECKS에 빠뜨려도 그 실패가 묻히지 않게 (https://github.com/reddol18/docflow/issues/106)
   - 건너뜀 없음. 단 코드 없는 PR(`git diff origin/main...HEAD` 파일이 weekly_metrics.is_no_code)은
     osv·semgrep·trivy 건너뜀(-Quick) 허용 — merge_gate의 판정과 같은 규칙. pytest 안의 `-Skip pg`도 건너뜀으로 본다
-  - HEAD가 GitHub에 있다(push함). 없는 커밋이면 GitHub이 거부(422)하므로 그것으로 안다
+  - HEAD가 GitHub에 있다(push함). 없는 커밋이면 GitHub이 422 "No commit found"로 거부하므로 그것으로 안다
+    (다른 422는 '올리기 실패' — 종료 코드 2)
 status는 커밋(sha)에 붙으므로 push로 head가 바뀌면 새 head에는 둘 다 없다 — 다시 검사·판정해야 한다.
 
   uv run --quiet --no-project python -I scripts/gate_status.py local-check --start-sha <sha> [--start-dirty]
@@ -64,6 +67,10 @@ def decide(results, *, start_sha, head_sha, start_dirty, end_dirty, no_code, ski
     failed = [c for c in mg.CHECKS if by.get(c) == "fail"]
     if failed:
         return False, f"막는 검사 실패: {', '.join(failed)}"
+    unknown = [n for n, s in results if s == "fail" and n not in mg.CHECKS and n not in mg.REPORT_ONLY]
+    if unknown:  # 막는지 모르는 검사의 실패는 막는 것으로 본다 (fail-closed)
+        return False, (f"모르는 검사 실패: {', '.join(unknown)} "
+                       "(merge_gate.CHECKS 또는 REPORT_ONLY에 넣는다)")
     missing = [c for c in mg.CHECKS if c not in by]
     if missing:
         return False, f"검사 결과 없음: {', '.join(missing)}"
@@ -97,7 +104,7 @@ def local_check(a):
     try:
         mg.post_status(head, CONTEXT_CHECK, desc)
     except SystemExit as e:
-        if re.search(r"422|No commit found", str(e)):
+        if re.search(r"No commit found", str(e), re.I):  # 422 전부가 아니다 (issues/106)
             print(f"commit status {CONTEXT_CHECK} 올리지 않음: HEAD {head[:7]}가 GitHub에 없음 (push한 뒤 다시 돌린다)")
             return 1
         print(f"commit status {CONTEXT_CHECK} 올리기 실패: {e}")

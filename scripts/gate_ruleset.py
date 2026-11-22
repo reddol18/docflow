@@ -14,7 +14,9 @@ classic branch protection이 아니라 이미 있는 ruleset("Protect Main": PR 
   --allow-admin-bypass   관리자 우회를 넣는다 (규칙은 그대로, 주인만 웹 화면에서 우회 가능)
   --remove-status-rule   status 규칙을 뺀다 (다른 규칙은 그대로)
 고친 뒤 인자 없이 다시 돌리면 원래대로 돌아간다.
-종료 코드: 0 성공(바뀐 것 없음 포함), 2 ruleset을 찾지 못함·gh 오류.
+비교는 GitHub 응답의 모양 차이(빈 parameters, status 규칙의 기본값·순서·빈 integration_id, actor_name)를 줄여서 한다.
+종료 코드: 0 성공(바뀐 것 없음 포함. PUT 뒤 다시 읽기만 실패하면 경고하고 0),
+           2 ruleset을 찾지 못함·gh 오류·PUT 뒤 다시 읽은 내용이 바꿀 것과 다름.
 """
 import argparse
 import copy
@@ -66,13 +68,27 @@ def desired(ruleset, strict=False, remove_status_rule=False, allow_admin_bypass=
     return body
 
 
+def _norm_rule(r):
+    """규칙 하나의 비교용 모양: 빈 parameters를 없애고, status 규칙은 기본값을 채우고 순서·빈 integration_id를 없앤다"""
+    r = {k: v for k, v in r.items() if not (k == "parameters" and not v)}
+    if r.get("type") == "required_status_checks":
+        p = dict(r.get("parameters") or {})
+        p.setdefault("strict_required_status_checks_policy", False)
+        p.setdefault("do_not_enforce_on_create", False)
+        checks = [{k: v for k, v in c.items() if not (k == "integration_id" and v is None)}
+                  for c in p.get("required_status_checks") or []]
+        p["required_status_checks"] = sorted(checks, key=lambda c: json.dumps(c, sort_keys=True))
+        r["parameters"] = p
+    return r
+
+
 def _norm(body):
-    """비교용: GitHub이 돌려주는 기본값·순서 차이를 줄인다"""
+    """비교용: GitHub이 돌려주는 기본값·순서·모양 차이를 줄인다 — 같은 내용을 다시 PUT하지 않게 (issues/106)"""
     b = copy.deepcopy(body)
-    for a in b.get("bypass_actors") or []:
-        a.pop("actor_name", None)
-    b["rules"] = sorted(b.get("rules") or [], key=lambda r: r.get("type", ""))
-    b["bypass_actors"] = sorted(b.get("bypass_actors") or [], key=lambda a: (a.get("actor_type", ""), a.get("actor_id") or 0))
+    actors = [{k: v for k, v in a.items() if k != "actor_name"} for a in b.get("bypass_actors") or []]
+    b["rules"] = sorted((_norm_rule(r) for r in b.get("rules") or []),
+                        key=lambda r: (r.get("type", ""), json.dumps(r, sort_keys=True)))
+    b["bypass_actors"] = sorted(actors, key=lambda a: json.dumps(a, sort_keys=True))
     return b
 
 
@@ -122,11 +138,19 @@ def main(argv=None):
             print("(--dry-run: 바꾸지 않음)")
             return 0
         gh("api", "-X", "PUT", f"repos/{REPO}/rulesets/{cur['id']}", "--input", "-", stdin=json.dumps(new))
-        print("바꿈. 지금: " + summary(find(a.name)))
-        return 0
     except SystemExit as e:
         print(f"실패: {e}")
         return 2
+    try:  # PUT은 성공했다 — 다시 읽기 실패는 '실패'가 아니다 (issues/106)
+        got = find(a.name)
+    except SystemExit as e:
+        print(f"바꿈 (PUT 성공). 다시 읽어 확인하지 못함: {e} — `--dry-run`으로 다시 확인한다")
+        return 0
+    if diff({k: got.get(k) for k in PUT_KEYS}, new):
+        print("PUT은 성공했지만 다시 읽은 ruleset이 바꿀 것과 다름: " + summary(got))
+        return 2
+    print("바꿈. 지금: " + summary(got))
+    return 0
 
 
 if __name__ == "__main__":
