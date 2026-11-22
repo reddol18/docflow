@@ -1,6 +1,7 @@
 """scripts/gate_status.py — docflow/local-check commit status를 올리는 조건 (https://github.com/reddol18/docflow/issues/85).
 git·gh는 가짜로 바꾼다 (실제 GitHub 호출·status 없음). 조건별: 통과·실패·건너뜀·커밋 안 된 변경·head 바뀜·push 안 함."""
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -178,3 +179,65 @@ def test_duplicate_result_rejected(monkeypatch, capsys):
 def test_bad_result_argument_rejected(bad):
     with pytest.raises(SystemExit):
         gs.main(["local-check", "--start-sha", SHA, "--at", "x", "--result", bad])
+
+
+# ---- 병합 게이트 보강 (https://github.com/reddol18/docflow/issues/106)
+
+@pytest.mark.parametrize("msg", ["gh api 실패: Validation Failed (HTTP 422)",
+                                 "gh api 실패: This SHA and context has reached the maximum number of statuses. (HTTP 422)"])
+def test_other_422_is_post_failure_not_unpushed(monkeypatch, capsys, msg):
+    """5: 422 전부가 'push 안 됨'은 아니다 — No commit found만 그렇고 나머지는 올리기 실패(2)"""
+    f = Fake()
+    monkeypatch.setattr(gs, "git", f.git)
+
+    def gh(*a):
+        f.gh_calls.append(a)
+        raise SystemExit(msg)
+    monkeypatch.setattr(gs.mg, "gh", gh)
+    assert gs.main(args(ALL)) == 2
+    out = capsys.readouterr().out
+    assert "올리기 실패" in out and "GitHub에 없음" not in out
+
+
+@pytest.mark.parametrize("state, posted", [("fail", False), ("pass", True)])
+def test_unknown_check_failure_blocks(monkeypatch, capsys, state, posted):
+    """6: CHECKS·REPORT_ONLY에 없는 이름(check.ps1에 새로 생긴 단계)이 실패면 거부, 통과면 그대로"""
+    code, f = run(monkeypatch, args(ALL + [("newcheck", state)]))
+    assert (code == 0) is posted and (len(f.posts) == 1) is posted
+    if not posted:
+        assert f.gh_calls == []
+        assert "모르는 검사 실패: newcheck" in capsys.readouterr().out
+
+
+def test_report_only_failure_does_not_block(monkeypatch):
+    """6: REPORT_ONLY에 넣은 검사의 실패는 막지 않는다"""
+    monkeypatch.setattr(gs.mg, "REPORT_ONLY", frozenset({"newcheck"}))
+    code, f = run(monkeypatch, args(ALL + [("newcheck", "fail")]))
+    assert code == 0 and len(f.posts) == 1
+
+
+def test_report_only_is_disjoint_from_checks():
+    assert not set(gs.mg.REPORT_ONLY) & set(gs.mg.CHECKS)
+
+
+# ---- PR #151 리뷰 반영 (https://github.com/reddol18/docflow/issues/106)
+
+def test_report_only_skip_does_not_block(monkeypatch, capsys):
+    """C2: 보고만 검사는 건너뛰어도 막지 않는다 (모르는 검사의 건너뜀은 막는다)"""
+    code, f = run(monkeypatch, args(ALL + [("newcheck", "skip")]))
+    assert code == 1 and f.posts == [] and "건너뜀: newcheck" in capsys.readouterr().out
+    monkeypatch.setattr(gs.mg, "REPORT_ONLY", frozenset({"newcheck"}))
+    code, f = run(monkeypatch, args(ALL + [("newcheck", "skip")]))
+    assert code == 0 and len(f.posts) == 1
+    assert "코드 없는 PR" not in next(x for x in f.posts[0] if x.startswith("description="))
+
+
+def test_check_ps1_steps_match_checks_and_report_only():
+    """C1: check.ps1의 막는 단계(Step 이름 $true)는 CHECKS, 막지 않는 단계($false)는 REPORT_ONLY와 같다.
+    막지 않는 단계의 실패는 '실패 (보고만)'으로 적어 merge_gate의 '**실패**' 거부에 걸리지 않는다"""
+    src = (Path(__file__).parent.parent / "scripts" / "check.ps1").read_text(encoding="utf-8-sig")
+    steps = re.findall(r'^\s*Step "([\w-]+)" \$(true|false)\b', src, re.M)
+    assert steps, "check.ps1에서 Step 줄을 찾지 못함"
+    assert {n for n, b in steps if b == "true"} == set(gs.mg.CHECKS)
+    assert {n for n, b in steps if b == "false"} == set(gs.mg.REPORT_ONLY)
+    assert 'elseif (-not $r.blocking) { "실패 (보고만)" }' in src

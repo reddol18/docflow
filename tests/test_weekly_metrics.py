@@ -102,3 +102,24 @@ def test_first_check_passed_uses_first_summary():
     assert wm.first_check_passed(["본문", bad, ok]) is False
     assert wm.first_check_passed([ok, bad]) is True
     assert wm.first_check_passed(["요약 없음"]) is None
+
+
+# ---- 보안 리뷰 필요 판정을 merge_gate와 같게 (https://github.com/reddol18/docflow/issues/106)
+
+SEC_BODY = "## 보안 영향\n- [x] 새 엔드포인트\n"
+PLAIN_BODY = "## 보안 영향\n- [ ] 새 엔드포인트\n"
+
+
+def _pr(n=90, title="기능 (#7)", body=""):
+    return {"number": n, "title": title, "body": body}
+
+
+def test_security_needed_follows_merge_gate_author_rules():
+    by_no = {7: {"body": PLAIN_BODY}, 8: {"body": SEC_BODY}}
+    owner = {90: "OWNER", 7: "OWNER", 8: "OWNER"}
+    assert wm.security_needed(_pr(), [], by_no, owner) is False
+    assert wm.security_needed(_pr(title="기능 (#8)"), [], by_no, owner) is True  # 칸 체크
+    assert wm.security_needed(_pr(), [], by_no, {**owner, 7: "NONE"}) is True  # 외부인이 연 이슈
+    assert wm.security_needed(_pr(title="기능"), [], by_no, {**owner, 90: "CONTRIBUTOR"}) is True  # 외부인 PR
+    assert wm.security_needed(_pr(), [], by_no, {7: "OWNER"}) is True  # PR 글쓴이를 모름 → 외부인으로
+    assert wm.TRUSTED == {"OWNER", "MEMBER", "COLLABORATOR"}

@@ -11,7 +11,8 @@
     계약 리뷰   "spec-reviewer" 또는 "spec-review"
     버그 리뷰   "code-review"
     보안 리뷰   "security-reviewer" — 닫거나 가리키는 이슈(닫는 이슈·제목의 #N·본문 줄 머리 Refs #N/이 저장소 이슈 URL)의
-                '보안 영향' 칸에 체크가 있을 때만 필요. 'PR별 절차'의 닫는 이슈 칸·리드타임에는 Refs를 넣지 않는다
+                '보안 영향' 칸에 체크가 있을 때만 필요. 'PR별 절차'의 닫는 이슈 칸·리드타임에는 Refs를 넣지 않는다.
+                그 이슈나 PR의 글쓴이가 저장소 주인·멤버·협업자가 아니면 칸과 상관없이 필요 (merge_gate와 같음, issues/106)
   병합 전 검사 `scripts/merge_gate.py`가 이 파일의 함수를 함께 쓴다(evidence·check_blocks·block_failed·_tables·
   issue_refs·is_no_code·needs_security·MARKS). merge_gate가 더 엄격하다: 로컬 검사는 PR head 커밋 요약이고 막는 검사 모두
   '통과'(건너뜀 거부, 코드 없는 PR만 osv·semgrep·trivy 건너뜀 허용), 리뷰는 본문이 아닌 댓글·리뷰 한 글 안에 '지적·반영' 표
@@ -110,6 +111,25 @@ def evidence_texts(body, comments, reviews):
 def needs_security(issue_body):
     s = section(issue_body, "보안 영향")
     return bool(s and re.search(r"- \[[xX]\]", s))
+
+
+TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}  # 글을 믿는 글쓴이 (author_association). merge_gate도 쓴다
+
+
+def associations():
+    """이슈·PR 번호 → 글쓴이 author_association (REST 이슈 목록은 PR도 담는다)"""
+    out = sh("gh", "api", "--paginate", f"repos/{REPO}/issues?state=all&per_page=100",
+             "--jq", '.[] | "\\(.number) \\(.author_association)"')
+    return {int(n): a for n, a in (ln.split() for ln in out.splitlines() if ln.strip())}
+
+
+def security_needed(pr, closes, by_no, assoc):
+    """보안 리뷰가 필요한가 (merge_gate.judge와 같은 규칙): PR이나 가리키는 이슈의 글쓴이가 저장소 사람이 아니거나
+    (모르면 아닌 것으로), 가리키는 이슈의 '보안 영향' 칸에 체크"""
+    if assoc.get(pr["number"]) not in TRUSTED:
+        return True
+    refs = [n for n in issue_refs(pr["title"], pr["body"], closes) if n in by_no]
+    return any(assoc.get(n) not in TRUSTED or needs_security(by_no[n].get("body")) for n in refs)
 
 
 _REF = r"(?:#\d+|https://github\.com/[\w.-]+/[\w.-]+/issues/\d+)"
@@ -351,6 +371,7 @@ def collect(start, end):
     if len(issues) >= limit:
         raise SystemExit(f"이슈가 {limit}개 이상이라 열린 수가 틀린다: limit을 올릴 것")
     by_no = {i["number"]: i for i in issues}
+    assoc = associations()
     tags = deploy_tags()
     rows = []
     for p in sorted(prs, key=lambda p: p["number"]):
@@ -358,8 +379,8 @@ def collect(start, end):
         closes = [c["number"] for c in p["closingIssuesReferences"]]
         # 제목의 (#N)도 관련 이슈로 보되, 이슈인 번호만 ("PR #38"의 38은 PR)
         refs = {n for n in linked_issues(p["title"], closes) if n in by_no}
-        # 보안 리뷰 필요 판정만 본문 Refs #N까지 본다 (merge_gate와 같게). 리드타임·'닫는 이슈' 칸은 그대로
-        sec = any(needs_security(by_no[n].get("body")) for n in issue_refs(p["title"], p["body"], closes) if n in by_no)
+        # 보안 리뷰 필요 판정만 본문 Refs #N·글쓴이까지 본다 (merge_gate와 같게). 리드타임·'닫는 이슈' 칸은 그대로
+        sec = security_needed(p, closes, by_no, assoc)
         marks = dict(marks)
         if not sec:
             marks["보안 리뷰"] = None  # 필요 없으면 세지 않음

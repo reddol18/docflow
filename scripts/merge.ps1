@@ -10,11 +10,12 @@ PR 병합은 이 스크립트로만 한다 (https://github.com/reddol18/docflow/
 commit status `docflow/review-gate`(https://github.com/reddol18/docflow/issues/85)는 병합을 실제로 하는 호출(묻고 y, -Yes)에서만
 판정 통과일 때 병합 직전에 올린다. -DryRun·처음 판정·취소에서는 올리지 않는다 — main ruleset(`scripts/protect_main.ps1`)이 이것과
 `docflow/local-check`(`scripts/check.ps1`이 올림)를 요구하므로 웹 화면·`gh pr merge`로는 승인 없이 병합할 수 없다.
-판정이 거부인데 head에 전의 success가 있으면 failure로 덮는다.
+판정이 거부인데 head에 전의 success가 있으면 failure로 덮는다. success를 올린 뒤 병합하지 못하고 끝나도 failure로 덮는다
+(https://github.com/reddol18/docflow/issues/106).
 
 확인하는 흔적(저장소 주인·멤버·협업자의 글만): 로컬 검사 요약과 head 커밋의 `docflow/local-check` status(PR head 커밋, 막는 검사 모두 통과, 건너뜀 거부 — 코드 없는 PR만 osv·semgrep·trivy 건너뜀 허용) ·
 계약 리뷰 · 버그 리뷰 결과 댓글(댓글·리뷰 한 글 안에 이름과 '| 지적 | 반영 |' 표, 코드 없는 PR은 면제) ·
-관련 이슈 보안 영향 칸에 체크가 있으면 보안 리뷰 결과 댓글.
+관련 이슈 보안 영향 칸에 체크가 있거나 그 이슈를 외부인이 열었으면 보안 리뷰 결과 댓글.
 묻고 병합할 때는 처음 판정한 head를 --expect-head로 넘긴다: 그 사이 push가 있으면 병합하지 않는다.
 종료 코드: 0 통과(병합함 / -DryRun이면 확인만), 1 빠진 흔적·취소, 2 병합할 수 없음(이미 병합·닫힘·초안, head 바뀜, 없는 이슈 등).
 #>
