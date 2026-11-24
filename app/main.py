@@ -75,7 +75,24 @@ from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import auth, error_list, errors, export, field_rules, flags, inspection, jobqueue, layout, llm, ocr, report, runs, store, workflow
+from app import (
+    auth,
+    error_list,
+    errors,
+    export,
+    field_rules,
+    flags,
+    inspection,
+    jobqueue,
+    layout,
+    llm,
+    ocr,
+    report,
+    retrieval,  # 검색 순위 (https://github.com/reddol18/docflow/issues/61)
+    runs,
+    store,
+    workflow,
+)
 from app import fields as schema_fields  # 'fields'는 경로 함수 인자 이름(고친 칸 dict)으로 쓰인다
 from app import graph as flow
 from app import upload as uploads  # 경로 함수 이름 upload와 겹치지 않게
@@ -1535,39 +1552,44 @@ def purge(vol: str, user: Admin, confirm: str = "", allow_problems: bool = False
     return {"vol": vol, "deleted": info}
 
 
-def query_words(q):
-    """낱말 검색에 넣을 낱말: 두 글자 이상, 연도(1997·1997년)는 뺀다"""
-    return [w for w in re.split(r"\s+", q) if len(w) >= 2 and not re.fullmatch(r"\d{4}년?", w)]
-
-
-def rrf(*lists):
-    """Reciprocal Rank Fusion 점수 {(vol, doc_id): 점수} — 문서 키는 철과 쪽 이름 둘 다
-    (https://github.com/reddol18/docflow/issues/50). 검색 평가(`eval/search_score.py`)도 이 함수를 쓴다"""
-    score = {}
-    for lst in lists:
-        for rank, r in enumerate(lst):
-            k = store.doc_key(r)
-            score[k] = score.get(k, 0) + 1 / (60 + rank + 1)
-    return score
-
+# 순위 계산은 app/retrieval.py (합성 평가 eval/search_synth.py·embed_compare.py·answer/gen_answers.py도 같은 함수)
+query_words = retrieval.query_words
+rrf = retrieval.rrf  # {(vol, doc_id): Σ 1/(60+순위)} — 문서 키는 철과 쪽 이름 둘 다 (https://github.com/reddol18/docflow/issues/50)
 
 CANDIDATES = 30  # 방식마다 가져오는 후보 수
+DOCNO_CANDIDATES = 20  # 문서번호 번호 부분이 든 문서 후보 (정확 일치는 retrieval.docno_matches가 고른다)
+
+
+def rank(q, vec, year_from=None, year_to=None):
+    """/search·/ask의 순위 계산(질의 임베딩 뒤) → retrieval.Ranking.
+    벡터 30 + 낱말 30 → RRF, 질의에 문서번호가 있으면 번호가 정확히 같은 문서를 맨 앞에 고정
+    (https://github.com/reddol18/docflow/issues/61 — 낱말 1위 예외는 문서번호 정확 일치만, 2026-11-24 결정)"""
+    v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
+    kw = store.keyword_search(query_words(q), year_from, year_to, limit=CANDIDATES)
+    docnos = retrieval.docnos_in(q)
+    cands = []
+    if docnos:
+        rows = store.docno_search([n for _, n in docnos], year_from, year_to, limit=DOCNO_CANDIDATES)
+        cands = [(store.doc_key(r), r["docno"]) for r in rows]
+    return retrieval.rank(q, v, kw, cands)
 
 
 def ranked(q, vec, year_from=None, year_to=None):
-    """/search의 순위 계산(질의 임베딩 뒤) → (벡터 결과, 낱말 결과, RRF 점수, RRF 순 (vol, doc_id)).
-    검색 평가(`eval/search_score.py`)도 이 함수를 그대로 부른다"""
-    v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
-    kw = store.keyword_search(query_words(q), year_from, year_to, limit=CANDIDATES)
-    score = rrf(v, kw)
-    return v, kw, score, sorted(score, key=score.get, reverse=True)
+    """rank()를 예전 꼴로 → (벡터 결과, 낱말 결과, RRF 점수, 화면 순서 (vol, doc_id)).
+    검색 평가(`eval/search_score.py`)가 이 함수를 그대로 부른다"""
+    r = rank(q, vec, year_from, year_to)
+    return r.vector, r.keyword, r.score, r.order
 
 
-def hybrid(q, year_from=None, year_to=None, k=10, user=None):
+def hybrid(q, year_from=None, year_to=None, k=10, user=None, empty_on_miss=False):
+    """empty_on_miss: 문서번호 질의인데 그 번호의 문서가 없으면 빈 목록('관련 문서 없음') — /search만 (/ask는 그대로)"""
     # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다.
     # 질의 임베딩은 검색·질문 예산(query) — 다 쓰면 BudgetExceeded → 503 (budget_exceeded 처리기)
     vec = llm.embed("-", [q], scope="query", user_id=getattr(user, "id", None))[0]
-    v, kw, score, order = ranked(q, vec, year_from, year_to)
+    r = rank(q, vec, year_from, year_to)
+    if empty_on_miss and retrieval.no_match(r):
+        return []
+    v, kw, score, order = r.vector, r.keyword, r.score, r.order
     top = order[:k]
     rows = store.get_documents(top)
     vr = {store.doc_key(r): i + 1 for i, r in enumerate(v)}
@@ -1637,7 +1659,7 @@ def refund_quota(key, route, wins):
 def search(q: Annotated[str, Query(min_length=1, max_length=Q_MAX)], user: Viewer, year_from: int | None = None,
            year_to: int | None = None, k: Annotated[int, Query(ge=1, le=50)] = 10):
     with rate_limited("search", user):
-        return hybrid(q, year_from, year_to, k, user)
+        return hybrid(q, year_from, year_to, k, user, empty_on_miss=True)
 
 
 def ask_answer(q, year_from, year_to, user):

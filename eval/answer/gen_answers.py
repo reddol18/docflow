@@ -1,8 +1,9 @@
 """합성 철 /ask 답변 만들기 (https://github.com/reddol18/docflow/issues/21 2단계 — 심판 채점 전 답변 파일).
 
 합성 답변 질의(eval/data/synth_answer_queries.jsonl, eval/answer/make_queries.py)마다 /ask와 같은 길로 답한다:
-  검색   app/main.ranked와 같은 셈을 메모리 안에서 (eval/embed_compare.py와 같은 함수 — 문서 글은 app/graph.doc_text 꼴,
-         벡터 코사인 30 + 낱말 30 → RRF). /ask는 연도 칸 없이 상위 5건 (app/main.ask_answer: hybrid(k=5)).
+  검색   app/main.rank와 같은 셈을 메모리 안에서 (eval/embed_compare.app_rank → app/retrieval.rank — 문서 글은
+         app/graph.doc_text 꼴, 벡터 코사인 30 + 낱말 30 → RRF, 문서번호 정확 일치는 맨 앞).
+         /ask는 연도 칸 없이 상위 5건 (app/main.ask_answer: hybrid(k=5)).
          Postgres·Qdrant에 넣지 않는다 — 이 PC에 운영 색인이 없고, 합성 철 평가가 운영 모음을 건드리지 않게.
   칸 값  합성 정답(gt) 4칸 — 운영에서는 추출(gpt-4.1-mini) 값이 들어간다
   근거   app/main.ask_answer와 같다: 문서 첫 쪽 OCR 앞 40줄을 이은 글(body). 메시지는 app/llm.answer_messages 그대로,
@@ -245,11 +246,10 @@ def main(argv=None):
     rows = []
     for q, qv in zip(sel, qvecs):
         if prev_rows is None:
-            v, _ = ec.vector_rank(qv, docs, dvecs)
-            kw = ec.keyword_rank(ec.query_words(q["question"]), docs)
-            scores = ec.rrf(v, kw)
-            order = sorted(scores, key=scores.get, reverse=True)
-            hits = ask_hits(order, by_key, bodies, scores, v, kw)
+            # app/main.rank와 같은 셈 (RRF + 문서번호 정확 일치 고정, https://github.com/reddol18/docflow/issues/61).
+            # /ask는 문서번호가 없어도 '없음'으로 비우지 않는다 (2026-11-24 결정)
+            r, _ = ec.app_rank(q["question"], qv, docs, dvecs)
+            hits = ask_hits(r.order, by_key, bodies, r.score, r.vector, r.keyword)
         else:
             hits = reuse_hits(prev_rows[q["id"]], bodies)
         res = answer_one(client, a.model, q, hits, budget, system_prompt=system_prompt, priced=not remote)

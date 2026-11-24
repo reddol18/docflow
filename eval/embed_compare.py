@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I: eval 폴�
 
 import compare_common as cc  # noqa: E402
 
-from app import fields  # noqa: E402
+from app import fields, retrieval  # noqa: E402
 
 QUERIES = Path(__file__).resolve().parent / "data" / "synth_search_queries.jsonl"
 SCHEMA = fields.load(fields.DIR / "gimhae.yaml")
@@ -40,18 +40,8 @@ BATCH = 64  # app/graph.index 묶음
 GT_FIELDS = ("docno", "date", "recipient", "title")
 
 
-def query_words(q):
-    """app/main.query_words와 같다: 두 글자 이상, 연도(1997·1997년)는 뺀다"""
-    return [w for w in re.split(r"\s+", q) if len(w) >= 2 and not re.fullmatch(r"\d{4}년?", w)]
-
-
-def rrf(*lists):
-    """app/main.rrf와 같다: {(vol, doc_id): Σ 1/(60+순위)} (순위는 1부터)"""
-    score = {}
-    for lst in lists:
-        for rank, k in enumerate(lst):
-            score[k] = score.get(k, 0) + 1 / (60 + rank + 1)
-    return score
+query_words = retrieval.query_words  # app/main.query_words와 같은 함수 (https://github.com/reddol18/docflow/issues/61)
+rrf = retrieval.rrf  # app/main.rrf와 같은 함수: {(vol, doc_id): Σ 1/(60+순위)} (순위는 1부터)
 
 
 def load_docs(work, vols):
@@ -146,17 +136,35 @@ def vector_rank(qv, docs, vecs, year=None):
     return [docs[i]["key"] for i in order[:CANDIDATES]], [float(sims[i]) for i in order[:CANDIDATES]]
 
 
+def docno_candidates(q, docs, year=None):
+    """app/store.docno_search와 같다: 질의 문서번호의 번호가 문서번호 칸에 (공백 무시) 든 문서 [(키, 칸 값)], doc_id → vol 순.
+    정확 일치는 retrieval.docno_matches가 고른다"""
+    nums = [n for _, n in retrieval.docnos_in(q)]
+    if not nums:
+        return []
+    col = retrieval.docno_field(SCHEMA)
+    out = [(d["key"], d["values"].get(col, "")) for d in docs
+           if (not year or d["year"] == year) and any(n in (d["values"].get(col) or "").replace(" ", "") for n in nums)]
+    return sorted(out, key=lambda c: (c[0][1], c[0][0]))
+
+
+def app_rank(q, qv, docs, dvecs, year=None):
+    """app/main.rank와 같은 셈을 메모리 안에서 → (retrieval.Ranking, 벡터 유사도 목록).
+    후보만 메모리에서 가져오고 합치기(RRF·문서번호 고정)는 운영과 같은 retrieval.rank"""
+    v, sims = vector_rank(qv, docs, dvecs, year)
+    kw = keyword_rank(query_words(q), docs, year)
+    return retrieval.rank(q, v, kw, docno_candidates(q, docs, year)), sims
+
+
 def rank_all(queries, docs, dvecs, qvecs):
-    """질의별 {vector, keyword, rrf} 순위 (키는 'vol/doc_id' 글자)"""
+    """질의별 {vector, keyword, rrf, app} 순위 (키는 'vol/doc_id' 글자). rrf = RRF만, app = 운영 순서(문서번호 고정 포함)"""
     out = {}
     for q, qv in zip(queries, qvecs):
-        year = q.get("year")
-        v, sims = vector_rank(qv, docs, dvecs, year)
-        kw = keyword_rank(query_words(q["q"]), docs, year)
-        score = rrf(v, kw)
-        order = sorted(score, key=score.get, reverse=True)
-        out[q["id"]] = {"vector": ["/".join(k) for k in v[:10]], "keyword": ["/".join(k) for k in kw[:10]],
-                        "rrf": ["/".join(k) for k in order[:10]], "top_sim": round(sims[0], 4) if sims else None}
+        r, sims = app_rank(q["q"], qv, docs, dvecs, q.get("year"))
+        rrf_order = retrieval.fuse(r.vector, r.keyword)[1]  # 고정 없는 RRF (예전 /search 순서)
+        out[q["id"]] = {"vector": ["/".join(k) for k in r.vector[:10]], "keyword": ["/".join(k) for k in r.keyword[:10]],
+                        "rrf": ["/".join(k) for k in rrf_order[:10]], "app": ["/".join(k) for k in r.order[:10]],
+                        "top_sim": round(sims[0], 4) if sims else None}
     return out
 
 

@@ -64,6 +64,24 @@ def test_save_search_vectors_and_hybrid(env, monkeypatch):
                                   "title": "가상 도로 점용 허가"}}
 
 
+def test_docno_search_exact_number(env, monkeypatch):
+    """문서번호 고정 (https://github.com/reddol18/docflow/issues/61): 번호가 든 문서를 좁혀 오고(공백 무시·연도 칸),
+    '…-804'와 '…-8040'은 hybrid에서 갈린다. 없는 번호면 /search는 빈 목록"""
+    from app import main
+    docs = [doc("e1", "1997-03-04", "가상 도로 점용", docno="지경 56120-8040"),
+            doc("e2", "1997-05-06", "가상 공장 등록", docno="지경 56120 - 804"),
+            doc("e3", "1999-01-02", "가상 건축 허가", docno="도시 56120-804")]
+    store.save_documents(docs)
+    store.upsert_vectors(docs, [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0]])
+    assert [r["doc_id"] for r in store.docno_search(["56120-804"])] == ["e1", "e2", "e3"]
+    assert [r["doc_id"] for r in store.docno_search(["56120-804"], 1999, 1999)] == ["e3"]
+    assert store.docno_search([]) == []
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[1.0, 0.0]])
+    hits = main.hybrid("문서번호 지경 56120-804 문서의 수신자는?", k=3, empty_on_miss=True)
+    assert [h["doc_id"] for h in hits][:1] == ["e2"]  # 벡터 1위(e1, …-8040)보다 앞
+    assert main.hybrid("도시 56120-80", empty_on_miss=True) == []
+
+
 def test_migrate_legacy_columns(env):
     """예전 판 표(고정 열)를 흉내 내 옮긴다: 값은 fields로, 검색 열은 스키마로, 고정 열은 지운다. 두 번 불러도 그대로"""
     with store.pool.connection() as c:

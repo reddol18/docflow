@@ -90,7 +90,8 @@ def test_review_empty_submit_both_routes(main, monkeypatch):
 
 
 def test_search_ask_limits(main, monkeypatch, ask_inline):
-    monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k, user=None: [])
+    # /search는 empty_on_miss=True를 넘긴다 (문서번호 없음 → 빈 목록, https://github.com/reddol18/docflow/issues/61)
+    monkeypatch.setattr(main, "hybrid", lambda q, yf, yt, k, user=None, **kw: [])
     monkeypatch.setattr(main.llm, "answer", lambda q, hits, user_id=None: ("답", []))
     monkeypatch.setattr(main.store, "take_quota", lambda *a: None)  # 호출 제한은 test_budget_pg에서
     c = TestClient(main.app)
