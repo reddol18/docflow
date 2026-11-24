@@ -15,6 +15,8 @@
   refusal            직접: 답이 '자료에 없어 답할 수 없다'로 피했는가 (모든 질의). '모른다' 비율 = 답 없는 질의 중 refusal 비율
 이진 판정: 지시문 파일 thresholds로 연속 점수를 P(통과)/F(실패)로, 해당 없음은 N (binarize). 사람 채점표와 같은 P/F/N.
 지시문: eval/answer/judge_prompts_ko.yaml — Ragas 지시문을 한국어로 바꾸고 직접 지표 지시문도 둔다. 판·sha256을 결과에 남긴다.
+      ragas_examples(선택)가 있으면 그 Ragas 지시문의 예시(few-shot)도 바꾼다 (Ragas 입력·출력 모델로 검사).
+--metrics: 고친 지표만 재채점할 때 (예: faithfulness,answer_relevancy). refusal은 늘 함께 채점하고, 고르지 않은 지표는 N.
 심판이 OpenAI로 새지 않게: OPENAI_API_KEY·OPENAI_BASE_URL을 프로세스 환경에서 뺀 뒤 Ragas를 부르고, 심판 클라이언트는 심판 주소에만,
       임베딩 클라이언트는 /embeddings에만 요청을 보내게 httpx 훅에서 막는다(어기면 멈춤). Ragas 사용 통계 전송은 끈다(RAGAS_DO_NOT_TRACK).
 결과: <답변 폴더>/judge/<label>.json — 질의별 점수·P/F/N·이유·초, 지표별 평균·통과율, 심판 모델(응답 이름·Ollama 다이제스트),
@@ -75,17 +77,44 @@ def load_prompts(path=PROMPTS):
         | (set(METRICS) - {"refusal"} - set(p.get("thresholds") or {}))
     if missing or not p.get("version"):
         raise SystemExit(f"지시문 파일에 없는 키: {sorted(missing) or ['version']}")
+    ex = p.get("ragas_examples") or {}  # 선택 (ko-2부터): Ragas 예시를 바꾼다
+    bad = sorted(set(ex) - need_ragas) + sorted(k for k, v in ex.items() if not (
+        isinstance(v, list) and v and all(isinstance(e, dict) and set(e) == {"input", "output"} for e in v)))
+    if bad:
+        raise SystemExit(f"ragas_examples 키·형식이 틀렸다 (키는 ragas와 같고, 값은 input·output 목록): {bad}")
     return p, hashlib.sha256(raw).hexdigest()
 
 
 def apply_prompts(metrics, prompts):
-    """Ragas 지표 객체의 지시문을 한국어로 바꾼다. {이름: 지표}의 속성이 없으면 멈춘다 (Ragas 판이 바뀐 것)"""
+    """Ragas 지표 객체의 지시문(과 ragas_examples가 있으면 예시)을 한국어로 바꾼다.
+    {이름: 지표}의 속성이 없거나 예시가 Ragas 입력·출력 모델에 안 맞으면 멈춘다 (Ragas 판이 바뀐 것)"""
     for key, text in prompts["ragas"].items():
         name, attr = key.split(".", 1)
         prompt = getattr(metrics[name], attr, None)
         if prompt is None or not hasattr(prompt, "instruction"):
             raise SystemExit(f"Ragas 지표 {name}에 지시문 {attr}이 없다 — Ragas 판 확인 (requirements.lock)")
         prompt.instruction = text
+    for key, examples in (prompts.get("ragas_examples") or {}).items():
+        name, attr = key.split(".", 1)
+        prompt = getattr(metrics[name], attr)
+        if not (hasattr(prompt, "input_model") and hasattr(prompt, "output_model")):
+            raise SystemExit(f"Ragas 지표 {name}.{attr}에 입력·출력 모델이 없다 — Ragas 판 확인")
+        try:
+            prompt.examples = [(prompt.input_model.model_validate(e["input"]), prompt.output_model.model_validate(e["output"]))
+                               for e in examples]
+        except ValueError as e:  # pydantic ValidationError는 ValueError
+            raise SystemExit(f"ragas_examples {key}가 Ragas 모델에 맞지 않다: {str(e)[:300]}") from None
+
+
+def parse_metrics(text):
+    """--metrics → 채점할 지표 집합 (refusal은 늘 — 충실도 건너뛰기·이진 판정에 쓴다). 빈 값이면 전부"""
+    want = {m.strip() for m in text.split(",") if m.strip()}
+    if not want:
+        return set(METRICS)
+    bad = sorted(want - set(METRICS))
+    if bad:
+        raise SystemExit(f"모르는 지표: {bad} (가능: {', '.join(METRICS)})")
+    return want | {"refusal"}
 
 
 def is_nan(v):
@@ -204,8 +233,9 @@ def make_prompt(instruction, data, out_model):
             f"-----------------------------\n입력: {json.dumps(data, ensure_ascii=False, indent=2)}\n출력: ")
 
 
-async def judge_row(row, metrics, llm, prompts, models):
-    """질의 하나 → {scores, binary, reasons, errors, seconds}"""
+async def judge_row(row, metrics, llm, prompts, models, only=None):
+    """질의 하나 → {scores, binary, reasons, errors, seconds}. only(지표 집합)가 있으면 그 지표만 (나머지는 N)"""
+    only = set(METRICS) if only is None else only
     t0 = time.time()
     scores, reasons, errors = {}, {}, {}
     ctx = [c["context"] for c in row["retrieved"]]
@@ -232,22 +262,25 @@ async def judge_row(row, metrics, llm, prompts, models):
                 "context_precision": dict(user_input=row["question"], reference=row["expected_answer"], retrieved_contexts=ctx),
                 "context_recall": dict(user_input=row["question"], retrieved_contexts=ctx, reference=row["expected_answer"])}
         for m in RAGAS_METRICS:
+            if m not in only:
+                continue
             if m == "faithfulness" and refused:
                 scores[m] = None  # 답을 피한 답 — 진술이 없어 NaN이 되거나 '없다'를 판정하게 된다 (사람 표도 N)
                 continue
             r = await run(m, metrics[m].ascore(**args[m]))
             scores[m] = None if r is None or is_nan(r.value) else round(float(r.value), 4)
-        supported = {}
-        for c in dict.fromkeys(row.get("cited") or []):
-            if c in keys:
-                s = await run("citation_accuracy", llm.agenerate(make_prompt(
-                    prompts["custom"]["citation_support"],
-                    {"answer": row["answer"], "cited_document": c, "document_text": ctx[keys.index(c)]},
-                    models["Support"]), models["Support"]))
-                supported[c] = bool(s and s.supported)
-                if s is not None:
-                    reasons.setdefault("citation_accuracy", {})[c] = s.reason
-        scores["citation_accuracy"] = citation_value(row.get("cited") or [], keys, supported, refused)
+        if "citation_accuracy" in only:
+            supported = {}
+            for c in dict.fromkeys(row.get("cited") or []):
+                if c in keys:
+                    s = await run("citation_accuracy", llm.agenerate(make_prompt(
+                        prompts["custom"]["citation_support"],
+                        {"answer": row["answer"], "cited_document": c, "document_text": ctx[keys.index(c)]},
+                        models["Support"]), models["Support"]))
+                    supported[c] = bool(s and s.supported)
+                    if s is not None:
+                        reasons.setdefault("citation_accuracy", {})[c] = s.reason
+            scores["citation_accuracy"] = citation_value(row.get("cited") or [], keys, supported, refused)
     th = prompts["thresholds"]
     binary = {m: binarize(m, scores.get(m), th, row["answerable"], refused) for m in METRICS}
     return {"scores": scores, "binary": binary, "reasons": reasons, "errors": errors, "seconds": round(time.time() - t0, 1)}
@@ -327,14 +360,14 @@ def build(a, prompts):
     return llm, metrics, {"Refusal": Refusal, "Support": Support}, jm, em, base, ebase
 
 
-async def run_all(rows, metrics, llm, prompts, models, deadline=None, save=None):
+async def run_all(rows, metrics, llm, prompts, models, deadline=None, save=None, only=None):
     """질의마다 채점하고 save(out, 끝났나)로 그때까지의 결과를 쓴다. deadline(epoch 초)을 넘기면 새 질의를 시작하지 않는다"""
     out = []
     for r in rows:
         if deadline and time.time() >= deadline:
             print(f"마감 시각을 넘겨 멈춤 — {len(out)}/{len(rows)}건 저장", flush=True)
             break
-        res = await judge_row(r, metrics, llm, prompts, models)
+        res = await judge_row(r, metrics, llm, prompts, models, only)
         out.append({"id": r["id"], "type": r["type"], "answerable": r["answerable"], **res})
         print(f"{r['id']} {res['seconds']}s {res['binary']} 오류 {list(res['errors'])}", flush=True)
         if save:
@@ -357,9 +390,12 @@ def main(argv=None):
     ap.add_argument("--embed-base-url", default=OPENAI_BASE, help="질문 적합도 임베딩 주소 (기본 OpenAI)")
     ap.add_argument("--out", default="")
     ap.add_argument("--deadline-utc", default="", help="이 시각(예: 2026-11-22T00:40:00Z)이 지나면 새 질의를 시작하지 않고 그때까지를 저장")
+    ap.add_argument("--metrics", default="",
+                    help="쉼표로 채점할 지표만 (예: faithfulness,answer_relevancy — refusal은 늘 함께). 빈 값이면 전부")
     a = ap.parse_args(argv)
     if not all(c.isalnum() or c in "._-" for c in a.label):
         raise SystemExit("--label은 영문·숫자·_.-만")
+    only = parse_metrics(a.metrics)
     prompts, p_hash = load_prompts(a.prompts)
     ans = json.loads(Path(a.answers).read_text(encoding="utf-8"))
     rows = pick(ans["rows"], a.ids)
@@ -385,6 +421,7 @@ def main(argv=None):
         res = {"label": a.label, "issue": "https://github.com/reddol18/docflow/issues/21", "answers_file": Path(a.answers).name,
                "answers_label": ans.get("label"), "answer_model": sorted({r.get("model") for r in rows if r.get("model")}),
                "complete": done, "judged": len(out), "planned": len(rows),
+               "metrics_judged": [m for m in METRICS if m in only],
                "judge": {"base_url": base, "model": a.model, "response_models": jm.dump()["models"],
                          "ollama_digest": digest, "system_prompt": a.system_prompt or None,
                          "max_tokens": a.max_tokens, "temperature": 0.0},
@@ -399,7 +436,7 @@ def main(argv=None):
         os.replace(tmp, p)
         holder["res"] = res
 
-    out = asyncio.run(run_all(rows, metrics, llm, prompts, models, deadline, save))
+    out = asyncio.run(run_all(rows, metrics, llm, prompts, models, deadline, save, only))
     if not out:
         raise SystemExit("채점한 질의가 없다")
     if not holder["res"]["complete"]:

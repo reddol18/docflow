@@ -5,7 +5,7 @@
 통과 기준 (2026-11-22 사용자 결정, https://github.com/reddol18/docflow/issues/21#issuecomment-7070886287):
   일치율 ≥ 80% 이고 kappa ≥ 0.6 → 그 지표를 쓴다. 아니면 심판 지시문을 한 번 고쳐 재채점(--revision 0일 때),
   고친 뒤에도(--revision 1) 못 넘으면 그 지표를 뺀다. kappa를 셀 수 없으면(한쪽이 모두 같은 값) 기준 미달로 본다.
-결과: 표준 출력에 마크다운 표, --out에 JSON.
+결과: 표준 출력에 마크다운 표, --out에 JSON. 심판 결과에 metrics_judged(judge.py --metrics)가 있으면 그 지표만 본다.
 
 실행 (표준 라이브러리 + openpyxl(xlsx일 때)):
   & $py -I -X utf8 eval/answer/agreement.py --human <human.xlsx> --judge <judge\\qwen3_30b.json> --revision 0
@@ -137,7 +137,9 @@ def main(argv=None):
     ap.add_argument("--out", default="")
     a = ap.parse_args(argv)
     judge = json.loads(Path(a.judge).read_text(encoding="utf-8"))
-    res = evaluate(read_human(a.human), judge["rows"], a.revision)
+    judged = judge.get("metrics_judged")  # judge.py --metrics로 일부만 채점했으면 그 지표만 본다
+    metrics = [k for k, _, _ in RUBRIC if judged is None or k in judged]
+    res = evaluate(read_human(a.human), judge["rows"], a.revision, metrics)
     print(f"심판 {judge['judge']['model']} · 지시문 {judge['prompts']['version']} ({judge['prompts']['sha256'][:12]}) · "
           f"기준 일치율 ≥ {MIN_AGREEMENT:.0%} 그리고 kappa ≥ {MIN_KAPPA}")
     print(table(res))

@@ -72,17 +72,97 @@ def test_prompt_file_missing_key(jd, tmp_path):
         jd.load_prompts(f)
 
 
+def _fake_ragas_metrics():
+    """Ragas 0.4.3 지시문 객체 흉내 — 입력·출력 모델 필드는 ragas.metrics.collections의 것과 같게"""
+    from pydantic import BaseModel
+
+    class SGIn(BaseModel):
+        question: str
+        answer: str
+
+    class SGOut(BaseModel):
+        statements: list[str]
+
+    class NLIOne(BaseModel):
+        statement: str
+        reason: str
+        verdict: int
+
+    class NLIIn(BaseModel):
+        context: str
+        statements: list[str]
+
+    class NLIOut(BaseModel):
+        statements: list[NLIOne]
+
+    class ARIn(BaseModel):
+        response: str
+
+    class AROut(BaseModel):
+        question: str
+        noncommittal: int
+
+    ns = lambda i=None, o=None: SimpleNamespace(instruction="english", examples=["en"], input_model=i, output_model=o)
+    return {"faithfulness": SimpleNamespace(statement_generator_prompt=ns(SGIn, SGOut), nli_statement_prompt=ns(NLIIn, NLIOut)),
+            "answer_relevancy": SimpleNamespace(prompt=ns(ARIn, AROut)), "context_precision": SimpleNamespace(prompt=ns()),
+            "context_recall": SimpleNamespace(prompt=ns())}
+
+
 def test_apply_prompts(jd):
     p, _ = jd.load_prompts()
-    ns = lambda: SimpleNamespace(instruction="english")
-    m = {"faithfulness": SimpleNamespace(statement_generator_prompt=ns(), nli_statement_prompt=ns()),
-         "answer_relevancy": SimpleNamespace(prompt=ns()), "context_precision": SimpleNamespace(prompt=ns()),
-         "context_recall": SimpleNamespace(prompt=ns())}
+    m = _fake_ragas_metrics()
     jd.apply_prompts(m, p)
     assert m["context_recall"].prompt.instruction == p["ragas"]["context_recall.prompt"]
+    assert m["context_recall"].prompt.examples == ["en"]  # 예시를 안 준 지표는 Ragas 예시 그대로
+    ar = m["answer_relevancy"].prompt.examples
+    assert len(ar) == len(p["ragas_examples"]["answer_relevancy.prompt"])
+    assert any(o.noncommittal == 0 and "보완 요구" in i.response for i, o in ar)  # 부정적인 처리결과도 회피가 아님
     del m["answer_relevancy"].prompt
     with pytest.raises(SystemExit):
         jd.apply_prompts(m, p)
+
+
+def test_apply_prompts_bad_example(jd):
+    p, _ = jd.load_prompts()
+    p = {**p, "ragas_examples": {"answer_relevancy.prompt": [{"input": {"response": "x"}, "output": {"question": "q"}}]}}
+    with pytest.raises(SystemExit):  # noncommittal 없음
+        jd.apply_prompts(_fake_ragas_metrics(), p)
+
+
+@pytest.mark.parametrize("ex", ["{nope.prompt: [{input: {}, output: {}}]}", "{answer_relevancy.prompt: []}",
+                                "{answer_relevancy.prompt: [{input: {}}]}"])
+def test_prompt_file_bad_examples(jd, tmp_path, ex):
+    import yaml
+    p = yaml.safe_load((ANS / "judge_prompts_ko.yaml").read_text(encoding="utf-8"))
+    p["ragas_examples"] = yaml.safe_load(ex)
+    f = tmp_path / "p.yaml"
+    f.write_text(yaml.safe_dump(p, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        jd.load_prompts(f)
+
+
+def test_examples_fit_real_ragas(jd):
+    """심판 환경(ragas 설치)에서만: 예시가 실제 Ragas 모델에 맞는지"""
+    pytest.importorskip("ragas")
+    from ragas.metrics.collections.answer_relevancy.util import AnswerRelevancePrompt
+    from ragas.metrics.collections.faithfulness.util import NLIStatementPrompt, StatementGeneratorPrompt
+    p, _ = jd.load_prompts()
+    m = {"faithfulness": SimpleNamespace(statement_generator_prompt=StatementGeneratorPrompt(),
+                                         nli_statement_prompt=NLIStatementPrompt()),
+         "answer_relevancy": SimpleNamespace(prompt=AnswerRelevancePrompt()),
+         "context_precision": SimpleNamespace(prompt=SimpleNamespace(instruction="")),
+         "context_recall": SimpleNamespace(prompt=SimpleNamespace(instruction=""))}
+    jd.apply_prompts(m, p)
+    s = m["faithfulness"].nli_statement_prompt.to_string(m["faithfulness"].nli_statement_prompt.input_model(
+        context="c", statements=["s"]))
+    assert "접수·처리과는 서식 칸 이름" in s and "Einstein" not in s
+
+
+def test_parse_metrics(jd):
+    assert jd.parse_metrics("") == set(jd.METRICS)
+    assert jd.parse_metrics("faithfulness, answer_relevancy") == {"faithfulness", "answer_relevancy", "refusal"}
+    with pytest.raises(SystemExit):
+        jd.parse_metrics("faithfulnes")
 
 
 @pytest.mark.parametrize("url,ok", [("http://127.0.0.1:18434/v1", True), ("https://x.proxy.runpod.net/v1", True),
@@ -199,7 +279,7 @@ def test_judge_row_with_fake_llm(jd):
 
         async def ascore(self, **kw):
             return SimpleNamespace(value=self.v)
-    metrics = {m: Metric(0.9) for m in jd.RAGAS_METRICS}
+    metrics = {m: Metric(1.0) for m in jd.RAGAS_METRICS}
     row = answers()["rows"][0]
     res = asyncio.run(jd.judge_row(row, metrics, LLM(0), p, {"Refusal": Refusal, "Support": Support}))
     assert res["binary"] == {"faithfulness": "P", "answer_relevancy": "P", "context_precision": "P", "context_recall": "P",
@@ -211,6 +291,14 @@ def test_judge_row_with_fake_llm(jd):
     un = answers()["rows"][-1]
     res = asyncio.run(jd.judge_row(un, metrics, LLM(1), p, {"Refusal": Refusal, "Support": Support}))
     assert res["binary"]["refusal"] == "P" and set(res["scores"]) == {"refusal"}
+    # --metrics: 고른 지표만 (refusal은 늘). 나머지는 점수 없이 N, 인용 판정 호출도 없음
+    llm = LLM(0)
+    res = asyncio.run(jd.judge_row(row, metrics, llm, p, {"Refusal": Refusal, "Support": Support},
+                                   jd.parse_metrics("faithfulness,answer_relevancy")))
+    assert set(res["scores"]) == {"refusal", "faithfulness", "answer_relevancy"}
+    assert res["binary"] == {"faithfulness": "P", "answer_relevancy": "P", "context_precision": "N", "context_recall": "N",
+                             "citation_accuracy": "N", "refusal": "N"}
+    assert len(llm.prompts) == 1  # refusal만 (Ragas는 가짜 지표)
 
 
 def test_run_all_saves_each_row_and_stops_at_deadline(jd, monkeypatch):
@@ -286,6 +374,22 @@ def test_join_and_gate(ag):
     assert ag.evaluate(human, jr, 1, ["faithfulness"])["faithfulness"]["verdict"] == "제외"
     with pytest.raises(ValueError):
         ag.join({"zz": {}}, jr, ["faithfulness"])
+
+
+def test_main_only_judged_metrics(ag, hs, tmp_path, capsys):
+    """judge.py --metrics 결과(metrics_judged)면 그 지표만 일치도를 낸다"""
+    rows = hs.sheet_rows(answers())
+    heads = {k: h for k, h, _ in hs.RUBRIC}
+    rows[0][heads["faithfulness"]] = "P"
+    c = tmp_path / "h.csv"
+    hs.write_csv(c, rows)
+    jr = [{"id": r["id"], "binary": {"faithfulness": "P", "answer_relevancy": "P", "refusal": "N"}} for r in answers()["rows"]]
+    j = tmp_path / "j.json"
+    j.write_text(json.dumps({"label": "x", "judge": {"model": "m"}, "prompts": {"version": "ko-2", "sha256": "0" * 64},
+                             "metrics_judged": ["faithfulness", "answer_relevancy", "refusal"], "rows": jr}), encoding="utf-8")
+    o = tmp_path / "o.json"
+    assert ag.main(["--human", str(c), "--judge", str(j), "--revision", "1", "--out", str(o)]) == 0
+    assert list(json.loads(o.read_text(encoding="utf-8"))["metrics"]) == ["faithfulness", "answer_relevancy", "refusal"]
 
 
 def test_gate_pass_and_nan_kappa(ag):
