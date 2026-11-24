@@ -177,6 +177,34 @@ def test_hybrid_query_year_threshold_and_ask_fallback(monkeypatch):
     assert main.no_match_threshold() is None
 
 
+def test_review_fixes_docno_shape_and_head_suffix():
+    """코드 리뷰 반영: 번지·전화는 문서번호가 아님, 질의 머리에 앞 글자가 붙어도 부서 약칭으로 맞춤, 문서번호 칸 없는 스키마"""
+    assert rt.docnos_in("삼정동 1234-5번지 공장") == []
+    assert rt.docnos_in("전화 0553-1234") == []
+    assert rt.docnos_in("외동 1234-5 번길") == []
+    cands = [(("V", "a"), "지경 56120-804"), (("V", "b"), "도시 56120-804")]
+    assert rt.docno_matches("문서번호지경56120-804", cands) == [("V", "a")]
+    r = rt.rank("참조 2023-15 보고서", [("V", "x")], [], docno=False)
+    assert r.docnos == [] and not rt.no_match(r) and r.order == [("V", "x")]
+
+
+def test_threshold_env_invalid_is_off(monkeypatch):
+    from app import main
+    for bad in ("on", "0.3x", "nan", "   "):
+        monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", bad)
+        assert main.no_match_threshold() is None, bad
+
+
+def test_query_year_does_not_filter_docno_and_ranked_matches_hybrid(monkeypatch):
+    """질의 연도가 그 문서번호 문서의 연도와 달라도 고정한다 (문서번호 후보는 화면 연도 칸으로만 거른다).
+    질의 연도로 비면 다시 찾는 것도 rank 안이라 ranked(채점기)와 hybrid 순서가 같다"""
+    main, calls = _fake_store(monkeypatch, [{"vol": "V", "doc_id": "c", "docno": "지경 56120-804"}])
+    hits = main.hybrid("1999년 지경 56120-804 수신자", empty_on_miss=True)
+    assert hits[0]["doc_id"] == "c" and calls[-1] == (("56120-804",), None, None, main.DOCNO_CANDIDATES)
+    *_, order = main.ranked("1999년 지경 56120-804 수신자", [0.0])
+    assert [k[1] for k in order] == [h["doc_id"] for h in hits]
+
+
 def test_no_docno_query_skips_docno_lookup(monkeypatch):
     main, calls = _fake_store(monkeypatch, [])
     main.hybrid("도로점용허가 회신")

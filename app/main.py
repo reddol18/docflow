@@ -54,6 +54,7 @@ import dataclasses
 import datetime as dt
 import filecmp
 import html
+import math
 import os
 import re
 import secrets
@@ -1566,23 +1567,25 @@ def rank(q, vec, year_from=None, year_to=None, cfg=None):
     벡터 30 + 낱말 30 → RRF(낱말 가중 cfg.kw_weight), 질의에 문서번호가 있으면 번호가 정확히 같은 문서를 맨 앞에 고정.
     화면 연도 칸이 비었고 질의에 연도('1995년')가 하나 있으면 그 연도로 거른다 (cfg.year). cfg 기본 = retrieval.SEARCH"""
     cfg = cfg or retrieval.SEARCH
-    qyear = None
-    if not year_from and not year_to:
-        qyear = retrieval.query_year(q, cfg)
-        year_from = year_to = qyear
-    v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
-    kw = store.keyword_search(retrieval.query_terms(q, cfg), year_from, year_to, limit=CANDIDATES)
-    docnos = retrieval.docnos_in(q)
+    qyear = retrieval.query_year(q, cfg) if not year_from and not year_to else None
+    yf, yt = (qyear, qyear) if qyear else (year_from, year_to)
+    v = store.vector_search(vec, yf, yt, limit=CANDIDATES)
+    kw = store.keyword_search(retrieval.query_terms(q, cfg), yf, yt, limit=CANDIDATES)
+    use_docno = retrieval.docno_field(schema_fields.SCHEMA) is not None
+    docnos = retrieval.docnos_in(q) if use_docno else []
     cands = []
-    if docnos:
+    if docnos:  # 문서번호는 화면 연도 칸으로만 거른다 — 질의 연도가 그 문서의 연도(판독)와 달라도 찾게
         rows = store.docno_search([n for _, n in docnos], year_from, year_to, limit=DOCNO_CANDIDATES)
         cands = [(store.doc_key(r), r["docno"]) for r in rows]
-    return retrieval.rank(q, v, kw, cands, cfg=cfg, year=qyear)
+    r = retrieval.rank(q, v, kw, cands, cfg=cfg, year=qyear, docno=use_docno)
+    if not r.order and qyear is not None:  # 질의 연도로 걸러 비면 연도 없이 다시 (/search·/ask, 2026-11-24 결정)
+        return rank(q, vec, year_from, year_to, cfg=dataclasses.replace(cfg, year=False))
+    return r
 
 
 def ranked(q, vec, year_from=None, year_to=None):
     """rank()를 예전 꼴로 → (벡터 결과, 낱말 결과, RRF 점수, 화면 순서 (vol, doc_id)).
-    검색 평가(`eval/search_score.py`)가 이 함수를 그대로 부른다"""
+    검색 평가(`eval/search_score.py`)가 이 함수를 그대로 부른다 — 순서는 /search와 같고('없음' 빈 목록만 빼고)"""
     r = rank(q, vec, year_from, year_to)
     return r.vector, r.keyword, r.score, r.order
 
@@ -1591,12 +1594,19 @@ def no_match_threshold():
     """'관련 문서 없음' 벡터 1위 유사도 하한. 기본은 쓰지 않는다 (2026-11-24 결정 — 합성 세트로만 정한 값이라 운영 기본은 끔).
     환경변수 SEARCH_NO_MATCH_THRESHOLD: 비움·'off' = 쓰지 않음, 'auto' = 지금 임베딩 모델의 값(retrieval.NO_MATCH_THRESHOLD,
     없으면 쓰지 않음), 숫자 = 그 값"""
-    raw = (os.environ.get("SEARCH_NO_MATCH_THRESHOLD") or "off").strip().lower()
-    if raw == "off":
+    raw = (os.environ.get("SEARCH_NO_MATCH_THRESHOLD") or "").strip().lower()
+    if raw in ("", "off"):
         return None
     if raw == "auto":
         return retrieval.threshold_for(store.embed_config()[0])
-    return float(raw)
+    try:
+        t = float(raw)
+    except ValueError:
+        t = math.nan
+    if not math.isfinite(t):  # 잘못된 값으로 /search가 500이 되지 않게 — 끄고 알린다
+        print(f"[search] SEARCH_NO_MATCH_THRESHOLD 값을 못 읽음 ({raw[:20]!r}) — 끔", file=sys.stderr, flush=True)
+        return None
+    return t
 
 
 def hybrid(q, year_from=None, year_to=None, k=10, user=None, empty_on_miss=False):
@@ -1606,9 +1616,7 @@ def hybrid(q, year_from=None, year_to=None, k=10, user=None, empty_on_miss=False
     # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다.
     # 질의 임베딩은 검색·질문 예산(query) — 다 쓰면 BudgetExceeded → 503 (budget_exceeded 처리기)
     vec = llm.embed("-", [q], scope="query", user_id=getattr(user, "id", None))[0]
-    r = rank(q, vec, year_from, year_to)
-    if not r.order and r.year is not None:
-        r = rank(q, vec, year_from, year_to, cfg=dataclasses.replace(retrieval.SEARCH, year=False))
+    r = rank(q, vec, year_from, year_to)  # 질의 연도로 비면 rank 안에서 연도 없이 다시 찾는다
     if empty_on_miss:
         top_sim = r.vector[0].get("score") if r.vector else None  # 점수 없는 후보(시험용 가짜)는 하한을 보지 않는다
         if retrieval.no_match(r, top_sim, no_match_threshold()):

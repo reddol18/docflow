@@ -139,14 +139,14 @@ def vector_rank(qv, docs, vecs, year=None):
 
 
 def docno_candidates(q, docs, year=None):
-    """app/store.docno_search와 같다: 질의 문서번호의 번호가 문서번호 칸에 (공백 무시) 든 문서 [(키, 칸 값)], doc_id → vol 순.
-    정확 일치는 retrieval.docno_matches가 고른다"""
+    """app/store.docno_search와 같다: 문서번호 칸의 번호 부분이 질의 문서번호의 번호와 같은 문서 [(키, 칸 값)], doc_id → vol 순.
+    부서 약칭 비교는 retrieval.docno_matches가 한다"""
     nums = [n for _, n in retrieval.docnos_in(q)]
     if not nums:
         return []
     col = retrieval.docno_field(SCHEMA)
     out = [(d["key"], d["values"].get(col, "")) for d in docs
-           if (not year or d["year"] == year) and any(n in (d["values"].get(col) or "").replace(" ", "") for n in nums)]
+           if (not year or d["year"] == year) and retrieval.docno_number(d["values"].get(col)) in nums]
     return sorted(out, key=lambda c: (c[0][1], c[0][0]))
 
 
@@ -159,7 +159,8 @@ def app_rank(q, qv, docs, dvecs, year=None, cfg=None):
     year = year or qyear
     v, sims = vector_rank(qv, docs, dvecs, year)
     kw = keyword_rank(retrieval.query_terms(q, cfg), docs, year)
-    r = retrieval.rank(q, v, kw, docno_candidates(q, docs, year), cfg=cfg, year=qyear)
+    # 문서번호 후보는 화면 연도 칸(year 인자)으로만 거른다 — app/main.rank와 같다
+    r = retrieval.rank(q, v, kw, docno_candidates(q, docs, None if qyear else year), cfg=cfg, year=qyear)
     if not r.order and qyear is not None:  # app/main.hybrid: 질의 연도로 비면 연도 없이 다시 (/search·/ask)
         return app_rank(q, qv, docs, dvecs, None, dataclasses.replace(cfg, year=False))
     return r, sims

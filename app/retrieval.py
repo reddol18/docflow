@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 
 # 문서번호 꼴: 부서 약칭(한글 1~4자) + 분류번호(4~5자리) + '-' + 일련번호(1~5자리). 문장 안에 있어도 잡는다.
 # 앞뒤가 숫자·'-'로 이어지면(더 긴 번호의 일부) 문서번호로 보지 않는다
-DOCNO_RX = re.compile(r"([가-힣]{1,4})\s*(?<![\d-])(\d{4,5})\s*-\s*(\d{1,5})(?![\d-])")
+# 주소 번지('외동 1234-5번지')·전화('전화 0553-1234')는 문서번호로 보지 않는다
+DOCNO_RX = re.compile(r"([가-힣]{1,4})\s*(?<![\d-])(\d{4,5})\s*-\s*(\d{1,5})(?![\d-])(?!\s*(?:번지|번길|호))")
+NOT_DOCNO_HEAD = ("전화", "전송", "팩스", "번지", "우편")
 # 문서번호 칸 값의 번호 부분 (부서 약칭 없이 번호만 남은 값도)
 NUMBER_RX = re.compile(r"(?<![\d-])(\d{4,5})\s*-\s*(\d{1,5})(?![\d])")
 YEAR_RX = re.compile(r"\d{4}년?")
@@ -115,6 +117,8 @@ def docnos_in(q):
     """질의 안 문서번호 [(부서 약칭, 번호 'NNNNN-N')] — 질의에 쓴 순서, 같은 것은 한 번"""
     out = []
     for m in DOCNO_RX.finditer(q or ""):
+        if m.group(1).endswith(NOT_DOCNO_HEAD):
+            continue
         d = (m.group(1), f"{m.group(2)}-{m.group(3)}")
         if d not in out:
             out.append(d)
@@ -149,7 +153,8 @@ def docno_matches(q, candidates):
     cands = [(key_of(k), v, docno_number(v), docno_head(v)) for k, v in candidates]
     for head, num in docnos_in(q):
         same = [c for c in cands if c[2] == num]
-        exact = [c for c in same if c[3] == head]
+        # 질의 머리는 앞 글자가 붙어 길게 잡힐 수 있다('문서번호지경' → '번호지경') — 칸 값 약칭이 그 끝과 같으면 같은 부서
+        exact = [c for c in same if c[3] and head.endswith(c[3])]
         for c in exact or same:
             if c[0] not in out:
                 out.append(c[0])
@@ -184,11 +189,12 @@ def fuse(vector, keyword, pinned=(), kw_weight=1.0):
     return score, pinned + rest
 
 
-def rank(q, vector, keyword, docno_candidates=(), cfg=None, year=None):
+def rank(q, vector, keyword, docno_candidates=(), cfg=None, year=None, docno=True):
     """후보 → Ranking. docno_candidates = [(키, 문서번호 칸 값)] (질의에 문서번호가 없으면 비워도 된다).
-    후보(vector·keyword)는 부르는 쪽이 query_terms·query_year로 가져온 것"""
+    후보(vector·keyword)는 부르는 쪽이 query_terms·query_year로 가져온 것.
+    docno=False(스키마에 문서번호 칸이 없음)면 문서번호 고정도 '없음'도 하지 않는다"""
     cfg = cfg or SEARCH
-    docnos = docnos_in(q)
+    docnos = docnos_in(q) if docno else []
     pinned = docno_matches(q, docno_candidates) if docnos else []
     score, order = fuse(vector, keyword, pinned, cfg.kw_weight)
     return Ranking(vector, keyword, score, order, pinned, docnos, year)

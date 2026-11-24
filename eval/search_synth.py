@@ -349,7 +349,11 @@ def main(argv=None):
         rest = argv[1:]
         max_false = 0
         if rest[:1] == ["--max-false"]:
+            if len(rest) < 2 or not rest[1].isdigit():
+                raise SystemExit("--pool --max-false <0 이상 정수> 결과.json ...")
             max_false, rest = int(rest[1]), rest[2:]
+        if not rest:
+            raise SystemExit("--pool에 결과 파일(JSON)을 하나 이상 준다")
         pool_main(rest, max_false)
         return 0
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])

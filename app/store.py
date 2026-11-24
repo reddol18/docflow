@@ -1304,16 +1304,18 @@ def keyword_search(words, year_from=None, year_to=None, limit=20):
 
 
 def docno_search(numbers, year_from=None, year_to=None, limit=20, schema=None):
-    """문서번호 칸 값에 번호('NNNNN-N')가 든 문서 [{vol, doc_id, docno}] — 공백은 무시하고 부분 일치로 좁혀 온다.
-    정확 일치('…-804'≠'…-8040')·부서 약칭 비교는 app/retrieval.docno_matches가 한다
-    (https://github.com/reddol18/docflow/issues/61). 스키마에 문서번호 칸(rule: docno)이 없으면 빈 목록"""
+    """문서번호 칸 값의 번호 부분이 numbers('NNNNN-N') 중 하나와 정확히 같은 문서 [{vol, doc_id, docno}] — 공백은 무시,
+    앞뒤가 숫자로 이어지면 다른 번호('…-804'≠'…-8040'). SQL에서 정확히 거르므로 앞자리가 같은 문서가 많아도 limit에
+    잘리지 않는다. 부서 약칭 비교는 app/retrieval.docno_matches가 한다 (https://github.com/reddol18/docflow/issues/61).
+    스키마에 문서번호 칸(rule: docno)이 없으면 빈 목록"""
     from app import retrieval  # noqa: PLC0415
     col = retrieval.docno_field(schema or fields.SCHEMA)
-    if not col or not numbers:
+    nums = [n.replace(" ", "") for n in numbers if re.fullmatch(r"\d{4,5}\s*-\s*\d{1,5}", n)]
+    if not col or not nums:
         return []
     val = "replace(coalesce(fields->>%s, ''), ' ', '')"
-    sql = f"SELECT vol, doc_id, fields->>%s AS docno FROM documents WHERE {val} LIKE ANY(%s)"  # noqa: S608 — 값은 매개변수
-    args = [col, col, [f"%{n.replace(' ', '')}%" for n in numbers]]
+    sql = f"SELECT vol, doc_id, fields->>%s AS docno FROM documents WHERE {val} ~ ANY(%s)"  # noqa: S608 — 값은 매개변수
+    args = [col, col, [f"(^|[^0-9-]){n}([^0-9]|$)" for n in nums]]  # n은 숫자와 '-'뿐 (위 fullmatch)
     if year_from:
         sql += " AND year >= %s"
         args.append(int(year_from))

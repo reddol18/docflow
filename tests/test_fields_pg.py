@@ -73,9 +73,14 @@ def test_docno_search_exact_number(env, monkeypatch):
             doc("e3", "1999-01-02", "가상 건축 허가", docno="도시 56120-804")]
     store.save_documents(docs)
     store.upsert_vectors(docs, [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0]])
-    assert [r["doc_id"] for r in store.docno_search(["56120-804"])] == ["e1", "e2", "e3"]
+    # SQL에서 번호 부분 정확 일치 — '…-8040'은 오지 않는다
+    assert [r["doc_id"] for r in store.docno_search(["56120-804"])] == ["e2", "e3"]
     assert [r["doc_id"] for r in store.docno_search(["56120-804"], 1999, 1999)] == ["e3"]
-    assert store.docno_search([]) == []
+    assert store.docno_search([]) == [] and store.docno_search(["x'; --"]) == []
+    # 앞자리가 같은 문서가 limit보다 많아도 정확한 번호는 잘리지 않는다 (코드 리뷰 반영)
+    many = [doc(f"f{i:02d}", "1997-01-01", "가상", docno=f"지경 56120-804{i}") for i in range(30)]
+    store.save_documents(many)
+    assert [r["doc_id"] for r in store.docno_search(["56120-804"], limit=2)] == ["e2", "e3"]
     monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[1.0, 0.0]])
     hits = main.hybrid("문서번호 지경 56120-804 문서의 수신자는?", k=3, empty_on_miss=True)
     assert [h["doc_id"] for h in hits][:1] == ["e2"]  # 벡터 1위(e1, …-8040)보다 앞
