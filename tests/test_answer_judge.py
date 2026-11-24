@@ -399,6 +399,46 @@ def test_gate_pass_and_nan_kappa(ag):
     assert ag.verdict(None, math.nan, 0) == "지시문 고쳐 재채점"
 
 
+def test_skew_rule(ag):
+    """일치율 ≥ 80%이고 한쪽 값이 90% 넘게 몰리면 kappa 대신 일치율만으로 사용 (11-23 사용자 결정)"""
+    assert ag.skew([]) is None
+    assert ag.skew(list(zip("PPPPPPPPPP", "PPPPPPPPPP"))) == 1.0
+    # 사람 P 10/11(90.9%) 심판 P 10/11, 어긋난 2건 → 일치율 9/11, kappa < 0.6, 쏠림 0.909
+    pairs = list(zip("PPPPPPPPPPF", "PPPPPPPPPFP"))
+    assert ag.skew(pairs) == pytest.approx(10 / 11)
+    assert ag.kappa(pairs) < 0.6
+    assert ag.verdict(9 / 11, ag.kappa(pairs), 1, ag.skew(pairs)) == "사용(쏠림 규칙)"
+    assert ag.verdict(1.0, math.nan, 1, 1.0) == "사용(쏠림 규칙)"  # kappa 셀 수 없음 — 모두 P
+    assert ag.verdict(0.89, 0.44, 0, 0.889) == "지시문 고쳐 재채점"  # 90% 이하는 규칙 밖 (경계: 초과만)
+    assert ag.verdict(0.89, 0.44, 0, 0.9) == "지시문 고쳐 재채점"
+    assert ag.verdict(0.79, 0.0, 1, 1.0) == "제외"  # 일치율 미달이면 쏠림이어도 제외
+    assert ag.verdict(0.9, 0.7, 0, 0.95) == "사용"  # 기본 기준을 넘으면 그냥 사용
+    r = ag.evaluate({"a01": {"refusal": "P"}, "a02": {"refusal": "P"}},
+                    judge_rows({"a01": {"refusal": "P"}, "a02": {"refusal": "P"}}), 1, ["refusal"])["refusal"]
+    assert (r["kappa"], r["skew"], r["verdict"]) == (None, 1.0, "사용(쏠림 규칙)")
+
+
+def test_gt_context(ag):
+    k = [f"S/d{i}" for i in range(4)]
+    rows = [{"id": "a01", "answerable": True, "source_docs": [k[0]], "retrieved": [{"key": k[0], "rank": 2}]},
+            {"id": "a02", "answerable": True, "source_docs": [k[0]], "retrieved": [{"key": k[0], "rank": 3}]},
+            {"id": "a03", "answerable": True, "source_docs": k[:3],
+             "retrieved": [{"key": k[0], "rank": 1}, {"key": k[3], "rank": 2}, {"key": k[1], "rank": 3}]},
+            {"id": "a04", "answerable": True, "source_docs": k[:2],
+             "retrieved": [{"key": k[1], "rank": 1}, {"key": k[0], "rank": 2}]},
+            {"id": "a99", "answerable": False, "source_docs": [], "retrieved": [{"key": k[0], "rank": 1}]}]
+    g = ag.gt_context(rows)
+    assert g["a01"] == {"context_precision": "P", "context_recall": "P"}
+    assert g["a02"] == {"context_precision": "F", "context_recall": "P"}
+    assert g["a03"] == {"context_precision": "F", "context_recall": "F"}  # 1~2위에 근거 1건뿐, 3건 중 2건만
+    assert g["a04"] == {"context_precision": "P", "context_recall": "P"}
+    assert g["a99"] == {"context_precision": "N", "context_recall": "N"}
+    human = {"a01": {"faithfulness": "P", "context_precision": ""}}
+    assert ag.apply_gt(human, g)["a01"] == {"faithfulness": "P", "context_precision": "P", "context_recall": "P"}
+    with pytest.raises(ValueError):
+        ag.apply_gt({"zz": {}}, g)
+
+
 def test_read_human_csv_and_xlsx(ag, hs, tmp_path):
     rows = hs.sheet_rows(answers())
     heads = {k: h for k, h, _ in hs.RUBRIC}
