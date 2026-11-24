@@ -1,0 +1,10 @@
+# 답변 평가 심판 환경 (https://github.com/reddol18/docflow/issues/21). 앱·검사 환경과 따로 쓴다 — ragas가 langchain·datasets를 끌어온다.
+# 판·해시 고정: eval/answer/requirements.lock (uv pip compile --universal --generate-hashes, 아래 실행 줄)
+#   uv pip compile --universal --python-version 3.11 --generate-hashes eval/answer/requirements.txt -o eval/answer/requirements.lock
+# 설치: uv venv <폴더> --python 3.11 ; uv pip install --python <폴더> --require-hashes -r eval/answer/requirements.lock
+ragas==0.4.3
+langchain-openai==1.8.5
+# 0.4는 ragas 0.4.3이 부르는 langchain_community.chat_models.vertexai를 뺐다 — 불러오기부터 실패
+langchain-community==0.3.31
+pyyaml==6.0.3
+openpyxl==3.1.5

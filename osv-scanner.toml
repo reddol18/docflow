@@ -34,3 +34,14 @@ reason = "glob 13.0.7 (AbortSignal로 멈춘 뒤에도 폴더를 계속 읽음, 
 id = "GHSA-fc5q-39xc-vjpf"
 ignoreUntil = 2027-02-01
 reason = "picomatch ReDoS(고친 판 없음): frontend npm 사본(2.3.2·4.0.7)은 dev라 npm prune으로 이미지에서 빠짐(2.x는 eslint-config-next의 fast-glob 3.3.1 고정 경로라 갱신·overrides 필요). next 내장 사본은 이미지에 있으나 next/image 패턴 매칭에서만 쓰고 images 패턴 설정이 없어 도달 불가 — next를 올려야 고쳐짐. promptfoo 사본은 nunjucks optional peer chokidar 경유 개발용(2026-12-07 재검토). https://github.com/reddol18/docflow/issues/141"
+
+# 답변 평가 심판 환경(eval/answer/requirements.lock, 개발 PC 전용 가상환경, 배포·이미지에 없음)의 ragas 0.4.3 관련 2건. 고친 판 없음.
+# 2026-11-22 사용자 결정으로 수용: https://github.com/reddol18/docflow/issues/59#issuecomment-7071108747 — 고친 판이 나오면 lock을 올린다.
+[[IgnoredVulns]]
+id = "GHSA-95ww-475f-pr4f"
+ignoreUntil = 2027-02-22
+reason = "ragas 0.4.3 SSRF(multi_modal_faithfulness util의 _try_process_local_file/_try_process_url): eval/answer/judge.py는 그 지표를 쓰지 않는다(faithfulness·answer_relevancy·context_precision·context_recall만). 넣는 문맥도 합성 답변 파일뿐. https://github.com/reddol18/docflow/issues/59#issuecomment-7071108747"
+[[IgnoredVulns]]
+id = "GHSA-w8v5-vhqr-4h9v"
+ignoreUntil = 2027-02-22
+reason = "diskcache 5.6.3 pickle 역직렬화(캐시 폴더에 쓸 수 있는 공격자): ragas 간접 의존성. judge.py는 캐시(cache=)를 넘기지 않아 디스크 캐시를 쓰지 않는다. https://github.com/reddol18/docflow/issues/59#issuecomment-7071108747"
