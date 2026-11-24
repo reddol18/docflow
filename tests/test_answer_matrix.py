@@ -433,6 +433,22 @@ def test_pairwise_sheet_pick_deterministic_and_balanced(psheet):
     assert sorted(pos.values()).count("a") == 6 and pos == psheet.positions(ids, 22)
 
 
+def test_pairwise_sheet_page_images(psheet, tmp_path):
+    """합성 철 쪽 이미지를 문서 키로 찾아 채점 페이지 옆에 띄운다 (없는 쪽 파일은 뺀다)"""
+    work, bundles = tmp_path / "work", tmp_path / "bundles"
+    (work / "platform").mkdir(parents=True)
+    (bundles / "SYNTH-V1").mkdir(parents=True)
+    (bundles / "SYNTH-V1" / "1.jpg").write_bytes(b"x")
+    (work / "platform" / "v.json").write_text(json.dumps([{"vol": "SYNTH-V1", "doc_id": "d1", "pages": [1, 2]}]),
+                                               encoding="utf-8")
+    pages = psheet.page_map(work, bundles)
+    assert pages == {"SYNTH-V1/d1": [(bundles / "SYNTH-V1" / "1.jpg").resolve().as_uri()]}
+    ra = {"retrieved": [{"key": "SYNTH-V1/d1", "context": "t"}]}
+    rb = {"retrieved": [{"key": "SYNTH-V1/d9", "context": "u"}]}
+    docs = psheet.documents(ra, rb, pages)
+    assert [len(d["pages"]) for d in docs] == [1, 0]
+
+
 def test_pairwise_sheet_blind(psheet):
     pw, a, b = pw_fixture()
     rows, key = psheet.build(pw, a, b, n=10, seed=22)

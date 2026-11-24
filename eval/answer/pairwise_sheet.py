@@ -81,17 +81,29 @@ def load_answers(pw, answers_dir):
     return out
 
 
-def documents(ra, rb):
-    """심판이 본 것과 같은 문서 목록 (pairwise.documents_of와 같은 순서: a 순서, 그다음 b에만 있는 것)"""
+def documents(ra, rb, pages=None):
+    """심판이 본 것과 같은 문서 목록 (pairwise.documents_of와 같은 순서: a 순서, 그다음 b에만 있는 것).
+    pages = {문서 키: [쪽 이미지 URI]} — 있으면 채점 페이지 옆에 원본 쪽을 띄운다"""
     seen, out = set(), []
     for c in [*ra["retrieved"], *rb["retrieved"]]:
         if c["key"] not in seen:
             seen.add(c["key"])
-            out.append({"key": c["key"], "text": c["context"]})
+            out.append({"key": c["key"], "text": c["context"], "pages": (pages or {}).get(c["key"], [])})
     return out
 
 
-def build(pw, ans_a, ans_b, n=20, seed=22):
+def page_map(work, bundles):
+    """합성 철 쪽 이미지: <work>/platform/*.json(문서→쪽 번호) + <bundles>/<철>/<쪽>.jpg → {문서 키: [file URI]}"""
+    work, bundles = Path(work), Path(bundles)
+    out = {}
+    for f in sorted((work / "platform").glob("*.json")):
+        for d in json.loads(f.read_text(encoding="utf-8")):
+            imgs = [bundles / d["vol"] / f"{p}.jpg" for p in d["pages"]]
+            out[f"{d['vol']}/{d['doc_id']}"] = [p.resolve().as_uri() for p in imgs if p.exists()]
+    return out
+
+
+def build(pw, ans_a, ans_b, n=20, seed=22, pages=None):
     """→ (표 줄 [dict], 열쇠 dict). 표 줄에는 심판 판정·모델 이름이 없다"""
     if not pw.get("complete"):
         raise SystemExit("쌍별 심판이 끝까지 돌지 않았다")
@@ -106,7 +118,7 @@ def build(pw, ans_a, ans_b, n=20, seed=22):
         first, second = (a, b) if pos[rid] == "a" else (b, a)
         rows.append({"id": rid, "순번": i, "답 있음": "예" if a["answerable"] else "아니오", "질문": a["question"],
                      "참고 답": a.get("expected_answer") or "", "답 A": first["answer"], "답 B": second["answer"],
-                     "docs": documents(a, b), VERDICT_COL: "", "메모": ""})
+                     "docs": documents(a, b, pages), VERDICT_COL: "", "메모": ""})
     judge = {r["id"]: r["result"] for r in pw["rows"]}
     key = {"pairwise_label": pw["label"], "issue": "https://github.com/reddol18/docflow/issues/22",
            "a": pw["a"], "b": pw["b"], "queries_sha256": pw.get("queries_sha256"), "seed": seed, "n": len(ids),
@@ -142,7 +154,18 @@ HTML = """<!doctype html>
   --line:#3a3a38; --on:#5cc27a; --tie:#a2a29d; --acc:#7ea2ff; } }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.65 system-ui, "Malgun Gothic", sans-serif; }
-.wrap { max-width:1400px; margin:0 auto; padding:16px; }
+.wrap { max-width:1800px; margin:0 auto; padding:16px; }
+.grid { display:grid; grid-template-columns:minmax(0, 760px) minmax(0, 1fr); gap:16px; align-items:start; }
+.grid.noimg { grid-template-columns:1fr; }
+.grid.noimg .viewer { display:none; }
+@media (max-width: 1000px) { .grid { grid-template-columns:1fr; } }
+.viewer { position:sticky; top:12px; background:var(--card); border:1px solid var(--line); border-radius:10px;
+  padding:10px; height:calc(100vh - 24px); display:flex; flex-direction:column; }
+.viewer .vt { font-size:14px; color:var(--muted); margin-bottom:6px; }
+.viewer .vbox { flex:1; overflow:auto; background:#fff; border-radius:6px; }
+.viewer img { width:100%; display:block; }
+a.pg { margin-right:8px; font-size:14px; color:var(--acc); }
+a.pg.sel { font-weight:700; text-decoration:none; color:var(--fg); }
 .top { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
 .bar { flex:1; min-width:160px; height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
 .bar i { display:block; height:100%; background:var(--on); }
@@ -179,11 +202,16 @@ ol.crit { margin:4px 0 0; padding-left:20px; font-size:14px; }
     <span class="count" id="count"></span>
     <button class="save" id="save">CSV 저장</button>
   </div>
-  <details class="block"><summary>판단 기준 (심판 지시문과 같다)</summary><ol class="crit" id="crit"></ol></details>
-  <div id="card"></div>
-  <div class="nav">
-    <button id="prev">← 이전</button>
-    <button id="next">다음 →</button>
+  <div class="grid" id="grid">
+    <div>
+      <details class="block"><summary>판단 기준 (심판 지시문과 같다)</summary><ol class="crit" id="crit"></ol></details>
+      <div id="card"></div>
+      <div class="nav">
+        <button id="prev">← 이전</button>
+        <button id="next">다음 →</button>
+      </div>
+    </div>
+    <div class="viewer"><div class="vt" id="vt"></div><div class="vbox"><img id="vimg" alt="원본 쪽 이미지"></div></div>
   </div>
 </div>
 <script>
@@ -193,6 +221,13 @@ let ans = {};
 try { ans = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { ans = {}; }
 const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(ans)); } catch (e) {} };
 let cur = 0;
+let view = null;  // {row, u}: 옆에 띄운 쪽 — 같은 쌍에서 고른 쪽은 다시 그려도 유지
+const hasImg = DATA.rows.some(r => r.docs.some(d => (d.pages || []).length));
+if (!hasImg) document.getElementById("grid").classList.add("noimg");
+function showPage(key, i, u) {
+  document.getElementById("vimg").src = u;
+  document.getElementById("vt").textContent = `${key} · 쪽 ${i + 1}`;
+}
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c])); }
 const isDone = r => !!(ans[r.id] || {}).v;
 document.getElementById("crit").innerHTML = DATA.criteria.map(c => `<li>${esc(c)}</li>`).join("");
@@ -211,10 +246,29 @@ function render() {
     [["A", "답 A"], ["B", "답 B"], ["비김", "비김"]].map(([v, lab]) =>
       `<button class="${v === "비김" ? "tie" : ""}${a.v === v ? " on" : ""}" data-v="${v}">${lab}</button>`).join("") +
     `</div><textarea id="memo" rows="2" placeholder="메모 (선택)">${esc(a.memo || "")}</textarea></div>`;
-  h += `<details class="block" open><summary>모델이 받은 문서 ${r.docs.length}건</summary>` + r.docs.map((d, i) =>
-    `<div class="ret"><b>${i + 1}.</b> ${esc(d.key)}<div class="pre">${esc(d.text)}</div></div>`).join("") + `</details>`;
+  if (!view || view.row !== r.id) {
+    const d0 = r.docs.find(d => (d.pages || []).length);
+    view = d0 ? { row: r.id, u: d0.pages[0] } : { row: r.id, u: "" };
+    if (d0) showPage(d0.key, 0, d0.pages[0]);
+    else {
+      document.getElementById("vimg").removeAttribute("src");
+      document.getElementById("vt").textContent = "원본 쪽 없음";
+    }
+  }
+  const links = d => (d.pages || []).map((u, i) =>
+    `<a href="#" class="pg${view.u === u ? " sel" : ""}" data-u="${esc(u)}" data-key="${esc(d.key)}" data-i="${i}">` +
+    `쪽 ${i + 1}</a>`).join("");
+  h += `<details class="block" open><summary>모델이 받은 문서 ${r.docs.length}건 (쪽을 누르면 옆에 원본)</summary>` +
+    r.docs.map((d, i) => `<div class="ret"><b>${i + 1}.</b> ${esc(d.key)} ${links(d)}` +
+      `<details><summary>OCR 글</summary><div class="pre">${esc(d.text)}</div></details></div>`).join("") + `</details>`;
   const card = document.getElementById("card");
   card.innerHTML = h;
+  card.querySelectorAll("a.pg").forEach(el => el.onclick = e => {
+    e.preventDefault();
+    view = { row: r.id, u: el.dataset.u };
+    showPage(el.dataset.key, +el.dataset.i, el.dataset.u);
+    card.querySelectorAll("a.pg").forEach(x => x.classList.toggle("sel", x === el));
+  });
   card.querySelectorAll(".opts button").forEach(b => b.onclick = () => {
     ans[r.id] = ans[r.id] || {};
     ans[r.id].v = ans[r.id].v === b.dataset.v ? "" : b.dataset.v;
@@ -286,10 +340,18 @@ def main(argv=None):
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--seed", type=int, default=22)
     ap.add_argument("--out-dir", default="", help="기본: <답변 폴더>/human")
+    ap.add_argument("--work", default="", help="합성 work 폴더 (platform/*.json). 기본: <답변 폴더>/..")
+    ap.add_argument("--bundles", default="", help="합성 철 쪽 이미지 폴더 (<철>/<쪽>.jpg). 기본: <work>/../bundles")
     a = ap.parse_args(argv)
     pw = json.loads(Path(a.pairwise).read_text(encoding="utf-8"))
-    ans_a, ans_b = load_answers(pw, a.answers_dir or Path(a.pairwise).resolve().parent.parent)
-    rows, key = build(pw, ans_a, ans_b, a.n, a.seed)
+    answers_dir = Path(a.answers_dir or Path(a.pairwise).resolve().parent.parent)
+    ans_a, ans_b = load_answers(pw, answers_dir)
+    work = Path(a.work) if a.work else answers_dir.resolve().parent
+    bundles = Path(a.bundles) if a.bundles else work.parent / "bundles"
+    pages = page_map(work, bundles) if (work / "platform").is_dir() and bundles.is_dir() else {}
+    rows, key = build(pw, ans_a, ans_b, a.n, a.seed, pages)
+    shown = sum(1 for r in rows for d in r["docs"] if d["pages"])
+    print(f"원본 쪽 이미지: 문서 {shown}/{sum(len(r['docs']) for r in rows)}건" if pages else "원본 쪽 이미지: 없음 (--work·--bundles)")
     p, sheet = paths(a.pairwise, pw["label"], a.out_dir)
     p["key"].parent.mkdir(parents=True, exist_ok=True)
     write_csv(p["csv"], rows)
