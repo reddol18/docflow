@@ -160,6 +160,17 @@ def test_judge_row_leak_stops(pw):
         asyncio.run(pw.judge_row(Leaky(None), "m", p, row("a1", "x"), row("a1", "y"), 100))
 
 
+def test_run_all_deadline(pw):
+    p, _ = pw.load_prompts()
+    good = FakeClient(lambda first: '{"winner": "A"}')
+    rows = [(row("a1", "x"), row("a1", "y")), (row("a2", "x"), row("a2", "y"))]
+    saved = []
+    out = asyncio.run(pw.run_all(good, "m", p, rows, 100, lambda o, done: saved.append(done), deadline=1.0))
+    assert out == [] and saved == [] and good.calls == []  # 지난 마감 — 새 질의를 시작하지 않는다
+    out = asyncio.run(pw.run_all(good, "m", p, rows, 100, lambda o, done: saved.append(done)))
+    assert len(out) == 2 and saved == [False, True]
+
+
 def test_pair_rows_checks(pw):
     a = {"queries_sha256": "h", "rows": [row("a1", "x"), row("a2", "y")]}
     b = {"queries_sha256": "h", "rows": [row("a2", "z"), row("a1", "w")]}
@@ -373,3 +384,122 @@ def test_answer_gate_main_exit_codes(agate, tmp_path, capsys):
     assert agate.main(["--cand", *base, "--cand", *cand, "--criteria", str(cf), "--out", str(out)]) == 1
     assert agate.main(["--cand", *base, "--criteria", str(cf), "--out", str(ROOT / "x")]) == 2  # 저장소 안
     assert agate.main(["--cand", *cand, "--criteria", str(cf), "--out", str(out)]) == 2  # 기준 없음
+
+
+# ---------- 쌍별 심판 사람 확인표·일치도 (2026-11-24 결정 3) ----------
+
+@pytest.fixture(scope="module")
+def psheet():
+    before = list(sys.path)
+    mod = _load("answer_pairwise_sheet", "eval/answer/pairwise_sheet.py")
+    yield mod
+    sys.path[:] = before
+
+
+@pytest.fixture(scope="module")
+def pagr():
+    before = list(sys.path)
+    mod = _load("answer_pairwise_agreement", "eval/answer/pairwise_agreement.py")
+    yield mod
+    sys.path[:] = before
+
+
+def pw_fixture(n=30):
+    """쌍별 결과·두 답변 파일 (지어낸 값). 결과 a·b·tie를 돌려 가며, 4번째마다 같은 답, 마지막은 오류"""
+    res = ["a", "b", "tie"]
+    pw_rows, ra, rb = [], [], []
+    for k in range(n):
+        i = f"q{k:02d}"
+        identical = k % 4 == 3
+        result = None if k == n - 1 else ("tie" if identical else res[k % 3])
+        pw_rows.append({"id": i, "identical": identical, "result": result, "consistent": True})
+        ra.append({**row(i, f"모델A 답 {i}"), "expected_answer": f"참고 {i}"})
+        rb.append(row(i, f"모델A 답 {i}" if identical else f"모델B 답 {i}", (K2, K3)))
+    pw = {"label": "base_vs_cand", "complete": True, "queries_sha256": "h", "a": {"file": "base.json", "model": "gpt-4o-mini"},
+          "b": {"file": "cand.json", "model": "gpt-4.1-mini"}, "judge": {"model": "j"},
+          "prompts": {"version": "pw-1", "sha256": "s" * 64}, "rows": pw_rows}
+    return pw, {"queries_sha256": "h", "rows": ra}, {"queries_sha256": "h", "rows": rb}
+
+
+def test_pairwise_sheet_pick_deterministic_and_balanced(psheet):
+    pw, _, _ = pw_fixture()
+    ids = psheet.pick(pw["rows"], 12, 22)
+    assert ids == psheet.pick(pw["rows"], 12, 22) and ids != psheet.pick(pw["rows"], 12, 23)
+    by = {r["id"]: r for r in pw["rows"]}
+    assert len(set(ids)) == 12 and not any(by[i]["identical"] or by[i]["result"] is None for i in ids)
+    assert {k: sum(by[i]["result"] == k for i in ids) for k in ("a", "b", "tie")} == {"a": 4, "b": 4, "tie": 4}
+    assert len(psheet.pick(pw["rows"], 100, 22)) == len(psheet.candidates(pw["rows"]))  # 모자라면 있는 만큼
+    pos = psheet.positions(ids, 22)
+    assert sorted(pos.values()).count("a") == 6 and pos == psheet.positions(ids, 22)
+
+
+def test_pairwise_sheet_blind(psheet):
+    pw, a, b = pw_fixture()
+    rows, key = psheet.build(pw, a, b, n=10, seed=22)
+    assert key["n"] == 10 and set(key["position_a_is"]) == {r["id"] for r in rows}
+    for r in rows:
+        want_a = "모델A" if key["position_a_is"][r["id"]] == "a" else "모델B"
+        assert r["답 A"].startswith(want_a) and r["답 B"] != r["답 A"]
+        assert [d["key"] for d in r["docs"]] == [K1, K2, K3]  # 심판과 같은 문서 합집합
+    page = psheet.html(rows, pw["label"], "x_pw_human")
+    for secret in ("gpt-4o-mini", "gpt-4.1-mini", "position_a_is", '"result"', "base.json", "cand.json"):
+        assert secret not in page  # 열쇠·모델 이름·심판 판정이 페이지에 없다
+    assert "</script>" not in psheet.html([{**rows[0], "답 A": "</script><b>"}], "l", "s").split("const DATA")[1].split("\n")[0]
+
+
+def test_pairwise_sheet_main_and_agreement(psheet, pagr, tmp_path):
+    pw, a, b = pw_fixture()
+    (tmp_path / "pairwise").mkdir()
+    pwp = tmp_path / "pairwise" / "base_vs_cand.json"
+    pwp.write_text(json.dumps(pw, ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "base.json").write_text(json.dumps(a, ensure_ascii=False), encoding="utf-8")
+    (tmp_path / "cand.json").write_text(json.dumps(b, ensure_ascii=False), encoding="utf-8")
+    assert psheet.main(["--pairwise", str(pwp), "--n", "9"]) == 0
+    h = tmp_path / "human"
+    csvp, keyp = h / "base_vs_cand_pw_human.csv", h / "_key" / "base_vs_cand_pw_key.json"
+    assert csvp.exists() and (h / "base_vs_cand_pw_score.html").exists() and keyp.exists()
+    with pytest.raises(SystemExit, match="덮지 않는다"):
+        psheet.main(["--pairwise", str(pwp), "--n", "9"])
+    key = json.loads(keyp.read_text(encoding="utf-8"))
+    judge = {r["id"]: r["result"] for r in pw["rows"]}
+    # 사람 = 심판과 같게 채움 (심판 tie인 쌍은 사람 비김) → 일치율 100%, 비김은 빠진다
+    import csv as _csv
+    with csvp.open(encoding="utf-8-sig", newline="") as f:
+        sheet = list(_csv.DictReader(f))
+    for r in sheet:
+        j, a_is = judge[r["id"]], key["position_a_is"][r["id"]]
+        r[psheet.VERDICT_COL] = "비김" if j == "tie" else ("A" if j == a_is else "B")
+    filled = tmp_path / "filled.csv"
+    with filled.open("w", encoding="utf-8-sig", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=psheet.COLUMNS)
+        w.writeheader()
+        w.writerows(sheet)
+    res = pagr.evaluate(pagr.read_human(filled), key, pw)
+    assert res["n"] == 6 and res["agreement"] == 1.0 and res["kappa"] == 1.0 and res["verdict"] == "사용"
+    assert res["human_ties"] == {"n": 3, "judge": {"a": 0, "b": 0, "tie": 3}}
+    out = tmp_path / "agr.json"
+    assert pagr.main(["--human", str(filled), "--key", str(keyp), "--pairwise", str(pwp), "--out", str(out)]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["agreement"] == 1.0
+    with pytest.raises(ValueError, match="열쇠"):
+        pagr.evaluate(pagr.read_human(filled), {**key, "pairwise_label": "other"}, pw)
+
+
+def test_pairwise_agreement_rules(pagr):
+    assert pagr.to_side("A", "b") == "b" and pagr.to_side("B", "b") == "a" and pagr.to_side("tie", "a") == "tie"
+    assert pagr.norm(" a ") == "A" and pagr.norm("비김") == "tie" and pagr.norm("") == ""
+    with pytest.raises(ValueError):
+        pagr.norm("C")
+    assert pagr.kappa([("a", "a"), ("b", "b")]) == 1.0
+    assert pagr.kappa([("a", "a"), ("b", "tie")]) == pytest.approx((0.5 - 0.25) / 0.75)  # 심판 tie는 불일치
+    import math as _m
+    assert _m.isnan(pagr.kappa([("a", "a"), ("a", "a")]))
+    pw = {"label": "l", "queries_sha256": "h", "rows": [{"id": f"q{i}", "result": r} for i, r in
+                                                        enumerate(["a"] * 9 + ["b"])]}
+    key = {"pairwise_label": "l", "queries_sha256": "h", "position_a_is": {f"q{i}": "a" for i in range(10)}}
+    human = {f"q{i}": "A" for i in range(10)}  # 사람 모두 a, 심판 9:1 → 일치 90%, 쏠림 100%
+    res = pagr.evaluate(human, key, pw)
+    assert res["agreement"] == 0.9 and res["kappa"] == 0.0 and res["verdict"] == "사용(쏠림 규칙)"
+    human = {**{f"q{i}": "B" for i in range(5)}, **{f"q{i}": "A" for i in range(5, 10)}}
+    res = pagr.evaluate(human, key, pw, revision=1)
+    assert res["verdict"] == "제외" and "참고값" in res["win_rate"]
+    assert pagr.evaluate({**human, "q0": ""}, key, pw)["blank"] == ["q0"]

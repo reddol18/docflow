@@ -220,9 +220,13 @@ def make_client(base_url, timeout):
     return client, meter, base
 
 
-async def run_all(client, model, prompts, rows, max_tokens, save=None):
+async def run_all(client, model, prompts, rows, max_tokens, save=None, deadline=None):
+    """질의마다 판정하고 save(out, 끝났나)로 그때까지를 쓴다. deadline(epoch 초)을 넘기면 새 질의를 시작하지 않는다 (judge.py와 같다)"""
     out = []
     for ra, rb in rows:
+        if deadline and time.time() >= deadline:
+            print(f"마감 시각을 넘겨 멈춤 — {len(out)}/{len(rows)}건 저장", flush=True)
+            break
         res = await judge_row(client, model, prompts, ra, rb, max_tokens)
         out.append(res)
         print(f"{res['id']} {res['seconds']}s 결과 {res['result']} 일관 {res['consistent']} 오류 {list(res['errors'])}", flush=True)
@@ -243,7 +247,9 @@ def main(argv=None):
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--out", default="")
+    ap.add_argument("--deadline-utc", default="", help="이 시각(예: 2026-11-25T01:00:00Z)이 지나면 새 질의를 시작하지 않고 그때까지를 저장")
     a = ap.parse_args(argv)
+    deadline = jd.parse_deadline(a.deadline_utc) if a.deadline_utc else None
     if not all(c.isalnum() or c in "._-" for c in a.label):
         raise SystemExit("--label은 영문·숫자·_.-만")
     prompts, p_hash = load_prompts(a.prompts)
@@ -270,9 +276,11 @@ def main(argv=None):
         os.replace(tmp, p)
         holder["res"] = res
 
-    asyncio.run(run_all(client, a.model, prompts, rows, a.max_tokens, save))
+    out = asyncio.run(run_all(client, a.model, prompts, rows, a.max_tokens, save, deadline))
     if meter.leaks:
         raise SystemExit(f"허용 밖 요청을 막았다: {meter.leaks[:3]}")
+    if not out:
+        raise SystemExit("판정한 질의가 없다 (마감 시각이 이미 지났나)")
     res = holder["res"]
     print(json.dumps({k: res[k] for k in ("judge", "tokens", "wall_s")}, ensure_ascii=False))
     print(json.dumps(res["summary"], ensure_ascii=False))
