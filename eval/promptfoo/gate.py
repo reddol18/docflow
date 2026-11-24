@@ -346,10 +346,8 @@ def main():
     # local-ollama·remote는 label만으로 어느 모델인지 모른다 → 실제로 부른 모델 id를 적는다
     used = {k[0]: sorted({provider_id(r) for r in g.values()}) for k, g in groups.items()}
     md += "\n\n모델 id: " + ", ".join(f"{p} = {'/'.join(i)}" for p, i in sorted(used.items()))
-    ans = (crit.get("answer") or {})
-    note = ("\n\n답변 채점(Ragas·쌍별 승률): " + ("기준 " + json.dumps(ans, ensure_ascii=False)
-                                           if any(v is not None for v in ans.values()) else
-                                           "아직 없음 — https://github.com/reddol18/docflow/issues/21"))
+    # 답변 채점은 답변 파일·심판 결과로 따로 돈다 (같은 criteria.yaml answer: 칸, https://github.com/reddol18/docflow/issues/22 조건 3)
+    note = "\n\n답변 채점(Ragas·쌍별 승률): eval/promptfoo/answer_gate.py → answer_gate.md (이 표와 따로 실행)"
     af = [f"{r['provider']}·{r['prompt']} {r['assert_failed']}건" for r in rows if r["assert_failed"]]
     if af:  # 응답은 읽었다 — 읽기 실패 열과 다를 수 있다 (check.py는 문서 하나만 본다)
         note += "\n\n단언(check.py) 실패·예외가 난 응답 (참고, 판정과 별개): " + ", ".join(af)

@@ -11,6 +11,19 @@ extract:
   field_drop_pp_max: 3.0     # 칸별 최종 정답률(문서번호·시행일자·수신·제목) 중 하나라도 3%p 넘게 떨어지면 실패
   parse_error_max: 0         # 응답이 JSON으로 읽히지 않은 문서가 있으면 실패
 
-answer:                # 검색 답변 채점 — Ragas 지표·심판 승률은 https://github.com/reddol18/docflow/issues/21 에서 채운다
-  faithfulness_min: null     # 근거 충실도가 이 값보다 낮으면 실패
-  win_rate_min: null         # 기준 모델과 나란히 놓고 심판이 고른 승률이 이 값보다 낮으면 실패
+# 검색 답변 채점 (https://github.com/reddol18/docflow/issues/22 조건 3) — eval/promptfoo/answer_gate.py가 읽는다.
+# 후보 = 답변 파일(eval/answer/gen_answers.py, 모델 × 답변 지시문 판) + 그 심판 결과(eval/answer/judge.py, ko-2) + 기준과의 쌍별 결과
+# (eval/answer/pairwise.py). 지표는 #21에서 사람과 일치도를 확인한 것만: 근거 충실도·질문 적합도·'모른다'(문맥 정밀도·재현율은
+# 검색만 보므로 표에만 — 같은 검색 결과(--reuse-retrieval)면 후보끼리 같다). 인용 정확도는 뺌(https://github.com/reddol18/docflow/issues/157).
+# 통과율은 이진 판정(P/F) 비율이고 %p로 비교한다. 42건 기준 1건 = 충실도 약 5.6%p(판정 18건)·적합도 3.1%p(32건)·'모른다' 10%p(10건).
+# 값은 사용자 결정 전이라 모두 null(보지 않음). 주석의 '제안'은 구현 때 낸 기본값 후보다.
+answer:
+  baseline:                       # 지금 운영 /ask: app/llm.py OPENAI_MODELS["chat"] + 운영 답변 지시문(app/llm.ANSWER_PROMPT)
+    model: gpt-4o-mini
+    prompt: current
+  faithfulness_pass_drop_pp_max: null       # 근거 충실도 통과율이 기준보다 이만큼(%p) 넘게 떨어지면 실패 — 제안 10.0
+  answer_relevancy_pass_drop_pp_max: null   # 질문 적합도 통과율 — 제안 10.0
+  dont_know_drop_pp_max: null               # 답 없는 질의에 '모른다'고 한 비율 — 제안 0.0 (하나라도 지어내면 실패)
+  refusal_answerable_rise_pp_max: null      # 답 있는 질의를 피한 비율이 이만큼 넘게 늘면 실패 — 제안 10.0
+  win_rate_min: null                        # 기준과의 쌍별 승률(무승부 0.5)이 이보다 낮으면 실패 — 제안 0.4. 쌍별 심판 사람 확인 뒤에 켠다
+  judge_error_max: null                     # 심판이 채점하지 못한 지표·질의 수 (후보마다, 기준 포함) — 제안 0
