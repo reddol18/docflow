@@ -62,7 +62,8 @@ OPENAI_MODELS = {
     "chat": "gpt-4o-mini",  # 검색 답변
 }
 # USD / 1M 토큰 (입력, 출력)
-PRICE = {"gpt-4o-mini": (0.15, 0.60), "gpt-4.1-mini": (0.40, 1.60), "text-embedding-3-small": (0.02, 0.0)}
+PRICE = {"gpt-4o-mini": (0.15, 0.60), "gpt-4.1-mini": (0.40, 1.60), "text-embedding-3-small": (0.02, 0.0),
+         "text-embedding-3-large": (0.13, 0.0)}  # large: 합성 철 모델 비교용 (https://github.com/reddol18/docflow/issues/61)
 BUDGET = float(os.environ.get("DAILY_BUDGET_USD", "3.0"))  # 색인·수정 (index)
 QUERY_BUDGET = float(os.environ.get("DAILY_QUERY_BUDGET_USD", "0.6"))  # 검색·질문 (query) — 색인 예산과 따로
 LIMITS = {"index": BUDGET, "query": QUERY_BUDGET}

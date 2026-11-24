@@ -1303,6 +1303,31 @@ def keyword_search(words, year_from=None, year_to=None, limit=20):
         return c.execute(sql, args).fetchall()
 
 
+def docno_search(numbers, year_from=None, year_to=None, limit=20, schema=None):
+    """문서번호 칸 값의 번호 부분이 numbers('NNNNN-N') 중 하나와 정확히 같은 문서 [{vol, doc_id, docno}] — 공백은 무시,
+    앞뒤가 숫자로 이어지면 다른 번호('…-804'≠'…-8040'). SQL에서 정확히 거르므로 앞자리가 같은 문서가 많아도 limit에
+    잘리지 않는다. 부서 약칭 비교는 app/retrieval.docno_matches가 한다 (https://github.com/reddol18/docflow/issues/61).
+    스키마에 문서번호 칸(rule: docno)이 없으면 빈 목록"""
+    from app import retrieval  # noqa: PLC0415
+    col = retrieval.docno_field(schema or fields.SCHEMA)
+    nums = [n.replace(" ", "") for n in numbers if re.fullmatch(r"\d{4,5}\s*-\s*\d{1,5}", n)]
+    if not col or not nums:
+        return []
+    val = "replace(coalesce(fields->>%s, ''), ' ', '')"
+    sql = f"SELECT vol, doc_id, fields->>%s AS docno FROM documents WHERE {val} ~ ANY(%s)"  # noqa: S608 — 값은 매개변수
+    args = [col, col, [f"(^|[^0-9-]){n}([^0-9]|$)" for n in nums]]  # n은 숫자와 '-'뿐 (위 fullmatch)
+    if year_from:
+        sql += " AND year >= %s"
+        args.append(int(year_from))
+    if year_to:
+        sql += " AND year <= %s"
+        args.append(int(year_to))
+    sql += " ORDER BY doc_id, vol LIMIT %s"
+    args.append(limit)
+    with pool.connection() as c:
+        return c.execute(sql, args).fetchall()
+
+
 def doc_key(r):
     """문서 키 (철, doc_id) — 같은 쪽 이름이 다른 철에도 있을 수 있다 (https://github.com/reddol18/docflow/issues/50)"""
     return r["vol"], r["doc_id"]
