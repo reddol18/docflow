@@ -7,7 +7,8 @@ import { api, type FieldDef, type Schema, type SearchHit } from "@/lib/api";
 import { Card } from "@/components/ui";
 
 const Q_MAX = 200; // 검색어 길이 상한 — 서버(`app/main.py`의 Q_MAX)와 같게
-const EXAMPLES =["공장설립 변경 신고", "한국전력공사 송전철탑", "1997년 도로 점용 허가", "폐기물 처리 사업장"];
+// 예시 칩은 김해 450건에 답이 있는 주제만 — 예전 '1997년 도로 점용 허가'는 답 없는 질의였다 (https://github.com/reddol18/docflow/issues/61)
+const EXAMPLES = ["공장설립 변경 신고", "한국전력공사 송전철탑", "1999년 행정심판청구서", "폐기물 처리 사업장"];
 
 export default function SearchPage() {
   return (
