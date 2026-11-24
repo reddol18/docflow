@@ -26,6 +26,11 @@ docflow/local-check(success)를 올린다 — 막는 검사 모두 통과, 건�
 시작·끝 모두 커밋 안 된 변경 없음, HEAD가 그대로이고 push돼 있을 때만. 실패·건너뜀·변경 있음이면 올리지 않는다.
 main ruleset이 이 status를 병합 필수 조건으로 건다. 올리지 않으려면 -NoStatus.
 종료 코드는 검사 결과만 따른다 (status를 올렸든 못 올렸든 같다).
+
+실행 기록 (https://github.com/reddol18/docflow/issues/55): 매 실행 끝에 커밋하지 않는(.gitignore /logs/) `logs/check_runs.jsonl`에
+JSON 한 줄을 덧붙인다 — 시각·브랜치·커밋·커밋 안 된 변경 여부·검사별 pass/fail/skip만 (경로·환경 변수·출력은 넣지 않는다).
+워크트리에서 돌려도 본 저장소(git common dir의 부모) 한 파일에 모인다. `scripts/weekly_metrics.py`가 브랜치별 첫 실행을 센다.
+기록을 못 써도 경고만 하고 검사 결과(종료 코드)는 그대로.
 #>
 param(
     [switch]$Quick,
@@ -112,6 +117,8 @@ Push-Location $root
 try {
     $fullSha = (git rev-parse HEAD).Trim()
     $sha = $fullSha.Substring(0, 7)
+    $branch = "$(git rev-parse --abbrev-ref HEAD)".Trim()  # 떨어진 HEAD면 "HEAD"
+    $commonDir = "$(git rev-parse --git-common-dir)".Trim()
     $porcelain = git status --porcelain
     $dirty = [bool]$porcelain -or [bool]$LASTEXITCODE  # git status가 실패하면 변경 있음으로 본다 (status 안 올림)
 
@@ -224,6 +231,32 @@ Write-Host "|---|---|---|"
 foreach ($r in $results) { Write-Host ("| {0} | {1} | {2} |" -f $r.name, (& $mark $r), $r.sec) }
 if ($failed.Count) { Write-Host "`n실패: $($failed.name -join ', ')" -ForegroundColor Red }
 else { Write-Host "`n막는 검사 모두 통과" -ForegroundColor Green }
+
+# 실행 기록 한 줄 (https://github.com/reddol18/docflow/issues/55) — 위 머리말 참고
+try {
+    $states = [ordered]@{}
+    foreach ($r in $results) { $states[$r.name] = if ($null -eq $r.ok) { "skip" } elseif ($r.ok) { "pass" } else { "fail" } }
+    $entry = [ordered]@{
+        at      = (Get-Date).ToString("yyyy-MM-dd'T'HH':'mm':'sszzz", [Globalization.CultureInfo]::InvariantCulture)
+        branch  = $branch
+        commit  = $fullSha
+        dirty   = $dirty
+        quick   = [bool]$Quick
+        skip    = @($Skip | Where-Object { $_ -cmatch '^[A-Za-z0-9_-]{1,32}$' } | Select-Object -Unique)  # 옵션 이름만 (pg 등)
+        results = $states
+        ok      = ($failed.Count -eq 0)
+    }
+    if (-not $commonDir) { throw "git rev-parse --git-common-dir 실패" }  # 비면 저장소 밖(부모 폴더)에 쓰게 된다
+    # 본 저장소에서는 상대 경로(.git), 워크트리에서는 절대 경로가 온다
+    $commonAbs = if ([IO.Path]::IsPathRooted($commonDir)) { $commonDir } else { Join-Path $root $commonDir }
+    $logDir = Join-Path (Split-Path ([IO.Path]::GetFullPath($commonAbs)) -Parent) "logs"
+    New-Item -ItemType Directory -Force $logDir | Out-Null
+    $line = ConvertTo-Json -InputObject $entry -Compress -Depth 3
+    [IO.File]::AppendAllText((Join-Path $logDir "check_runs.jsonl"), $line + "`n", [Text.UTF8Encoding]::new($false))
+    Write-Host "실행 기록: logs/check_runs.jsonl ($branch)"
+} catch {
+    Write-Host "실행 기록을 못 씀 (검사 결과는 그대로): $_" -ForegroundColor Yellow
+}
 
 # commit status docflow/local-check — 올릴지는 gate_status.py가 정한다 (실패여도 넘겨서 '올리지 않음' 이유를 보인다)
 if ($NoStatus) {
