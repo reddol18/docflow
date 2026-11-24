@@ -23,10 +23,23 @@
       role: admin
       reject: true
 
+표본 단계 반려 (https://github.com/reddol18/docflow/issues/94) — 새 항목이 없으면 지금처럼 표본 단계는 반려할 수 없다.
+표본 오류를 어떻게 처리할지는 설정에서 미리 정하고, 검사자는 오류 문서를 반려(사유 필수)만 한다:
+    - name: inspect
+      role: inspector
+      select: sample
+      reject: true
+      reject_to: entry
+      sample_error: volume     # document(기본): 그 문서만 reject_to로 재작업 (가)
+                               # volume: 표본 오류(반려된 표본 문서 수)가 volume_at건 이상이고 반려자가
+                               #   서로 다른 2명 이상이 되면 철 전체를 reject_to로 (다). 한 명뿐이면 그 문서만
+      volume_at: 2             # volume일 때만, 1 이상 정수 (필수)
+
 규칙
   - 단계 이름은 영문 소문자로 시작하는 [a-z0-9_] 32자까지, 겹치지 않는다. 맡는 역할은 reviewer·inspector·admin
     (역할은 auth.ROLES 순서대로 넓다 — 위 역할도 맡을 수 있다)
-  - sample 단계는 하나까지, 마지막 단계여야 하고 반려를 지원하지 않는다 (표본 밖 문서는 검사 없이 확정)
+  - sample 단계는 하나까지, 마지막 단계여야 한다 (표본 밖 문서는 검사 없이 확정). 반려는 reject: true일 때만
+  - sample_error·volume_at은 반려하는 sample 단계에만
   - reject_to는 앞 단계만 (sample 단계로는 못 돌린다)
 문서 위치(어느 단계에 있나)의 판단은 여기 순수 함수로 하고, 저장은 app/store.py(doc_stage·stage_log), 경로는 app/main.py.
 """
@@ -43,9 +56,10 @@ NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 STAGE_ROLES = ("reviewer", "inspector", "admin")  # 보기(viewer)는 단계를 맡을 수 없다
 SELECTS = ("all", "sample")
 SUBMITS = ("manual", "on_index")
+SAMPLE_ERRORS = ("document", "volume")  # 표본 오류 처리: 그 문서만 재작업 (가) / 기준 건수 이상이면 철 전체 되돌림 (다)
 TOP_KEYS = {"name", "note", "distinct_actors", "count_unconfirmed", "stages"}
 ENTRY_KEYS = {"name", "label", "role", "submit", "note"}
-STAGE_KEYS = {"name", "label", "role", "select", "rate", "reject", "reject_to", "note"}
+STAGE_KEYS = {"name", "label", "role", "select", "rate", "reject", "reject_to", "sample_error", "volume_at", "note"}
 
 
 class WorkflowError(ValueError):
@@ -57,6 +71,25 @@ def _bool(d, key, default, where):
     if not isinstance(v, bool):
         raise WorkflowError(f"{where}{key}는 true/false")
     return v
+
+
+def _sample_error(s, sel, reject, where):
+    """표본 단계의 오류 처리 설정 (https://github.com/reddol18/docflow/issues/94). 반려하는 sample 단계에만 둔다.
+    반려하는 sample 단계의 기본은 document (그 문서만 재작업). 다른 단계는 둘 다 None"""
+    err, at = s.get("sample_error"), s.get("volume_at")
+    if not (sel == "sample" and reject):
+        if err is not None or at is not None:
+            raise WorkflowError(f"{where}sample_error·volume_at은 반려하는 sample 단계만 (select: sample, reject: true)")
+        return {"sample_error": None, "volume_at": None}
+    err = err if err is not None else "document"
+    if err not in SAMPLE_ERRORS:
+        raise WorkflowError(f"{where}sample_error는 {' | '.join(SAMPLE_ERRORS)}")
+    if err == "volume":
+        if isinstance(at, bool) or not isinstance(at, int) or at < 1:
+            raise WorkflowError(f"{where}sample_error: volume이면 volume_at(1 이상 정수, 철 전체를 되돌릴 표본 오류 건수) 필요")
+    elif at is not None:
+        raise WorkflowError(f"{where}volume_at은 sample_error: volume일 때만")
+    return {"sample_error": err, "volume_at": at if err == "volume" else None}
 
 
 def parse(t):
@@ -90,7 +123,8 @@ def parse(t):
         if i == 0:
             if s.get("submit", "manual") not in SUBMITS:
                 raise WorkflowError(f"{where}submit은 {' | '.join(SUBMITS)}")
-            st.update(kind="entry", submit=s.get("submit", "manual"), select="all", reject=False, reject_to=None, rate=None)
+            st.update(kind="entry", submit=s.get("submit", "manual"), select="all", reject=False, reject_to=None, rate=None,
+                      sample_error=None, volume_at=None)
         else:
             sel = s.get("select", "all")
             if sel not in SELECTS:
@@ -113,7 +147,7 @@ def parse(t):
                 if prev[to]["select"] == "sample":
                     raise WorkflowError(f"{where}sample 단계로는 반려할 수 없음")
             st.update(kind="review", select=sel, rate=float(rate) if rate is not None else None, reject=reject,
-                      reject_to=to if reject else None)
+                      reject_to=to if reject else None, **_sample_error(s, sel, reject, where))
         stages.append(st)
     if len(stages) == 1 and stages[0]["submit"] == "on_index":
         raise WorkflowError("입력 단계 하나뿐인 흐름은 submit: on_index일 수 없음 (색인만으로 확정되어 검토가 없다)")
@@ -123,8 +157,6 @@ def parse(t):
     if samples:
         if samples[0] is not stages[-1]:
             raise WorkflowError("sample 단계는 마지막 단계여야 함 (표본 밖 문서는 검사 없이 확정되므로)")
-        if samples[0]["reject"]:
-            raise WorkflowError("sample 단계는 반려를 지원하지 않음")
     name = t.get("name", "")
     if not isinstance(name, str) or len(name) > 80:
         raise WorkflowError("name은 80자까지 글자")
@@ -187,9 +219,17 @@ def actionable(wf, name):
     return s is not None and s["select"] != "sample"
 
 
+def sample_rejects(wf):
+    """표본 단계가 반려를 받는가 (https://github.com/reddol18/docflow/issues/94). 반려는 /inspection 경로로"""
+    s = sample_stage(wf)
+    return s is not None and s["reject"]
+
+
 def public(wf):
-    """화면용 흐름 — 단계 목록과 단계마다 할 수 있는 일"""
+    """화면용 흐름 — 단계 목록과 단계마다 할 수 있는 일. 반려하는 표본 단계에는 오류 처리(sample_error·volume_at)도"""
     return {"name": wf["name"], "distinct_actors": wf["distinct_actors"], "count_unconfirmed": wf["count_unconfirmed"],
             "initial": initial(wf),
             "stages": [{k: s[k] for k in ("name", "label", "role", "kind", "select", "rate", "reject", "reject_to")}
-                       | {"submit": s.get("submit"), "actions": s["select"] != "sample"} for s in wf["stages"]]}
+                       | {"submit": s.get("submit"), "actions": s["select"] != "sample"}
+                       | ({"sample_error": s["sample_error"], "volume_at": s["volume_at"]} if s["sample_error"] else {})
+                       for s in wf["stages"]]}

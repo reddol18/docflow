@@ -54,6 +54,38 @@ Windows ─(ssh 터널 → kubectl port-forward)→ docs 네임스페이스 (k3s
 어제 게이트웨이처럼 Redis Streams + KEDA로 docflow 작업자를 늘리는 쪽이 자연스럽다 (LangGraph는 "무슨 단계를 어떤 순서로",
 대기열은 "언제, 몇 개를").
 
+### 표본 단계 반려 (https://github.com/reddol18/docflow/issues/94)
+
+검토 단계 설정(`app/workflows/*.yaml`, https://github.com/reddol18/docflow/issues/86)의 표본(sample) 단계에 반려를 켤 수 있다.
+표본 오류를 어떻게 처리할지는 **흐름 설정에서 미리 정하고**, 검사자는 오류 문서를 반려(사유 필수)만 한다.
+
+```yaml
+  - name: inspect
+    select: sample
+    reject: true          # 없으면 지금처럼 표본 반려 불가 (기본 흐름 default.yaml은 그대로)
+    reject_to: entry
+    sample_error: volume  # document(기본): 그 문서만 재작업 / volume: 표본 오류가 volume_at건 이상이고 반려자 2명 이상이면 철 전체
+    volume_at: 2
+```
+
+- **그 문서만 (document):** 반려된 문서는 `reject_to`로 돌아가 차례(round)가 하나 늘고, 다시 올라오면 같은 검사 목록 행을
+  다시 검사한다. 같은 검사자도 다른 검사자도 되지만 그 문서를 재작업한 사람은 안 된다(작업자 ≠ 검수자 그대로).
+- **철 전체 (volume):** 표본 오류 = 이 검사 목록에서 반려된 **무작위 표본** 문서 수(표시 문서·100% 검수 칸 문서의 반려는
+  그 문서만 돌린다). 기준 건수에 이르고 **그 표본을 반려한 검사자가 서로 다른 2명 이상**이면(반려자 수 — 같은 사람이
+  여러 번 반려해도 1명, 검사 목록 행의 `rejected_by`로 센다) 표본 단계·확정·그 사이 단계에 있는 다른 문서도 모두
+  `reject_to`로 돌리고(이미 확정된 문서 포함), 검사 목록을 지운다 — 돌아온 철은 검사 목록을 새로 만들어 새 표본으로 검사하고,
+  오류 건수·반려자 수도 새로 센다. 반려자가 한 명뿐이면 건수를 채워도 그 문서만 재작업한다 — 검사자 한 명이 철 전체를
+  되돌리지 못하게(보안 리뷰 V4.1.3, https://github.com/reddol18/docflow/issues/94#issuecomment-7134836866).
+  같은 철의 반려는 검사 목록 행을 잠가 차례로 처리한다(오류 건수를 놓치지 않게). 되돌려야 할 때 다른 문서가 검사 중이면
+  아무것도 쓰지 않고 409 — 그 검사가 끝나거나 차지를 푼 뒤 다시 반려한다. 함께 옮긴 문서의 stage_log는 사람 없이 남겨
+  (반려한 사람은 감사 로그에) 반려한 검사자가 손대지 않은 문서의 다른 단계를 맡는 것을 막지 않는다.
+  되돌리면 그 검사 목록의 철별 추정 오류율도 사라진다(새 목록부터 다시 센다). 오류의 기록은 stage_log·감사 로그에 남는다.
+- **미확정 세기:** 반려된 문서는 재검사 전까지 미확정. 검사 목록이 끝나지 않았으므로 검사 제외 문서도 미확정으로 남는다.
+  철 전체를 되돌리면 검사 목록이 없어 모든 문서가 미확정.
+- **기록:** 반려마다 stage_log에 reject(사유), 철 전체 되돌림으로 옮긴 문서도 각각 reject(사유 '철 전체 되돌림 …').
+  감사 로그 `inspect_reject`에는 단계·차례·사유 길이·오류 건수·반려자 수(`rejectors`)·철 전체 여부(되돌렸으면 함께 옮긴 문서 id `moved_ids`, 검사 중이라 막혔으면 그 문서 id `busy`)·함께 옮긴 수만(사유 원문 없음).
+  철별 추정 오류율은 반려된 표본을 오류를 찾은 표본으로 센다.
+
 ## 3. API
 
 | | |
@@ -63,6 +95,7 @@ Windows ─(ssh 터널 → kubectl port-forward)→ docs 네임스페이스 (k3s
 | `POST /volumes/{vol}/resume` | 끊긴 곳부터 다시 |
 | `GET /volumes/{vol}`, `/documents` | 상태(다음 노드·검토 대기·비용), 문서별 결과 |
 | `GET/POST /review/{vol}` | 사람 검토 화면 → 제출하면 흐름 재개 |
+| `POST /inspection/{vol}/{doc_id}/reject` | 표본 단계 반려 (사유 필수, 흐름 설정 `reject: true`일 때만) |
 | `GET /search?q=&year_from=&year_to=` | Qdrant 벡터 + Postgres 낱말 결과를 RRF로 합침 |
 | `GET /ask?q=` | 상위 5건으로 GPT가 답하고 근거 doc_id를 단다 |
 | `GET /graph` | 흐름 그림 (mermaid) |
