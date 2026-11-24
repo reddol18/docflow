@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -238,13 +239,22 @@ def take_env(name):
     return v or _user_env(name)
 
 
+SECRET_RE = re.compile(r"(sk-|key[-_]?)[A-Za-z0-9_\-*]{4,}", re.IGNORECASE)
+
+
+def mask_secret(text):
+    """오류 문구에 든 키 조각(OpenAI 401의 가린 키 꼬리 등)을 지운다 — 결과 파일에 남기 전에"""
+    return SECRET_RE.sub(r"\1***", text)
+
+
 def ollama_digest(base_url, model, timeout=10):
-    """Ollama면 /api/tags에서 그 모델의 다이제스트, 아니면 None (주소는 check_base_url을 지난 것)"""
-    import urllib.request  # noqa: PLC0415
+    """Ollama면 /api/tags에서 그 모델의 다이제스트, 아니면 None (주소는 check_base_url을 지난 것, 리다이렉트는 따르지 않음)"""
+    import httpx  # noqa: PLC0415
     root = base_url[:-3] if base_url.endswith("/v1") else base_url
     try:
-        with urllib.request.urlopen(f"{root}/api/tags", timeout=timeout) as r:  # noqa: S310 — 검사한 주소
-            tags = json.load(r).get("models", [])
+        r = httpx.get(f"{root}/api/tags", timeout=timeout, follow_redirects=False)
+        r.raise_for_status()
+        tags = r.json().get("models", [])
     except Exception:  # noqa: BLE001 — Ollama가 아니면 없음
         return None
     for m in tags:
@@ -275,7 +285,7 @@ async def judge_row(row, metrics, llm, prompts, models, only=None):
             leak = leak_in(e)
             if leak is not None:  # 허용 밖 요청 — 싸여 와도 멈춘다
                 raise leak from e
-            errors[name] = f"{type(e).__name__}: {str(e)[:200]}"
+            errors[name] = f"{type(e).__name__}: {mask_secret(str(e))[:200]}"
             return None
 
     ref = await run("refusal", llm.agenerate(make_prompt(prompts["custom"]["refusal"], {"answer": row["answer"]},

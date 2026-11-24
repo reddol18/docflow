@@ -432,6 +432,57 @@ def test_main_only_judged_metrics(ag, hs, tmp_path, capsys):
     assert list(json.loads(o.read_text(encoding="utf-8"))["metrics"]) == ["faithfulness", "answer_relevancy", "refusal"]
 
 
+def test_csv_safe_blocks_formula_keeps_na(hs, tmp_path):
+    """LLM 답이 '='·'+'·'-'·'@'로 시작하면 앞에 ' — 채점 칸의 '-'(해당 없음)는 그대로 (보안 리뷰 LLM05)"""
+    assert hs.csv_safe("=HYPERLINK(\"x\")") == "'=HYPERLINK(\"x\")"
+    assert hs.csv_safe("@SUM(A1)") == "'@SUM(A1)"
+    assert hs.csv_safe("-") == "-"
+    assert hs.csv_safe("보통 답") == "보통 답"
+    rows = hs.sheet_rows(answers())
+    rows[0]["답"] = "=1+1"
+    c = tmp_path / "h.csv"
+    hs.write_csv(c, rows)
+    text = c.read_text(encoding="utf-8-sig")
+    assert "'=1+1" in text
+    heads = {h for _, h, _ in hs.RUBRIC}
+    import csv as _csv  # noqa: PLC0415
+    back = list(_csv.DictReader(c.open(encoding="utf-8-sig")))
+    assert all(back[i][h] == rows[i][h] for i in range(len(rows)) for h in heads)
+
+
+def test_xlsx_formula_stored_as_text(hs, tmp_path):
+    pytest.importorskip("openpyxl")
+    from openpyxl import load_workbook  # noqa: PLC0415
+    rows = hs.sheet_rows(answers())
+    rows[0]["답"] = "=1+1"
+    p = tmp_path / "h.xlsx"
+    hs.write_xlsx(p, rows)
+    ws = load_workbook(p)["채점"]
+    col = [c.value for c in ws[1]].index("답") + 1
+    assert ws.cell(2, col).data_type == "s"
+    assert ws.cell(2, col).value == "=1+1"
+
+
+def test_mask_secret(jd):
+    """오류 문구의 키 조각은 결과 파일에 남기지 않는다 (보안 리뷰 LLM02)"""
+    out = jd.mask_secret("Incorrect API key provided: sk-proj-abc1****wxyz. You can find")
+    assert "abc1" not in out and "wxyz" not in out
+    assert jd.mask_secret("timeout after 600s") == "timeout after 600s"
+
+
+def test_ollama_digest_no_redirect(jd, monkeypatch):
+    """/api/tags가 다른 곳으로 리다이렉트하면 따르지 않고 None (보안 리뷰 API7)"""
+    import httpx  # noqa: PLC0415
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen.update(kw, url=url)
+        return httpx.Response(302, headers={"location": "http://evil.example/"}, request=httpx.Request("GET", url))
+    monkeypatch.setattr(httpx, "get", fake_get)
+    assert jd.ollama_digest("http://127.0.0.1:18434/v1", "m") is None
+    assert seen["follow_redirects"] is False and seen["url"] == "http://127.0.0.1:18434/api/tags"
+
+
 def test_gate_pass_and_nan_kappa(ag):
     assert ag.verdict(0.8, 0.6, 0) == "사용"
     assert ag.verdict(0.9, 0.59, 0) == "지시문 고쳐 재채점"

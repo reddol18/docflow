@@ -75,6 +75,9 @@ def write_xlsx(path, rows):
     ws.append(cols)
     for r in rows:
         ws.append([r[c] for c in cols])
+        for cell in ws[ws.max_row]:  # LLM 답이 '='로 시작해도 수식이 아니라 글로 (수식 인젝션)
+            if isinstance(cell.value, str) and cell.data_type == "f":
+                cell.data_type = "s"
     widths = {"질문": 40, "답": 50, "참고 답": 40, "가져온 문서 (순위·넘긴 글)": 90,
               "근거 문서": 30, "답의 인용": 30, "메모": 30}
     grey = PatternFill("solid", fgColor="DDDDDD")
@@ -107,11 +110,22 @@ def write_xlsx(path, rows):
     wb.save(path)
 
 
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value):
+    """스프레드시트가 수식으로 읽을 글 앞에 ' 를 붙인다 (CSV 수식 인젝션). 채점 칸의 '-'(해당 없음)는 그대로"""
+    if isinstance(value, str) and value != "-" and value.startswith(FORMULA_START):
+        return "'" + value
+    return value
+
+
 def write_csv(path, rows):
+    scored = {h for _, h, _ in RUBRIC}
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=columns())
         w.writeheader()
-        w.writerows(rows)
+        w.writerows({k: (v if k in scored else csv_safe(v)) for k, v in r.items()} for r in rows)
 
 
 def main(argv=None):
