@@ -183,6 +183,15 @@ def answer_one(client, model, q, hits, budget, system_prompt=None, priced=True):
             "usd": round(usd, 8), "latency_ms": latency_ms}
 
 
+PAID_SUFFIXES = (".openai.com", ".openai.azure.com")  # 단가가 붙는 OpenAI·Azure OpenAI — --base-url(0원)로 못 부른다
+
+
+def paid_host(base_url):
+    """주소의 호스트가 OpenAI(지역 엔드포인트·Azure 포함)면 True — 대소문자·끝의 '.'·포트 무관"""
+    host = (urlsplit(base_url).hostname or "").rstrip(".").lower()
+    return host == "openai.com" or host.endswith(PAID_SUFFIXES)
+
+
 def main(argv=None):
     from app import llm  # noqa: PLC0415
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -221,7 +230,7 @@ def main(argv=None):
     by_key = {d["key"]: d for d in docs}
     remote = bool(a.base_url)
     # 0원으로 세지 않게 — 대소문자·:443·경로 차이로 빠져나가지 않도록 호스트로 본다
-    if remote and (urlsplit(cc.check_base_url(a.base_url)).hostname or "").rstrip(".") == urlsplit(cc.OPENAI_BASE).hostname:
+    if remote and paid_host(cc.check_base_url(a.base_url)):
         raise SystemExit("OpenAI는 --base-url 없이 부른다 (단가·지출 상한 적용)")
     # 검색을 다시 할 때만 OpenAI 임베딩 클라이언트가 필요하다 (답변이 로컬 모델이어도)
     eclient = cc.make_client(True, None)[0] if prev_rows is None else None

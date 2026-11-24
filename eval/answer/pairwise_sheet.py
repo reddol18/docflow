@@ -293,9 +293,10 @@ document.getElementById("save").onclick = () => {
   const lines = [DATA.columns.map(cell).join(",")];
   for (const r of DATA.rows) {
     const a = ans[r.id] || {};
-    const v = { "id": r.id, "순번": r.no, "답 있음": r.answerable ? "예" : "아니오", "질문": safe(r.question),
+    const verdict = ["A", "B", "비김"].includes(a.v) ? a.v : "";  // localStorage 값은 허용 목록만
+    const v = { "id": safe(r.id), "순번": r.no, "답 있음": r.answerable ? "예" : "아니오", "질문": safe(r.question),
       "참고 답": safe(r.reference), "답 A": safe(r.A), "답 B": safe(r.B), "가져온 문서": "",
-      [DATA.verdict_col]: a.v || "", "메모": safe(a.memo || "") };
+      [DATA.verdict_col]: verdict, "메모": safe(a.memo || "") };
     lines.push(DATA.columns.map(c => cell(v[c])).join(","));
   }
   const blob = new Blob(["\\ufeff" + lines.join("\\r\\n") + "\\r\\n"], { type: "text/csv;charset=utf-8" });

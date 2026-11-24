@@ -548,3 +548,19 @@ def test_pairwise_agreement_rules(pagr):
     res = pagr.evaluate(human, key, pw, revision=1)
     assert res["verdict"] == "제외" and "참고값" in res["win_rate"]
     assert pagr.evaluate({**human, "q0": ""}, key, pw)["blank"] == ["q0"]
+
+
+def test_paid_host_blocks_openai_variants(ga):
+    """--base-url(0원·상한 없음)로 OpenAI·Azure OpenAI를 못 부른다 — 대소문자·포트·끝의 '.' 변형 포함 (보안 리뷰 LLM10)"""
+    for u in ("https://api.openai.com/v1", "https://API.OpenAI.com:443/v1/", "https://api.openai.com./v1",
+              "https://eu.api.openai.com/v1", "https://x.openai.azure.com/openai"):
+        assert ga.paid_host(u), u
+    for u in ("http://127.0.0.1:18434/v1", "https://openai.com.example.net/v1", "https://notopenai.com/v1"):
+        assert not ga.paid_host(u), u
+
+
+def test_pairwise_page_csv_safe_on_id_and_verdict(psheet):
+    """채점 페이지 'CSV 저장'은 id에도 safe(), 판정은 허용 목록만 (보안 리뷰 F)"""
+    page = psheet.HTML
+    assert '"id": safe(r.id)' in page
+    assert '["A", "B", "비김"].includes(a.v)' in page
