@@ -1093,13 +1093,23 @@ def reject_sample(vol, doc_id, stage, rnd, to_stage, user_id, reason, gen, init,
       2. 그 문서를 to_stage로, 차례 +1, 사유·반려한 단계를 문서에 (move_stage와 같은 규칙), stage_log에 reject
       3. volume={"at": 기준 건수, "doc_ids": 철의 문서 id, "back": 되돌릴 위치 이름들, "reason": 기록 사유}를 주면 (다):
          이 철 검사 목록의 반려된 무작위 표본 문서 수(reason=sample, 오류 건수)가 기준 이상일 때
-         back 위치(표본 단계·확정·그 사이 단계)에 있는 다른 문서도 모두 to_stage로 (차례 +1, stage_log에 reject와 기록 사유), 검사 목록을 지운다 — 돌아온 철은 새 표본으로
+         back 위치(표본 단계·확정·그 사이 단계)에 있는 다른 문서도 모두 to_stage로 (차례 +1, stage_log에 reject와 기록 사유),
+         검사 목록을 지운다 — 돌아온 철은 새 표본으로. 함께 옮긴 문서의 기록은 user_id 없이 남긴다(철 전체 처리 — 반려한
+         사람은 감사 로그에). 그때 다른 문서가 검사 중이면(차지만 있고 끝나지 않음) 아무것도 쓰지 않고 {"busy": 검사 중 문서 수}
     세대가 바뀌었거나(/run) 행·단계가 확인 때와 다르면 아무것도 쓰지 않고 None.
     결과 {"errors": 오류 건수, "volume": 철 전체를 되돌렸나, "moved": 함께 되돌린 다른 문서 수}"""
     try:
         with pool.connection() as c, c.transaction():
             if not _same_gen(c, vol, gen):
                 return None
+            claimed = []
+            if volume is not None:
+                # 철의 검사 목록 행을 doc_id 순서로 모두 잡는다: 같은 철의 반려끼리 차례로(오류 건수를 서로 못 보고 놓치거나
+                # 교착되지 않게), 되돌리는 동안 다른 문서의 검사 차지가 끼어들지 못하게(차지는 기다렸다가 지워진 행에 409)
+                rows = c.execute("SELECT doc_id, inspected_at, fixed_fields FROM inspection WHERE vol = %s "
+                                 "ORDER BY doc_id FOR UPDATE", (vol,)).fetchall()
+                claimed = [r["doc_id"] for r in rows if r["doc_id"] != doc_id and r["inspected_at"] is not None
+                           and r["fixed_fields"] is None]
             if c.execute("UPDATE inspection SET rejects = rejects + 1, rejected_at = now() "
                          "WHERE vol = %s AND doc_id = %s AND inspected_at IS NULL", (vol, doc_id)).rowcount != 1:
                 raise _Rollback
@@ -1112,6 +1122,8 @@ def reject_sample(vol, doc_id, stage, rnd, to_stage, user_id, reason, gen, init,
             out = {"errors": errors, "volume": False, "moved": 0}
             if volume is None or errors < volume["at"]:
                 return out
+            if claimed:  # 검사 중인 문서가 있으면 되돌리지 않는다 — 그 검사가 고친 칸이 되돌린 문서에 남지 않게
+                raise _Busy(len(claimed))
             others = [d for d in volume["doc_ids"] if d != doc_id]
             if init is not None and others:  # 행이 없는 문서는 처음 단계 행부터 (위치는 그대로)
                 c.cursor().executemany("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
@@ -1121,7 +1133,7 @@ def reject_sample(vol, doc_id, stage, rnd, to_stage, user_id, reason, gen, init,
                              (vol, others, list(volume["back"]))).fetchall()
             for r in rows:
                 if not _move_one(c, vol, r["doc_id"], r["stage"], r["round"], "reject", to_stage, r["round"] + 1,
-                                 user_id, volume["reason"], None, None, by=stage):
+                                 None, volume["reason"], None, None, by=stage):  # 사람 행위 아님 → 작업자≠검수자에 안 듦
                     raise _Rollback
             c.execute("DELETE FROM inspection WHERE vol = %s", (vol,))
             c.execute("DELETE FROM inspection_plan WHERE vol = %s", (vol,))
@@ -1129,6 +1141,12 @@ def reject_sample(vol, doc_id, stage, rnd, to_stage, user_id, reason, gen, init,
             return out
     except _Rollback:
         return None
+    except _Busy as e:
+        return {"busy": e.args[0]}
+
+
+class _Busy(Exception):
+    """철 전체 되돌림 때 다른 문서의 검사가 진행 중 (검사 중 문서 수) — reject_sample 트랜잭션을 되돌린다"""
 
 
 def confirm_sample(vol, doc_id, stage, rnd, user_id, fixed, gen):

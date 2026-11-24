@@ -610,7 +610,7 @@ def test_sample_reject_volume_rollback(main, monkeypatch):
     assert {d: x["reason"] for d, x in inspection_docs(c).items()} == {"d01": "flagged", "d02": "sample",
                                                                        "d03": "sample"}
     # 표시 문서 반려: 그 문서만, 오류 건수 0 → 재작업 뒤 다시 검사해 확정
-    assert sreject(c, "q", "d01", "가상 사유: 표시 칸").json()["errors"] == 0
+    assert sreject(c, "q2", "d01", "가상 사유: 표시 칸").json()["errors"] == 0
     assert approve(c, "w", "d01", "entry").status_code == 200
     assert c.post("/inspection/v1/d01", headers=h("q2"), json={}).status_code == 200
     assert where(c)["d01"]["confirmed"]
@@ -618,6 +618,16 @@ def test_sample_reject_volume_rollback(main, monkeypatch):
     r = sreject(c, "q", "d02", "가상 사유: 표본 1").json()
     assert (r["errors"], r["volume"], r["moved"]) == (1, False, 0)
     assert where(c)["d03"]["stage"] == "inspect" and where(c)["d01"]["confirmed"]
+    # 표본 오류 2건 = 기준인데 다른 문서가 검사 중이면 되돌리지 않고 409 (아무것도 안 씀) — 차지를 풀면 된다
+    assert store.claim_inspection("v1", "d01", 4) is False  # 끝난 검사는 차지 못 함 (시험 준비 확인)
+    with store.pool.connection() as conn:
+        conn.execute("UPDATE inspection SET inspected_by = 4, inspected_at = now(), fixed_fields = NULL "
+                     "WHERE vol = 'v1' AND doc_id = 'd01'")
+    r = sreject(c, "q", "d03", "가상 사유: 표본 2")
+    assert r.status_code == 409 and "검사 중" in r.json()["detail"]
+    assert where(c)["d03"]["stage"] == "inspect" and inspection_docs(c)["d03"]["rejects"] == 0
+    with store.pool.connection() as conn:
+        conn.execute("UPDATE inspection SET fixed_fields = '{}' WHERE vol = 'v1' AND doc_id = 'd01'")
     # 표본 오류 2건 = 기준 → 철 전체: 확정된 d01도 입력으로, 이미 입력에 있는 d02는 그대로
     r = sreject(c, "q", "d03", "가상 사유: 표본 2").json()
     assert (r["errors"], r["volume"], r["moved"]) == (2, True, 1)
@@ -630,12 +640,14 @@ def test_sample_reject_volume_rollback(main, monkeypatch):
     assert unconfirmed(c) == 3
     assert c.get("/documents/v1/d01/stages", headers=h("v")).json()[-1] | {"ts": None} == {
         "ts": None, "stage": "inspect", "round": 2, "action": "reject", "to_stage": "entry", "reason": w["d01"]["last_reason"],
-        "fixed_fields": None, "username": "q", "name": None}
+        "fixed_fields": None, "username": None, "name": None}  # 철 전체 처리 — 사람은 감사 로그에
     log = next(r for r in store.audit_log() if r["action"] == "inspect_reject" and r["result"] == "ok")
     assert (log["doc_id"], log["info"]["volume"], log["info"]["errors"], log["info"]["moved"]) == ("d03", True, 2, 1)
 
-    # 재작업 → 새 검사 목록 → 끝까지 (오류 건수는 새 목록에서 다시 센다)
-    for d in ("d01", "d02", "d03"):
+    # 재작업 → 새 검사 목록 → 끝까지 (오류 건수는 새 목록에서 다시 센다).
+    # 반려한 q는 손대지 않은 d01(함께 되돌려졌을 뿐)의 입력을 맡을 수 있다 — 철 전체 기록은 q의 단계로 세지 않는다
+    assert approve(c, "q", "d01", "entry").status_code == 200
+    for d in ("d02", "d03"):
         assert approve(c, "w", d, "entry").status_code == 200
     assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
     assert all(x["rejects"] == 0 for x in inspection_docs(c).values())

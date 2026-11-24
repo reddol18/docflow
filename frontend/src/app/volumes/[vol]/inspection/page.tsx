@@ -197,7 +197,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
       drop(d.doc_id);
       setNote(
         r.volume
-          ? `${d.doc_id} 반려 — 표본 오류 ${r.errors}건으로 철 전체(${r.moved + 1}건)를 ${stageLabel(r.to)}(으)로 되돌림. 검사 목록은 새로 만듭니다`
+          ? `${d.doc_id} 반려 — 표본 오류 ${r.errors}건으로 철 전체를 ${stageLabel(r.to)}(으)로 되돌림 (함께 되돌린 문서 ${r.moved}건). 검사 목록은 새로 만듭니다`
           : `${d.doc_id} 반려 — ${stageLabel(r.to)}(으)로 돌아감 (표본 오류 ${r.errors}건)`,
       );
       reload();

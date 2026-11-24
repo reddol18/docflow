@@ -1229,7 +1229,7 @@ def inspect_reject(vol: str, doc_id: str, body: StageRejectIn, user: SampleUser)
         reason = clean_reason(body.reason)
         if not reason:
             raise HTTPException(422, "반려 사유를 적어야 함")
-        docs = [d["doc_id"] for d in _done_docs(vol)]
+        docs = _done_docs(vol)
         row = store.inspection_row(vol, doc_id)
         if not row:
             raise HTTPException(404, "검사 목록에 없는 문서")
@@ -1247,13 +1247,16 @@ def inspect_reject(vol: str, doc_id: str, body: StageRejectIn, user: SampleUser)
             raise HTTPException(409, "이미 검사함" if row["fixed_fields"] is not None else "누가 검사 중인 문서")
         volume = None
         if SAMPLE["sample_error"] == "volume":
-            volume = {"at": SAMPLE["volume_at"], "doc_ids": docs, "back": _volume_back(),
+            volume = {"at": SAMPLE["volume_at"], "doc_ids": [d["doc_id"] for d in docs], "back": _volume_back(),
                       "reason": f"철 전체 되돌림: 표본 오류 {SAMPLE['volume_at']}건 이상"}
         rnd, to = pos["round"], SAMPLE["reject_to"]
         out = store.reject_sample(vol, doc_id, SAMPLE["name"], rnd, to, user.id, reason, gen,
                                   workflow.initial(WORKFLOW), volume)
         if out is None:
             raise HTTPException(409, "철을 다시 돌렸거나 문서의 단계·검사 목록이 바뀜")
+        if "busy" in out:
+            raise HTTPException(409, f"이 반려로 철 전체를 되돌려야 하는데 다른 문서 {out['busy']}건이 검사 중 — "
+                                     "그 검사가 끝나거나 차지를 푼 뒤 다시 반려")
         info.update(to=to, round=rnd + 1, reason_chars=len(reason), sample_error=SAMPLE["sample_error"],
                     errors=out["errors"], volume=out["volume"], moved=out["moved"])
         if out["volume"]:
