@@ -68,7 +68,20 @@ def _flow(*stages, **top):
            {"name": "sv", "role": "admin"}), "앞 단계"),  # 뒤 단계로는 반려 못 함
     (_flow({"name": "qc", "role": "inspector", "reject": True, "reject_to": "qc"}), "앞 단계"),  # 자기 자신도 안 됨
     (_flow({"name": "s", "role": "inspector", "select": "sample"}, {"name": "sv", "role": "admin"}), "마지막"),
-    (_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True}), "반려"),
+    # 표본 오류 처리 (https://github.com/reddol18/docflow/issues/94): 반려하는 sample 단계에만, volume이면 기준 건수 필수
+    (_flow({"name": "s", "role": "inspector", "select": "sample", "sample_error": "document"}), "반려하는 sample"),
+    (_flow({"name": "qc", "role": "inspector", "reject": True, "sample_error": "volume", "volume_at": 2}),
+     "반려하는 sample"),
+    (_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True, "sample_error": "all"}),
+     "sample_error는"),
+    (_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True, "sample_error": "volume"}),
+     "volume_at"),
+    (_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True, "sample_error": "volume",
+            "volume_at": 0}), "volume_at"),
+    (_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True, "sample_error": "volume",
+            "volume_at": True}), "volume_at"),
+    (_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True, "volume_at": 2}),
+     "volume일 때만"),
     (_flow({"name": "qc", "role": "inspector", "label": ""}), "label"),
     (_flow(distinct_actors="no"), "true/false"),
 ])
@@ -83,6 +96,25 @@ def test_on_index_then_full_stage_not_editable_by_entry_path():
                                     {"name": "qc", "role": "inspector", "reject": True}]})
     assert workflow.initial(wf) == "qc" and workflow.editable_positions(wf) == {"entry"}
     assert workflow.actionable(wf, "qc") and not workflow.actionable(wf, workflow.CONFIRMED)
+
+
+def test_sample_stage_reject_settings():
+    """표본 단계 반려 (https://github.com/reddol18/docflow/issues/94): 새 항목이 없으면 지금처럼 반려 없음,
+    reject: true면 기본 처리는 그 문서만 재작업(document), volume이면 기준 건수와 함께. 화면용 흐름에도 싣는다"""
+    default = workflow.load(workflow.DEFAULT)
+    s = workflow.sample_stage(default)
+    assert (s["reject"], s["sample_error"], s["volume_at"]) == (False, None, None)
+    assert not workflow.sample_rejects(default) and "sample_error" not in workflow.public(default)["stages"][1]
+    doc = workflow.parse(_flow({"name": "s", "role": "inspector", "select": "sample", "reject": True}))
+    s = workflow.sample_stage(doc)
+    assert (s["reject"], s["reject_to"], s["sample_error"], s["volume_at"]) == (True, "entry", "document", None)
+    assert workflow.sample_rejects(doc) and not workflow.actionable(doc, "s")  # 반려도 /inspection 경로
+    vol = workflow.load(workflow.DIR / "sample_rework.yaml")
+    s = workflow.sample_stage(vol)
+    assert (s["reject_to"], s["sample_error"], s["volume_at"]) == ("entry", "volume", 2)
+    assert workflow.initial(vol) == "inspect"  # 입력 on_index — 기본 흐름과 같다
+    pub = workflow.public(vol)["stages"][1]
+    assert (pub["reject"], pub["sample_error"], pub["volume_at"], pub["actions"]) == (True, "volume", 2, False)
 
 
 def test_reject_to_defaults_to_previous_stage():

@@ -14,6 +14,8 @@
   POST  /volumes/{vol}/inspection      검사 목록 만들기 (표시 문서 전부 + 표본 + 100% 검수 칸) — 검사자
   GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부·막힌 까닭 block·차지 풀기 can_release)
   POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
+  POST  /inspection/{vol}/{doc_id}/reject   표본 단계 반려 (사유 필수, 흐름 설정 reject: true일 때만) → 그 문서만 또는
+                                            표본 오류가 기준 건수 이상이면 철 전체를 앞 단계로 (설정 sample_error)
   POST  /inspection/{vol}/{doc_id}/release  끝나지 않은 검사 차지 풀기 — 관리자·본인은 바로, 남의 차지는 INSPECT_CLAIM_STALE_MIN분 뒤
   GET   /workflow                      검토 흐름 설정 (단계·맡는 역할·전수/표본·반려 규칙 — app/workflows/*.yaml)
   GET   /volumes/{vol}/workflow        문서마다 지금 단계·차례(재검수)·반려 사유·내가 승인/반려할 수 있나
@@ -969,6 +971,8 @@ def inspection_view(vol: str, user: Viewer):
         out.append({**r, "fields": d.get("fields"), "flags": d.get("flags"),
                     "check_fields": _check_fields(d, r["reason"], plan["fields100"]),
                     "can_inspect": block is None, "block": block,
+                    # 반려(사유 필수)도 검사와 같은 조건 — 흐름 설정에서 표본 단계가 reject: true일 때만
+                    "can_reject": block is None and SAMPLE["reject"],
                     "can_release": block == "in_progress" and release is None, "release_denied": release,
                     "releasable_at": r["inspected_at"] + dt.timedelta(minutes=CLAIM_STALE_MIN)
                     if release == "recent" else None})
@@ -995,7 +999,7 @@ def _inspect_block(row, inspector, user, whole, mine, stage):
     inspected 이미 검사함 / in_progress 누가 차지해 검사 중(아직 안 끝남) / role 검사 역할 아님 /
     user 사용자를 알 수 없음(인증 끈 개발 모드 — POST가 늘 403) / submitted 이 철의 검토 제출자 /
     entered 이 문서를 입력 단계에서 고침 / other_stage 같은 문서의 다른 검수 단계를 맡음 /
-    stage 아직 검사 단계에 오지 않음 (POST /inspection과 같은 규칙)"""
+    stage 아직 검사 단계에 오지 않음 (POST /inspection과 같은 규칙) / rejected 표본 단계에서 반려돼 재작업 중"""
     if row["inspected_at"] is not None:
         return "inspected" if row["fixed_fields"] is not None else "in_progress"
     if not inspector:
@@ -1005,7 +1009,8 @@ def _inspect_block(row, inspector, user, whole, mine, stage):
     if mine:
         return "submitted" if whole else "entered" if ENTRY["name"] in mine else "other_stage"
     if stage != SAMPLE["name"]:
-        return "stage"
+        # 반려돼 앞 단계에서 재작업 중 (https://github.com/reddol18/docflow/issues/94) — 다시 올라오면 다시 검사한다
+        return "rejected" if row.get("rejects") else "stage"
     return None
 
 
@@ -1196,6 +1201,66 @@ def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
             raise HTTPException(409, "철을 다시 돌렸거나 문서의 단계가 바뀜")
         info.update(to=to, round=rnd + 1, reason_chars=len(reason))
     return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd + 1}
+
+
+def _volume_back():
+    """철 전체 되돌림(sample_error: volume)에서 함께 되돌릴 위치: reject_to보다 뒤의 단계(표본 단계 포함)와 확정.
+    reject_to와 그 앞에 있는 문서는 이미 앞 단계에 있으므로 그대로 둔다"""
+    to = workflow.stage(WORKFLOW, SAMPLE["reject_to"])["index"]
+    return [s["name"] for s in WORKFLOW["stages"] if s["index"] > to] + [CONFIRMED]
+
+
+@app.post("/inspection/{vol}/{doc_id}/reject")
+@audit_as("inspect_reject")
+def inspect_reject(vol: str, doc_id: str, body: StageRejectIn, user: SampleUser):
+    """표본 단계 반려 (https://github.com/reddol18/docflow/issues/94) — 흐름 설정에서 표본 단계가 reject: true일 때만.
+    검사자는 오류 문서를 사유(필수)와 함께 반려만 하고, 처리는 설정(sample_error)이 정한다:
+      document  그 문서만 reject_to로, 차례 +1. 다시 올라오면 같은 검사 목록 행을 다시 검사한다 (같은 검사자 또는 다른 검사자)
+      volume    위와 같고, 반려된 표본 문서 수가 volume_at 이상이 되면 철의 다른 문서(표본 단계·확정·그 사이 단계)도 모두
+                reject_to로 되돌리고 검사 목록을 지운다 — 돌아온 철은 검사 목록을 새로 만들어 새 표본으로 검사한다
+    검사 경로와 같은 확인(검사 목록에 있음·표본 단계에 와 있음·차지 없음·작업자 ≠ 검수자)을 문서 잠금 안에서 한다.
+    사유는 stage_log에, 감사 로그에는 단계·차례·사유 길이·오류 건수·철 전체 되돌림 여부만"""
+    with audited(user, "inspect_reject", vol, doc_id, stage=body.stage) as info, store.doc_lock(vol, doc_id):
+        _need_sample()
+        if not SAMPLE["reject"]:
+            raise HTTPException(409, "이 흐름의 표본 단계는 반려할 수 없음")
+        if body.stage != SAMPLE["name"]:
+            raise HTTPException(409, "표본 단계 이름이 다름")
+        reason = clean_reason(body.reason)
+        if not reason:
+            raise HTTPException(422, "반려 사유를 적어야 함")
+        docs = [d["doc_id"] for d in _done_docs(vol)]
+        row = store.inspection_row(vol, doc_id)
+        if not row:
+            raise HTTPException(404, "검사 목록에 없는 문서")
+        if user.id is None:
+            raise HTTPException(403, "사용자를 알 수 없어 작업자 ≠ 검수자를 확인할 수 없음")
+        if WORKFLOW["distinct_actors"]:
+            other = other_stages(*acted_stages(vol, user), doc_id, SAMPLE["name"])
+            if other:
+                raise HTTPException(403, f"같은 문서의 다른 단계({', '.join(sorted(other))})를 맡은 사람은 반려할 수 없음")
+        gen = store.current_gen(vol)
+        pos = positions(vol, [doc_id])[doc_id]
+        if pos["stage"] != SAMPLE["name"]:
+            raise HTTPException(409, "아직 검사 단계에 오지 않은 문서")
+        if row["inspected_at"] is not None:
+            raise HTTPException(409, "이미 검사함" if row["fixed_fields"] is not None else "누가 검사 중인 문서")
+        volume = None
+        if SAMPLE["sample_error"] == "volume":
+            volume = {"at": SAMPLE["volume_at"], "doc_ids": docs, "back": _volume_back(),
+                      "reason": f"철 전체 되돌림: 표본 오류 {SAMPLE['volume_at']}건 이상"}
+        rnd, to = pos["round"], SAMPLE["reject_to"]
+        out = store.reject_sample(vol, doc_id, SAMPLE["name"], rnd, to, user.id, reason, gen,
+                                  workflow.initial(WORKFLOW), volume)
+        if out is None:
+            raise HTTPException(409, "철을 다시 돌렸거나 문서의 단계·검사 목록이 바뀜")
+        info.update(to=to, round=rnd + 1, reason_chars=len(reason), sample_error=SAMPLE["sample_error"],
+                    errors=out["errors"], volume=out["volume"], moved=out["moved"])
+        if out["volume"]:
+            store.event(vol, "inspection", "volume_reject", None, user=user.username, errors=out["errors"],
+                        moved=out["moved"])
+    return {"doc_id": doc_id, "stage": SAMPLE["name"], "to": to, "round": rnd + 1, "errors": out["errors"],
+            "volume": out["volume"], "moved": out["moved"]}
 
 
 @app.get("/documents/{vol}/{doc_id}/stages")

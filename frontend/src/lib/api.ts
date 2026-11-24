@@ -158,6 +158,10 @@ export type WorkflowStage = {
   reject_to: string | null;
   submit: "manual" | "on_index" | null;
   actions: boolean; // /workflow 경로로 승인·반려하는 단계 (표본 검사 단계는 /inspection)
+  // 반려하는 표본 단계만 (https://github.com/reddol18/docflow/issues/94): document 그 문서만 재작업 /
+  // volume 표본 오류가 volume_at건 이상이면 철 전체를 reject_to로
+  sample_error?: "document" | "volume";
+  volume_at?: number | null;
 };
 export type Workflow = {
   name: string;
@@ -182,9 +186,12 @@ export type DocStage = {
   can_reject: boolean;
 };
 export type VolumeWorkflow = { workflow: Workflow; ready: boolean; counts: Record<string, number>; docs: DocStage[] };
-// 단계 승인·반려를 이 화면에서 하는 흐름인가 (기본 흐름 — 입력은 색인으로 끝나고 검사는 표본 — 이면 화면은 지금 그대로)
+// 단계 승인·반려를 이 화면에서 하는 흐름인가 (기본 흐름 — 입력은 색인으로 끝나고 검사는 표본 — 이면 화면은 지금 그대로).
+// 표본 단계가 반려하면 돌아온 문서를 입력에서 다시 넘겨야 하므로 단계 화면을 쓴다 (https://github.com/reddol18/docflow/issues/94)
 export const hasStageActions = (wf: Workflow | null | undefined) =>
-  !!wf && (wf.stages.some((s) => s.kind === "review" && s.actions) || wf.stages[0]?.submit === "manual");
+  !!wf &&
+  (wf.stages.some((s) => s.kind === "review" && (s.actions || (s.select === "sample" && s.reject))) ||
+    wf.stages[0]?.submit === "manual");
 
 // 표본 검사 (GET/POST /volumes/{vol}/inspection, POST /inspection/{vol}/{doc_id} — https://github.com/reddol18/docflow/issues/66)
 export type InspectionReason = "flagged" | "sample" | "field100";
@@ -197,7 +204,8 @@ export type InspectBlock =
   | "submitted"
   | "entered"
   | "other_stage"
-  | "stage";
+  | "stage"
+  | "rejected"; // 표본 단계에서 반려돼 앞 단계에서 재작업 중 — 다시 올라오면 다시 검사
 export type InspectionPlan = {
   vol: string;
   rate: number;
@@ -217,6 +225,8 @@ export type InspectionDoc = {
   flags: Partial<Record<string, string[]>> | null;
   check_fields: string[];
   can_inspect: boolean;
+  can_reject: boolean; // 반려(사유 필수) — 흐름 설정에서 표본 단계가 reject: true이고 검사할 수 있을 때
+  rejects: number; // 이 검사 목록에서 반려된 횟수
   block: InspectBlock | null;
   // 끝나지 않은 검사 차지('검사 중')를 내가 풀 수 있나 (서버 main._release_denied — https://github.com/reddol18/docflow/issues/100)
   can_release: boolean;
@@ -355,6 +365,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fields }),
     }),
+  // 표본 단계 반려 (사유 필수, https://github.com/reddol18/docflow/issues/94). 처리(그 문서만·철 전체)는 흐름 설정이 정한다
+  rejectInspection: (vol: string, docId: string, stage: string, reason: string) =>
+    call<{ to: string; round: number; errors: number; volume: boolean; moved: number }>(
+      `/inspection/${enc(vol)}/${enc(docId)}/reject`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage, reason }) },
+    ),
   // 끝나지 않은 검사 차지 풀기 — 권한(관리자·본인·시간 지난 남의 차지)은 서버가 본다
   releaseInspection: (vol: string, docId: string) =>
     call<{ doc_id: string; released: boolean }>(`/inspection/${enc(vol)}/${enc(docId)}/release`, { method: "POST" }),

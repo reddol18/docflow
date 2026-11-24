@@ -50,6 +50,8 @@ function blockText(b: InspectBlock, d: InspectionDoc, role: string) {
       return "같은 문서의 다른 검수 단계를 맡은 사람은 검사할 수 없음";
     case "stage":
       return "아직 검사 단계에 오지 않은 문서";
+    case "rejected":
+      return "반려돼 앞 단계에서 재작업 중 — 다시 올라오면 다시 검사합니다";
   }
 }
 
@@ -174,6 +176,30 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
       // 다음 남은 문서로 — 내가 검사할 수 있는 것만 (막힌 문서로 넘어가지 않게)
       const next = nextAfter(shown, d.doc_id, (x) => !isDone(x) && x.can_inspect);
       setSel(next?.doc_id ?? (onlyLeft ? null : d.doc_id));
+      reload();
+    } catch (e) {
+      setNote(`실패: ${errMsg(e)}`);
+      reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 표본 단계 반려 (https://github.com/reddol18/docflow/issues/94) — 사유 필수. 그 문서만 돌릴지 철 전체를 돌릴지는 흐름 설정
+  const rejectDoc = async (d: InspectionDoc) => {
+    if (!stage) return;
+    const reason = window.prompt(`${d.doc_id} 반려 사유 (필수)`)?.trim();
+    if (!reason) return;
+    setBusy(true);
+    setNote(null);
+    try {
+      const r = await api.rejectInspection(vol, d.doc_id, stage.name, reason);
+      drop(d.doc_id);
+      setNote(
+        r.volume
+          ? `${d.doc_id} 반려 — 표본 오류 ${r.errors}건으로 철 전체(${r.moved + 1}건)를 ${stageLabel(r.to)}(으)로 되돌림. 검사 목록은 새로 만듭니다`
+          : `${d.doc_id} 반려 — ${stageLabel(r.to)}(으)로 돌아감 (표본 오류 ${r.errors}건)`,
+      );
       reload();
     } catch (e) {
       setNote(`실패: ${errMsg(e)}`);
@@ -445,6 +471,20 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                         >
                           고쳐서 저장{dirty ? ` (${dirty}칸)` : ""}
                         </button>
+                        {cur.can_reject && (
+                          <button
+                            onClick={() => rejectDoc(cur)}
+                            disabled={busy || dirty > 0}
+                            title={
+                              stage?.sample_error === "volume"
+                                ? `표본 오류가 ${stage.volume_at}건 이상이면 철 전체를 되돌립니다`
+                                : "이 문서만 앞 단계로 돌려 재작업합니다"
+                            }
+                            className="rounded-md border border-rose-300 bg-white px-4 py-2 text-sm font-medium text-rose-700 disabled:opacity-30"
+                          >
+                            반려
+                          </button>
+                        )}
                       </div>
                     ) : (
                       cur.block && (

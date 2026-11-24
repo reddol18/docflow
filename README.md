@@ -179,7 +179,8 @@ OCR 텍스트·색인 값에 심어진 문장이 추출과 검색 답변을 조�
 
 검토 흐름(단계 수·이름·맡는 역할·전수/표본·반려 규칙)도 YAML(`app/workflows/`)이 정한다. 쓰는 파일은 `WORKFLOW=경로`, 없으면 `default.yaml` — 지금까지의 입력(reviewer, 철 검토·색인 뒤 수정) → 표본 검사(inspector, `/volumes/{vol}/inspection`) 2단계와 동작·API·화면이 같다. 틀리면 앱이 시작하지 않는다. 항목은 `app/workflow.py` 머리말.
 
-- 예시: `three_stage.yaml`(작업자 → 품질관리자 → 감독관, 감독관은 지금 역할 체계에서 admin), `register_approve.yaml`(가등록 → 승인 → 자료정리 → 등록).
+- 예시: `three_stage.yaml`(작업자 → 품질관리자 → 감독관, 감독관은 지금 역할 체계에서 admin), `register_approve.yaml`(가등록 → 승인 → 자료정리 → 등록), `sample_rework.yaml`(기본 흐름 + 표본 반려, 표본 오류 2건이면 철 전체).
+- 표본 단계 반려 (https://github.com/reddol18/docflow/issues/94): 표본 단계에 `reject: true`·`reject_to`를 두면 검사자가 검사 탭에서 **반려**(사유 필수, `POST /inspection/{vol}/{doc_id}/reject`)할 수 있다. 처리는 설정 `sample_error`가 정한다 — `document`(기본) 그 문서만 재작업, `volume` 반려된 무작위 표본이 `volume_at`건 이상이면 철 전체(확정 문서 포함)를 `reject_to`로 되돌리고 검사 목록을 지운다(새로 만든다). 새 항목이 없으면 지금처럼 반려 불가(409). 감사 로그 `inspect_reject`. 규칙은 `docs/design.md` 2장.
 - 단계 승인 `POST /workflow/{vol}/{doc_id}/approve`(고친 칸 함께, 마지막 단계면 확정), 반려 `POST /workflow/{vol}/{doc_id}/reject`(사유 필수) → 그 문서만 `reject_to` 단계로 돌아가고 차례(`round`)가 늘어 다시 올라오면 재검수. 서버가 단계 역할·문서의 지금 단계(건너뛰기·확정 문서)·작업자 ≠ 검수자(`distinct_actors`)를 확인한다. 확인과 쓰기는 문서 잠금(`store.doc_lock`: 프로세스 안 잠금 + Postgres advisory lock) 안에서 한다 — 입력 수정·검사·승인·반려 모두.
 - 입력 경로(`PATCH /documents`)로 고칠 수 있는 것은 입력 단계에 있는 문서뿐이다. 예외는 입력 `on_index` 바로 다음이 표본 단계인 흐름(기본 흐름): 검사 전·검사 목록 밖 문서를 지금처럼 고친다. 전수 검수 단계에 있는 문서는 검수자가 승인하며 고치거나 반려로 입력에 돌아와야 고친다. 화면은 `/volumes/{vol}/workflow`의 `editable`로 같은 규칙을 쓴다.
 - 문서 상태(`status`): `confirmed` 확정, `excluded` 표본 단계의 검사 목록 밖(검사 제외 — 출력 전 검증에서는 미확정이 아니고 입력 경로로 고칠 수 있다), `pending` 차례 기다림.

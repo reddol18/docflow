@@ -243,6 +243,8 @@ CREATE TABLE IF NOT EXISTS inspection (
   vol text NOT NULL, doc_id text NOT NULL, reason text NOT NULL,
   inspected_by bigint, inspected_at timestamptz, fixed_fields text[],
   PRIMARY KEY (vol, doc_id));
+ALTER TABLE inspection ADD COLUMN IF NOT EXISTS rejects int NOT NULL DEFAULT 0;
+ALTER TABLE inspection ADD COLUMN IF NOT EXISTS rejected_at timestamptz;
 CREATE TABLE IF NOT EXISTS review_submitters (
   vol text NOT NULL, user_id bigint NOT NULL, ts timestamptz DEFAULT now(), PRIMARY KEY (vol, user_id));
 CREATE TABLE IF NOT EXISTS exports (
@@ -785,7 +787,7 @@ def add_review_submitter(vol, user_id):
 def inspection_rows(vol):
     """검사 목록 행. owner_id·claim_age(차지한 뒤 지난 초, DB 시계)는 차지 풀기 판단용 — 화면에 내보내지 않는다"""
     with pool.connection() as c:
-        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, u.username AS inspected_by, "
+        return c.execute("SELECT i.doc_id, i.reason, i.inspected_at, i.fixed_fields, i.rejects, u.username AS inspected_by, "
                          "i.inspected_by AS owner_id, extract(epoch FROM now() - i.inspected_at)::float AS claim_age "
                          "FROM inspection i LEFT JOIN users u ON u.id = i.inspected_by WHERE i.vol = %s ORDER BY i.doc_id",
                          (vol,)).fetchall()
@@ -866,13 +868,17 @@ def release_claim(vol, doc_id, inspected_at):
 
 def inspection_stats(start=None, end=None):
     """철별 표본 검사 결과: 표본 수, 검사 끝난 표본 n, 그중 고친 k, 추정 오류율 k/n.
-    start·end(시각)를 주면 그 기간에 검사한 것만 센다 (리포트 기간과 맞춤). 끝나지 않은(차지만 한) 검사는 세지 않는다"""
-    done = "i.reason = 'sample' AND i.fixed_fields IS NOT NULL"
-    period = " AND i.inspected_at >= %(start)s AND i.inspected_at < %(end)s" if start and end else ""
+    start·end(시각)를 주면 그 기간에 검사한 것만 센다 (리포트 기간과 맞춤). 끝나지 않은(차지만 한) 검사는 세지 않는다.
+    반려된 표본(https://github.com/reddol18/docflow/issues/94)은 다시 검사하기 전에도 검사해 오류를 찾은 것으로 센다
+    (기간은 검사 시각, 아직 다시 검사하지 않았으면 반려 시각)"""
+    done = "i.reason = 'sample' AND (i.fixed_fields IS NOT NULL OR i.rejects > 0)"
+    at = "coalesce(i.inspected_at, i.rejected_at)"
+    period = f" AND {at} >= %(start)s AND {at} < %(end)s" if start and end else ""
     with pool.connection() as c:
         rows = c.execute("SELECT p.vol, p.sample, p.rate::float AS rate, "  # noqa: S608 — 상수 조각만 끼움
                          f"count(*) FILTER (WHERE {done}{period}) AS inspected, "
-                         f"count(*) FILTER (WHERE {done}{period} AND cardinality(i.fixed_fields) > 0) AS fixed "
+                         f"count(*) FILTER (WHERE {done}{period} AND (cardinality(i.fixed_fields) > 0 OR i.rejects > 0)) "
+                         "AS fixed "
                          "FROM inspection_plan p LEFT JOIN inspection i ON i.vol = p.vol GROUP BY p.vol, p.sample, p.rate "
                          "ORDER BY p.vol", {"start": start, "end": end}).fetchall()
     for r in rows:
@@ -1048,28 +1054,81 @@ def move_stage(vol, doc_id, stage, rnd, action, to_stage, to_round, user_id, rea
         with pool.connection() as c, c.transaction():
             if gen is not None and not _same_gen(c, vol, gen):
                 return False
-            if init is not None:
-                c.execute("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                          (vol, doc_id, init))
-            n = c.execute(
-                "UPDATE doc_stage SET stage = %(to)s, round = %(tr)s, "
-                "last_reason = CASE WHEN %(rej)s THEN %(why)s WHEN rejected_from = %(s)s OR %(to)s = %(fin)s THEN NULL "
-                "ELSE last_reason END, "
-                "rejected_from = CASE WHEN %(rej)s THEN %(s)s WHEN rejected_from = %(s)s OR %(to)s = %(fin)s THEN NULL "
-                "ELSE rejected_from END, updated_at = now() "
-                "WHERE vol = %(v)s AND doc_id = %(d)s AND stage = %(s)s AND round = %(r)s",
-                {"to": to_stage, "tr": to_round, "rej": action == "reject", "why": reason, "fin": CONFIRMED,
-                 "v": vol, "d": doc_id, "s": stage, "r": rnd}).rowcount
-            if n != 1:
+            if not _move_one(c, vol, doc_id, stage, rnd, action, to_stage, to_round, user_id, reason, fixed, init):
                 raise _Rollback  # 만든 처음 단계 행까지 되돌린다
-            add_stage_log(vol, doc_id, stage, rnd, action, to_stage, user_id, reason, fixed, conn=c)
     except _Rollback:
         return False
     return True
 
 
+def _move_one(c, vol, doc_id, stage, rnd, action, to_stage, to_round, user_id, reason, fixed, init, by=None):
+    """트랜잭션 안에서 문서 하나를 옮기고 기록한다 (move_stage·reject_sample이 함께 쓴다). 옮겼으면 True.
+    by: 처리한 단계 (기록·반려한 단계 칸) — 철 전체 되돌림에서 표본 단계가 다른 위치(확정 등)의 문서를 옮길 때. 기본은 stage"""
+    by = by or stage
+    if init is not None:
+        c.execute("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                  (vol, doc_id, init))
+    n = c.execute(
+        "UPDATE doc_stage SET stage = %(to)s, round = %(tr)s, "
+        "last_reason = CASE WHEN %(rej)s THEN %(why)s WHEN rejected_from = %(by)s OR %(to)s = %(fin)s THEN NULL "
+        "ELSE last_reason END, "
+        "rejected_from = CASE WHEN %(rej)s THEN %(by)s WHEN rejected_from = %(by)s OR %(to)s = %(fin)s THEN NULL "
+        "ELSE rejected_from END, updated_at = now() "
+        "WHERE vol = %(v)s AND doc_id = %(d)s AND stage = %(s)s AND round = %(r)s",
+        {"to": to_stage, "tr": to_round, "rej": action == "reject", "why": reason, "fin": CONFIRMED,
+         "v": vol, "d": doc_id, "s": stage, "by": by, "r": rnd}).rowcount
+    if n != 1:
+        return False
+    add_stage_log(vol, doc_id, by, rnd, action, to_stage, user_id, reason, fixed, conn=c)
+    return True
+
+
 class _Rollback(Exception):
-    """move_stage 트랜잭션을 되돌리는 신호"""
+    """move_stage·reject_sample 트랜잭션을 되돌리는 신호"""
+
+
+def reject_sample(vol, doc_id, stage, rnd, to_stage, user_id, reason, gen, init, volume=None):
+    """표본 단계 반려 (https://github.com/reddol18/docflow/issues/94) — 한 트랜잭션으로 (doc_lock 안에서 부른다):
+      1. 검사 목록 행에 반려를 센다 (inspection.rejects·rejected_at). 차지된(검사 중·끝난) 행이면 쓰지 않는다
+      2. 그 문서를 to_stage로, 차례 +1, 사유·반려한 단계를 문서에 (move_stage와 같은 규칙), stage_log에 reject
+      3. volume={"at": 기준 건수, "doc_ids": 철의 문서 id, "back": 되돌릴 위치 이름들, "reason": 기록 사유}를 주면 (다):
+         이 철 검사 목록의 반려된 무작위 표본 문서 수(reason=sample, 오류 건수)가 기준 이상일 때
+         back 위치(표본 단계·확정·그 사이 단계)에 있는 다른 문서도 모두 to_stage로 (차례 +1, stage_log에 reject와 기록 사유), 검사 목록을 지운다 — 돌아온 철은 새 표본으로
+    세대가 바뀌었거나(/run) 행·단계가 확인 때와 다르면 아무것도 쓰지 않고 None.
+    결과 {"errors": 오류 건수, "volume": 철 전체를 되돌렸나, "moved": 함께 되돌린 다른 문서 수}"""
+    try:
+        with pool.connection() as c, c.transaction():
+            if not _same_gen(c, vol, gen):
+                return None
+            if c.execute("UPDATE inspection SET rejects = rejects + 1, rejected_at = now() "
+                         "WHERE vol = %s AND doc_id = %s AND inspected_at IS NULL", (vol, doc_id)).rowcount != 1:
+                raise _Rollback
+            if not _move_one(c, vol, doc_id, stage, rnd, "reject", to_stage, rnd + 1, user_id, reason, None, init):
+                raise _Rollback
+            # 표본 오류 = 반려된 무작위 표본 문서 수 (reason=sample). 표시 문서·100% 검수 칸 문서의 반려는 그 문서만 되돌린다
+            # — 표본 밖 문서를 의심할 근거는 무작위 표본의 오류이므로
+            errors = c.execute("SELECT count(*) AS n FROM inspection WHERE vol = %s AND reason = 'sample' AND rejects > 0",
+                               (vol,)).fetchone()["n"]
+            out = {"errors": errors, "volume": False, "moved": 0}
+            if volume is None or errors < volume["at"]:
+                return out
+            others = [d for d in volume["doc_ids"] if d != doc_id]
+            if init is not None and others:  # 행이 없는 문서는 처음 단계 행부터 (위치는 그대로)
+                c.cursor().executemany("INSERT INTO doc_stage (vol, doc_id, stage) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                                       [(vol, d, init) for d in others])
+            rows = c.execute("SELECT doc_id, stage, round FROM doc_stage WHERE vol = %s AND doc_id = ANY(%s) "
+                             "AND stage = ANY(%s) ORDER BY doc_id FOR UPDATE",
+                             (vol, others, list(volume["back"]))).fetchall()
+            for r in rows:
+                if not _move_one(c, vol, r["doc_id"], r["stage"], r["round"], "reject", to_stage, r["round"] + 1,
+                                 user_id, volume["reason"], None, None, by=stage):
+                    raise _Rollback
+            c.execute("DELETE FROM inspection WHERE vol = %s", (vol,))
+            c.execute("DELETE FROM inspection_plan WHERE vol = %s", (vol,))
+            out.update(volume=True, moved=len(rows))
+            return out
+    except _Rollback:
+        return None
 
 
 def confirm_sample(vol, doc_id, stage, rnd, user_id, fixed, gen):

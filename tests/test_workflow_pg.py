@@ -508,3 +508,156 @@ def test_rerun_resets_stage_positions(main, monkeypatch):
     assert where(c, "q")["d02"]["can_approve"] is True
     assert approve(c, "q", "d02", "entry").status_code == 200
     assert approve(c, "q", "d02", "qc").status_code == 403  # 이번 세대 안에서는 여전히 작업자 ≠ 검수자
+
+
+# ---------- 표본 단계 반려 (https://github.com/reddol18/docflow/issues/94) ----------
+
+def sample_flow(**err):
+    """기본 흐름(입력 on_index → 표본 검사)에 표본 반려를 켠 흐름"""
+    return workflow.parse({"stages": [
+        {"name": "entry", "label": "입력", "role": "reviewer", "submit": "on_index"},
+        {"name": "inspect", "label": "검사", "role": "inspector", "select": "sample", "reject": True,
+         "reject_to": "entry", **err}]})
+
+
+def sreject(c, who, did, reason, stage="inspect"):
+    return c.post(f"/inspection/v1/{did}/reject", headers=h(who), json={"stage": stage, "reason": reason})
+
+
+def inspection_docs(c, who="q"):
+    return {d["doc_id"]: d for d in c.get("/volumes/v1/inspection", headers=h(who)).json()["docs"]}
+
+
+def test_sample_reject_off_by_default(main):
+    """설정에 새 항목이 없으면(기본 흐름) 지금처럼 표본 단계는 반려할 수 없다 — 409, 아무것도 바뀌지 않음"""
+    c = TestClient(main.app)
+    assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
+    assert all(d["can_reject"] is False for d in inspection_docs(c).values())
+    r = sreject(c, "q", "d02", "가상 사유")
+    assert r.status_code == 409 and "반려할 수 없음" in r.json()["detail"]
+    assert store.stage_rows("v1") == {} and c.get("/documents/v1/d02/stages", headers=h("v")).json() == []
+    assert any(r["action"] == "inspect_reject" and r["result"] == "rejected_409" for r in store.audit_log())
+
+
+def test_sample_reject_document_rework(main, monkeypatch):
+    """(가) sample_error: document — 그 문서만 입력으로 재작업, 다시 올라오면 같은 검사자가 다시 검사(작업자 ≠ 검수자 유지).
+    미확정 세기: 반려된 표본은 재검사 전까지 미확정이고 검사 목록이 끝나지 않아 검사 제외 문서도 미확정. 감사 로그·stage_log"""
+    use_flow(main, monkeypatch, sample_flow())
+    c = TestClient(main.app)
+    assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 0.5, "seed": 3}).status_code == 200
+    view = inspection_docs(c)
+    smp = next(d for d, x in view.items() if x["reason"] == "sample")
+    excluded = ({"d02", "d03"} - set(view)).pop()
+    assert view[smp]["can_reject"] is True and view[smp]["rejects"] == 0
+    assert c.post("/inspection/v1/d01", headers=h("q2"), json={}).status_code == 200  # 표시 문서 통과
+    assert where(c)[excluded]["status"] == "excluded" and unconfirmed(c) == 2  # 남은 표본 + 검사 제외
+
+    # 막기: 사유 필수, 역할(검사자), 단계 이름, 이미 검사한 문서, 목록 밖 문서
+    assert sreject(c, "q", smp, " \x07 ").status_code == 422
+    assert sreject(c, "w", smp, "가상 사유").status_code == 403
+    assert sreject(c, "q", smp, "가상 사유", stage="entry").status_code == 409
+    assert sreject(c, "q", "d01", "가상 사유").status_code == 409
+    assert sreject(c, "q", excluded, "가상 사유").status_code == 404
+
+    r = sreject(c, "q", smp, "가상 사유: 표본 제목 오기")
+    assert r.status_code == 200 and r.json() == {"doc_id": smp, "stage": "inspect", "to": "entry", "round": 2,
+                                                 "errors": 1, "volume": False, "moved": 0}
+    x = where(c)[smp]
+    assert (x["stage"], x["round"], x["status"], x["last_reason"], x["rejected_from"], x["editable"]) == (
+        "entry", 2, "pending", "가상 사유: 표본 제목 오기", "inspect", True)
+    assert where(c)["d01"]["status"] == "confirmed" and where(c)[excluded]["status"] == "excluded"  # 다른 문서는 그대로
+    v = inspection_docs(c)[smp]
+    assert (v["block"], v["can_inspect"], v["can_reject"], v["rejects"]) == ("rejected", False, False, 1)
+    assert c.post(f"/inspection/v1/{smp}", headers=h("q"), json={}).status_code == 409  # 돌아오기 전엔 검사 못 함
+    assert sreject(c, "q", smp, "가상 사유").status_code == 409
+    assert unconfirmed(c) == 2  # 반려된 표본(재작업 중) + 검사 제외(목록이 아직 안 끝남)
+
+    # 재작업: 반려한 검사자 q는 입력을 맡지 못하고, 작업자 w가 고쳐 넘긴다
+    assert approve(c, "q", smp, "entry").status_code == 403
+    assert c.patch(f"/documents/v1/{smp}", headers=h("q"), json={"title": "x"}).status_code == 403
+    assert c.patch(f"/documents/v1/{smp}", headers=h("w"), json={"title": "가상 고친 제목"}).status_code == 200
+    r = approve(c, "w", smp, "entry")
+    assert r.status_code == 200 and (r.json()["to"], r.json()["round"]) == ("inspect", 2)
+    # 재검사: 재작업한 w는 검사 못 함(교차검사), 같은 검사자 q가 다시 검사
+    assert inspection_docs(c, "w")[smp]["can_inspect"] is False
+    assert c.post(f"/inspection/v1/{smp}", headers=h("w"), json={}).status_code == 403
+    assert inspection_docs(c)[smp]["can_inspect"] is True
+    assert c.post(f"/inspection/v1/{smp}", headers=h("q"), json={}).status_code == 200
+    assert where(c)[smp]["confirmed"] and unconfirmed(c) == 0  # 목록이 끝나 검사 제외도 확정
+
+    hist = c.get(f"/documents/v1/{smp}/stages", headers=h("v")).json()
+    assert [(e["stage"], e["round"], e["action"], e["to_stage"], e["username"], e["reason"], e["fixed_fields"])
+            for e in hist] == [
+        ("inspect", 1, "reject", "entry", "q", "가상 사유: 표본 제목 오기", None),
+        ("entry", 2, "approve", "inspect", "w", None, ["title"]),
+        ("inspect", 2, "approve", workflow.CONFIRMED, "q", None, [])]
+    log = [r for r in reversed(store.audit_log()) if r["action"] == "inspect_reject" and r["result"] == "ok"]
+    assert [(r["doc_id"], r["info"]["to"], r["info"]["round"], r["info"]["sample_error"], r["info"]["errors"],
+             r["info"]["volume"]) for r in log] == [(smp, "entry", 2, "document", 1, False)]
+    assert log[0]["info"]["reason_chars"] == len("가상 사유: 표본 제목 오기") and "오기" not in str(log[0]["info"])
+    # 철별 추정 오류율: 반려된 표본은 다시 검사해 통과해도 오류를 찾은 표본으로 센다
+    st = next(r for r in store.inspection_stats() if r["vol"] == "v1")
+    assert (st["inspected"], st["fixed"]) == (1, 1)
+
+
+def test_sample_reject_volume_rollback(main, monkeypatch):
+    """(다) sample_error: volume, volume_at: 2 — 표본 오류가 2건이 되면 철 전체(확정 문서 포함)를 입력으로 되돌리고
+    검사 목록을 지운다. 표시 문서의 반려는 오류 건수에 들지 않는다. 돌아온 철은 새 검사 목록으로 끝까지"""
+    use_flow(main, monkeypatch, sample_flow(sample_error="volume", volume_at=2))
+    c = TestClient(main.app)
+    assert c.get("/workflow", headers=h("v")).json()["stages"][1]["volume_at"] == 2
+    assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
+    assert {d: x["reason"] for d, x in inspection_docs(c).items()} == {"d01": "flagged", "d02": "sample",
+                                                                       "d03": "sample"}
+    # 표시 문서 반려: 그 문서만, 오류 건수 0 → 재작업 뒤 다시 검사해 확정
+    assert sreject(c, "q", "d01", "가상 사유: 표시 칸").json()["errors"] == 0
+    assert approve(c, "w", "d01", "entry").status_code == 200
+    assert c.post("/inspection/v1/d01", headers=h("q2"), json={}).status_code == 200
+    assert where(c)["d01"]["confirmed"]
+    # 표본 오류 1건: 그 문서만
+    r = sreject(c, "q", "d02", "가상 사유: 표본 1").json()
+    assert (r["errors"], r["volume"], r["moved"]) == (1, False, 0)
+    assert where(c)["d03"]["stage"] == "inspect" and where(c)["d01"]["confirmed"]
+    # 표본 오류 2건 = 기준 → 철 전체: 확정된 d01도 입력으로, 이미 입력에 있는 d02는 그대로
+    r = sreject(c, "q", "d03", "가상 사유: 표본 2").json()
+    assert (r["errors"], r["volume"], r["moved"]) == (2, True, 1)
+    w = where(c)
+    assert {d: (x["stage"], x["round"], x["status"]) for d, x in w.items()} == {
+        "d01": ("entry", 3, "pending"), "d02": ("entry", 2, "pending"), "d03": ("entry", 2, "pending")}
+    assert w["d01"]["last_reason"].startswith("철 전체 되돌림") and w["d01"]["rejected_from"] == "inspect"
+    assert w["d03"]["last_reason"] == "가상 사유: 표본 2"
+    assert c.get("/volumes/v1/inspection", headers=h("q")).status_code == 404  # 검사 목록은 새로 만든다
+    assert unconfirmed(c) == 3
+    assert c.get("/documents/v1/d01/stages", headers=h("v")).json()[-1] | {"ts": None} == {
+        "ts": None, "stage": "inspect", "round": 2, "action": "reject", "to_stage": "entry", "reason": w["d01"]["last_reason"],
+        "fixed_fields": None, "username": "q", "name": None}
+    log = next(r for r in store.audit_log() if r["action"] == "inspect_reject" and r["result"] == "ok")
+    assert (log["doc_id"], log["info"]["volume"], log["info"]["errors"], log["info"]["moved"]) == ("d03", True, 2, 1)
+
+    # 재작업 → 새 검사 목록 → 끝까지 (오류 건수는 새 목록에서 다시 센다)
+    for d in ("d01", "d02", "d03"):
+        assert approve(c, "w", d, "entry").status_code == 200
+    assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
+    assert all(x["rejects"] == 0 for x in inspection_docs(c).values())
+    r = sreject(c, "q", "d02", "가상 사유: 다시 1").json()
+    assert (r["errors"], r["volume"]) == (1, False)
+    assert approve(c, "w", "d02", "entry").status_code == 200
+    for d in ("d01", "d02", "d03"):
+        assert c.post(f"/inspection/v1/{d}", headers=h("q2"), json={}).status_code == 200
+    assert unconfirmed(c) == 0
+
+
+def test_sample_reject_run_reset_is_409(main, monkeypatch):
+    """반려 확인 뒤 쓰기 전에 /run이 다시 돌리면(세대가 바뀜) 409이고 아무것도 쓰지 않는다"""
+    use_flow(main, monkeypatch, sample_flow(sample_error="volume", volume_at=1))
+    c = TestClient(main.app)
+    assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
+    real = store.reject_sample
+
+    def reset_then_reject(*a, **k):
+        store.reset_stages("v1")
+        return real(*a, **k)
+
+    monkeypatch.setattr(store, "reject_sample", reset_then_reject)
+    assert sreject(c, "q", "d02", "가상 사유").status_code == 409
+    assert store.stage_rows("v1") == {} and inspection_docs(c)["d02"]["rejects"] == 0
