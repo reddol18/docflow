@@ -292,7 +292,9 @@ OCR 텍스트·색인 값에 심어진 문장이 추출과 검색 답변을 조�
   (기준과 같은 검색 결과로 답만 바꿈 — 임베딩 호출 없음, 질의별 지연 `latency_ms`), Ragas 지표는 `eval/answer/judge.py --metrics faithfulness,answer_relevancy`
   (#21 심판·ko-2), 쌍별 승률은 `eval/answer/pairwise.py`(두 순서로 묻고 같은 쪽을 골라야 승, 아니면 무승부), 판정은
   `eval/promptfoo/answer_gate.py --cand <답변> <심판> ... --pair <쌍별>`이 `criteria.yaml` `answer:`로 낸다(종료 코드 0/1/2, 건당 비용·지연 열).
-  `answer:` 기준값은 사용자 결정 전이라 null이고, 쌍별 심판은 아직 사람과의 일치도를 재지 않았다.
+  `answer:` 기준값은 2026-11-24 사용자 결정값(충실도·적합도 −10%p, '모른다' 0%p, 회피 +10%p, 심판 오류 0). 쌍별 승률은 사람 확인 20쌍에서
+  사람이 17쌍을 비김으로 매겨 기준을 못 넘어 **참고값**(`win_rate_min: null`, 표에는 나옴) — 다시 재는 일은 https://github.com/reddol18/docflow/issues/158.
+  실측은 `docs/design.md` '검색 답변 — 모델 비교 행렬'.
 - **결과·개인정보:** 실제 문서 글자가 담긴 결과(`results.json`, 다시 조립한 문서, promptfoo 결과 DB)는 저장소 밖 `work/promptfoo/`에만 쓴다.
   promptfoo 공유·원격 생성·사용 통계·업데이트 확인은 끈다(`PROMPTFOO_DISABLE_*`, `--no-share`). 단, promptfoo 0.125.0은 사용 통계를 꺼도
   'telemetry disabled' 이벤트 한 번을 r.promptfoo.app으로 보낸다(문서 글자·결과는 없음).

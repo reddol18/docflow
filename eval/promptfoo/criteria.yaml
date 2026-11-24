@@ -25,8 +25,9 @@ answer:
   answer_relevancy_pass_drop_pp_max: 10.0   # 질문 적합도 통과율
   dont_know_drop_pp_max: 0.0                # 답 없는 질의에 '모른다'고 한 비율 — 조금이라도 떨어지면(하나라도 지어내면) 실패
   refusal_answerable_rise_pp_max: 10.0      # 답 있는 질의를 피한 비율이 이만큼 넘게 늘면 실패
-  # 기준과의 쌍별 승률(무승부 0.5)이 이보다 낮으면 실패 (후보값 0.4). 쌍별 심판(pairwise.py)은 아직 사람과의 일치도를
-  # 재지 않아 null(보지 않음) — eval/answer/pairwise_sheet.py·pairwise_agreement.py로 약 20쌍을 사람이 확인해 #21 기준
-  # (일치율 ≥ 80%·kappa ≥ 0.6, 쏠림 규칙)을 넘으면 켠다. 지시문을 한 번 고쳐도 못 넘으면 승률은 참고값으로만 둔다.
+  # 기준과의 쌍별 승률(무승부 0.5)이 이보다 낮으면 실패 (후보값 0.4). null = 참고값(표에만 나오고 판정에 안 씀).
+  # 2026-11-24 사람 확인 20쌍(pairwise_sheet.py·pairwise_agreement.py): 사람이 17쌍을 비김으로 매겨 비김 뺀 3쌍 일치율 33%·kappa 0.0
+  # — #21 기준(일치율 ≥ 80%·kappa ≥ 0.6) 미달. 사용자 결정으로 #22는 참고값으로 닫고, 비김 다루기·다시 재기는
+  # https://github.com/reddol18/docflow/issues/158. 그 기준을 넘으면 켠다.
   win_rate_min: null
   judge_error_max: 0                        # 심판이 채점하지 못한 지표·질의 수 (후보마다, 기준 포함)
