@@ -103,6 +103,10 @@ def check_same(cands):
         vals = {json.dumps(c[key]) for c in cands}
         if len(vals) > 1:
             raise InputError(f"후보마다 {what}가 다르다: " + ", ".join(f"{c['answers_file']}={str(c[key])[:40]}" for c in cands))
+    files = [c["answers_file"] for c in cands]  # 쌍별 결과는 파일 이름으로 후보를 찾는다
+    same = sorted({f for f in files if files.count(f) > 1})
+    if same:
+        raise InputError(f"답변 파일 이름이 같은 후보가 둘 이상 (폴더가 달라도 쌍별 결과를 구분 못 함): {same}")
     names = [(c["model"], c["prompt"]) for c in cands]
     dup = sorted({n for n in names if names.count(n) > 1})
     if dup:
@@ -120,6 +124,8 @@ def attach_pairs(cands, base, pair_paths):
             raise InputError(f"{Path(p).name}: 후보에 없는 답변 파일 ({fa}, {fb})")
         if not pw.get("complete"):
             raise InputError(f"{Path(p).name}: 쌍별 심판이 끝까지 돌지 않았다")
+        if pw.get("queries_sha256") != base["queries_sha256"]:
+            raise InputError(f"{Path(p).name}: 쌍별 질의 세트가 후보의 질의 세트와 다르다")
         if sorted(r["id"] for r in pw["rows"]) != base["ids"]:
             raise InputError(f"{Path(p).name}: 쌍별 질의가 심판 채점 질의와 다르다")
         s = pw["summary"]
@@ -132,7 +138,8 @@ def attach_pairs(cands, base, pair_paths):
                     raise InputError(f"{c['answers_file']}의 기준 대 쌍별 결과가 둘 이상")
                 c["win"], c["pair"] = s[f"win_rate_{side}"], {"wins": s[f"{side}_wins"], "ties": s["ties"],
                                                              "losses": s[f"{'b' if side == 'a' else 'a'}_wins"],
-                                                             "n": s["n"], "file": Path(p).name}
+                                                             "n": s["n"], "errors": s.get("errors", 0),
+                                                             "file": Path(p).name}
     return pairs
 
 
@@ -146,7 +153,7 @@ def judge(c, base, crit):
             return
         if cur is None or ref is None:
             why.append(f"{label} 값 없음 (판정 0건)")
-        elif ref - cur > lim:
+        elif round(ref - cur, 6) > lim:  # 부동소수 오차(0.14→0.04 = 10.000000000000002)로 경계값이 실패하지 않게
             why.append(f"{label} {ref:.1f}% → {cur:.1f}% (-{lim}%p 초과)")
 
     drop("faithfulness_pass_drop_pp_max", "근거 충실도 통과율", c["m"]["faithfulness"]["pass"], base["m"]["faithfulness"]["pass"])
@@ -157,11 +164,14 @@ def judge(c, base, crit):
     if lim is not None:
         if c["refusal_answerable"] is None or base["refusal_answerable"] is None:
             why.append("답 있는 질의 회피율 값 없음")
-        elif c["refusal_answerable"] - base["refusal_answerable"] > lim:
+        elif round(c["refusal_answerable"] - base["refusal_answerable"], 6) > lim:
             why.append(f"답 있는 질의 회피 {base['refusal_answerable']:.1f}% → {c['refusal_answerable']:.1f}% (+{lim}%p 초과)")
     lim = crit.get("win_rate_min")
     if lim is not None and c["win"] is not None and c["win"] < lim:
         why.append(f"기준 대비 승률 {c['win']:.2f} (< {lim})")
+    err_max = crit.get("judge_error_max")
+    if lim is not None and c["pair"] is not None and err_max is not None and c["pair"]["errors"] > err_max:
+        why.append(f"쌍별 심판 오류 {c['pair']['errors']}건 (> {err_max}) — 승률이 일부 쌍만으로 나옴")
     return why
 
 

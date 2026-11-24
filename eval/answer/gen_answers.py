@@ -29,8 +29,9 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
-EVAL = Path(__file__).resolve().parents[1]
+EVAL =Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EVAL))  # python -I: eval 폴더 (compare_common·embed_compare)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -79,13 +80,13 @@ def reuse_hits(prev_row, bodies):
     return hits
 
 
-def load_reuse(path, queries):
-    """--reuse-retrieval 파일 → {질의 id: 줄}. 질의 세트(해시·id)가 이번 것과 같아야 한다"""
+def load_reuse(path, queries, sel=None):
+    """--reuse-retrieval 파일 → {질의 id: 줄}. 질의 세트 해시는 전체(queries)로, 빠진 질의는 이번에 고른 것(sel)으로 본다"""
     prev = json.loads(Path(path).read_text(encoding="utf-8"))
     if prev.get("queries_sha256") != ec.digest(queries):
         raise SystemExit("--reuse-retrieval 파일의 질의 세트가 이번 질의 세트와 다르다")
     rows = {r["id"]: r for r in prev["rows"]}
-    missing = [q["id"] for q in queries if q["id"] not in rows]
+    missing = [q["id"] for q in (queries if sel is None else sel) if q["id"] not in rows]
     if missing:
         raise SystemExit(f"--reuse-retrieval 파일에 없는 질의: {missing[:5]}")
     return prev, rows
@@ -214,12 +215,13 @@ def main(argv=None):
         sel = [by_id[i] for i in want]
     else:
         sel = queries
-    prev_rows = load_reuse(a.reuse_retrieval, queries)[1] if a.reuse_retrieval else None
+    prev_rows = load_reuse(a.reuse_retrieval, queries, sel)[1] if a.reuse_retrieval else None
     out = cc.out_dir(a.work, "answers")
     bodies = {d["key"]: " ".join(cc.page_ocr(a.work, d["key"][0], d["key"][1])["lines"][:BODY_LINES]) for d in docs}
     by_key = {d["key"]: d for d in docs}
     remote = bool(a.base_url)
-    if remote and cc.check_base_url(a.base_url) == cc.OPENAI_BASE:  # 0원으로 세지 않게
+    # 0원으로 세지 않게 — 대소문자·:443·경로 차이로 빠져나가지 않도록 호스트로 본다
+    if remote and (urlsplit(cc.check_base_url(a.base_url)).hostname or "").rstrip(".") == urlsplit(cc.OPENAI_BASE).hostname:
         raise SystemExit("OpenAI는 --base-url 없이 부른다 (단가·지출 상한 적용)")
     # 검색을 다시 할 때만 OpenAI 임베딩 클라이언트가 필요하다 (답변이 로컬 모델이어도)
     eclient = cc.make_client(True, None)[0] if prev_rows is None else None
@@ -252,11 +254,15 @@ def main(argv=None):
     tot = totals(rows)
     tot.update(embed_tokens=et1 + et2, embed_usd=round(eu1 + eu2, 6), total_usd=round(tot["usd"] + eu1 + eu2, 6),
                wall_s=round(time.time() - t0, 1))
-    res = {"label": label, "issue": "https://github.com/reddol18/docflow/issues/21", "chat_model": a.model,
+    # 검색을 다시 쓴 후보 답변은 #22 모델 비교, 검색부터 한 답변은 #21 심판 검증용
+    issue = "https://github.com/reddol18/docflow/issues/" + ("22" if prev_rows is not None else "21")
+    res = {"label": label, "issue": issue, "chat_model": a.model,
            "answer_prompt": a.answer_prompt, "base_url": cc.check_base_url(a.base_url) if remote else cc.OPENAI_BASE,
            "priced": not remote, "reuse_retrieval": Path(a.reuse_retrieval).name if a.reuse_retrieval else None,
            "ids": [q["id"] for q in sel] if a.ids else None,
-           "embed_model": a.embed_model, "vols": vols, "docs": len(docs), "queries_file": Path(a.queries).name,
+           # 검색을 다시 썼으면 임베딩을 부르지 않았다 — 그때 모델은 reuse_retrieval 파일에 있다
+           "embed_model": a.embed_model if prev_rows is None else None, "vols": vols, "docs": len(docs),
+           "queries_file": Path(a.queries).name,
            "queries_sha256": q_digest, "settings": {"top_k": TOP_K, "body_lines": BODY_LINES, "body_chars": BODY_CHARS,
                                                     "temperature": 0, "max_tokens": llm.ANSWER_MAX_TOKENS,
                                                     "answer_prompt_sha256": ec.digest(system_prompt)},

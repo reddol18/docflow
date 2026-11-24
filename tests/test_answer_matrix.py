@@ -224,6 +224,11 @@ def test_load_reuse_checks_queries(ga, tmp_path):
     assert set(ga.load_reuse(p, qs)[1]) == {"a1"}
     with pytest.raises(SystemExit, match="질의 세트"):
         ga.load_reuse(p, [{"id": "a1", "question": "다른 q"}])
+    qs2 = [{"id": "a1", "question": "q"}, {"id": "a2", "question": "q2"}]  # --ids a1로 만든 파일을 --ids a1로 다시 씀
+    p.write_text(json.dumps({"queries_sha256": ga.ec.digest(qs2), "rows": [{"id": "a1"}]}), encoding="utf-8")
+    assert set(ga.load_reuse(p, qs2, qs2[:1])[1]) == {"a1"}
+    with pytest.raises(SystemExit, match="없는 질의"):
+        ga.load_reuse(p, qs2)
 
 
 def test_prompt_name_of(ga):
@@ -288,13 +293,13 @@ def write_cand(d, name, model, s, prompt="current", latency=True, judge_model="j
     return [str(d / f"{name}.json"), str(d / f"{name}_judge.json")]
 
 
-def write_pair(d, a, b, wa, wb, ties):
+def write_pair(d, a, b, wa, wb, ties, errors=0, qsha="h"):
     n = wa + wb + ties
     pwj = {"a": {"file": f"{a}.json"}, "b": {"file": f"{b}.json"}, "complete": True, "judge": {"model": "j"},
-           "prompts": {"version": "pw-1"}, "rows": [{"id": "a1"}, {"id": "a2"}],
+           "queries_sha256": qsha, "prompts": {"version": "pw-1"}, "rows": [{"id": "a1"}, {"id": "a2"}],
            "summary": {"n": n, "a_wins": wa, "b_wins": wb, "ties": ties, "identical": 0, "inconsistent": 0,
                        "win_rate_a": (wa + ties / 2) / n, "win_rate_b": (wb + ties / 2) / n, "first_position_rate": 0.5,
-                       "different_retrieval": 0, "errors": 0}}
+                       "different_retrieval": 0, "errors": errors}}
     p = d / f"{a}_vs_{b}.json"
     p.write_text(json.dumps(pwj), encoding="utf-8")
     return str(p)
@@ -370,6 +375,30 @@ def test_answer_gate_input_errors_files(agate, tmp_path):
     Path(cand[1]).write_text(json.dumps({**j, "complete": False}), encoding="utf-8")
     with pytest.raises(agate.InputError, match="끝까지"):
         agate.run([base, cand], [], CRIT)
+
+
+def test_answer_gate_boundary_float(agate, tmp_path):
+    # 0.14 → 0.04는 부동소수로 10.000000000000002%p — 허용폭 10%p와 같으면 통과
+    base = write_cand(tmp_path, "base", "gpt-4o-mini", summary(0.14, 0.9, 1.0, 0.04))
+    cand = write_cand(tmp_path, "cand", "gpt-4.1-mini", summary(0.04, 0.9, 1.0, 0.14))
+    code, md, _ = agate.run([base, cand], [], crit(faithfulness_pass_drop_pp_max=10.0, refusal_answerable_rise_pp_max=10.0))
+    assert code == 0, md
+
+
+def test_answer_gate_pair_checks(agate, tmp_path):
+    base = write_cand(tmp_path, "base", "gpt-4o-mini", summary(0.8, 0.9, 1.0, 0.4))
+    cand = write_cand(tmp_path, "cand", "gpt-4.1-mini", summary(0.8, 0.9, 1.0, 0.4))
+    with pytest.raises(agate.InputError, match="쌍별 질의 세트"):
+        agate.run([base, cand], [write_pair(tmp_path, "base", "cand", 3, 1, 2, qsha="other")], CRIT)
+    pair = write_pair(tmp_path, "base", "cand", 1, 3, 0, errors=2)
+    assert agate.run([base, cand], [pair], crit(judge_error_max=0))[0] == 0  # 승률을 안 쓰면 쌍별 오류도 안 봄
+    code, md, _ = agate.run([base, cand], [pair], crit(judge_error_max=0, win_rate_min=0.4))
+    assert code == 1 and "쌍별 심판 오류 2건" in md
+    other = tmp_path / "other"
+    other.mkdir()
+    dup = write_cand(other, "cand", "local", summary(0.8, 0.9, 1.0, 0.4))
+    with pytest.raises(agate.InputError, match="파일 이름이 같은"):
+        agate.run([base, cand, dup], [], CRIT)
 
 
 def test_answer_gate_main_exit_codes(agate, tmp_path, capsys):

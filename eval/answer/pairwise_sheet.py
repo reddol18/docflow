@@ -273,7 +273,9 @@ function render() {
     ans[r.id] = ans[r.id] || {};
     ans[r.id].v = ans[r.id].v === b.dataset.v ? "" : b.dataset.v;
     persist(); render();
-    if (isDone(r) && cur < DATA.rows.length - 1) setTimeout(() => { cur++; render(); window.scrollTo(0, 0); }, 250);
+    // 0.25초 안에 다른 쪽으로 옮겼으면 넘기지 않는다 (카드를 건너뛰지 않게)
+    const at = cur;
+    if (isDone(r) && cur < DATA.rows.length - 1) setTimeout(() => { if (cur !== at) return; cur++; render(); window.scrollTo(0, 0); }, 250);
   });
   document.getElementById("memo").oninput = e => { ans[r.id] = ans[r.id] || {}; ans[r.id].memo = e.target.value; persist(); };
   document.getElementById("prev").disabled = cur === 0;
