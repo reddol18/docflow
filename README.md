@@ -287,7 +287,14 @@ OCR 텍스트·색인 값에 심어진 문장이 추출과 검색 답변을 조�
   `gate.py`는 기준 줄만 이번 결과의 철에 맞춰 가져오고, 기준 모델 id·temperature·response_format·apiBaseUrl이 이번 설정과 다르거나,
   같은 판 후보의 지시문(`prompt.raw`)이 문서마다 기준과 다르거나, 문서 묶음이 다르면 종료 코드 2. `max_tokens` 같은 그 밖의 차이는 gate.md에 경고.
   `gate.md`에는 판정 표 아래 텍스트 추출(B)만 칸별 정답률 표가 붙는다.
-- **답변 채점(Ragas·쌍별 승률)은 아직 없다:** `criteria.yaml`의 `answer:` 칸은 자리만 있다 → https://github.com/reddol18/docflow/issues/21.
+- **답변 채점(Ragas·쌍별 승률, https://github.com/reddol18/docflow/issues/22 조건 3):** 4칸 추출 행렬과 따로, 합성 질의 42건 답변 파일로 돈다.
+  후보 답변은 `eval/answer/gen_answers.py --model <모델> [--answer-prompt <판>] [--base-url <로컬·터널>] --reuse-retrieval <기준 답변.json>`
+  (기준과 같은 검색 결과로 답만 바꿈 — 임베딩 호출 없음, 질의별 지연 `latency_ms`), Ragas 지표는 `eval/answer/judge.py --metrics faithfulness,answer_relevancy`
+  (#21 심판·ko-2), 쌍별 승률은 `eval/answer/pairwise.py`(두 순서로 묻고 같은 쪽을 골라야 승, 아니면 무승부), 판정은
+  `eval/promptfoo/answer_gate.py --cand <답변> <심판> ... --pair <쌍별>`이 `criteria.yaml` `answer:`로 낸다(종료 코드 0/1/2, 건당 비용·지연 열).
+  `answer:` 기준값은 2026-11-24 사용자 결정값(충실도·적합도 −10%p, '모른다' 0%p, 회피 +10%p, 심판 오류 0). 쌍별 승률은 사람 확인 20쌍에서
+  사람이 17쌍을 비김으로 매겨 기준을 못 넘어 **참고값**(`win_rate_min: null`, 표에는 나옴) — 다시 재는 일은 https://github.com/reddol18/docflow/issues/158.
+  실측은 `docs/design.md` '검색 답변 — 모델 비교 행렬'.
 - **결과·개인정보:** 실제 문서 글자가 담긴 결과(`results.json`, 다시 조립한 문서, promptfoo 결과 DB)는 저장소 밖 `work/promptfoo/`에만 쓴다.
   promptfoo 공유·원격 생성·사용 통계·업데이트 확인은 끈다(`PROMPTFOO_DISABLE_*`, `--no-share`). 단, promptfoo 0.125.0은 사용 통계를 꺼도
   'telemetry disabled' 이벤트 한 번을 r.promptfoo.app으로 보낸다(문서 글자·결과는 없음).
