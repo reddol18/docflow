@@ -31,7 +31,8 @@
       reject: true
       reject_to: entry
       sample_error: volume     # document(기본): 그 문서만 reject_to로 재작업 (가)
-                               # volume: 표본 오류(반려된 표본 문서 수)가 volume_at건 이상이 되면 철 전체를 reject_to로 (다)
+                               # volume: 표본 오류(반려된 표본 문서 수)가 volume_at건 이상이고 반려자가
+                               #   서로 다른 2명 이상이 되면 철 전체를 reject_to로 (다). 한 명뿐이면 그 문서만
       volume_at: 2             # volume일 때만, 1 이상 정수 (필수)
 
 규칙

@@ -561,7 +561,7 @@ def test_sample_reject_document_rework(main, monkeypatch):
 
     r = sreject(c, "q", smp, "가상 사유: 표본 제목 오기")
     assert r.status_code == 200 and r.json() == {"doc_id": smp, "stage": "inspect", "to": "entry", "round": 2,
-                                                 "errors": 1, "volume": False, "moved": 0}
+                                                 "errors": 1, "rejectors": 1, "volume": False, "moved": 0}
     x = where(c)[smp]
     assert (x["stage"], x["round"], x["status"], x["last_reason"], x["rejected_from"], x["editable"]) == (
         "entry", 2, "pending", "가상 사유: 표본 제목 오기", "inspect", True)
@@ -601,48 +601,73 @@ def test_sample_reject_document_rework(main, monkeypatch):
 
 
 def test_sample_reject_volume_rollback(main, monkeypatch):
-    """(다) sample_error: volume, volume_at: 2 — 표본 오류가 2건이 되면 철 전체(확정 문서 포함)를 입력으로 되돌리고
-    검사 목록을 지운다. 표시 문서의 반려는 오류 건수에 들지 않는다. 돌아온 철은 새 검사 목록으로 끝까지"""
+    """(다) sample_error: volume, volume_at: 2 — 철 전체 되돌림은 반려된 무작위 표본이 2건 이상이고 그 표본을 반려한
+    검사자가 서로 다른 2명 이상일 때만 (보안 리뷰 V4.1.3: 검사자 한 명이 철 전체를 되돌리지 못하게).
+    q 혼자 표본 2건을 반려하면(같은 문서를 다시 반려해도 1명) 그 문서들만 재작업. 두 번째 검사자 q2의 표본 반려로
+    기준을 채우면 철 전체(확정 문서 포함)를 입력으로 되돌리고 검사 목록을 지운다. 표시 문서의 반려는 오류 건수·반려자 수에
+    들지 않는다. 돌아온 철은 새 검사 목록으로 끝까지"""
     use_flow(main, monkeypatch, sample_flow(sample_error="volume", volume_at=2))
     c = TestClient(main.app)
     assert c.get("/workflow", headers=h("v")).json()["stages"][1]["volume_at"] == 2
     assert c.post("/volumes/v1/inspection", headers=h("s"), json={"rate": 1, "seed": 1}).status_code == 200
     assert {d: x["reason"] for d, x in inspection_docs(c).items()} == {"d01": "flagged", "d02": "sample",
                                                                        "d03": "sample"}
-    # 표시 문서 반려: 그 문서만, 오류 건수 0 → 재작업 뒤 다시 검사해 확정
-    assert sreject(c, "q2", "d01", "가상 사유: 표시 칸").json()["errors"] == 0
+
+    def errs(r):
+        return r["errors"], r["rejectors"], r["volume"], r["moved"]
+
+    # 표시 문서 반려(q2): 그 문서만, 오류 건수·반려자 수 0 → 재작업 뒤 다시 검사해 확정
+    assert errs(sreject(c, "q2", "d01", "가상 사유: 표시 칸").json()) == (0, 0, False, 0)
     assert approve(c, "w", "d01", "entry").status_code == 200
     assert c.post("/inspection/v1/d01", headers=h("q2"), json={}).status_code == 200
     assert where(c)["d01"]["confirmed"]
-    # 표본 오류 1건: 그 문서만
-    r = sreject(c, "q", "d02", "가상 사유: 표본 1").json()
-    assert (r["errors"], r["volume"], r["moved"]) == (1, False, 0)
-    assert where(c)["d03"]["stage"] == "inspect" and where(c)["d01"]["confirmed"]
-    # 표본 오류 2건 = 기준인데 다른 문서가 검사 중이면 되돌리지 않고 409 (아무것도 안 씀) — 차지를 풀면 된다
+    # q 혼자 표본 오류 2건 = 기준 건수지만 반려자 1명 → 철 전체는 그대로, 반려한 문서만 재작업
+    assert errs(sreject(c, "q", "d02", "가상 사유: 표본 1").json()) == (1, 1, False, 0)
+    assert errs(sreject(c, "q", "d03", "가상 사유: 표본 2").json()) == (2, 1, False, 0)
+    w = where(c)
+    assert w["d01"]["confirmed"] and (w["d02"]["stage"], w["d03"]["stage"]) == ("entry", "entry")
+    assert c.get("/volumes/v1/inspection", headers=h("q")).status_code == 200  # 검사 목록도 그대로
+    # 재작업된 d02를 q가 다시 반려해도 반려자는 여전히 1명 (같은 사람이 같은 문서를 여러 번 반려해도 1명)
+    assert approve(c, "w", "d02", "entry").status_code == 200
+    assert errs(sreject(c, "q", "d02", "가상 사유: 표본 1 다시").json()) == (2, 1, False, 0)
+    assert where(c)["d02"]["round"] == 3 and where(c)["d01"]["confirmed"]
+    assert approve(c, "w", "d02", "entry").status_code == 200
+    # 두 번째 검사자가 기준을 채우는데 다른 문서가 검사 중이면 되돌리지 않고 409 (아무것도 안 씀) — 차지를 풀면 된다
     assert store.claim_inspection("v1", "d01", 4) is False  # 끝난 검사는 차지 못 함 (시험 준비 확인)
     with store.pool.connection() as conn:
+        done = conn.execute("SELECT inspected_by, inspected_at, fixed_fields FROM inspection "
+                            "WHERE vol = 'v1' AND doc_id = 'd01'").fetchone()
         conn.execute("UPDATE inspection SET inspected_by = 4, inspected_at = now(), fixed_fields = NULL "
                      "WHERE vol = 'v1' AND doc_id = 'd01'")
-    r = sreject(c, "q", "d03", "가상 사유: 표본 2")
-    assert r.status_code == 409 and "검사 중" in r.json()["detail"]
-    assert where(c)["d03"]["stage"] == "inspect" and inspection_docs(c)["d03"]["rejects"] == 0
+    r = sreject(c, "q2", "d02", "가상 사유: 표본 3")
+    assert r.status_code == 409 and "검사 중" in r.json()["detail"] and "d01" in r.json()["detail"]
+    assert (where(c)["d02"]["stage"], inspection_docs(c)["d02"]["rejects"]) == ("inspect", 2)
+    busy = next(r for r in store.audit_log() if r["action"] == "inspect_reject")
+    assert (busy["result"], busy["info"]["busy"], busy["info"]["volume"]) == ("rejected_409", ["d01"], False)
     with store.pool.connection() as conn:
-        conn.execute("UPDATE inspection SET fixed_fields = '{}' WHERE vol = 'v1' AND doc_id = 'd01'")
-    # 표본 오류 2건 = 기준 → 철 전체: 확정된 d01도 입력으로, 이미 입력에 있는 d02는 그대로
-    r = sreject(c, "q", "d03", "가상 사유: 표본 2").json()
-    assert (r["errors"], r["volume"], r["moved"]) == (2, True, 1)
+        assert conn.execute("SELECT cardinality(rejected_by) AS n FROM inspection "
+                            "WHERE vol = 'v1' AND doc_id = 'd02'").fetchone()["n"] == 1  # q2는 안 쓰임
+        conn.execute("UPDATE inspection SET inspected_by = %(by)s, inspected_at = %(at)s, fixed_fields = %(f)s "
+                     "WHERE vol = 'v1' AND doc_id = 'd01'",
+                     {"by": done["inspected_by"], "at": done["inspected_at"], "f": done["fixed_fields"]})  # 원래대로
+    # 표본 오류 2건·반려자 2명 = 기준 → 철 전체: 확정된 d01도 입력으로, 이미 입력에 있는 d03은 그대로
+    assert errs(sreject(c, "q2", "d02", "가상 사유: 표본 3").json()) == (2, 2, True, 1)
     w = where(c)
     assert {d: (x["stage"], x["round"], x["status"]) for d, x in w.items()} == {
-        "d01": ("entry", 3, "pending"), "d02": ("entry", 2, "pending"), "d03": ("entry", 2, "pending")}
+        "d01": ("entry", 3, "pending"), "d02": ("entry", 4, "pending"), "d03": ("entry", 2, "pending")}
     assert w["d01"]["last_reason"].startswith("철 전체 되돌림") and w["d01"]["rejected_from"] == "inspect"
-    assert w["d03"]["last_reason"] == "가상 사유: 표본 2"
+    assert "반려자 2명" in w["d01"]["last_reason"]
+    assert w["d02"]["last_reason"] == "가상 사유: 표본 3" and w["d03"]["last_reason"] == "가상 사유: 표본 2"
     assert c.get("/volumes/v1/inspection", headers=h("q")).status_code == 404  # 검사 목록은 새로 만든다
     assert unconfirmed(c) == 3
     assert c.get("/documents/v1/d01/stages", headers=h("v")).json()[-1] | {"ts": None} == {
         "ts": None, "stage": "inspect", "round": 2, "action": "reject", "to_stage": "entry", "reason": w["d01"]["last_reason"],
         "fixed_fields": None, "username": None, "name": None}  # 철 전체 처리 — 사람은 감사 로그에
-    log = next(r for r in store.audit_log() if r["action"] == "inspect_reject" and r["result"] == "ok")
-    assert (log["doc_id"], log["info"]["volume"], log["info"]["errors"], log["info"]["moved"]) == ("d03", True, 2, 1)
+    log = [r for r in reversed(store.audit_log()) if r["action"] == "inspect_reject" and r["result"] == "ok"]
+    assert [(r["doc_id"], r["info"]["errors"], r["info"]["rejectors"], r["info"]["volume"], r["info"]["moved"])
+            for r in log] == [("d01", 0, 0, False, 0), ("d02", 1, 1, False, 0), ("d03", 2, 1, False, 0),
+                              ("d02", 2, 1, False, 0), ("d02", 2, 2, True, 1)]
+    assert log[-1]["info"]["moved_ids"] == ["d01"] and "moved_ids" not in log[-2]["info"]  # 함께 되돌린 문서는 감사 로그에
 
     # 재작업 → 새 검사 목록 → 끝까지 (오류 건수는 새 목록에서 다시 센다).
     # 반려한 q는 손대지 않은 d01(함께 되돌려졌을 뿐)의 입력을 맡을 수 있다 — 철 전체 기록은 q의 단계로 세지 않는다

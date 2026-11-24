@@ -15,7 +15,8 @@
   GET   /volumes/{vol}/inspection      검사 목록과 진행 (문서마다 이유·확인할 칸·검사 가능 여부·막힌 까닭 block·차지 풀기 can_release)
   POST  /inspection/{vol}/{doc_id}     검사 결과 제출 (고친 칸만, 없으면 통과). 자기가 입력한 문서는 403
   POST  /inspection/{vol}/{doc_id}/reject   표본 단계 반려 (사유 필수, 흐름 설정 reject: true일 때만) → 그 문서만 또는
-                                            표본 오류가 기준 건수 이상이면 철 전체를 앞 단계로 (설정 sample_error)
+                                            표본 오류가 기준 건수 이상이고 반려자가 서로 다른 2명 이상이면 철 전체를
+                                            앞 단계로 (설정 sample_error)
   POST  /inspection/{vol}/{doc_id}/release  끝나지 않은 검사 차지 풀기 — 관리자·본인은 바로, 남의 차지는 INSPECT_CLAIM_STALE_MIN분 뒤
   GET   /workflow                      검토 흐름 설정 (단계·맡는 역할·전수/표본·반려 규칙 — app/workflows/*.yaml)
   GET   /volumes/{vol}/workflow        문서마다 지금 단계·차례(재검수)·반려 사유·내가 승인/반려할 수 있나
@@ -1203,6 +1204,11 @@ def stage_reject(vol: str, doc_id: str, body: StageRejectIn, user: StageUser):
     return {"doc_id": doc_id, "stage": st["name"], "to": to, "round": rnd + 1}
 
 
+# 철 전체 되돌림(sample_error: volume)에 필요한 서로 다른 반려자 수 — 검사자 한 명이 표본 volume_at건을 반려해
+# 철 전체를 되돌리지 못하게 (https://github.com/reddol18/docflow/issues/94#issuecomment-7134836866)
+VOLUME_REJECTORS = 2
+
+
 def _volume_back():
     """철 전체 되돌림(sample_error: volume)에서 함께 되돌릴 위치: reject_to보다 뒤의 단계(표본 단계 포함)와 확정.
     reject_to와 그 앞에 있는 문서는 이미 앞 단계에 있으므로 그대로 둔다"""
@@ -1216,10 +1222,12 @@ def inspect_reject(vol: str, doc_id: str, body: StageRejectIn, user: SampleUser)
     """표본 단계 반려 (https://github.com/reddol18/docflow/issues/94) — 흐름 설정에서 표본 단계가 reject: true일 때만.
     검사자는 오류 문서를 사유(필수)와 함께 반려만 하고, 처리는 설정(sample_error)이 정한다:
       document  그 문서만 reject_to로, 차례 +1. 다시 올라오면 같은 검사 목록 행을 다시 검사한다 (같은 검사자 또는 다른 검사자)
-      volume    위와 같고, 반려된 표본 문서 수가 volume_at 이상이 되면 철의 다른 문서(표본 단계·확정·그 사이 단계)도 모두
-                reject_to로 되돌리고 검사 목록을 지운다 — 돌아온 철은 검사 목록을 새로 만들어 새 표본으로 검사한다
+      volume    위와 같고, 반려된 표본 문서 수가 volume_at 이상이고 그 표본을 반려한 서로 다른 검사자가
+                VOLUME_REJECTORS(2)명 이상이 되면 철의 다른 문서(표본 단계·확정·그 사이 단계)도 모두 reject_to로 되돌리고
+                검사 목록을 지운다 — 돌아온 철은 검사 목록을 새로 만들어 새 표본으로 검사한다.
+                반려자가 한 명뿐이면 건수를 채워도 그 문서만 재작업 (검사자 한 명이 철 전체를 되돌리지 못하게, 보안 리뷰 V4.1.3)
     검사 경로와 같은 확인(검사 목록에 있음·표본 단계에 와 있음·차지 없음·작업자 ≠ 검수자)을 문서 잠금 안에서 한다.
-    사유는 stage_log에, 감사 로그에는 단계·차례·사유 길이·오류 건수·철 전체 되돌림 여부만"""
+    사유는 stage_log에, 감사 로그에는 단계·차례·사유 길이·오류 건수·반려자 수·철 전체 되돌림 여부만"""
     with audited(user, "inspect_reject", vol, doc_id, stage=body.stage) as info, store.doc_lock(vol, doc_id):
         _need_sample()
         if not SAMPLE["reject"]:
@@ -1247,23 +1255,26 @@ def inspect_reject(vol: str, doc_id: str, body: StageRejectIn, user: SampleUser)
             raise HTTPException(409, "이미 검사함" if row["fixed_fields"] is not None else "누가 검사 중인 문서")
         volume = None
         if SAMPLE["sample_error"] == "volume":
-            volume = {"at": SAMPLE["volume_at"], "doc_ids": [d["doc_id"] for d in docs], "back": _volume_back(),
-                      "reason": f"철 전체 되돌림: 표본 오류 {SAMPLE['volume_at']}건 이상"}
+            volume = {"at": SAMPLE["volume_at"], "rejectors": VOLUME_REJECTORS, "doc_ids": [d["doc_id"] for d in docs],
+                      "back": _volume_back(),
+                      "reason": f"철 전체 되돌림: 표본 오류 {SAMPLE['volume_at']}건 이상·반려자 {VOLUME_REJECTORS}명 이상"}
         rnd, to = pos["round"], SAMPLE["reject_to"]
         out = store.reject_sample(vol, doc_id, SAMPLE["name"], rnd, to, user.id, reason, gen,
                                   workflow.initial(WORKFLOW), volume)
         if out is None:
             raise HTTPException(409, "철을 다시 돌렸거나 문서의 단계·검사 목록이 바뀜")
         if "busy" in out:
-            raise HTTPException(409, f"이 반려로 철 전체를 되돌려야 하는데 다른 문서 {out['busy']}건이 검사 중 — "
-                                     "그 검사가 끝나거나 차지를 푼 뒤 다시 반려")
+            info.update(volume=False, busy=out["busy"])  # 되돌림이 검사 중 때문에 막혔음을 감사 로그에
+            raise HTTPException(409, f"이 반려로 철 전체를 되돌려야 하는데 다른 문서 {len(out['busy'])}건"
+                                     f"({', '.join(out['busy'])})이 검사 중 — 그 검사가 끝나거나 차지를 푼 뒤 다시 반려")
         info.update(to=to, round=rnd + 1, reason_chars=len(reason), sample_error=SAMPLE["sample_error"],
-                    errors=out["errors"], volume=out["volume"], moved=out["moved"])
+                    errors=out["errors"], rejectors=out["rejectors"], volume=out["volume"], moved=out["moved"])
         if out["volume"]:
+            info.update(moved_ids=out["moved_ids"])  # 함께 되돌린 문서의 stage_log는 사람 없이 남으므로 여기서 잇는다
             store.event(vol, "inspection", "volume_reject", None, user=user.username, errors=out["errors"],
-                        moved=out["moved"])
+                        rejectors=out["rejectors"], moved=out["moved"], moved_ids=out["moved_ids"])
     return {"doc_id": doc_id, "stage": SAMPLE["name"], "to": to, "round": rnd + 1, "errors": out["errors"],
-            "volume": out["volume"], "moved": out["moved"]}
+            "rejectors": out["rejectors"], "volume": out["volume"], "moved": out["moved"]}
 
 
 @app.get("/documents/{vol}/{doc_id}/stages")

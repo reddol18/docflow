@@ -197,8 +197,8 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
       drop(d.doc_id);
       setNote(
         r.volume
-          ? `${d.doc_id} 반려 — 표본 오류 ${r.errors}건으로 철 전체를 ${stageLabel(r.to)}(으)로 되돌림 (함께 되돌린 문서 ${r.moved}건). 검사 목록은 새로 만듭니다`
-          : `${d.doc_id} 반려 — ${stageLabel(r.to)}(으)로 돌아감 (표본 오류 ${r.errors}건)`,
+          ? `${d.doc_id} 반려 — 표본 오류 ${r.errors}건·반려자 ${r.rejectors}명으로 철 전체를 ${stageLabel(r.to)}(으)로 되돌림 (함께 되돌린 문서 ${r.moved}건). 검사 목록은 새로 만듭니다`
+          : `${d.doc_id} 반려 — ${stageLabel(r.to)}(으)로 돌아감 (표본 오류 ${r.errors}건·반려자 ${r.rejectors}명)`,
       );
       reload();
     } catch (e) {
@@ -477,7 +477,7 @@ export default function InspectionPage({ params }: { params: Promise<{ vol: stri
                             disabled={busy || dirty > 0}
                             title={
                               stage?.sample_error === "volume"
-                                ? `표본 오류가 ${stage.volume_at}건 이상이면 철 전체를 되돌립니다`
+                                ? `표본 오류가 ${stage.volume_at}건 이상이고 반려한 검사자가 서로 다른 2명 이상이면 철 전체를 되돌립니다 (한 명뿐이면 이 문서만 재작업)`
                                 : "이 문서만 앞 단계로 돌려 재작업합니다"
                             }
                             className="rounded-md border border-rose-300 bg-white px-4 py-2 text-sm font-medium text-rose-700 disabled:opacity-30"

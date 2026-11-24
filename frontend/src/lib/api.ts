@@ -159,7 +159,7 @@ export type WorkflowStage = {
   submit: "manual" | "on_index" | null;
   actions: boolean; // /workflow 경로로 승인·반려하는 단계 (표본 검사 단계는 /inspection)
   // 반려하는 표본 단계만 (https://github.com/reddol18/docflow/issues/94): document 그 문서만 재작업 /
-  // volume 표본 오류가 volume_at건 이상이면 철 전체를 reject_to로
+  // volume 표본 오류가 volume_at건 이상이고 반려자가 서로 다른 2명 이상이면 철 전체를 reject_to로
   sample_error?: "document" | "volume";
   volume_at?: number | null;
 };
@@ -367,7 +367,7 @@ export const api = {
     }),
   // 표본 단계 반려 (사유 필수, https://github.com/reddol18/docflow/issues/94). 처리(그 문서만·철 전체)는 흐름 설정이 정한다
   rejectInspection: (vol: string, docId: string, stage: string, reason: string) =>
-    call<{ to: string; round: number; errors: number; volume: boolean; moved: number }>(
+    call<{ to: string; round: number; errors: number; rejectors: number; volume: boolean; moved: number }>(
       `/inspection/${enc(vol)}/${enc(docId)}/reject`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage, reason }) },
     ),
