@@ -127,15 +127,55 @@ def keyword_rank(words, docs, year=None):
     return [h[3] for h in sorted(hits)[:CANDIDATES]]
 
 
-def vector_rank(qv, docs, vecs, year=None):
-    """코사인 상위 CANDIDATES (Qdrant COSINE과 같은 순서), 연도 칸 거르기"""
+@dataclasses.dataclass(frozen=True)
+class SplitVecs:
+    """제목·칸과 본문을 따로 임베딩한 문서 벡터 (https://github.com/reddol18/docflow/issues/61 계약 2 '따로 넣고 합치기').
+    fields·body = 문서 순서대로 벡터. how = rrf(칸 벡터 순위와 본문 벡터 순위를 RRF, 각 30개) | sum(두 코사인의 평균)"""
+    fields: list
+    body: list
+    how: str = "rrf"
+
+    def __post_init__(self):
+        if self.how not in ("rrf", "sum"):
+            raise ValueError(f"SplitVecs.how는 rrf·sum: {self.how}")
+        if len(self.fields) != len(self.body):
+            raise ValueError("칸·본문 벡터 수가 다르다")
+
+    @property
+    def dim(self):
+        return len(self.fields[0]) if self.fields else None
+
+
+def _cos(qv, vecs):
     import numpy as np  # noqa: PLC0415
     m = np.asarray(vecs, dtype=np.float64)
     m = m / np.linalg.norm(m, axis=1, keepdims=True)
     q = np.asarray(qv, dtype=np.float64)
-    sims = m @ (q / np.linalg.norm(q))
+    return m @ (q / np.linalg.norm(q))
+
+
+def _top(sims, docs, year):
+    import numpy as np  # noqa: PLC0415
     order = [i for i in np.argsort(-sims, kind="stable") if not year or docs[i]["year"] == year]
-    return [docs[i]["key"] for i in order[:CANDIDATES]], [float(sims[i]) for i in order[:CANDIDATES]]
+    return order[:CANDIDATES]
+
+
+def vector_rank(qv, docs, vecs, year=None):
+    """코사인 상위 CANDIDATES (Qdrant COSINE과 같은 순서), 연도 칸 거르기.
+    vecs가 SplitVecs면 칸·본문 벡터를 따로 재서 합친다 (rrf: 두 순위의 RRF — 유사도는 둘 중 큰 값, sum: 코사인 평균)"""
+    if isinstance(vecs, SplitVecs):
+        sf, sb = _cos(qv, vecs.fields), _cos(qv, vecs.body)
+        if vecs.how == "sum":
+            sims = (sf + sb) / 2
+        else:
+            at = {tuple(d["key"]): i for i, d in enumerate(docs)}
+            score = retrieval.rrf(*([docs[i]["key"] for i in _top(s, docs, year)] for s in (sf, sb)))
+            order = [at[k] for k in sorted(score, key=score.get, reverse=True)[:CANDIDATES]]
+            return [docs[i]["key"] for i in order], [float(max(sf[i], sb[i])) for i in order]
+    else:
+        sims = _cos(qv, vecs)
+    order = _top(sims, docs, year)
+    return [docs[i]["key"] for i in order], [float(sims[i]) for i in order]
 
 
 def docno_candidates(q, docs, year=None):

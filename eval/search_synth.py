@@ -6,7 +6,9 @@
            합치기는 운영과 같은 app/retrieval 함수 (eval/embed_compare.app_rank) — 복사본이 아니다.
            설정 후보 16개(VARIANTS)의 머리 지표도 함께 낸다 (설정별 표)
   문서 글  --compose: current(= app/graph.doc_text 꼴: 4칸 + 첫 쪽 OCR 60줄) · fields(4칸만) · body(본문만) ·
-           rich(current + 한글 날짜·기관 줄)
+           rich(current + 한글 날짜·기관 줄) · split(fields·body를 따로 임베딩, 두 벡터 순위를 RRF) ·
+           split_sum(따로 임베딩, 두 코사인 평균) — split 둘은 fields·body 캐시를 그대로 쓴다
+  전후     summary(예전 vector·keyword·rrf, 지금 app)와 summary_after(지금 규칙을 벡터만·낱말만에 건 vector_app·keyword_app)
   지표     유형별 recall@1·@5·@10, MRR(전체 순위), 근거 모두 상위 5 (정답이 있는 질의만)
            '없음' 임계값 훑기: 벡터 1위 유사도 < t 이면 '없음'(app/retrieval.no_match) — 답 없음 질의의 정밀도·재현율,
            답 있는 질의를 잘못 '없음'으로 본 수
@@ -23,6 +25,7 @@
   & $py -I -X utf8 eval/search_synth.py --work ..\\work_synth\\w48_21\\work --queries eval/data/synth_answer_queries.jsonl
   & $py -I -X utf8 eval/search_synth.py --work ..\\work_synth\\w47 --queries eval/data/synth_search_queries.jsonl
   & $py -I -X utf8 eval/search_synth.py --work ... --model bge-m3 --base-url http://127.0.0.1:11434/v1
+  & $py -I -X utf8 eval/search_synth.py --work ... --compose split --cache-only   # 캐시만 (없으면 멈춤, 0원)
 결과: <work>/search_eval/<label>.json (질의별 전체 순위·1위 유사도·지표, 유형별 표, 임계값 훑기)
 """
 import argparse
@@ -72,7 +75,12 @@ COMPOSE = {"current": lambda d: d["text"],
            "fields": lambda d: ec.fields.embed_text(ec.SCHEMA, d["values"]),
            "body": lambda d: "본문: " + " ".join(d["lines"]),
            "rich": _rich}
+# 따로 넣고 합치기 (계약 2): fields·body 글을 따로 임베딩(캐시가 fields·body와 같다)해 문서 하나에 벡터 둘 —
+# split = 두 벡터 순위의 RRF, split_sum = 두 코사인의 평균 (eval/embed_compare.SplitVecs)
+SPLIT = {"split": "rrf", "split_sum": "sum"}
 METHODS = ("vector", "keyword", "rrf", "app")
+# 운영 규칙(문서번호 고정·질의 연도·연도로 비면 다시)을 한 후보 목록에만 건 순위 — 전후 비교의 '후' (app = 둘을 합친 RRF)
+AFTER_METHODS = ("vector_app", "keyword_app", "app")
 # 6단계 설정 후보: 질의 다듬기 × 질의 연도 × 낱말 가중 (kw0 = 문서번호 아닌 질의는 벡터만)
 VARIANTS = {c.name: c for c in (retrieval.Config(clean, year, w) for clean in (False, True) for year in (False, True)
                                 for w in (1.0, 0.5, 0.25, 0.0))}
@@ -112,14 +120,38 @@ def text_key(text):
 
 
 def model_dir(model):
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", model):
-        raise SystemExit("--model 이름은 영문·숫자·_.:- 80자까지")
+    """캐시 폴더 이름. 첫 글자는 영문·숫자 — '.'·'..'처럼 경로를 거슬러 오르는 이름을 받지 않는다"""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}", model):
+        raise SystemExit("--model 이름은 영문·숫자로 시작하고 영문·숫자·_.:- 80자까지")
     return model.replace(":", "_")
+
+
+DIM_FILE = "_dim"  # 캐시 폴더의 벡터 차원 기록 (sha256 이름과 겹치지 않는다)
+
+
+def check_dim(cdir, vecs):
+    """캐시 폴더 벡터 차원이 하나인지 — 벡터들끼리, 그리고 cdir/_dim 기록과. 기록이 없으면 남긴다 (예전 캐시).
+    같은 모델 이름에 다른 차원(서버의 다른 모델·잘린 파일)이 섞이면 SystemExit"""
+    dims = {len(v) for v in vecs}
+    if not dims:
+        return None
+    if len(dims) != 1 or 0 in dims:
+        raise SystemExit(f"캐시 {cdir.name}: 벡터 차원이 섞였다 {sorted(dims)} — 그 모델 캐시 폴더를 지우고 다시 잰다")
+    dim = dims.pop()
+    f = cdir / DIM_FILE
+    if f.exists():
+        rec = f.read_text(encoding="utf-8").strip()
+        if rec != str(dim):
+            raise SystemExit(f"캐시 {cdir.name}: 기록된 차원 {rec[:10]} ≠ 지금 벡터 {dim} — 섞어 쓰지 않는다")
+    else:
+        cdir.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(dim), encoding="utf-8")
+    return dim
 
 
 def embed_cached(texts, model, cdir, client_fn, budget):
     """글 → 벡터. 캐시(cdir/<sha256(글)>)에 없는 글만 부른다. client_fn()은 부를 글이 있을 때만 부른다 (캐시만이면 키도
-    필요 없다). → (벡터들, 토큰, 비용, 부른 글 수)"""
+    필요 없다). 읽은 벡터·새 벡터의 차원이 cdir/_dim과 같은지 본다 (check_dim). → (벡터들, 토큰, 비용, 부른 글 수)"""
     cdir = Path(cdir)
     keys = [text_key(t) for t in texts]
     have = {}
@@ -127,12 +159,13 @@ def embed_cached(texts, model, cdir, client_fn, budget):
         p = cdir / k
         if p.exists():
             have[k] = json.loads(p.read_text(encoding="utf-8"))
+    check_dim(cdir, have.values())
     miss = list(dict.fromkeys(t for t, k in zip(texts, keys) if k not in have))
     tokens, usd = 0, 0.0
     if miss:
         client, priced = client_fn()
         vecs, tokens, usd = ec.embed(client, model, miss, priced, budget)
-        cdir.mkdir(parents=True, exist_ok=True)
+        check_dim(cdir, [*vecs, *have.values()])  # 쓰기 전에 — 다른 차원이면 캐시에 남기지 않는다
         for t, v in zip(miss, vecs):
             k = text_key(t)
             tmp = cdir / f"{k}.tmp"
@@ -273,9 +306,10 @@ BASE = retrieval.Config()  # 예전 /search: 그대로 나눈 낱말, RRF 가중
 
 
 def rank_queries(queries, docs, dvecs, qvecs, cfg=None):
-    """질의별 줄: 네 방식 전체 순위('vol/doc_id'), 1위 유사도, 문서번호, 지표.
+    """질의별 줄: 방식별 전체 순위('vol/doc_id'), 1위 유사도, 문서번호, 지표.
     vector·keyword·rrf = 예전 /search (다듬지 않은 낱말, 문서번호 고정 없음), app = cfg로 낸 /search 순서
-    (문서번호 고정, '없음'이면 빈 목록 — 임계값 없이)"""
+    (문서번호 고정, '없음'이면 빈 목록 — 임계값 없이). vector_app·keyword_app = cfg 규칙(질의 연도·문서번호 고정·'없음')을
+    벡터·낱말 후보 하나에만 건 순서 (AFTER_METHODS, 전후 비교용)"""
     cfg = cfg or retrieval.SEARCH
     rows = []
     for q, qv in zip(queries, qvecs):
@@ -283,14 +317,16 @@ def rank_queries(queries, docs, dvecs, qvecs, cfg=None):
         r, sims = ec.app_rank(q["q"], qv, docs, dvecs, q["year"], cfg=cfg)
         miss = retrieval.no_match(r)  # /search: 문서번호 질의인데 그 번호가 없거나 후보가 없으면 빈 목록
         ranks = {"vector": b.vector, "keyword": b.keyword, "rrf": retrieval.fuse(b.vector, b.keyword)[1],
-                 "app": [] if miss else r.order}
+                 "app": [] if miss else r.order,
+                 "vector_app": [] if miss else retrieval.fuse(r.vector, [], r.pinned)[1],
+                 "keyword_app": [] if miss else retrieval.fuse([], r.keyword, r.pinned)[1]}
         ranks = {m: ["/".join(k) for k in v] for m, v in ranks.items()}
         rows.append({"id": q["id"], "type": q["type"], "q": q["q"], "year": q["year"], "answerable": q["answerable"],
                      "gold": q["gold"], "top_sim": round(sims[0], 4) if sims else None, "year_used": r.year,
                      "terms": retrieval.query_terms(q["q"], cfg),
                      "docnos": [" ".join(d) for d in r.docnos], "pinned": ["/".join(k) for k in r.pinned],
                      "docno_miss": miss, "ranks": ranks,
-                     "metrics": {m: query_metrics(ranks[m], q["gold"]) for m in METHODS} if q["gold"] else None,
+                     "metrics": {m: query_metrics(ranks[m], q["gold"]) for m in ranks} if q["gold"] else None,
                      "_ranking": r})
     return rows
 
@@ -361,7 +397,9 @@ def main(argv=None):
     ap.add_argument("--queries", required=True, help="합성 질의 파일 (synth_answer_queries·synth_search_queries 형식)")
     ap.add_argument("--model", default=llm.OPENAI_MODELS["embed"], help="임베딩 모델")
     ap.add_argument("--base-url", default="", help="OpenAI 호환 임베딩 주소 (https 또는 http://127.0.0.1:<포트>/v1). 비우면 OpenAI")
-    ap.add_argument("--compose", default="current", choices=sorted(COMPOSE), help="문서 글 짜기")
+    ap.add_argument("--compose", default="current", choices=sorted([*COMPOSE, *SPLIT]),
+                    help="문서 글 짜기 (split·split_sum = fields·body를 따로 임베딩해 합치기)")
+    ap.add_argument("--cache-only", action="store_true", help="캐시에 없는 글이 있으면 부르지 않고 멈춘다 (재측정 0원 보장)")
     ap.add_argument("--fusion", default=retrieval.SEARCH.name, choices=sorted(VARIANTS),
                     help="app 순위의 검색 설정 (질의 다듬기·질의 연도·낱말 가중, retrieval.Config.name). 기본: 운영 설정")
     ap.add_argument("--max-usd", type=float, default=0.2, help="OpenAI 지출 상한 (이번 실행, 캐시에 없는 글만 부른다)")
@@ -380,14 +418,25 @@ def main(argv=None):
     client = []
 
     def client_fn():  # 캐시에 없는 글이 있을 때만 만든다 (키를 읽지 않게)
+        if a.cache_only:
+            raise SystemExit("--cache-only: 캐시에 없는 글이 있다 — 부르지 않고 멈춘다")
         if not client:
             client.append(cc.make_client(not remote, a.base_url or None))
         return client[0]
 
     t0 = time.time()
-    compose = COMPOSE[a.compose]
-    dvecs, t1, u1, m1 = embed_cached([compose(d) for d in docs], a.model, cdir, client_fn, budget)
+    if a.compose in SPLIT:
+        texts = [COMPOSE[c](d) for c in ("fields", "body") for d in docs]
+        vs_, t1, u1, m1 = embed_cached(texts, a.model, cdir, client_fn, budget)
+        dvecs = ec.SplitVecs(vs_[:len(docs)], vs_[len(docs):], SPLIT[a.compose])
+        dim = dvecs.dim
+    else:
+        texts = [COMPOSE[a.compose](d) for d in docs]
+        dvecs, t1, u1, m1 = embed_cached(texts, a.model, cdir, client_fn, budget)
+        dim = len(dvecs[0]) if dvecs else None
     qvecs, t2, u2, m2 = embed_cached([q["q"] for q in queries], a.model, cdir, client_fn, budget)
+    if qvecs and dim is not None and len(qvecs[0]) != dim:
+        raise SystemExit(f"문서 벡터 {dim}차원 ≠ 질의 벡터 {len(qvecs[0])}차원")
     rows = rank_queries(queries, docs, dvecs, qvecs, VARIANTS[a.fusion])
     summary = summarize(rows)
     sw = sweep(rows)
@@ -395,16 +444,20 @@ def main(argv=None):
     res = {"label": label, "issue": "https://github.com/reddol18/docflow/issues/61", "model": a.model,
            "where": cc.check_base_url(a.base_url).split("/v1")[0] if remote else "OpenAI", "compose": a.compose,
            "fusion": a.fusion, "queries_file": Path(a.queries).name, "queries_sha256": ec.digest(queries),
-           "vols": vols, "docs": len(docs), "dim": len(dvecs[0]) if dvecs else None,
+           "vols": vols, "docs": len(docs), "dim": dim,
            "embedded": m1 + m2,
-           "cached": len({compose(d) for d in docs}) + len({q["q"] for q in queries}) - m1 - m2, "tokens": t1 + t2,
+           "cached": len(set(texts)) + len({q["q"] for q in queries}) - m1 - m2, "tokens": t1 + t2,
            "usd": round(u1 + u2, 6), "wall_s": round(time.time() - t0, 1),
-           "summary": summary, "sweep": sw, "variants": vs, "rows": [{k: v for k, v in r.items() if k != "_ranking"} for r in rows]}
+           "summary": summary, "summary_after": summarize(rows, AFTER_METHODS), "sweep": sw, "variants": vs,
+           "rows": [{k: v for k, v in r.items() if k != "_ranking"} for r in rows]}
     p = out / f"{label}.json"
     p.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"합성 철 {len(vols)}개, 문서 {len(docs)}, 질의 {len(queries)}, 차원 {res['dim']}, "
           f"새로 임베딩 {res['embedded']} (캐시 {res['cached']}), 토큰 {res['tokens']:,}, 비용 ${res['usd']:.6f}")
     print(type_table(summary))
+    print()
+    print(f"지금 규칙({a.fusion})을 후보 하나에만 건 순위")
+    print(type_table(res["summary_after"], AFTER_METHODS))
     print()
     print("설정별 (app 순위)")
     print(variants_table(vs))

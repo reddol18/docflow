@@ -166,7 +166,9 @@ def test_cache_miss_then_hit_no_api_call(ssy, tmp_path):
     vecs, tok, usd, n = ssy.embed_cached(["가상 글", "둘", "가상 글"], "text-embedding-3-small", tmp_path / "c", client_fn, budget)
     assert vecs == [[4.0, 1.0], [1.0, 1.0], [4.0, 1.0]] and n == 2 and fake.calls == [["가상 글", "둘"]]
     assert tok == 20 and usd > 0
-    assert sorted(p.name for p in (tmp_path / "c").iterdir()) == sorted({ssy.text_key("가상 글"), ssy.text_key("둘")})
+    assert sorted(p.name for p in (tmp_path / "c").iterdir()) == sorted({ssy.text_key("가상 글"), ssy.text_key("둘"),
+                                                                         ssy.DIM_FILE})
+    assert (tmp_path / "c" / ssy.DIM_FILE).read_text(encoding="utf-8") == "2"
 
     def no_client():
         pytest.fail("캐시에 있으면 클라이언트도 만들지 않는다")
@@ -184,8 +186,56 @@ def test_cache_respects_budget(ssy, tmp_path):
 
 def test_model_dir(ssy):
     assert ssy.model_dir("bge-m3:latest") == "bge-m3_latest"
-    with pytest.raises(SystemExit):
-        ssy.model_dir("../x")
+    assert ssy.model_dir("text-embedding-3-small") == "text-embedding-3-small"
+    for bad in ("../x", "..", ".", "...", ".hidden", "-x", "_x", ":x", "", "a/b", "a\\b", "x" * 81):
+        with pytest.raises(SystemExit):
+            ssy.model_dir(bad)
+
+
+def test_cache_dim_mixed_rejected(ssy, tmp_path):
+    """같은 모델 캐시에 다른 차원 벡터가 섞이면 멈춘다 — 파일끼리, 기록(_dim)과, 새로 부른 벡터와"""
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / ssy.text_key("가")).write_text(json.dumps([1.0, 0.0]), encoding="utf-8")
+    (c / ssy.text_key("나")).write_text(json.dumps([1.0, 0.0, 0.0]), encoding="utf-8")
+    no_client = lambda: pytest.fail("부르면 안 된다")  # noqa: E731
+    with pytest.raises(SystemExit, match="차원"):
+        ssy.embed_cached(["가", "나"], "m", c, no_client, ssy.cc.Budget(0.2))
+    # 예전 캐시(기록 없음): 읽으며 차원을 남긴다, 기록과 다르면 멈춘다
+    (c / ssy.text_key("나")).unlink()
+    assert ssy.embed_cached(["가"], "m", c, no_client, ssy.cc.Budget(0.2))[0] == [[1.0, 0.0]]
+    assert (c / ssy.DIM_FILE).read_text(encoding="utf-8") == "2"
+    (c / ssy.DIM_FILE).write_text("1024", encoding="utf-8")
+    with pytest.raises(SystemExit, match="차원"):
+        ssy.embed_cached(["가"], "m", c, no_client, ssy.cc.Budget(0.2))
+    # 새로 부른 벡터(FakeClient 2차원)가 기록(3차원)과 다르면 캐시에 쓰지 않는다
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / ssy.DIM_FILE).write_text("3", encoding="utf-8")
+    with pytest.raises(SystemExit, match="차원"):
+        ssy.embed_cached(["새 글"], "m", d, lambda: (FakeClient(), False), ssy.cc.Budget(0.2))
+    assert sorted(p.name for p in d.iterdir()) == [ssy.DIM_FILE]
+
+
+def test_split_vector_rank(ssy):
+    """따로 넣고 합치기: 칸 벡터 1위와 본문 벡터 1위를 RRF로 (둘 다 위인 문서가 앞), sum은 코사인 평균"""
+    ec = ssy.ec
+    docs = _docs(ec) + [dict(_docs(ec)[0], key=("SYNTH0001-1994-0001", "SYNTH0001-1994-0001-0003"))]
+    f = [[1.0, 0.0], [0.6, 0.8], [0.8, 0.6]]  # 질의 [1,0]: 칸은 0001 > 0003 > 0002
+    b = [[0.0, 1.0], [0.8, 0.6], [0.9, 0.43589]]  # 본문은 0003 > 0002 > 0001
+    keys, sims = ec.vector_rank([1.0, 0.0], docs, ec.SplitVecs(f, b, "rrf"))
+    assert [k[1][-1] for k in keys] == ["3", "1", "2"] and sims[0] == pytest.approx(0.9)
+    keys, sims = ec.vector_rank([1.0, 0.0], docs, ec.SplitVecs(f, b, "sum"))
+    assert [k[1][-1] for k in keys] == ["3", "2", "1"] and sims[0] == pytest.approx(0.85)
+    # 연도 칸 거르기는 두 목록 모두에
+    keys, _ = ec.vector_rank([1.0, 0.0], docs, ec.SplitVecs(f, b, "rrf"), year=1998)
+    assert [k[1][-1] for k in keys] == ["2"]
+    with pytest.raises(ValueError):
+        ec.SplitVecs(f, b[:2])
+    # 메모리 안 /search 순위도 SplitVecs를 받는다
+    rows = ssy.rank_queries([{"id": "s01", "type": "주제", "q": "가상", "year": None, "gold": [], "answerable": False}],
+                            docs, ec.SplitVecs(f, b, "rrf"), [[1.0, 0.0]])
+    assert rows[0]["ranks"]["vector"][0].endswith("0003")
 
 
 def test_rank_queries_uses_app_ranking(ssy):
@@ -200,3 +250,8 @@ def test_rank_queries_uses_app_ranking(ssy):
     assert rows[0]["ranks"]["app"][0].endswith("0001") and rows[0]["pinned"] == [qs[0]["gold"][0]]  # '…-9280'은 고정 안 됨
     assert rows[0]["metrics"]["app"]["r1"] == 1.0
     assert rows[1]["docno_miss"] and rows[1]["ranks"]["app"] == [] and rows[1]["ranks"]["rrf"]
+    # 전후 비교의 '후': 지금 규칙(문서번호 고정·'없음')을 벡터만·낱말만에도 건다
+    assert rows[0]["ranks"]["vector_app"][0].endswith("0001") and rows[0]["ranks"]["keyword_app"][0].endswith("0001")
+    assert rows[1]["ranks"]["vector_app"] == [] == rows[1]["ranks"]["keyword_app"]
+    after = ssy.summarize(rows, ssy.AFTER_METHODS)
+    assert after[ssy.ALL]["vector_app"]["r1"] == 1.0 and after[ssy.ALL]["vector_app"]["n"] == 1
