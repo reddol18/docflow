@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _p = Path(__file__).parent.parent / "scripts" / "weekly_metrics.py"
 _spec = importlib.util.spec_from_file_location("weekly_metrics", _p)
 wm = importlib.util.module_from_spec(_spec)
@@ -187,13 +189,71 @@ def test_to_attach_picks_week_items_without_milestone():
 
 
 def test_milestone_description_keeps_hand_written_text():
-    old = "주간 점검·회고\r\n\r\n회고 (11-14): 바꾼 규칙 B"
+    old = "주간 점검·회고\n\n회고 (11-14): 바꾼 규칙 B"
     d1 = wm.milestone_description(old, "지표 요약 1")
     assert d1.startswith("주간 점검·회고\n\n회고 (11-14): 바꾼 규칙 B\n\n<!-- weekly_metrics -->\n지표 요약 1\n")
     d2 = wm.milestone_description(d1 + "\n회고 줄 뒤에 추가", "지표 요약 2")
     assert "지표 요약 1" not in d2 and "지표 요약 2" in d2 and d2.endswith("회고 줄 뒤에 추가")
     assert d2.count(wm.MS_BEGIN) == 1
+    assert wm.milestone_description(d2, "지표 요약 2") == d2  # 같은 요약이면 바뀌지 않음
     assert wm.milestone_description("", "x") == "<!-- weekly_metrics -->\nx\n<!-- /weekly_metrics -->"
+
+
+def test_milestone_description_keeps_crlf_outside_markers():
+    head, tail = "주간 점검·회고\r\n\r\n회고 (11-14): 바꾼 규칙 B\r\n\r\n", "\r\n회고 뒤 줄\r\n  들여쓴 줄\r\n"
+    d1 = wm.milestone_description(head.rstrip(), "요약 1\n둘째 줄")
+    assert d1 == head + "<!-- weekly_metrics -->\r\n요약 1\r\n둘째 줄\r\n<!-- /weekly_metrics -->"
+    old = head + "<!-- weekly_metrics -->\r\n요약 1\r\n<!-- /weekly_metrics -->" + tail
+    d2 = wm.milestone_description(old, "요약 2")
+    assert d2 == head + "<!-- weekly_metrics -->\r\n요약 2\r\n<!-- /weekly_metrics -->" + tail
+
+
+def test_milestone_description_mixed_newlines_and_marker_text_in_prose():
+    old = "회고\r\n\r\n<!-- weekly_metrics -->\n요약 한 줄\n<!-- /weekly_metrics -->\r\n끝 줄"
+    d1 = wm.milestone_description(old, "요약 한 줄")
+    assert d1 == "회고\r\n\r\n<!-- weekly_metrics -->\r\n요약 한 줄\r\n<!-- /weekly_metrics -->\r\n끝 줄"
+    assert wm.milestone_description(d1, "요약 한 줄") == d1  # 두 번째 실행은 바뀌는 것 없음
+    prose = "메모: `<!-- /weekly_metrics -->` 위는 지우지 말 것\n\n<!-- weekly_metrics -->\n옛 요약\n<!-- /weekly_metrics -->"
+    assert wm.milestone_description(prose, "새 요약") == prose.replace("옛 요약", "새 요약")
+
+
+@pytest.mark.parametrize("old", [
+    "회고 줄\n<!-- weekly_metrics -->\n요약\n뒤에 쓴 회고",  # 끝 표시만 지워짐
+    "회고 줄\n요약\n<!-- /weekly_metrics -->\n뒤에 쓴 회고",  # 시작 표시만 지워짐
+    "<!-- /weekly_metrics -->\n회고 줄\n<!-- weekly_metrics -->\n요약",  # 순서 뒤바뀜
+    "<!-- weekly_metrics -->\n가\n<!-- /weekly_metrics -->\n회고\n<!-- weekly_metrics -->\n나\n<!-- /weekly_metrics -->",  # 두 쌍
+])
+def test_milestone_description_refuses_broken_markers(old):
+    with pytest.raises(ValueError, match="표시가 깨짐"):
+        wm.milestone_description(old, "새 요약")
+
+
+def test_sync_milestone_stops_before_writing_on_broken_markers(monkeypatch):
+    calls = []
+    ms = [{"number": 9, "title": "2026-W48", "description": "회고\n<!-- weekly_metrics -->\n요약"}]
+
+    def fake_sh(*args):
+        calls.append(args)
+        return wm.json.dumps(ms)
+    monkeypatch.setattr(wm, "sh", fake_sh)
+    start, end = wm.week_range("2026-W48")[1:]
+    for dry_run in (True, False):
+        with pytest.raises(SystemExit, match="표시가 깨짐"):
+            wm.sync_milestone("2026-W48", start, end, [], {"prs": []}, "새 요약", dry_run)
+    assert all("PATCH" not in a and "POST" not in a for a in calls)
+
+
+def test_main_saves_week_record_before_milestone_stops(monkeypatch, tmp_path):
+    monkeypatch.setattr(wm, "collect", lambda *a: ([], [], [], {}))
+    monkeypatch.setattr(wm, "render", lambda *a: "주간 기록")
+    monkeypatch.setattr(wm, "milestone_summary", lambda *a: "요약")
+
+    def broken(*a):
+        raise SystemExit("표시가 깨짐")
+    monkeypatch.setattr(wm, "sync_milestone", broken)
+    with pytest.raises(SystemExit, match="표시가 깨짐"):
+        wm.main(["--week", "2026-W48", "--milestone", "--out", str(tmp_path)])
+    assert (tmp_path / "2026-W48.md").read_text(encoding="utf-8") == "주간 기록"
 
 
 def test_milestone_summary_links_week_record():

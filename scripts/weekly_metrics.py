@@ -421,13 +421,23 @@ def to_attach(prs, issues, start, end, title):
 
 
 def milestone_description(old, summary):
-    """설명에서 표시 사이만 summary로 바꾼다. 표시가 없으면 끝에 붙인다 (손으로 쓴 설명·회고 줄은 그대로)"""
-    block = f"{MS_BEGIN}\n{summary.strip()}\n{MS_END}"
-    old = (old or "").replace("\r\n", "\n")
-    i, j = old.find(MS_BEGIN), old.find(MS_END)
-    if i != -1 and j > i:
-        return old[:i] + block + old[j + len(MS_END):]
-    return f"{old.rstrip()}\n\n{block}" if old.strip() else block
+    """설명에서 표시 사이만 summary로 바꾼다. 표시가 없으면 끝에 붙인다.
+    표시 밖(손으로 쓴 설명·회고 줄)은 줄바꿈까지 그대로 둔다. 블록은 설명의 줄바꿈(CRLF/LF)을 따른다.
+    표시는 줄 전체가 표시 문자열일 때만 센다 (글 속에 적은 표시 문자열은 표시가 아님).
+    표시가 깨졌으면(하나만 있음·여러 쌍·순서 뒤바뀜) 손으로 쓴 줄을 지우지 않게 ValueError"""
+    old = old or ""
+    nl = "\r\n" if "\r\n" in old else "\n"
+    body = nl.join(summary.strip().replace("\r\n", "\n").split("\n"))
+    block = f"{MS_BEGIN}{nl}{body}{nl}{MS_END}"
+    begins = [m.start() for m in re.finditer(rf"(?m)^{re.escape(MS_BEGIN)}(?=\r?$)", old)]
+    ends = [m.end() for m in re.finditer(rf"(?m)^{re.escape(MS_END)}(?=\r?$)", old)]
+    if not begins and not ends:
+        return f"{old.rstrip()}{nl}{nl}{block}" if old.strip() else block
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        raise ValueError(f"마일스톤 설명의 지표 표시가 깨짐 (시작 {len(begins)}개, 끝 {len(ends)}개"
+                         + (", 끝이 시작보다 앞" if len(begins) == len(ends) == 1 else "")
+                         + "): 손으로 고친 뒤 다시 실행")
+    return old[:begins[0]] + block + old[ends[0]:]
 
 
 def bug_fields(body):
@@ -649,10 +659,13 @@ def sync_milestone(label, start, end, issues, extra, summary, dry_run):
     ms = next((m for m in got if m["title"] == label), None)
     attach, other = to_attach(extra["prs"], issues, start, end, label)
     old = (ms or {}).get("description") or ""  # 설명이 비면 API는 null
-    desc = milestone_description(old, summary)
+    try:  # 쓰기 전에(dry-run에서도) 깨진 표시를 알리고 멈춘다
+        desc = milestone_description(old, summary)
+    except ValueError as e:
+        raise SystemExit(f"마일스톤 {label}: {e}") from None
     tag = "(dry-run) " if dry_run else ""
     print(f"{tag}마일스톤 {label}: " + (f"있음 #{ms['number']}" if ms else f"만듦 (마감 {milestone_due(start)})"))
-    print(f"{tag}설명 지표 칸: " + ("바꿀 것 없음" if ms and desc == old.replace("\r\n", "\n") else "씀"))
+    print(f"{tag}설명 지표 칸: " + ("바꿀 것 없음" if ms and desc == old else "씀"))
     print(f"{tag}붙일 것 {len(attach)}: " + (", ".join(f"{k} #{n}" for k, n, _ in attach) or "없음"))
     if other:
         print("다른 마일스톤에 있어 그대로 둠: " + ", ".join(f"{k} #{n}({m})" for k, n, m in other))
@@ -662,7 +675,7 @@ def sync_milestone(label, start, end, issues, extra, summary, dry_run):
     if ms is None:
         ms = json.loads(sh("gh", "api", "-X", "POST", f"repos/{REPO}/milestones", "-f", f"title={label}",
                            "-f", f"due_on={milestone_due(start)}", "-f", f"description={desc}"))
-    elif desc != old.replace("\r\n", "\n"):
+    elif desc != old:
         sh("gh", "api", "-X", "PATCH", f"repos/{REPO}/milestones/{int(ms['number'])}", "-f", f"description={desc}")
     for _, n, _ in attach:  # PR도 이슈 API로 붙인다
         sh("gh", "api", "-X", "PATCH", f"repos/{REPO}/issues/{int(n)}", "-F", f"milestone={int(ms['number'])}")
@@ -748,19 +761,16 @@ def main(argv=None):
     label, start, end = week_range(a.week)
     rows, issues, tags, extra = collect(start, end, a.check_log)
     md = render(label, start, end, rows, issues, tags, extra)
-    if a.milestone:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sync_milestone(label, start, end, issues, extra, milestone_summary(label, rows, extra), a.dry_run)
-        if not a.out:
-            return
-    if a.out:
+    sys.stdout.reconfigure(encoding="utf-8")
+    if a.out:  # 마일스톤 갱신이 멈춰도(깨진 표시) 요약이 링크하는 기록 파일은 남게 먼저 쓴다
         p = Path(a.out) / f"{label}.md"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(md, encoding="utf-8")
         print(f"저장: {p}")
-    else:
-        sys.stdout.reconfigure(encoding="utf-8")
+    elif not a.milestone:
         print(md)
+    if a.milestone:
+        sync_milestone(label, start, end, issues, extra, milestone_summary(label, rows, extra), a.dry_run)
 
 
 if __name__ == "__main__":
