@@ -1588,29 +1588,31 @@ def ranked(q, vec, year_from=None, year_to=None):
 
 
 def no_match_threshold():
-    """'관련 문서 없음' 벡터 1위 유사도 하한 — 지금 임베딩 모델의 값(retrieval.NO_MATCH_THRESHOLD). 환경변수
-    SEARCH_NO_MATCH_THRESHOLD로 바꾼다 (빈 값·'off' = 쓰지 않음). 모델 값이 없으면 None"""
-    raw = os.environ.get("SEARCH_NO_MATCH_THRESHOLD")
-    if raw is not None:
-        raw = raw.strip().lower()
-        return None if raw in ("", "off") else float(raw)
-    return retrieval.threshold_for(store.embed_config()[0])
+    """'관련 문서 없음' 벡터 1위 유사도 하한. 기본은 쓰지 않는다 (2026-11-24 결정 — 합성 세트로만 정한 값이라 운영 기본은 끔).
+    환경변수 SEARCH_NO_MATCH_THRESHOLD: 비움·'off' = 쓰지 않음, 'auto' = 지금 임베딩 모델의 값(retrieval.NO_MATCH_THRESHOLD,
+    없으면 쓰지 않음), 숫자 = 그 값"""
+    raw = (os.environ.get("SEARCH_NO_MATCH_THRESHOLD") or "off").strip().lower()
+    if raw == "off":
+        return None
+    if raw == "auto":
+        return retrieval.threshold_for(store.embed_config()[0])
+    return float(raw)
 
 
 def hybrid(q, year_from=None, year_to=None, k=10, user=None, empty_on_miss=False):
-    """empty_on_miss=True(/search): '관련 문서 없음'이면 빈 목록 — 문서번호 질의인데 그 번호가 없거나, 질의 연도로 걸러
-    후보가 없거나, 벡터 1위 유사도가 하한(no_match_threshold) 밑. False(/ask)는 비우지 않는다: 질의 연도로 비었으면
-    연도 없이 다시 찾는다 (2026-11-24 결정 — /ask는 그대로, 문서번호 고정만)"""
+    """질의 연도로 걸러 후보가 비면 연도 없이 다시 찾는다 (/search·/ask 둘 다, 2026-11-24 결정).
+    empty_on_miss=True(/search): '관련 문서 없음'이면 빈 목록 — 문서번호 질의인데 그 번호가 없거나, 후보가 없거나,
+    벡터 1위 유사도가 하한(no_match_threshold, 기본 끔) 밑. False(/ask)는 비우지 않는다 (/ask는 그대로, 문서번호 고정만)"""
     # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다.
     # 질의 임베딩은 검색·질문 예산(query) — 다 쓰면 BudgetExceeded → 503 (budget_exceeded 처리기)
     vec = llm.embed("-", [q], scope="query", user_id=getattr(user, "id", None))[0]
     r = rank(q, vec, year_from, year_to)
+    if not r.order and r.year is not None:
+        r = rank(q, vec, year_from, year_to, cfg=dataclasses.replace(retrieval.SEARCH, year=False))
     if empty_on_miss:
         top_sim = r.vector[0].get("score") if r.vector else None  # 점수 없는 후보(시험용 가짜)는 하한을 보지 않는다
         if retrieval.no_match(r, top_sim, no_match_threshold()):
             return []
-    elif not r.order and r.year is not None:
-        r = rank(q, vec, year_from, year_to, cfg=dataclasses.replace(retrieval.SEARCH, year=False))
     v, kw, score, order = r.vector, r.keyword, r.score, r.order
     top = order[:k]
     rows = store.get_documents(top)

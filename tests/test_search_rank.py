@@ -158,17 +158,23 @@ def test_hybrid_query_year_threshold_and_ask_fallback(monkeypatch):
     main.hybrid("1995년 도로 점용", k=2)
     main.hybrid("1995년 도로 점용", 1990, 1999, k=2)
     assert calls[-2:] == [(1995, 1995), (1990, 1999)]
-    # /search: 질의 연도로 걸러 비면 '없음', /ask: 연도 없이 다시
-    assert main.hybrid("1990년 영업신고", empty_on_miss=True) == []
+    # 질의 연도로 걸러 비면 /search·/ask 둘 다 연도 없이 다시 찾는다 (2026-11-24 결정)
+    assert [h["doc_id"] for h in main.hybrid("1990년 영업신고", empty_on_miss=True)] == ["a", "b"]
+    assert calls[-2:] == [(1990, 1990), (None, None)]
     assert [h["doc_id"] for h in main.hybrid("1990년 영업신고")] == ["a", "b"] and calls[-1] == (None, None)
-    # 유사도 하한: 기본 모델 te3-small 0.34 → 1위 0.3이면 /search '없음', /ask는 그대로
+    # 화면 연도 칸으로 비면 다시 찾지 않는다: /search '없음'
+    assert main.hybrid("영업신고", 1990, 1990, empty_on_miss=True) == [] and calls[-1] == (1990, 1990)
+    # 유사도 하한: 기본은 끔
+    assert main.no_match_threshold() is None and len(main.hybrid("도로 점용", empty_on_miss=True)) == 2
+    # auto = 지금 모델(te3-small 0.34) → 1위 0.3이면 /search '없음', /ask는 그대로
+    monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", "auto")
     assert main.no_match_threshold() == rt.NO_MATCH_THRESHOLD["text-embedding-3-small"]
     assert main.hybrid("도로 점용", empty_on_miss=True) == []
     assert len(main.hybrid("도로 점용")) == 2
-    monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", "off")
-    assert main.no_match_threshold() is None and len(main.hybrid("도로 점용", empty_on_miss=True)) == 2
     monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", "0.25")
     assert len(main.hybrid("도로 점용", empty_on_miss=True)) == 2
+    monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", "off")
+    assert main.no_match_threshold() is None
 
 
 def test_no_docno_query_skips_docno_lookup(monkeypatch):

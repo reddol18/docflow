@@ -196,7 +196,8 @@ def rank(q, vector, keyword, docno_candidates=(), cfg=None, year=None):
 
 def no_match(ranking, top_sim=None, threshold=None):
     """'관련 문서 없음'으로 볼지 (/search만 — /ask는 그대로, 2026-11-24 결정).
-    문서번호 질의인데 그 번호의 문서가 없거나, 후보가 하나도 없거나(연도로 걸러 비었을 때), threshold(벡터 1위 유사도 하한)를
+    문서번호 질의인데 그 번호의 문서가 없거나, 후보가 하나도 없거나(화면 연도 칸으로 걸러 비었을 때 — 질의 연도로 비면
+    부르는 쪽이 연도 없이 다시 찾는다), threshold(벡터 1위 유사도 하한)를
     주면 top_sim < threshold일 때. 문서번호가 맞은 질의는 '없음'이 아니다"""
     if ranking.docno_miss or not ranking.order:
         return True
@@ -211,8 +212,9 @@ def no_match(ranking, top_sim=None, threshold=None):
 SEARCH = Config(clean=False, year=True, kw_weight=0.5)
 # 벡터 1위 유사도 '없음' 하한 {임베딩 모델: 값} — 모델마다 유사도 분포가 달라 모델별로. 없는 모델은 임계값을 쓰지 않는다
 # (7단계, 합성 세트 A·B 62질의, 운영 설정 SEARCH·문서 글 current). 보수적으로: 답 있는 질의를 하나도 '없음'으로 보지 않는
-# 가장 큰 값 (eval/search_synth.py --pool). 김해 실제 문서로는 재지 않은 값 — 운영에서는 SEARCH_NO_MATCH_THRESHOLD로 끌 수 있다
-#   text-embedding-3-small 0.34: 합성 답 없음 12건 중 이 값으로 더 잡는 것 없음 (문서번호·연도 규칙으로 3건). 1위 유사도가
+# 가장 큰 값 (eval/search_synth.py --pool). 김해 실제 문서로는 재지 않은 값 — 운영 기본은 끔(2026-11-24 결정),
+# SEARCH_NO_MATCH_THRESHOLD=auto로 켠다 (app/main.no_match_threshold)
+#   text-embedding-3-small 0.34: 합성 답 없음 12건 중 이 값으로 더 잡는 것 없음 (문서번호 규칙으로 2건). 1위 유사도가
 #                          답 있음·없음에 겹쳐 있다 (답 있는 바꿔 말하기 질의 0.343 < 답 없는 질의 0.39~0.62)
 #   bge-m3 0.578: 답 없음 9/12, 잘못 '없음' 0 (하나 빼고 고르기 9/12, 잘못 1)
 NO_MATCH_THRESHOLD = {"text-embedding-3-small": 0.34, "bge-m3": 0.578}

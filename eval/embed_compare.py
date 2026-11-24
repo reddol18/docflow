@@ -20,6 +20,7 @@ Qdrant(1536 고정, app/store.py)에 넣지 않고 메모리 안에서 같은 �
 결과: <work>/embed/<label>.json (질의별 순위·차원·토큰·비용). 합성 철만 받는다 (eval/compare_common.py).
 """
 import argparse
+import dataclasses
 import json
 import re
 import statistics
@@ -154,10 +155,14 @@ def app_rank(q, qv, docs, dvecs, year=None, cfg=None):
     후보만 메모리에서 가져오고 낱말 나누기·질의 연도·합치기(RRF 가중·문서번호 고정)는 운영과 같은 retrieval 함수.
     cfg = retrieval.Config (없으면 운영 설정 retrieval.SEARCH). year = 화면 연도 칸 (주면 질의 연도보다 앞)"""
     cfg = cfg or retrieval.SEARCH
-    year = year or retrieval.query_year(q, cfg)
+    qyear = None if year else retrieval.query_year(q, cfg)
+    year = year or qyear
     v, sims = vector_rank(qv, docs, dvecs, year)
     kw = keyword_rank(retrieval.query_terms(q, cfg), docs, year)
-    return retrieval.rank(q, v, kw, docno_candidates(q, docs, year), cfg=cfg, year=year), sims
+    r = retrieval.rank(q, v, kw, docno_candidates(q, docs, year), cfg=cfg, year=qyear)
+    if not r.order and qyear is not None:  # app/main.hybrid: 질의 연도로 비면 연도 없이 다시 (/search·/ask)
+        return app_rank(q, qv, docs, dvecs, None, dataclasses.replace(cfg, year=False))
+    return r, sims
 
 
 def rank_all(queries, docs, dvecs, qvecs):
