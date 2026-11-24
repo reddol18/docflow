@@ -1606,7 +1606,7 @@ def hybrid(q, year_from=None, year_to=None, k=10, user=None, empty_on_miss=False
     vec = llm.embed("-", [q], scope="query", user_id=getattr(user, "id", None))[0]
     r = rank(q, vec, year_from, year_to)
     if empty_on_miss:
-        top_sim = r.vector[0]["score"] if r.vector else None
+        top_sim = r.vector[0].get("score") if r.vector else None  # 점수 없는 후보(시험용 가짜)는 하한을 보지 않는다
         if retrieval.no_match(r, top_sim, no_match_threshold()):
             return []
     elif not r.order and r.year is not None:
