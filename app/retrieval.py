@@ -26,19 +26,88 @@ def query_words(q):
     return [w for w in re.split(r"\s+", q) if len(w) >= 2 and not YEAR_RX.fullmatch(w)]
 
 
+@dataclass(frozen=True)
+class Config:
+    """검색 설정 (https://github.com/reddol18/docflow/issues/61 6단계에서 합성 세트로 고른다).
+    clean      질의 다듬기: 괄호·문장부호 떼기, 낱말 끝 조사 떼기, 질문 틀 낱말(누구인가·문서번호 …) 빼기, 월·일 빼기
+    year       질의 안 연도('1995년' 하나)를 연도 칸으로 (화면 연도 칸이 비었을 때만)
+    kw_weight  RRF에서 낱말 순위의 가중 (1 = 예전과 같음, 0 = 낱말 순위를 합치지 않고 벡터만 — 문서번호 고정은 그대로)"""
+    clean: bool = False
+    year: bool = False
+    kw_weight: float = 1.0
+
+    @property
+    def name(self):
+        return f"{'clean_' if self.clean else ''}{'year_' if self.year else ''}kw{self.kw_weight:g}"
+
+
+PUNCT_RX = re.compile(r"[()\[\]{}<>「」『』\"'“”‘’?!.,·:;~]")
+# 낱말 끝 조사 (긴 것 먼저). 떼고 두 글자 이상 남을 때만 — 낱말 검색은 부분 일치라 덜 떼어도 맞고 더 떼도 맞는다
+PARTICLES = ("에서는", "에서", "으로", "에게", "께서", "부터", "까지", "에는", "의", "에", "을", "를", "이", "가", "은", "는", "로",
+             "와", "과", "도")
+# 질문 틀 낱말 (조사 뗀 뒤) — 어느 문서의 제목·수신·문서번호에도 뜻 없이 걸리거나 아무 데도 안 걸린다
+STOPWORDS = frozenset({"문서", "문서번호", "무엇인가", "누구인가", "언제", "어디인가", "어느", "각각", "모두", "찾아", "알려",
+                       "요약해", "시행되었나", "냈나", "관련", "신청인", "대표자", "수신자", "처리결과", "위치", "주소", "시행일자",
+                       "내용", "건이고", "있나", "되었나", "처리되었나", "어떻게"})
+DAY_RX = re.compile(r"\d{1,2}(월|일)")
+QUERY_YEAR_RX = re.compile(r"(?<!\d)((?:19|20)\d{2})년")
+
+
+NO_STRIP = ("허가", "인가", "평가", "추가", "참가", "증가")  # '가'로 끝나는 낱말 (조사 아님)
+
+
+def strip_particle(w):
+    if w.endswith(NO_STRIP):
+        return w
+    for p in PARTICLES:
+        if w.endswith(p) and len(w) - len(p) >= 2:
+            return w[:-len(p)]
+    return w
+
+
+def clean_words(q):
+    """다듬은 낱말 (Config.clean): 괄호·문장부호 → 공백, 연도·월·일 빼기, 조사 떼기, 질문 틀 낱말 빼기, 같은 낱말 한 번.
+    문서번호(번호 부분의 '-')는 그대로 둔다"""
+    out = []
+    for w in PUNCT_RX.sub(" ", q or "").split():
+        w = strip_particle(w)
+        if YEAR_RX.fullmatch(w) or DAY_RX.fullmatch(w):
+            continue
+        if len(w) >= 2 and w not in STOPWORDS and w not in out:
+            out.append(w)
+    return out
+
+
+def query_terms(q, cfg=None):
+    """낱말 검색에 넣을 낱말 — 설정에 따라 query_words 또는 clean_words"""
+    return clean_words(q) if (cfg or SEARCH).clean else query_words(q)
+
+
+def query_year(q, cfg=None):
+    """질의 안 연도 (Config.year일 때, 'NNNN년'이 한 가지일 때만). 아니면 None"""
+    if not (cfg or SEARCH).year:
+        return None
+    ys = set(QUERY_YEAR_RX.findall(q or ""))
+    return int(ys.pop()) if len(ys) == 1 else None
+
+
 def key_of(r):
     """문서 키 (철, doc_id) — 검색 행(dict) 또는 이미 키(tuple)인 것 모두 받는다
     (같은 쪽 이름이 다른 철에도 있을 수 있다, https://github.com/reddol18/docflow/issues/50)"""
     return (r["vol"], r["doc_id"]) if isinstance(r, dict) else tuple(r)
 
 
-def rrf(*lists):
-    """Reciprocal Rank Fusion 점수 {(vol, doc_id): Σ 1/(60+순위)} (순위는 1부터)"""
+def rrf(*lists, weights=None):
+    """Reciprocal Rank Fusion 점수 {(vol, doc_id): Σ w/(60+순위)} (순위는 1부터, 가중 w 기본 1).
+    가중이 0인 목록은 합치지 않는다 (그 목록에만 있는 문서도 넣지 않는다)"""
     score = {}
-    for lst in lists:
+    for i, lst in enumerate(lists):
+        w = 1 if weights is None else weights[i]
+        if not w:
+            continue
         for rank, r in enumerate(lst):
             k = key_of(r)
-            score[k] = score.get(k, 0) + 1 / (RRF_K + rank + 1)
+            score[k] = score.get(k, 0) + w / (RRF_K + rank + 1)
     return score
 
 
@@ -96,6 +165,7 @@ class Ranking:
     order: list  # 문서번호 고정 → RRF 순 키
     pinned: list = field(default_factory=list)  # 문서번호 정확 일치로 앞에 둔 키
     docnos: list = field(default_factory=list)  # 질의 안 문서번호
+    year: int | None = None  # 걸러 쓴 연도 (화면 연도 칸 또는 질의 연도)
 
     @property
     def docno_miss(self):
@@ -103,10 +173,10 @@ class Ranking:
         return bool(self.docnos) and not self.pinned
 
 
-def fuse(vector, keyword, pinned=()):
+def fuse(vector, keyword, pinned=(), kw_weight=1.0):
     """(RRF 점수, 순서). 순서 = pinned(문서번호 정확 일치, 그 순서) → 나머지 RRF 내림차순 (같은 점수는 먼저 나온 후보 순 —
-    예전 main.ranked와 같다)"""
-    score = rrf(vector, keyword)
+    예전 main.ranked와 같다). kw_weight = 낱말 순위의 가중 (0이면 벡터만)"""
+    score = rrf(vector, keyword, weights=(1.0, kw_weight))
     pinned = [key_of(k) for k in pinned]
     for k in pinned:
         score.setdefault(k, 0.0)
@@ -114,20 +184,39 @@ def fuse(vector, keyword, pinned=()):
     return score, pinned + rest
 
 
-def rank(q, vector, keyword, docno_candidates=()):
-    """후보 → Ranking. docno_candidates = [(키, 문서번호 칸 값)] (질의에 문서번호가 없으면 비워도 된다)"""
+def rank(q, vector, keyword, docno_candidates=(), cfg=None, year=None):
+    """후보 → Ranking. docno_candidates = [(키, 문서번호 칸 값)] (질의에 문서번호가 없으면 비워도 된다).
+    후보(vector·keyword)는 부르는 쪽이 query_terms·query_year로 가져온 것"""
+    cfg = cfg or SEARCH
     docnos = docnos_in(q)
     pinned = docno_matches(q, docno_candidates) if docnos else []
-    score, order = fuse(vector, keyword, pinned)
-    return Ranking(vector, keyword, score, order, pinned, docnos)
+    score, order = fuse(vector, keyword, pinned, cfg.kw_weight)
+    return Ranking(vector, keyword, score, order, pinned, docnos, year)
 
 
 def no_match(ranking, top_sim=None, threshold=None):
     """'관련 문서 없음'으로 볼지 (/search만 — /ask는 그대로, 2026-11-24 결정).
-    지금: 문서번호 질의인데 그 번호의 문서가 없을 때만. threshold(벡터 1위 유사도 하한)는 모델을 정한 뒤 정한다
-    (https://github.com/reddol18/docflow/issues/61 7단계) — 주면 top_sim < threshold도 '없음'. 문서번호가 맞은 질의는 '없음'이 아니다"""
-    if ranking.docno_miss:
+    문서번호 질의인데 그 번호의 문서가 없거나, 후보가 하나도 없거나(연도로 걸러 비었을 때), threshold(벡터 1위 유사도 하한)를
+    주면 top_sim < threshold일 때. 문서번호가 맞은 질의는 '없음'이 아니다"""
+    if ranking.docno_miss or not ranking.order:
         return True
     if ranking.pinned or threshold is None or top_sim is None:
         return False
     return top_sim < threshold
+
+
+# 운영 검색 설정 (https://github.com/reddol18/docflow/issues/61 6단계, 합성 세트 A·B로 고름): 질의 연도 → 연도 칸, 낱말 가중 0.5,
+# 질의 다듬기는 끔. text-embedding-3-small 기준 A 근거 모두 상위5 20 → 28/32, B 주제·바꿔 말하기·조건 R@5는 그대로.
+# 다듬기(clean)는 모델·글마다 들쭉날쭉(±)이고, 가중 0(벡터만)은 A가 더 오르지만 B 바꿔 말하기 R@5가 떨어진다
+SEARCH = Config(clean=False, year=True, kw_weight=0.5)
+# 벡터 1위 유사도 '없음' 하한 {임베딩 모델: 값} — 모델마다 유사도 분포가 달라 모델별로. 없는 모델은 임계값을 쓰지 않는다
+# (7단계, 합성 세트 A·B 62질의, 운영 설정 SEARCH·문서 글 current). 보수적으로: 답 있는 질의를 하나도 '없음'으로 보지 않는
+# 가장 큰 값 (eval/search_synth.py --pool). 김해 실제 문서로는 재지 않은 값 — 운영에서는 SEARCH_NO_MATCH_THRESHOLD로 끌 수 있다
+#   text-embedding-3-small 0.34: 합성 답 없음 12건 중 이 값으로 더 잡는 것 없음 (문서번호·연도 규칙으로 3건). 1위 유사도가
+#                          답 있음·없음에 겹쳐 있다 (답 있는 바꿔 말하기 질의 0.343 < 답 없는 질의 0.39~0.62)
+#   bge-m3 0.578: 답 없음 9/12, 잘못 '없음' 0 (하나 빼고 고르기 9/12, 잘못 1)
+NO_MATCH_THRESHOLD = {"text-embedding-3-small": 0.34, "bge-m3": 0.578}
+
+
+def threshold_for(model):
+    return NO_MATCH_THRESHOLD.get(model)

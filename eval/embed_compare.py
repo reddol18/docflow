@@ -52,8 +52,9 @@ def load_docs(work, vols):
         for d in cc.stored_docs(work, vol):
             row = gt.get(d["doc_id"]) or {}
             values = {k: row.get(k, "") for k in GT_FIELDS}
-            body = " ".join(cc.page_ocr(work, vol, d["pages"][0])["lines"][:60])
-            docs.append({"key": (vol, d["doc_id"]), "values": values,
+            lines = cc.page_ocr(work, vol, d["pages"][0])["lines"][:60]
+            body = " ".join(lines)
+            docs.append({"key": (vol, d["doc_id"]), "values": values, "lines": lines,
                          "text": f"{fields.embed_text(SCHEMA, values)}\n본문: {body}",
                          "search_text": fields.search_text(SCHEMA, values), "year": fields.year_of(SCHEMA, values)})
     return docs
@@ -148,12 +149,15 @@ def docno_candidates(q, docs, year=None):
     return sorted(out, key=lambda c: (c[0][1], c[0][0]))
 
 
-def app_rank(q, qv, docs, dvecs, year=None):
+def app_rank(q, qv, docs, dvecs, year=None, cfg=None):
     """app/main.rank와 같은 셈을 메모리 안에서 → (retrieval.Ranking, 벡터 유사도 목록).
-    후보만 메모리에서 가져오고 합치기(RRF·문서번호 고정)는 운영과 같은 retrieval.rank"""
+    후보만 메모리에서 가져오고 낱말 나누기·질의 연도·합치기(RRF 가중·문서번호 고정)는 운영과 같은 retrieval 함수.
+    cfg = retrieval.Config (없으면 운영 설정 retrieval.SEARCH). year = 화면 연도 칸 (주면 질의 연도보다 앞)"""
+    cfg = cfg or retrieval.SEARCH
+    year = year or retrieval.query_year(q, cfg)
     v, sims = vector_rank(qv, docs, dvecs, year)
-    kw = keyword_rank(query_words(q), docs, year)
-    return retrieval.rank(q, v, kw, docno_candidates(q, docs, year)), sims
+    kw = keyword_rank(retrieval.query_terms(q, cfg), docs, year)
+    return retrieval.rank(q, v, kw, docno_candidates(q, docs, year), cfg=cfg, year=year), sims
 
 
 def rank_all(queries, docs, dvecs, qvecs):

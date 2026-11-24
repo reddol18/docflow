@@ -118,7 +118,15 @@ function Search() {
         </Card>
       )}
 
-      {hits && !cols.length && (
+      {/* /search는 관련 문서가 없다고 보면 빈 목록을 준다 — 없는 문서번호, 질의 연도의 문서 없음, 유사도 하한 밑
+          (https://github.com/reddol18/docflow/issues/61) */}
+      {hits && hits.length === 0 && !answer && (
+        <Card title="결과 0건">
+          <p className="text-sm text-slate-600">관련 문서 없음 — 검색어와 맞는 문서를 찾지 못했습니다. 문서번호·연도·낱말을 바꿔 다시 찾아 보세요.</p>
+        </Card>
+      )}
+
+      {hits && hits.length > 0 && !cols.length && (
         <Card title={`결과 ${hits.length}건`}>
           <p className="text-sm text-slate-500">
             {schemaErr
@@ -130,7 +138,7 @@ function Search() {
         </Card>
       )}
 
-      {hits && cols.length > 0 && (
+      {hits && hits.length > 0 && cols.length > 0 && (
         <Card title={`결과 ${hits.length}건`}>
           <table className="w-full text-sm">
             <thead className="text-left text-xs text-slate-500">

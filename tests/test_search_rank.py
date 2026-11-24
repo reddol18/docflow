@@ -113,6 +113,64 @@ def test_search_route_uses_empty_on_miss(monkeypatch):
     assert seen["empty_on_miss"] is True
 
 
+def test_clean_words_and_query_year():
+    assert rt.clean_words("주식회사 마루상사(대표 윤서우)의 건축허가 신청을 처리한 문서는 언제 시행되었나?") == \
+        ["주식회사", "마루상사", "대표", "윤서우", "건축허가", "신청", "처리한"]  # '허가'의 '가'는 조사가 아니다
+    assert rt.clean_words("새솔시에서 1995년 12월 24일에 시행한 공장설립 승인") == ["새솔시", "시행한", "공장설립", "승인"]
+    assert rt.clean_words("문서번호 지경 56120-275 문서의 수신자는 누구인가?") == ["지경", "56120-275"]
+    assert rt.strip_particle("도로") == "도로" and rt.strip_particle("가람군이") == "가람군"  # 떼고 두 글자 이상만
+    on = rt.Config(clean=True, year=True)
+    assert rt.query_terms("1995년 도로 점용", rt.Config()) == ["도로", "점용"]
+    assert rt.query_year("새솔시가 1995년에 시행한", on) == 1995
+    assert rt.query_year("1995년 1996년", on) is None and rt.query_year("1995년", rt.Config()) is None
+    assert rt.query_year("1995-12-24 시행", on) is None
+    assert on.name == "clean_year_kw1" and rt.Config(kw_weight=0.5).name == "kw0.5"
+
+
+def test_weighted_fuse_and_vector_only():
+    v, kw = [("V", "a"), ("V", "b"), ("V", "c")], [("V", "c"), ("V", "d")]
+    assert rt.fuse(v, kw)[1] == [("V", "c"), ("V", "a"), ("V", "b"), ("V", "d")]
+    s, order = rt.fuse(v, kw, kw_weight=0.5)
+    assert order == [("V", "c"), ("V", "a"), ("V", "b"), ("V", "d")] and s[("V", "d")] == 0.5 / 62
+    s, order = rt.fuse(v, kw, kw_weight=0)  # 벡터만 — 낱말에만 있는 d는 빠진다
+    assert order == v and ("V", "d") not in s
+    assert rt.fuse(v, kw, pinned=[("V", "d")], kw_weight=0)[1][0] == ("V", "d")  # 문서번호 고정은 그대로
+    assert rt.no_match(rt.Ranking([], [], {}, []))  # 후보가 하나도 없으면 '없음'
+
+
+def test_hybrid_query_year_threshold_and_ask_fallback(monkeypatch):
+    from app import main
+    calls = []
+
+    def vector_search(vec, yf, yt, limit):
+        calls.append((yf, yt))
+        return [] if yf == 1990 else [{"vol": "V", "doc_id": "a", "score": 0.3}, {"vol": "V", "doc_id": "b", "score": 0.2}]
+
+    monkeypatch.setattr(main.store, "vector_search", vector_search)
+    monkeypatch.setattr(main.store, "keyword_search", lambda words, yf, yt, limit: [])
+    monkeypatch.setattr(main.llm, "embed", lambda vol, texts, **k: [[0.0]])
+    monkeypatch.setattr(main.store, "get_documents", lambda keys: {k: {"vol": k[0], "fields": {}} for k in keys})
+    monkeypatch.delenv("SEARCH_NO_MATCH_THRESHOLD", raising=False)
+    monkeypatch.delenv("EMBED_MODEL", raising=False)
+    monkeypatch.delenv("EMBED_DIM", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    # 질의 연도 → 연도 칸 (화면 연도 칸이 비었을 때만)
+    main.hybrid("1995년 도로 점용", k=2)
+    main.hybrid("1995년 도로 점용", 1990, 1999, k=2)
+    assert calls[-2:] == [(1995, 1995), (1990, 1999)]
+    # /search: 질의 연도로 걸러 비면 '없음', /ask: 연도 없이 다시
+    assert main.hybrid("1990년 영업신고", empty_on_miss=True) == []
+    assert [h["doc_id"] for h in main.hybrid("1990년 영업신고")] == ["a", "b"] and calls[-1] == (None, None)
+    # 유사도 하한: 기본 모델 te3-small 0.34 → 1위 0.3이면 /search '없음', /ask는 그대로
+    assert main.no_match_threshold() == rt.NO_MATCH_THRESHOLD["text-embedding-3-small"]
+    assert main.hybrid("도로 점용", empty_on_miss=True) == []
+    assert len(main.hybrid("도로 점용")) == 2
+    monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", "off")
+    assert main.no_match_threshold() is None and len(main.hybrid("도로 점용", empty_on_miss=True)) == 2
+    monkeypatch.setenv("SEARCH_NO_MATCH_THRESHOLD", "0.25")
+    assert len(main.hybrid("도로 점용", empty_on_miss=True)) == 2
+
+
 def test_no_docno_query_skips_docno_lookup(monkeypatch):
     main, calls = _fake_store(monkeypatch, [])
     main.hybrid("도로점용허가 회신")

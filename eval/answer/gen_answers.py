@@ -26,6 +26,7 @@ OpenAI에는 합성 철 글과 합성 질의만 간다 (eval/compare_common.synt
       --model gpt-4.1-mini --reuse-retrieval ..\\work_synth\\w48_21\\work\\answers\\gpt4omini_20261122.json --max-usd 0.2
 """
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -249,6 +250,8 @@ def main(argv=None):
             # app/main.rank와 같은 셈 (RRF + 문서번호 정확 일치 고정, https://github.com/reddol18/docflow/issues/61).
             # /ask는 문서번호가 없어도 '없음'으로 비우지 않는다 (2026-11-24 결정)
             r, _ = ec.app_rank(q["question"], qv, docs, dvecs)
+            if not r.order and r.year is not None:  # app/main.hybrid(/ask): 질의 연도로 비면 연도 없이 다시
+                r, _ = ec.app_rank(q["question"], qv, docs, dvecs, cfg=dataclasses.replace(ec.retrieval.SEARCH, year=False))
             hits = ask_hits(r.order, by_key, bodies, r.score, r.vector, r.keyword)
         else:
             hits = reuse_hits(prev_rows[q["id"]], bodies)

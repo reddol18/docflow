@@ -91,8 +91,9 @@ def test_query_metrics(ssy):
 
 def _row(qid, typ, gold, ranking, top_sim=0.5, docnos=(), pinned=()):
     from app import retrieval
-    r = retrieval.Ranking([], [], {}, [], list(pinned), list(docnos))
+    r = retrieval.Ranking([], [], {}, [("V", "x")], list(pinned), list(docnos))
     return {"id": qid, "type": typ, "gold": gold, "answerable": bool(gold), "top_sim": top_sim,
+            "pinned": ["/".join(k) for k in pinned], "docno_miss": r.docno_miss,
             "metrics": {m: ssy_metrics(ranking, gold) for m in ("vector", "keyword", "rrf", "app")} if gold else None,
             "_ranking": r}
 
@@ -113,16 +114,31 @@ def test_summarize_and_sweep(ssy):
     assert s[ssy.ALL]["app"]["n"] == 3 and s[ssy.ALL]["app"]["all5"] == 2
     assert s["수신"]["app"] == {"n": 2, "r1": 0.5, "r5": 1.0, "r10": 1.0, "mrr": 0.75, "all5": 2}
     assert s["여러 문서"]["app"]["r5"] == 0.5 and s["여러 문서"]["app"]["all5"] == 0
-    sw = ssy.sweep(rows, "app", [None, 0.32, 0.4, 0.55])
+    sw = ssy.sweep(rows, [None, 0.32, 0.4, 0.55])
     assert sw[0] == {"t": None, "none_n": 1, "tp": 1, "precision": 1.0, "recall": 0.5, "false_none": 0,
                      "false_none_ids": []}  # 문서번호 없음만
     assert sw[1]["t"] == 0.32 and sw[1]["tp"] == 2 and sw[1]["false_none"] == 0 and sw[1]["recall"] == 1.0
     assert sw[2]["t"] == 0.4 and sw[2]["false_none_ids"] == ["a2"] and sw[2]["precision"] == round(2 / 3, 3)
     assert sw[3]["t"] == 0.55 and sw[3]["false_none_ids"] == ["a2", "a3"]
-    # rrf는 문서번호 규칙 없이 임계값만
-    assert ssy.sweep(rows, "rrf", [None])[0]["none_n"] == 0
     # 결과가 앞 임계값과 같으면 줄을 뺀다
-    assert [x["t"] for x in ssy.sweep(rows, "app", [None, 0.1, 0.2, 0.32])] == [None, 0.32]
+    assert [x["t"] for x in ssy.sweep(rows, [None, 0.1, 0.2, 0.32])] == [None, 0.32]
+
+
+def test_threshold_pick_loo_and_saved_rows(ssy):
+    """보수적 임계값 = 가장 작은 답 있는 질의 유사도 (잘못 '없음' 0), 하나 빼고 고르기, 저장된 줄(_ranking 없음)도 같은 판정"""
+    rows = [_row("a1", "수신", ["d1"], ["d1"], 0.6), _row("a2", "수신", ["d3"], ["d3"], 0.35),
+            _row("a3", "수신", ["d1"], ["d1"], 0.2, docnos=[("도시", "1-1")], pinned=[("V", "d1")]),  # 문서번호가 맞음: 빼고 고른다
+            _row("n1", "답 없음", [], [], 0.30), _row("n2", "답 없음(없는 회사)", [], [], 0.5)]
+    assert ssy.scored_sims(rows) == [0.35, 0.6]
+    assert ssy.pick_threshold(rows) == 0.35 and ssy.pick_threshold(rows, max_false=1) == 0.6
+    lo = ssy.loo(rows)
+    # a2를 빼면 임계값 0.6 → a2를 '없음'으로 (잘못), n1은 어느 쪽이든 '없음', n2(0.5)는 a2가 있을 때 0.35라 아님
+    assert lo == {"tp": 1, "n_neg": 2, "false_none": 1, "false_none_ids": ["a2"], "none_ids": ["n1"]}
+    rep = ssy.none_report(rows, 0.35)
+    assert rep["all"] == "1/2" and rep["core"] == "1/1" and rep["excluded"] == "0/1" and rep["false_none"] == []
+    saved = [{k: v for k, v in r.items() if k != "_ranking"} | {"docno_miss": False, "pinned": r["_ranking"].pinned}
+             for r in rows]
+    assert [ssy.predict_none(r, 0.35) for r in saved] == [ssy.predict_none(r, 0.35) for r in rows]
 
 
 # ---------- 임베딩 캐시 ----------

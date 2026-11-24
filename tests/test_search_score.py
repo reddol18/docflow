@@ -77,7 +77,8 @@ def test_rrf_matches_search(monkeypatch):
     monkeypatch.setattr(main.store, "get_documents", lambda keys: {k: row for k in keys})
     got = [(h["vol"], h["doc_id"]) for h in main.hybrid("1999년 공장 등록", 1999, 1999, k=3)]
     *_, order = main.ranked("1999년 공장 등록", [0.0], 1999, 1999)
-    assert got == order[:3] == [("v", "c"), ("v", "b"), ("v", "a")]  # 두 쪽에 다 있는 c(1/63+1/61)·b(2/62)가 앞
+    # 두 쪽에 다 있는 b·c가 앞. 낱말 가중 0.5 (https://github.com/reddol18/docflow/issues/61): b(1/62+0.5/62) > c(1/63+0.5/61)
+    assert got == order[:3] == [("v", "b"), ("v", "c"), ("v", "a")]
     assert calls[0] == ("v", 1999, 1999, main.CANDIDATES)
     assert calls[1] == ("k", ("공장", "등록"), 1999, 1999, main.CANDIDATES)
     assert calls[:2] == calls[2:4]  # hybrid와 ranked가 같은 인자로 검색한다

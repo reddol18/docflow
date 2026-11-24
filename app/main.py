@@ -50,6 +50,7 @@ https://github.com/reddol18/docflow/issues/86). 설정이 없으면 위의 입�
 상한 잠금을 못 얻으면 503 + Retry-After. 실행 상태는 vol_run 행(app/runs.py) — API·워커가 같이 본다.
 WORKER_INLINE=1이면 이 프로세스 안에서도 워커를 돌린다 (워커 Pod 없는 개발용).
 """
+import dataclasses
 import datetime as dt
 import filecmp
 import html
@@ -1560,18 +1561,23 @@ CANDIDATES = 30  # 방식마다 가져오는 후보 수
 DOCNO_CANDIDATES = 20  # 문서번호 번호 부분이 든 문서 후보 (정확 일치는 retrieval.docno_matches가 고른다)
 
 
-def rank(q, vec, year_from=None, year_to=None):
-    """/search·/ask의 순위 계산(질의 임베딩 뒤) → retrieval.Ranking.
-    벡터 30 + 낱말 30 → RRF, 질의에 문서번호가 있으면 번호가 정확히 같은 문서를 맨 앞에 고정
-    (https://github.com/reddol18/docflow/issues/61 — 낱말 1위 예외는 문서번호 정확 일치만, 2026-11-24 결정)"""
+def rank(q, vec, year_from=None, year_to=None, cfg=None):
+    """/search·/ask의 순위 계산(질의 임베딩 뒤) → retrieval.Ranking (https://github.com/reddol18/docflow/issues/61).
+    벡터 30 + 낱말 30 → RRF(낱말 가중 cfg.kw_weight), 질의에 문서번호가 있으면 번호가 정확히 같은 문서를 맨 앞에 고정.
+    화면 연도 칸이 비었고 질의에 연도('1995년')가 하나 있으면 그 연도로 거른다 (cfg.year). cfg 기본 = retrieval.SEARCH"""
+    cfg = cfg or retrieval.SEARCH
+    qyear = None
+    if not year_from and not year_to:
+        qyear = retrieval.query_year(q, cfg)
+        year_from = year_to = qyear
     v = store.vector_search(vec, year_from, year_to, limit=CANDIDATES)
-    kw = store.keyword_search(query_words(q), year_from, year_to, limit=CANDIDATES)
+    kw = store.keyword_search(retrieval.query_terms(q, cfg), year_from, year_to, limit=CANDIDATES)
     docnos = retrieval.docnos_in(q)
     cands = []
     if docnos:
         rows = store.docno_search([n for _, n in docnos], year_from, year_to, limit=DOCNO_CANDIDATES)
         cands = [(store.doc_key(r), r["docno"]) for r in rows]
-    return retrieval.rank(q, v, kw, cands)
+    return retrieval.rank(q, v, kw, cands, cfg=cfg, year=qyear)
 
 
 def ranked(q, vec, year_from=None, year_to=None):
@@ -1581,14 +1587,30 @@ def ranked(q, vec, year_from=None, year_to=None):
     return r.vector, r.keyword, r.score, r.order
 
 
+def no_match_threshold():
+    """'관련 문서 없음' 벡터 1위 유사도 하한 — 지금 임베딩 모델의 값(retrieval.NO_MATCH_THRESHOLD). 환경변수
+    SEARCH_NO_MATCH_THRESHOLD로 바꾼다 (빈 값·'off' = 쓰지 않음). 모델 값이 없으면 None"""
+    raw = os.environ.get("SEARCH_NO_MATCH_THRESHOLD")
+    if raw is not None:
+        raw = raw.strip().lower()
+        return None if raw in ("", "off") else float(raw)
+    return retrieval.threshold_for(store.embed_config()[0])
+
+
 def hybrid(q, year_from=None, year_to=None, k=10, user=None, empty_on_miss=False):
-    """empty_on_miss: 문서번호 질의인데 그 번호의 문서가 없으면 빈 목록('관련 문서 없음') — /search만 (/ask는 그대로)"""
+    """empty_on_miss=True(/search): '관련 문서 없음'이면 빈 목록 — 문서번호 질의인데 그 번호가 없거나, 질의 연도로 걸러
+    후보가 없거나, 벡터 1위 유사도가 하한(no_match_threshold) 밑. False(/ask)는 비우지 않는다: 질의 연도로 비었으면
+    연도 없이 다시 찾는다 (2026-11-24 결정 — /ask는 그대로, 문서번호 고정만)"""
     # LLM_PROVIDER=off면 질의 임베딩에서 LLMOff → 503 (llm_off 처리기). 낱말 검색만으로 답할지는 정하지 않았다.
     # 질의 임베딩은 검색·질문 예산(query) — 다 쓰면 BudgetExceeded → 503 (budget_exceeded 처리기)
     vec = llm.embed("-", [q], scope="query", user_id=getattr(user, "id", None))[0]
     r = rank(q, vec, year_from, year_to)
-    if empty_on_miss and retrieval.no_match(r):
-        return []
+    if empty_on_miss:
+        top_sim = r.vector[0]["score"] if r.vector else None
+        if retrieval.no_match(r, top_sim, no_match_threshold()):
+            return []
+    elif not r.order and r.year is not None:
+        r = rank(q, vec, year_from, year_to, cfg=dataclasses.replace(retrieval.SEARCH, year=False))
     v, kw, score, order = r.vector, r.keyword, r.score, r.order
     top = order[:k]
     rows = store.get_documents(top)
