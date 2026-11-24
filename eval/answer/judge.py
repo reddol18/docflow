@@ -166,17 +166,44 @@ def summarize(rows, thresholds):
     return out
 
 
-class Meter:
-    """httpx 응답 훅: 토큰·모델 이름을 세고, 정한 호스트·경로 밖 요청은 막는다"""
+def parse_deadline(s):
+    """'2026-11-22T00:40:00Z'·'+09:00' 붙은 시각 → epoch 초. 시간대가 없으면 UTC로 본다 (이름이 --deadline-utc)"""
+    import datetime as dt  # noqa: PLC0415
+    t = dt.datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
 
-    def __init__(self, host, paths):
-        self.host, self.paths = host, tuple(paths)
+
+def _origin(scheme, host, port):
+    return (scheme, host or "", port or {"https": 443, "http": 80}.get(scheme))
+
+
+def leak_in(e):
+    """예외 사슬(__cause__·__context__) 안에 JudgeLeak이 있으면 그것 — SDK가 훅 예외를 APIConnectionError로 싸서 다시 던진다"""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        if isinstance(e, JudgeLeak):
+            return e
+        seen.add(id(e))
+        e = e.__cause__ or e.__context__
+    return None
+
+
+class Meter:
+    """httpx 훅: 토큰·모델 이름을 세고, 정한 주소(스킴·호스트·포트)·경로 밖 요청은 막는다. 막은 요청은 leaks에도 남긴다"""
+
+    def __init__(self, base_url, paths):
+        u = urlsplit(base_url)
+        self.origin, self.paths = _origin(u.scheme, u.hostname, u.port), tuple(paths)
         self.prompt_tokens = self.completion_tokens = self.calls = 0
         self.models = set()
+        self.leaks = []
 
     async def on_request(self, request):
-        if request.url.host != self.host or not request.url.path.endswith(self.paths):
-            raise JudgeLeak(f"허용 밖 요청 {request.url.host}{request.url.path} (허용 {self.host} {self.paths})")
+        got = _origin(request.url.scheme, request.url.host, request.url.port)
+        if got != self.origin or not request.url.path.endswith(self.paths):
+            msg = f"허용 밖 요청 {got[0]}://{got[1]}:{got[2]}{request.url.path} (허용 {self.origin} {self.paths})"
+            self.leaks.append(msg)
+            raise JudgeLeak(msg)
 
     async def on_response(self, response):
         await response.aread()
@@ -244,9 +271,10 @@ async def judge_row(row, metrics, llm, prompts, models, only=None):
     async def run(name, coro):
         try:
             return await coro
-        except JudgeLeak:
-            raise
         except Exception as e:  # noqa: BLE001 — 심판 응답이 형식에 안 맞는 등. 그 지표만 해당 없음으로
+            leak = leak_in(e)
+            if leak is not None:  # 허용 밖 요청 — 싸여 와도 멈춘다
+                raise leak from e
             errors[name] = f"{type(e).__name__}: {str(e)[:200]}"
             return None
 
@@ -280,7 +308,9 @@ async def judge_row(row, metrics, llm, prompts, models, only=None):
                     supported[c] = bool(s and s.supported)
                     if s is not None:
                         reasons.setdefault("citation_accuracy", {})[c] = s.reason
-            scores["citation_accuracy"] = citation_value(row.get("cited") or [], keys, supported, refused)
+            # 판정 하나라도 오류면 실패로 세지 않고 해당 없음 (다른 지표와 같게)
+            scores["citation_accuracy"] = (None if "citation_accuracy" in errors
+                                           else citation_value(row.get("cited") or [], keys, supported, refused))
     th = prompts["thresholds"]
     binary = {m: binarize(m, scores.get(m), th, row["answerable"], refused) for m in METRICS}
     return {"scores": scores, "binary": binary, "reasons": reasons, "errors": errors, "seconds": round(time.time() - t0, 1)}
@@ -322,7 +352,7 @@ def build(a, prompts):
     os.environ.pop("OPENAI_BASE_URL", None)
     judge_key = take_env("DOCFLOW_JUDGE_API_KEY") or "none"
     base = check_base_url(a.base_url)
-    jm = Meter(urlsplit(base).hostname, ("/chat/completions",))
+    jm = Meter(base, ("/chat/completions",))
     jclient = AsyncOpenAI(api_key=judge_key, base_url=base, timeout=a.timeout, max_retries=1,
                           http_client=httpx.AsyncClient(timeout=a.timeout, event_hooks={"request": [jm.on_request],
                                                                                          "response": [jm.on_response]}))
@@ -335,7 +365,7 @@ def build(a, prompts):
     if ebase == OPENAI_BASE and not openai_key:
         raise SystemExit("OPENAI_API_KEY가 없다 (질문 적합도 임베딩용)")
     ekey = openai_key if ebase == OPENAI_BASE else (take_env("DOCFLOW_EMBED_API_KEY") or "none")
-    em = Meter(urlsplit(ebase).hostname, ("/embeddings",))
+    em = Meter(ebase, ("/embeddings",))
     eclient = AsyncOpenAI(api_key=ekey, base_url=ebase, timeout=60, max_retries=2,
                           http_client=httpx.AsyncClient(timeout=60, event_hooks={"request": [em.on_request],
                                                                                   "response": [em.on_response]}))
@@ -409,8 +439,7 @@ def main(argv=None):
     digest = ollama_digest(base, a.model)  # 시작할 때 (마감·끊김 뒤에는 못 읽을 수 있다)
     deadline = None
     if a.deadline_utc:
-        import datetime as dt  # noqa: PLC0415
-        deadline = dt.datetime.fromisoformat(a.deadline_utc.replace("Z", "+00:00")).timestamp()
+        deadline = parse_deadline(a.deadline_utc)
     t0 = time.time()
     holder = {}
 
@@ -437,6 +466,8 @@ def main(argv=None):
         holder["res"] = res
 
     out = asyncio.run(run_all(rows, metrics, llm, prompts, models, deadline, save, only))
+    if jm.leaks or em.leaks:  # 어디서 삼켜졌든 막은 요청이 있었으면 실패로 끝낸다
+        raise SystemExit(f"허용 밖 요청을 막았다: {(jm.leaks + em.leaks)[:3]}")
     if not out:
         raise SystemExit("채점한 질의가 없다")
     if not holder["res"]["complete"]:

@@ -216,7 +216,9 @@ def unanswerable(facts, r):
     for c, what in ABSENT_CASE[:2]:
         out.append(("없는 건 종류", f"{r.choice(cities)}에서 {c}({what}) 신청을 처리한 문서의 시행일자는 언제인가?"))
     out.append(("없는 도시", f"{ABSENT_CITY[0]}에서 {case} 신청을 처리한 문서는 어느 부서에서 냈나?"))
-    y = next(y for y in (1990, 1999, 1989) if y not in years)
+    y = next((y for y in (1990, 1999, 1989) if y not in years), None)
+    if y is None:
+        raise ValueError("'없는 연도' 질의에 쓸 연도가 없다 — 사실표에 1990·1999·1989가 모두 있다")
     out.append(("없는 연도", f"{y}년에 시행한 {case} 관련 문서의 신청인은 누구인가?"))
     comp = r.choice(sorted(companies))
     for rep in ABSENT_REP[:2]:

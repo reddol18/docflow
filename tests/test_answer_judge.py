@@ -214,16 +214,39 @@ def test_summarize(jd):
 
 
 def test_meter_blocks_other_hosts(jd):
-    m = jd.Meter("127.0.0.1", ("/chat/completions",))
-    req = lambda url: SimpleNamespace(url=SimpleNamespace(host=url[0], path=url[1]))
-    asyncio.run(m.on_request(req(("127.0.0.1", "/v1/chat/completions"))))
-    for bad in (("api.openai.com", "/v1/chat/completions"), ("127.0.0.1", "/v1/embeddings")):
+    m = jd.Meter("http://127.0.0.1:18434/v1", ("/chat/completions",))
+    req = lambda s, h, port, path: SimpleNamespace(url=SimpleNamespace(scheme=s, host=h, port=port, path=path))
+    asyncio.run(m.on_request(req("http", "127.0.0.1", 18434, "/v1/chat/completions")))
+    for bad in (("https", "api.openai.com", None, "/v1/chat/completions"), ("http", "127.0.0.1", 18434, "/v1/embeddings"),
+                ("http", "127.0.0.1", 11434, "/v1/chat/completions")):  # 같은 호스트 다른 포트(이 PC Ollama)도 막음
         with pytest.raises(jd.JudgeLeak):
-            asyncio.run(m.on_request(req(bad)))
+            asyncio.run(m.on_request(req(*bad)))
+    assert len(m.leaks) == 3
+    o = jd.Meter("https://api.openai.com/v1", ("/embeddings",))  # 기본 포트 443 = 포트 표기 없음
+    asyncio.run(o.on_request(req("https", "api.openai.com", None, "/v1/embeddings")))
+    asyncio.run(o.on_request(req("https", "api.openai.com", 443, "/v1/embeddings")))
+
+
+def test_leak_in_wrapped_exception(jd):
+    """SDK가 훅 예외를 다른 예외로 싸도 JudgeLeak을 찾는다"""
+    leak = jd.JudgeLeak("x")
+    try:
+        try:
+            raise leak
+        except jd.JudgeLeak as e:
+            raise ConnectionError("wrapped") from e
+    except ConnectionError as w:
+        assert jd.leak_in(w) is leak
+    assert jd.leak_in(ValueError("y")) is None
+
+
+def test_parse_deadline(jd):
+    assert jd.parse_deadline("2026-11-22T00:40:00Z") == jd.parse_deadline("2026-11-22T00:40:00")  # 시간대 없음 = UTC
+    assert jd.parse_deadline("2026-11-22T09:40:00+09:00") == jd.parse_deadline("2026-11-22T00:40:00Z")
 
 
 def test_meter_counts(jd):
-    m = jd.Meter("h", ("/embeddings",))
+    m = jd.Meter("http://h/v1", ("/embeddings",))
 
     class R:
         async def aread(self):
@@ -299,6 +322,23 @@ def test_judge_row_with_fake_llm(jd):
     assert res["binary"] == {"faithfulness": "P", "answer_relevancy": "P", "context_precision": "N", "context_recall": "N",
                              "citation_accuracy": "N", "refusal": "N"}
     assert len(llm.prompts) == 1  # refusal만 (Ragas는 가짜 지표)
+
+    class BadSupport(LLM):  # 인용 판정 응답이 형식 오류 → 실패(F)가 아니라 해당 없음(N)
+        async def agenerate(self, prompt, model):
+            if model is Support:
+                raise ValueError("형식 오류")
+            return await super().agenerate(prompt, model)
+    res = asyncio.run(jd.judge_row(row, metrics, BadSupport(0), p, {"Refusal": Refusal, "Support": Support}))
+    assert res["binary"]["citation_accuracy"] == "N" and "citation_accuracy" in res["errors"]
+
+    class Leaky(LLM):  # 허용 밖 요청이 SDK 예외로 싸여 와도 멈춘다
+        async def agenerate(self, prompt, model):
+            try:
+                raise jd.JudgeLeak("밖")
+            except jd.JudgeLeak as e:
+                raise ConnectionError("APIConnectionError") from e
+    with pytest.raises(jd.JudgeLeak):
+        asyncio.run(jd.judge_row(row, metrics, Leaky(0), p, {"Refusal": Refusal, "Support": Support}))
 
 
 def test_run_all_saves_each_row_and_stops_at_deadline(jd, monkeypatch):

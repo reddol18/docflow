@@ -35,8 +35,7 @@ RUBRIC = [
      "답 없는 질의만: 답이 '자료에 없어 답할 수 없다'는 뜻이면 P, 지어낸 값을 답했으면 F."),
 ]
 VALUES = "P(통과) / F(실패) / N(해당 없음)"
-BASE_COLS = ["id", "유형", "답 있음", "질문", "답 (gpt-4o-mini)", "참고 답", "근거 문서", "가져온 문서 (순위·넘긴 글)", "답의 인용"]
-CONTEXT_CHARS = 700  # 넘긴 글은 600자 + 칸 값 — 다 보이게
+BASE_COLS = ["id", "유형", "답 있음", "질문", "답", "참고 답", "근거 문서", "가져온 문서 (순위·넘긴 글)", "답의 인용"]
 
 
 def applicable(metric, answerable):
@@ -49,9 +48,10 @@ def sheet_rows(answers):
     for r in answers["rows"]:
         if "error" in r:
             raise SystemExit(f"답변이 없는 질의 {r['id']} — 답변을 다시 만든다")
-        ctx = "\n\n".join(f"{c['rank']}위 {c['key']}\n{c['context'][:CONTEXT_CHARS]}" for c in r["retrieved"])
+        # 넘긴 글은 자르지 않는다 — 심판이 본 글과 같아야 일치도가 공정하다
+        ctx = "\n\n".join(f"{c['rank']}위 {c['key']}\n{c['context']}" for c in r["retrieved"])
         row = {"id": r["id"], "유형": r["type"], "답 있음": "예" if r["answerable"] else "아니오", "질문": r["question"],
-               "답 (gpt-4o-mini)": r["answer"], "참고 답": r["expected_answer"], "근거 문서": "\n".join(r["source_docs"]) or "-",
+               "답": r["answer"], "참고 답": r["expected_answer"], "근거 문서": "\n".join(r["source_docs"]) or "-",
                "가져온 문서 (순위·넘긴 글)": ctx, "답의 인용": "\n".join(r.get("cited") or []) or "(없음)"}
         for key, head, _ in RUBRIC:
             row[head] = "" if applicable(key, r["answerable"]) else "-"
@@ -75,7 +75,7 @@ def write_xlsx(path, rows):
     ws.append(cols)
     for r in rows:
         ws.append([r[c] for c in cols])
-    widths = {"질문": 40, "답 (gpt-4o-mini)": 50, "참고 답": 40, "가져온 문서 (순위·넘긴 글)": 90,
+    widths = {"질문": 40, "답": 50, "참고 답": 40, "가져온 문서 (순위·넘긴 글)": 90,
               "근거 문서": 30, "답의 인용": 30, "메모": 30}
     grey = PatternFill("solid", fgColor="DDDDDD")
     dv = DataValidation(type="list", formula1='"P,F,N"', allow_blank=True)
