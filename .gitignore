@@ -25,6 +25,9 @@ openai_key
 # 개인 메모
 docs/vocab_handoff_*.md
 
+# 로컬 실행 기록 — scripts/check.ps1이 매 실행 한 줄 (https://github.com/reddol18/docflow/issues/55)
+/logs/
+
 # 빌드 산출물
 __pycache__/
 *.pyc

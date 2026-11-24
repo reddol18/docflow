@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _p = Path(__file__).parent.parent / "scripts" / "weekly_metrics.py"
 _spec = importlib.util.spec_from_file_location("weekly_metrics", _p)
 wm = importlib.util.module_from_spec(_spec)
@@ -102,6 +104,164 @@ def test_first_check_passed_uses_first_summary():
     assert wm.first_check_passed(["본문", bad, ok]) is False
     assert wm.first_check_passed([ok, bad]) is True
     assert wm.first_check_passed(["요약 없음"]) is None
+
+
+# ---- 실행 기록·병합 시점 본문·마일스톤 (https://github.com/reddol18/docflow/issues/55)
+
+LOG3 = [  # check.ps1이 쓰는 꼴 (가짜 값)
+    '{"at":"2026-11-24T10:00:00+09:00","branch":"feat/a","commit":"' + "a" * 40 + '","dirty":true,"quick":false,'
+    '"skip":[],"results":{"ruff":"fail","pytest":"pass","osv":"skip"},"ok":false}',
+    '{"at":"2026-11-24T10:05:00+09:00","branch":"feat/a","commit":"' + "b" * 40 + '","dirty":false,"quick":false,'
+    '"skip":[],"results":{"ruff":"pass","pytest":"pass","osv":"skip"},"ok":true}',
+    '{"at":"2026-11-24T11:00:00+09:00","branch":"feat/b","commit":"' + "c" * 40 + '","dirty":false,"quick":false,'
+    '"skip":["pg"],"results":{"ruff":"pass","pytest":"pass"},"ok":true}',
+]
+
+
+def test_first_local_check_from_log_is_one_of_two():
+    runs, bad = wm.parse_check_log(LOG3)
+    assert bad == 0 and len(runs) == 3
+    firsts = [wm.first_run_passed(runs, b) for b in ("feat/a", "feat/b")]
+    assert firsts == [False, True]
+    assert wm._ratio(firsts) == "1/2"
+    assert wm.first_run_passed(runs, "feat/none") is None  # 기록 없음 → 분모에서 뺌
+
+
+def test_first_run_respects_since_until_and_order():
+    runs, _ = wm.parse_check_log(list(reversed(LOG3)) + ["깨진 줄", '{"at":"2026-11-24","branch":"x","results":{}}', ""])
+    assert len(runs) == 3  # 시각대 없는 줄·깨진 줄은 뺀다
+    assert wm.parse_check_log(["{}", "[1]", '{"at":null}'])[1] == 3
+    t = wm.parse_ts
+    assert wm.first_run_passed(runs, "feat/a") is False  # 줄 순서가 아니라 시각 순
+    assert wm.first_run_passed(runs, "feat/a", since=t("2026-11-24T01:01:00Z")) is True  # 앞 PR 병합 뒤 실행만
+    assert wm.first_run_passed(runs, "feat/b", until=t("2026-11-24T01:30:00Z")) is None  # 병합 뒤 실행은 뺌
+
+
+def test_body_at_merge_ignores_later_edits():
+    merged = wm.parse_ts("2026-11-04T13:42:01Z")
+    edits = {"totalCount": 3, "nodes": [  # GraphQL은 최근 판이 먼저
+        {"editedAt": "2026-11-04T14:12:08Z", "diff": "| 완료 조건 | 결과 |\n|---|---|\n| a | 충족 |\n| b | 충족 |"},
+        {"editedAt": "2026-11-04T12:54:52Z", "diff": "| 완료 조건 | 결과 |\n|---|---|\n| a | 충족 |\n| b | 일부 |"},
+        {"editedAt": "2026-11-04T12:47:52Z", "diff": "처음 본문"},
+    ]}
+    now_body = edits["nodes"][0]["diff"]
+    assert wm.criteria_met(now_body) == (2, 2)
+    assert wm.criteria_met(wm.body_at(now_body, edits, merged)) == (1, 2)  # 병합 시점 값
+    assert wm.body_at("지금", None, merged) == "지금"  # 고친 적 없음
+    assert wm.body_at("지금", {"totalCount": 0, "nodes": []}, merged) == "지금"
+    assert wm.body_at("지금", {"totalCount": 200, "nodes": edits["nodes"][:1]}, merged) is None  # 잘려서 모름
+    gone = {"totalCount": 2, "nodes": [{"editedAt": "2026-11-04T12:54:52Z", "diff": None}, edits["nodes"][2]]}
+    assert wm.body_at("지금", gone, merged) is None  # 지운 판 → 부르는 쪽이 지금 본문으로
+
+
+def test_first_check_value_falls_back_when_week_has_no_log():
+    rows = [{"first_check": None, "first_check_pr": True}, {"first_check": None, "first_check_pr": False}]
+    assert wm.first_check_value(rows, {}) == "1/2 (실행 기록 없음 — PR에 붙인 요약 기준)"
+    rows[0]["first_check"] = False
+    assert wm.first_check_value(rows, {"bad_log": 1}) == "0/1 (기록 없는 PR 1, PR에 붙인 요약 기준 1/2, 깨진 기록 줄 1)"
+
+
+def test_milestone_due_is_sunday_2359_kst():
+    _, start, _ = wm.week_range("2026-W48")
+    assert wm.milestone_due(start) == "2026-11-29T14:59:59Z"  # 11-29(일) 23:59:59 KST
+
+
+def test_to_attach_picks_week_items_without_milestone():
+    _, start, end = wm.week_range("2026-W48")
+    w48 = {"title": "2026-W48"}
+    prs = [
+        {"number": 160, "mergedAt": "2026-11-23T01:00:00Z", "milestone": None},  # 이 주 → 붙임
+        {"number": 161, "mergedAt": "2026-11-24T01:00:00Z", "milestone": w48},  # 이미 붙음
+        {"number": 162, "mergedAt": "2026-11-22T14:59:59Z", "milestone": None},  # 11-22 23:59:59 KST = 지난주
+        {"number": 163, "mergedAt": "2026-11-29T14:59:59Z", "milestone": None},  # 일요일 23:59:59 KST → 이 주
+        {"number": 164, "mergedAt": "2026-11-29T15:00:00Z", "milestone": None},  # 다음 주 월요일 00:00 KST
+    ]
+    issues = [
+        {"number": 55, "closedAt": "2026-11-25T01:00:00Z", "state": "CLOSED", "milestone": None},
+        {"number": 56, "closedAt": "2026-11-25T01:00:00Z", "state": "CLOSED", "milestone": {"title": "2026-W49"}},
+        {"number": 57, "closedAt": None, "state": "OPEN", "milestone": None},
+        {"number": 58, "closedAt": "2026-11-25T01:00:00Z", "state": "OPEN", "milestone": None},  # 다시 열림
+        {"number": 59, "closedAt": "2026-11-20T01:00:00Z", "state": "CLOSED", "milestone": None},  # 지난주
+    ]
+    attach, other = wm.to_attach(prs, issues, start, end, "2026-W48")
+    assert attach == [("PR", 160, None), ("PR", 163, None), ("이슈", 55, None)]
+    assert other == [("이슈", 56, "2026-W49")]  # 다른 마일스톤은 옮기지 않음
+
+
+def test_milestone_description_keeps_hand_written_text():
+    old = "주간 점검·회고\n\n회고 (11-14): 바꾼 규칙 B"
+    d1 = wm.milestone_description(old, "지표 요약 1")
+    assert d1.startswith("주간 점검·회고\n\n회고 (11-14): 바꾼 규칙 B\n\n<!-- weekly_metrics -->\n지표 요약 1\n")
+    d2 = wm.milestone_description(d1 + "\n회고 줄 뒤에 추가", "지표 요약 2")
+    assert "지표 요약 1" not in d2 and "지표 요약 2" in d2 and d2.endswith("회고 줄 뒤에 추가")
+    assert d2.count(wm.MS_BEGIN) == 1
+    assert wm.milestone_description(d2, "지표 요약 2") == d2  # 같은 요약이면 바뀌지 않음
+    assert wm.milestone_description("", "x") == "<!-- weekly_metrics -->\nx\n<!-- /weekly_metrics -->"
+
+
+def test_milestone_description_keeps_crlf_outside_markers():
+    head, tail = "주간 점검·회고\r\n\r\n회고 (11-14): 바꾼 규칙 B\r\n\r\n", "\r\n회고 뒤 줄\r\n  들여쓴 줄\r\n"
+    d1 = wm.milestone_description(head.rstrip(), "요약 1\n둘째 줄")
+    assert d1 == head + "<!-- weekly_metrics -->\r\n요약 1\r\n둘째 줄\r\n<!-- /weekly_metrics -->"
+    old = head + "<!-- weekly_metrics -->\r\n요약 1\r\n<!-- /weekly_metrics -->" + tail
+    d2 = wm.milestone_description(old, "요약 2")
+    assert d2 == head + "<!-- weekly_metrics -->\r\n요약 2\r\n<!-- /weekly_metrics -->" + tail
+
+
+def test_milestone_description_mixed_newlines_and_marker_text_in_prose():
+    old = "회고\r\n\r\n<!-- weekly_metrics -->\n요약 한 줄\n<!-- /weekly_metrics -->\r\n끝 줄"
+    d1 = wm.milestone_description(old, "요약 한 줄")
+    assert d1 == "회고\r\n\r\n<!-- weekly_metrics -->\r\n요약 한 줄\r\n<!-- /weekly_metrics -->\r\n끝 줄"
+    assert wm.milestone_description(d1, "요약 한 줄") == d1  # 두 번째 실행은 바뀌는 것 없음
+    prose = "메모: `<!-- /weekly_metrics -->` 위는 지우지 말 것\n\n<!-- weekly_metrics -->\n옛 요약\n<!-- /weekly_metrics -->"
+    assert wm.milestone_description(prose, "새 요약") == prose.replace("옛 요약", "새 요약")
+
+
+@pytest.mark.parametrize("old", [
+    "회고 줄\n<!-- weekly_metrics -->\n요약\n뒤에 쓴 회고",  # 끝 표시만 지워짐
+    "회고 줄\n요약\n<!-- /weekly_metrics -->\n뒤에 쓴 회고",  # 시작 표시만 지워짐
+    "<!-- /weekly_metrics -->\n회고 줄\n<!-- weekly_metrics -->\n요약",  # 순서 뒤바뀜
+    "<!-- weekly_metrics -->\n가\n<!-- /weekly_metrics -->\n회고\n<!-- weekly_metrics -->\n나\n<!-- /weekly_metrics -->",  # 두 쌍
+])
+def test_milestone_description_refuses_broken_markers(old):
+    with pytest.raises(ValueError, match="표시가 깨짐"):
+        wm.milestone_description(old, "새 요약")
+
+
+def test_sync_milestone_stops_before_writing_on_broken_markers(monkeypatch):
+    calls = []
+    ms = [{"number": 9, "title": "2026-W48", "description": "회고\n<!-- weekly_metrics -->\n요약"}]
+
+    def fake_sh(*args):
+        calls.append(args)
+        return wm.json.dumps(ms)
+    monkeypatch.setattr(wm, "sh", fake_sh)
+    start, end = wm.week_range("2026-W48")[1:]
+    for dry_run in (True, False):
+        with pytest.raises(SystemExit, match="표시가 깨짐"):
+            wm.sync_milestone("2026-W48", start, end, [], {"prs": []}, "새 요약", dry_run)
+    assert all("PATCH" not in a and "POST" not in a for a in calls)
+
+
+def test_main_saves_week_record_before_milestone_stops(monkeypatch, tmp_path):
+    monkeypatch.setattr(wm, "collect", lambda *a: ([], [], [], {}))
+    monkeypatch.setattr(wm, "render", lambda *a: "주간 기록")
+    monkeypatch.setattr(wm, "milestone_summary", lambda *a: "요약")
+
+    def broken(*a):
+        raise SystemExit("표시가 깨짐")
+    monkeypatch.setattr(wm, "sync_milestone", broken)
+    with pytest.raises(SystemExit, match="표시가 깨짐"):
+        wm.main(["--week", "2026-W48", "--milestone", "--out", str(tmp_path)])
+    assert (tmp_path / "2026-W48.md").read_text(encoding="utf-8") == "주간 기록"
+
+
+def test_milestone_summary_links_week_record():
+    row = {"deploy_h": 1.0, "follow": [], "rework": None, "review": (2, 1, 0), "criteria": (3, 4),
+           "first_check": True, "first_check_pr": True}
+    s = wm.milestone_summary("2026-W48", [row], {"bad_log": 0}, now=wm.dt.datetime(2026, 11, 29, 23, 0, tzinfo=wm.KST))
+    assert "docs/process/2026-W48.md" in s and "병합 PR 1" in s and "완료 조건 충족 3/4" in s
+    assert "첫 로컬 검사 통과 1/1" in s
 
 
 # ---- 보안 리뷰 필요 판정을 merge_gate와 같게 (https://github.com/reddol18/docflow/issues/106)

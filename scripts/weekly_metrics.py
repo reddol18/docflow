@@ -3,6 +3,13 @@
   uv run --no-project python -I scripts/weekly_metrics.py            # 이번 주 (월~일, KST)
   uv run --no-project python -I scripts/weekly_metrics.py --week 2026-W45
   ... --out docs/process                                              # `docs/process/2026-W45.md`에 저장
+  ... --milestone --dry-run                                           # 마일스톤에 할 일만 보임 (GitHub에 안 씀)
+  ... --milestone                                                     # 마일스톤 `YYYY-Www` 만들기·PR·이슈 붙이기·설명 갱신
+
+--milestone (https://github.com/reddol18/docflow/issues/55): 마일스톤 `YYYY-Www`(마감 그 주 일요일 23:59 KST)가 없으면 만들고,
+  그 주에 병합한 PR·닫은 이슈 중 마일스톤이 없는 것을 붙인다(다른 마일스톤에 있는 것은 옮기지 않고 보이기만 — 계획한 주를
+  지우지 않게). 설명에는 `<!-- weekly_metrics -->` 표시 사이에 지표 요약과 `docs/process/YYYY-Www.md` 링크를 쓴다
+  (표시 밖의 손으로 쓴 설명·회고 줄은 그대로).
 
 무엇을 재나
 - 흐름: 병합한 PR 수, PR 크기, 열고 병합하기까지 걸린 시간, 배포 태그 수
@@ -25,6 +32,8 @@
 - 속도·품질·리뷰·계약 (표의 '어떻게 셌나' 칸): 이슈 시작→병합→배포 시간, 변경 실패율, 재작업률, 다시 열린 이슈,
   리뷰 지적 처리, 리뷰 뒤 버그, 완료 조건 충족률, 범위 변경 비율, 첫 로컬 검사 통과율. AI 비용은 집계 수단이 없어 –
   글에서 읽는 지표는 PR 템플릿·리뷰 댓글 형식('완료 조건별 결과' 표, '지적·반영' 표)을 따를 때만 잡힌다
+  완료 조건 충족률은 병합 시점 본문(GraphQL userContentEdits)으로, 첫 로컬 검사 통과율은 `scripts/check.ps1` 실행 기록
+  `logs/check_runs.jsonl`(이 PC에만 있음, gitignore)의 PR 브랜치 첫 실행으로 센다 (https://github.com/reddol18/docflow/issues/55)
 - 이슈: 연 것·닫은 것, 우선순위별 열린 수, 위험 수용(라벨 risk-accepted) 열린 수
 - 보안: `security/asvs.yaml`의 미충족·일부·미판정 항목 수 (지금 작업 트리 기준)
 흔적은 글자로 찾는다: PR 본문(템플릿 줄을 뺀 나머지)·댓글·리뷰 본문·줄 댓글. 제목은 흔적이 아니다.
@@ -186,6 +195,39 @@ def pr_extra(n):
     return len(v["commits"]), [f["path"] for f in v["files"]], [r["body"] for r in v["reviews"]] + [inline]
 
 
+def pr_edits(numbers):
+    """PR 번호 → 본문 편집 이력(GraphQL userContentEdits, 최근 100판). 20개씩 한 쿼리로"""
+    owner, name = REPO.split("/")
+    out = {}
+    for i in range(0, len(numbers), 20):
+        chunk = numbers[i:i + 20]
+        q = ("query($o: String!, $r: String!) { repository(owner: $o, name: $r) { "
+             + " ".join(f"p{n}: pullRequest(number: {int(n)}) {{ userContentEdits(first: 100) "
+                        "{ totalCount nodes { editedAt diff } } }" for n in chunk) + " } }")
+        d = json.loads(sh("gh", "api", "graphql", "-f", f"query={q}", "-f", f"o={owner}", "-f", f"r={name}"))
+        for n in chunk:
+            out[n] = d["data"]["repository"][f"p{n}"]["userContentEdits"]
+    return out
+
+
+def prior_merge(branch, n, merged):
+    """같은 이름 브랜치에서 PR n보다 먼저 병합한 PR의 마지막 병합 시각 (없으면 None)"""
+    got = gh_json("pr", "list", "--state", "merged", "--head", branch, "--limit", "100", "--json", "number,mergedAt")
+    return max((t for q in got if q["number"] != n and (t := parse_ts(q["mergedAt"])) and t < merged), default=None)
+
+
+def check_log_path():
+    """실행 기록 파일: 본 저장소(워크트리면 git common dir의 부모) 아래 logs/check_runs.jsonl"""
+    common = sh("git", "-C", str(ROOT), "rev-parse", "--git-common-dir").strip()
+    return (ROOT / common).resolve().parent / CHECK_LOG
+
+
+def read_check_log(path):
+    if not path.exists():
+        return [], 0
+    return parse_check_log(path.read_text(encoding="utf-8").splitlines())
+
+
 def pr_marks(p):
     commits, files, reviews = pr_extra(p["number"])
     text = "\n\n".join(evidence_texts(p["body"], [c["body"] for c in p["comments"]], reviews))  # 빈 줄로 이어 표끼리 붙지 않게
@@ -301,6 +343,103 @@ def first_check_passed(texts):
     return None
 
 
+# ---------- 로컬 검사 실행 기록·병합 시점 본문·마일스톤 (순수 함수, https://github.com/reddol18/docflow/issues/55) ----------
+
+CHECK_LOG = Path("logs") / "check_runs.jsonl"  # `scripts/check.ps1`가 본 저장소(git common dir의 부모) 아래에 쓴다
+
+
+def parse_check_log(lines):
+    """실행 기록 줄들 → (실행 목록, 깨진 줄 수). 실행은 {"at": datetime, "branch", "results": {검사: pass/fail/skip}, ...}"""
+    runs, bad = [], 0
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            r = json.loads(ln)
+            at = parse_ts(r["at"])
+            if at is None or at.tzinfo is None or not isinstance(r.get("branch"), str) or not isinstance(r.get("results"), dict):
+                raise ValueError
+        except (ValueError, KeyError, TypeError, AttributeError):
+            bad += 1
+            continue
+        runs.append({**r, "at": at})
+    return runs, bad
+
+
+def run_passed(run):
+    """막는 검사 중 fail이 하나도 없음 (건너뜀은 실패로 보지 않는다 — check.ps1의 '막는 검사 모두 통과'와 같다)"""
+    return "fail" not in run["results"].values()
+
+
+def first_run_passed(runs, branch, since=None, until=None):
+    """그 브랜치의 첫 `scripts/check.ps1` 실행이 통과였나. 기록이 없으면 None.
+    since(그 시각 뒤)·until(그 시각까지)로 자른다: 같은 이름 브랜치를 앞 PR이 이미 병합했으면 그 뒤 실행만, 병합 뒤 실행은 뺀다"""
+    xs = [r for r in runs if r["branch"] == branch
+          and (since is None or r["at"] > since) and (until is None or r["at"] <= until)]
+    return run_passed(min(xs, key=lambda r: r["at"])) if xs else None
+
+
+def body_at(body, edits, at):
+    """시각 at(병합)의 PR 본문. edits는 GraphQL userContentEdits {totalCount, nodes: [{editedAt, diff}]} — diff가 그 판의
+    본문 전체이고 가장 오래된 판이 처음 본문이다(2026-11-25 PR 57로 확인). 고친 적 없으면 지금 본문.
+    받은 판 중 at 이전 판이 없거나(판이 너무 많아 잘림) 그 판이 지워졌으면(diff null) None"""
+    nodes = [e for e in ((edits or {}).get("nodes") or []) if e and e.get("editedAt")]
+    if not nodes:
+        return body
+    before = [e for e in nodes if parse_ts(e["editedAt"]) <= at]
+    if not before:
+        return None
+    return max(before, key=lambda e: parse_ts(e["editedAt"])).get("diff")
+
+
+MS_BEGIN, MS_END = "<!-- weekly_metrics -->", "<!-- /weekly_metrics -->"
+
+
+def milestone_due(start):
+    """그 주(월요일 00:00 KST 시작)의 마감 = 일요일 23:59:59 KST, GitHub API 형식(UTC)"""
+    due = start + dt.timedelta(days=6, hours=23, minutes=59, seconds=59)
+    return due.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def to_attach(prs, issues, start, end, title):
+    """마일스톤 title에 붙일 것 → (붙일 것, 다른 마일스톤에 있어 두는 것). 각 항목 (종류, 번호, 지금 마일스톤).
+    대상: start~end에 병합한 PR(mergedAt)·닫은 이슈(closedAt, 지금 닫힘). 이미 title에 있으면 뺀다.
+    다른 마일스톤에 있는 것은 옮기지 않는다 (계획한 주의 기록을 지우지 않게 — 사람이 정한다)"""
+    attach, other = [], []
+    items = ([("PR", p["number"], p.get("mergedAt"), p.get("milestone")) for p in prs]
+             + [("이슈", i["number"], i.get("closedAt"), i.get("milestone")) for i in issues
+                if i.get("state", "CLOSED") != "OPEN"])
+    for kind, n, ts, ms in items:
+        t = parse_ts(ts)
+        if t is None or not (start <= t < end):
+            continue
+        cur = (ms or {}).get("title")
+        if cur == title:
+            continue
+        (other if cur else attach).append((kind, n, cur))
+    return sorted(attach), sorted(other)
+
+
+def milestone_description(old, summary):
+    """설명에서 표시 사이만 summary로 바꾼다. 표시가 없으면 끝에 붙인다.
+    표시 밖(손으로 쓴 설명·회고 줄)은 줄바꿈까지 그대로 둔다. 블록은 설명의 줄바꿈(CRLF/LF)을 따른다.
+    표시는 줄 전체가 표시 문자열일 때만 센다 (글 속에 적은 표시 문자열은 표시가 아님).
+    표시가 깨졌으면(하나만 있음·여러 쌍·순서 뒤바뀜) 손으로 쓴 줄을 지우지 않게 ValueError"""
+    old = old or ""
+    nl = "\r\n" if "\r\n" in old else "\n"
+    body = nl.join(summary.strip().replace("\r\n", "\n").split("\n"))
+    block = f"{MS_BEGIN}{nl}{body}{nl}{MS_END}"
+    begins = [m.start() for m in re.finditer(rf"(?m)^{re.escape(MS_BEGIN)}(?=\r?$)", old)]
+    ends = [m.end() for m in re.finditer(rf"(?m)^{re.escape(MS_END)}(?=\r?$)", old)]
+    if not begins and not ends:
+        return f"{old.rstrip()}{nl}{nl}{block}" if old.strip() else block
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        raise ValueError(f"마일스톤 설명의 지표 표시가 깨짐 (시작 {len(begins)}개, 끝 {len(ends)}개"
+                         + (", 끝이 시작보다 앞" if len(begins) == len(ends) == 1 else "")
+                         + "): 손으로 고친 뒤 다시 실행")
+    return old[:begins[0]] + block + old[ends[0]:]
+
+
 def bug_fields(body):
     """버그 템플릿의 '발견 단계'·'원인 PR' 칸"""
     stage = (section(body, "발견 단계") or "").strip().splitlines()
@@ -316,9 +455,10 @@ def asvs_counts():
     return {s: len(re.findall(rf"status:\s*{s}\b", text)) for s in ("미충족", "일부", "미판정")}
 
 
-def collect(start, end):
+def collect(start, end, log_path=None):
     # commits는 목록에 넣으면 GraphQL 노드 상한을 넘는다 → 이 주 PR만 따로 센다
-    fields = "number,title,createdAt,mergedAt,additions,deletions,body,comments,closingIssuesReferences,mergeCommit"
+    fields = ("number,title,createdAt,mergedAt,additions,deletions,body,comments,closingIssuesReferences,mergeCommit,"
+              "headRefName,milestone")
     # 병합 날짜로 찾는다 (최근 N개를 받아 거르면 오래 열려 있던 PR·지난 주가 빠진다)
     span = f"merged:{start.isoformat(timespec='seconds')}..{(end - dt.timedelta(seconds=1)).isoformat(timespec='seconds')}"
     prs = gh_json("pr", "list", "--state", "merged", "--search", span, "--limit", "200", "--json", fields)
@@ -367,12 +507,15 @@ def collect(start, end):
         return out
     limit = 1000
     issues = gh_json("issue", "list", "--state", "all", "--limit", str(limit),
-                     "--json", "number,title,createdAt,closedAt,labels,state,body")
+                     "--json", "number,title,createdAt,closedAt,labels,state,body,milestone")
     if len(issues) >= limit:
         raise SystemExit(f"이슈가 {limit}개 이상이라 열린 수가 틀린다: limit을 올릴 것")
     by_no = {i["number"]: i for i in issues}
     assoc = associations()
     tags = deploy_tags()
+    edits = pr_edits([p["number"] for p in prs])
+    log_path = log_path or check_log_path()
+    runs, bad_log = read_check_log(log_path)
     rows = []
     for p in sorted(prs, key=lambda p: p["number"]):
         commits, files, _, marks = info(p)
@@ -405,6 +548,12 @@ def collect(start, end):
         fixes = None if not tag_at else [q["number"] for q in follow_ups(p["number"], merged)
                                          if parse_ts(q["mergedAt"]) > tag_at]
         window_done = dt.datetime.now(dt.timezone.utc) >= merged + REWORK_DAYS
+        # 병합 시점 본문 (병합 뒤 고친 것은 빼고). 편집 이력이 잘려 모르면 지금 본문
+        merged_body = body_at(p["body"], edits.get(p["number"]), merged)
+        if merged_body is None:
+            merged_body = p["body"]
+        # 같은 이름 브랜치를 앞서(지난 주 포함) 병합한 PR이 있으면 그 병합 뒤 실행만 본다
+        since = prior_merge(p["headRefName"], p["number"], merged) if runs else None
         rows.append({
             "n": p["number"], "title": p["title"], "size": p["additions"] + p["deletions"], "commits": commits,
             "hours": (merged - parse_ts(p["createdAt"])).total_seconds() / 3600,
@@ -413,9 +562,11 @@ def collect(start, end):
             "deploy_h": (tag_at - merged).total_seconds() / 3600 if tag_at else None,           # 병합 → 배포
             "follow": fixes, "rework": rework(p["number"], merged, files), "rework_done": window_done,
             "review": review_fixes(info(p)[2]),
-            "criteria": criteria_met(p["body"]), "extra": extra_changes(p["body"]), "scope": scope_change(p["body"]),
-            # 댓글(시간 순)을 먼저 본다 — 본문의 요약은 다시 돌린 뒤 바꿔 붙였을 수 있다
-            "first_check": first_check_passed(comments + [evidence(p["body"])]),
+            "criteria": criteria_met(merged_body), "extra": extra_changes(merged_body), "scope": scope_change(merged_body),
+            # 실행 기록의 브랜치 첫 실행 (기록 없으면 None — 이 PC 밖에서 돌렸거나 기록 전 PR)
+            "first_check": first_run_passed(runs, p["headRefName"], since, merged),
+            # 예전 방식(PR에 처음 붙인 요약) — 기록 없는 PR 참고용. 댓글(시간 순)을 먼저 본다
+            "first_check_pr": first_check_passed(comments + [evidence(p["body"])]),
         })
     # 다시 열린 이슈 (PR 제외, 이슈 수). 저장소 전체 이벤트를 넘겨 본다 — 커지면 기간으로 자를 방법을 찾을 것
     ev = sh("gh", "api", "--paginate", f"repos/{REPO}/issues/events",
@@ -423,7 +574,8 @@ def collect(start, end):
     reopened = {int(n) for n, ts in (ln.split() for ln in ev.splitlines() if ln.strip()) if start <= parse_ts(ts) < end}
     bugs = [(i["number"], *bug_fields(i["body"])) for i in issues if start <= parse_ts(i["createdAt"]) < end
             and any(lb["name"] == "bug" for lb in i["labels"])]
-    extra = {"reopened": len(reopened), "bugs": bugs}
+    extra = {"reopened": len(reopened), "bugs": bugs, "bad_log": bad_log,
+             "prs": [{k: p[k] for k in ("number", "mergedAt", "milestone")} for p in prs]}
     return rows, issues, [t for t in tags if start <= t[1] < end], extra
 
 
@@ -458,12 +610,76 @@ HOW = {  # 표의 '어떻게 셌나' 칸
     "reopen": "이 주에 reopened된 이슈 수 (PR 제외)",
     "review": "리뷰 결과 댓글의 '지적·반영' 표 (PR 템플릿 형식)",
     "bug": "이 주에 연 bug 이슈 중 발견 단계가 배포 후 확인·운영인 것",
-    "criteria": "PR 본문 '완료 조건별 결과' 표의 '충족' (작성자가 적은 값, 해당 없음 제외)",
+    "criteria": "병합 시점 PR 본문(편집 이력 userContentEdits)의 '완료 조건별 결과' 표 '충족' (작성자가 적은 값, 해당 없음 제외)",
     "scope": "PR 본문에 '범위 변경' (완료 조건을 줄이거나 바꾼 기록)",
     "extra": "'범위 밖 변경' 절이 '없음'이 아님 (안 채운 PR은 뺌)",
-    "check": "PR에 처음 붙인 `scripts/check.ps1` 요약에 실패가 없음 (붙이기 전 실패는 남지 않음)",
+    "check": ("실행 기록 `logs/check_runs.jsonl`(이 PC, gitignore)에서 PR 브랜치의 병합 전 첫 `scripts/check.ps1` 실행에 실패가 "
+              "없음(-Quick·-Skip으로 건너뛴 검사는 실패로 보지 않음 — check.ps1의 '막는 검사 모두 통과'와 같은 기준). "
+              "기록 없는 PR은 분모에서 빼고, 괄호에 PR에 처음 붙인 요약 기준(예전 방식)을 함께 적는다. "
+              "이 주 PR이 모두 기록에 없으면 예전 방식 값"),
     "cost": "gh·git에는 없다. 세션 기록(`~/.claude/projects/*.jsonl`)은 이 PC에만 있고 이슈와 잇는 키가 없다",
 }
+
+
+def first_check_value(rows, extra):
+    """'첫 로컬 검사 통과' 칸: 실행 기록 기준 비율 + (기록 없는 PR 수, 예전 방식 값, 깨진 기록 줄).
+    이 주 PR이 하나도 기록에 없으면(기록 전 주를 다시 만들 때) 예전 방식 값을 앞에 둔다"""
+    no_log = sum(r["first_check"] is None for r in rows)
+    if rows and no_log == len(rows):
+        return f"{_ratio([r.get('first_check_pr') for r in rows])} (실행 기록 없음 — PR에 붙인 요약 기준)"
+    notes = []
+    if no_log:
+        notes.append(f"기록 없는 PR {no_log}")
+    notes.append(f"PR에 붙인 요약 기준 {_ratio([r.get('first_check_pr') for r in rows])}")
+    if extra.get("bad_log"):
+        notes.append(f"깨진 기록 줄 {extra['bad_log']}")
+    return f"{_ratio([r['first_check'] for r in rows])} ({', '.join(notes)})"
+
+
+def milestone_summary(label, rows, extra, now=None):
+    """마일스톤 설명에 넣을 지표 요약 (몇 줄)"""
+    now = now or dt.datetime.now(KST)
+    fx = [sum(r["review"][i] for r in rows) for i in range(3)]
+    met, total = sum(r["criteria"][0] for r in rows), sum(r["criteria"][1] for r in rows)
+    return "\n".join([
+        f"지표 요약 ({now:%Y-%m-%d %H:%M} KST, `scripts/weekly_metrics.py --milestone`):",
+        f"- 병합 PR {len(rows)}, 병합→배포 중앙값 {_med([r['deploy_h'] for r in rows])}, "
+        f"변경 실패 {_ratio([r['follow'] for r in rows])}, 재작업 {_ratio([r['rework'] for r in rows])}",
+        f"- 리뷰 지적 고침 {f'{fx[0]}/{sum(fx)}' if sum(fx) else '–'}, 병합 때 완료 조건 충족 {f'{met}/{total}' if total else '–'}, "
+        f"첫 로컬 검사 통과 {first_check_value(rows, extra)}",
+        f"- 기록: https://github.com/{REPO}/blob/main/docs/process/{label}.md",
+    ])
+
+
+def sync_milestone(label, start, end, issues, extra, summary, dry_run):
+    """마일스톤 label을 만들거나 찾아, 이 주 병합 PR·닫은 이슈를 붙이고 설명의 지표 칸을 갱신한다. dry_run이면 할 일만 출력"""
+    got = json.loads(sh("gh", "api", f"repos/{REPO}/milestones?state=all&per_page=100"))
+    if len(got) >= 100:
+        raise SystemExit("마일스톤이 100개 이상: 페이지를 넘겨 찾도록 고칠 것")
+    ms = next((m for m in got if m["title"] == label), None)
+    attach, other = to_attach(extra["prs"], issues, start, end, label)
+    old = (ms or {}).get("description") or ""  # 설명이 비면 API는 null
+    try:  # 쓰기 전에(dry-run에서도) 깨진 표시를 알리고 멈춘다
+        desc = milestone_description(old, summary)
+    except ValueError as e:
+        raise SystemExit(f"마일스톤 {label}: {e}") from None
+    tag = "(dry-run) " if dry_run else ""
+    print(f"{tag}마일스톤 {label}: " + (f"있음 #{ms['number']}" if ms else f"만듦 (마감 {milestone_due(start)})"))
+    print(f"{tag}설명 지표 칸: " + ("바꿀 것 없음" if ms and desc == old else "씀"))
+    print(f"{tag}붙일 것 {len(attach)}: " + (", ".join(f"{k} #{n}" for k, n, _ in attach) or "없음"))
+    if other:
+        print("다른 마일스톤에 있어 그대로 둠: " + ", ".join(f"{k} #{n}({m})" for k, n, m in other))
+    if dry_run:
+        print("---- 설명 지표 칸 ----\n" + summary)
+        return
+    if ms is None:
+        ms = json.loads(sh("gh", "api", "-X", "POST", f"repos/{REPO}/milestones", "-f", f"title={label}",
+                           "-f", f"due_on={milestone_due(start)}", "-f", f"description={desc}"))
+    elif desc != old:
+        sh("gh", "api", "-X", "PATCH", f"repos/{REPO}/milestones/{int(ms['number'])}", "-f", f"description={desc}")
+    for _, n, _ in attach:  # PR도 이슈 API로 붙인다
+        sh("gh", "api", "-X", "PATCH", f"repos/{REPO}/issues/{int(n)}", "-F", f"milestone={int(ms['number'])}")
+    print(f"마일스톤 {label} #{ms['number']}: {len(attach)}개 붙임")
 
 
 def quality(rows, extra):
@@ -475,6 +691,7 @@ def quality(rows, extra):
     bugs = ", ".join(f"#{n}({s or '단계 없음'}{f', 원인 #{c}' if c else ''})" for n, s, c in extra["bugs"]) or "없음"
     rework = _ratio([r["rework"] for r in rows]) + (f" (잠정: 7일이 안 지난 PR {open_win})" if open_win else "")
     review = f"{fx[0]}/{nfx} (후속 {fx[1]}, 그대로 {fx[2]})" if nfx else "–"
+    check = first_check_value(rows, extra)
     vals = [
         ("이슈 시작 → 병합 중앙값", _med([r["lead_h"] for r in rows]), HOW["lead"]),
         ("병합 → 배포 중앙값", _med([r["deploy_h"] for r in rows]), HOW["deploy"]),
@@ -486,7 +703,7 @@ def quality(rows, extra):
         ("병합 때 완료 조건 충족", f"{met}/{total}" if total else "–", HOW["criteria"]),
         ("범위 변경 기록이 있는 PR", _ratio([r["scope"] for r in rows]), HOW["scope"]),
         ("범위 밖 변경이 있는 PR", _ratio([r["extra"] for r in rows]), HOW["extra"]),
-        ("첫 로컬 검사 통과", _ratio([r["first_check"] for r in rows]), HOW["check"]),
+        ("첫 로컬 검사 통과", check, HOW["check"]),
         ("AI 비용", "–", HOW["cost"]),
     ]
     return (["## 속도·품질·리뷰·계약", "", "| 지표 | 값 | 어떻게 셌나 |", "|---|---|---|"]
@@ -535,17 +752,25 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--week", help="예: 2026-W45 (기본: 이번 주)")
     ap.add_argument("--out", help="이 폴더에 YYYY-Www.md로 저장")
+    ap.add_argument("--check-log", type=Path, help="실행 기록 파일 (기본: 본 저장소 logs/check_runs.jsonl)")
+    ap.add_argument("--milestone", action="store_true", help="마일스톤 YYYY-Www 만들기·PR·이슈 붙이기·설명 지표 칸 갱신")
+    ap.add_argument("--dry-run", action="store_true", help="--milestone: GitHub에 쓰지 않고 할 일만 출력")
     a = ap.parse_args(argv)
+    if a.dry_run and not a.milestone:
+        ap.error("--dry-run은 --milestone과 함께")
     label, start, end = week_range(a.week)
-    md = render(label, start, end, *collect(start, end))
-    if a.out:
+    rows, issues, tags, extra = collect(start, end, a.check_log)
+    md = render(label, start, end, rows, issues, tags, extra)
+    sys.stdout.reconfigure(encoding="utf-8")
+    if a.out:  # 마일스톤 갱신이 멈춰도(깨진 표시) 요약이 링크하는 기록 파일은 남게 먼저 쓴다
         p = Path(a.out) / f"{label}.md"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(md, encoding="utf-8")
         print(f"저장: {p}")
-    else:
-        sys.stdout.reconfigure(encoding="utf-8")
+    elif not a.milestone:
         print(md)
+    if a.milestone:
+        sync_milestone(label, start, end, issues, extra, milestone_summary(label, rows, extra), a.dry_run)
 
 
 if __name__ == "__main__":
