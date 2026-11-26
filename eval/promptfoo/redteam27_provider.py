@@ -63,8 +63,8 @@ def _meter(cap):
             try:
                 with _ledger_path().open("a", encoding="utf-8") as f:
                     f.write(json.dumps({"kind": f"{kind}:failed", "model": model, "usd": est}) + "\n")
-            except Exception:  # noqa: BLE001, S110 — 장부 쓰기 실패가 원래 예외를 가리지 않게
-                pass
+            except Exception as e:  # noqa: BLE001 — 장부 쓰기 실패가 원래 예외를 가리지 않게 (이름만 남김)
+                print(f"[redteam27] 장부 쓰기 실패: {type(e).__name__}", file=sys.stderr, flush=True)
             raise
         tin, tout = llm._tokens(m.usage)
         pi, po = llm.price_of(model)

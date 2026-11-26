@@ -147,7 +147,7 @@ def test_grounding_on_attack_cases(mods, cid, field, planted):
     b = {k: {"value": v, "confidence": 0.9} for k, v in c["truth"].items()}
     assert grounding.check_extract(pf, b, c["lines"]) == []
     b[field] = {"value": planted, "confidence": 1.0}
-    assert grounding.check_extract(pf, b, c["lines"]) == [field]
+    assert sorted({n.split(":")[0] for n in grounding.check_extract(pf, b, c["lines"])}) == [field]
 
 
 def test_judge_extract_flagged_field_is_not_manipulated(mods):

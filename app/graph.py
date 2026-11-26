@@ -473,21 +473,26 @@ def rule_values_of(b, hw, recipient, n_pages):
             "b_serial": layout.serial_of(b_doc), "b_date": b_date}
     # 어느 부분이 LLM 값(b)에서 왔나 — 근거 없는 LLM 값의 표시를 그 값이 최종 칸에 들어간 칸에만 붙이려고 (from_b_flags)
     serial_from_b = bool(serial) and not s_doc
-    from_b = {"docno": head_from_b or serial_from_b, "serial": serial_from_b,
-              "date": bool(date) and not layout.date_of(hw["date"]["text"])}
+    from_b = {"head": head_from_b, "serial": serial_from_b, "date": bool(date) and not layout.date_of(hw["date"]["text"])}
     return rule_values, {**info, "from_b": from_b}
 
 
 def from_b_flags(schema, b, final, cand, from_b, recipient_fix=""):
-    """근거 없는 추출 칸(cand) 중 그 LLM 값(일부라도)이 최종 칸 값에 들어간 칸. 규칙 칸은 rule_values_of가 센 출처(from_b)로 —
-    문서번호는 앞부분(부서·분류번호)이나 일련번호 중 하나라도 b에서 왔으면. 수신은 배치 규칙이 쪽 아래 목록으로 바꾼 때('목록')만 빼고
-    LLM 값이 그대로 있으면. 그 밖의 칸(llm_extract 등)은 LLM 값이 최종 값에 들어 있으면 (grounding.reached)"""
+    """근거 없는 추출 칸(cand, grounding.check_extract) 중 그 LLM 값(일부라도)이 최종 칸 값에 들어간 칸. 규칙 칸은 rule_values_of가 센
+    출처(from_b)로 — 문서번호는 부분별('칸:head' 부서·분류번호, '칸:serial' 일련번호): 근거 없는 부분이 b에서 와 최종 값에 들어갔으면.
+    수신은 배치 규칙이 쪽 아래 목록으로 바꾼 때('목록')만 빼고 LLM 값이 그대로 있으면. 그 밖의 칸(llm_extract 등)은 LLM 값이 최종 값에
+    들어 있으면 (grounding.reached)"""
     rules = {f["name"]: f.get("rule") for f in schema["fields"]}
     out = []
-    for n in cand:
+    for c in cand:
+        n, _, part = c.partition(":")
         rule = rules.get(n)
-        if rule in ("docno", "serial", "date"):
-            hit = from_b.get(rule, False)
+        if n in out:
+            continue
+        if part:  # 문서번호 부분
+            hit = from_b.get(part, False)
+        elif rule == "date":
+            hit = from_b.get("date", False)
         elif rule == "recipient":
             hit = recipient_fix != "목록" and grounding.reached((b.get(n) or {}).get("value"), final.get(n))
         else:

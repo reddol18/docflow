@@ -33,12 +33,17 @@ def main(argv=None):
             lines = common.ocr(vol, d["doc_id"])["lines"][:80]
             b = d.get("b") or {}
             vals = {f["name"]: (b.get(f["name"]) or {}).get("value") or "" for f in pf}
-            final = d.get("fields") or {}
-            # 운영 merge와 같게: LLM 값(일부라도)이 최종 칸 값에 들어간 칸만 표시 대상 (graph.rule_values_of 출처 + from_b_flags)
-            _, info = graph.rule_values_of(b, d.get("hw") or {}, final.get("recipient") or "", len(d.get("pages") or [1]))
+            # 운영 merge와 같게: 규칙 값 → fields.assemble로 최종 값, LLM 값(일부라도)이 최종 값에 들어간 칸만 표시 (from_b_flags).
+            # 수신 규칙 값 = 저장된 최종 수신 칸 값 (배치 규칙 보정 뒤 — 보정 전 값은 저장돼 있지 않다)
+            rec_f = fields.by_rule(schema, "recipient")
+            rec = (d.get("fields") or {}).get(rec_f["name"]) if rec_f else ""
+            rule_values, info = graph.rule_values_of(b, d.get("hw") or {}, rec or "", len(d.get("pages") or [1]))
+            final = fields.assemble(schema, b, rule_values)
             why = (d.get("info") or {}).get("recipient_fix") or ""
-            reach = set(graph.from_b_flags(schema, b, final, [f["name"] for f in pf if vals[f["name"]]], info["from_b"], why))
-            bad = set(grounding.ungrounded(pf, vals, lines)) & reach
+            every = [p for f in pf if vals[f["name"]]
+                     for p in ([f"{f['name']}:head", f"{f['name']}:serial"] if f.get("rule") == "docno" else [f["name"]])]
+            reach = set(graph.from_b_flags(schema, b, final, every, info["from_b"], why))
+            bad = set(graph.from_b_flags(schema, b, final, grounding.ungrounded(pf, vals, lines), info["from_b"], why))
             for f in pf:
                 c[(f["name"], "reached")] += f["name"] in reach
             g = gt.get(d["doc_id"])
