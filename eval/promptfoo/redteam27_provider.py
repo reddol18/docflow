@@ -18,7 +18,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import redteam27 as rt  # noqa: E402 — common을 거쳐 sys.path에 doc_platform
 
-from app import llm  # noqa: E402
+from app import fields, grounding, llm  # noqa: E402
 
 
 class _Recorder:
@@ -81,6 +81,8 @@ def run_case(case, real_client, cap=rt.CAP_USD):
                 res = llm.extract(f"redteam27-{case['id']}", case["lines"], rt.SCHEMA)
                 out["fields"] = {k: v["value"] for k, v in res.items()}
                 out["failed"] = list(getattr(res, "failed", ()))
+                # 운영 근거 확인 (app/graph.py extract와 같은 함수) — 근거 없는 칸은 화면에 'OCR 근거 없음' 검토 표시
+                out["flagged"] = grounding.check_extract(fields.prompt_fields(rt.SCHEMA), res, case["lines"], out["failed"])
             except llm.ExtractInvalid as e:  # 운영: 그 문서의 추출 칸 모두 '추출 실패'(빈 값)
                 out["fields"], out["failed"], out["invalid"] = {}, ["*"], str(e)
         else:

@@ -20,6 +20,8 @@ LLM이 채울 칸에 'LLM 꺼짐' 검토 표시가 붙고, review_mode가 auto�
 드러나고 그 칸에 '추출 실패' 검토 표시가 붙는다. 맞는 칸은 값을 그대로 쓴다. 응답이 JSON 객체가 아니면 추출 칸 모두가 실패.
 철 실행은 멈추지 않는다 — 표시가 있으니 human이면 사람 검토에서 멈추고, auto(평가용)면 실패 칸을 빈 값·표시로 둔 채 색인까지
 간다(내보내기 전 검증 /export/check의 '검토 안 끝난 건'과 검토 목록이 잡는다).
+추출 값이 OCR 텍스트(지시처럼 보이는 줄은 빼고)에 근거가 없으면 그 칸에 'OCR 근거 없음' 검토 표시 (값은 그대로, info.llm_ungrounded,
+app/grounding.py) — 문서에 심은 지시로 넣은 값을 사람이 보게 한다 (레드팀 세트 E3).
 """
 import json
 import operator
@@ -33,7 +35,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import cancel, errors, fields, flags, layout, line_crops, llm, ocr, store
+from app import cancel, errors, fields, flags, grounding, layout, line_crops, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -129,6 +131,16 @@ def off_flags(d, schema=None):
     return dict(sorted(out.items()))
 
 
+GROUND_FLAG = "OCR 근거 없음"  # 추출 값이 OCR(지시 꼴 줄 빼고)에 없음 — app/grounding.py (https://github.com/reddol18/docflow/issues/27)
+
+
+def ground_flags(d, schema=None):
+    """추출 값이 OCR 텍스트에 근거가 없는 칸(info.llm_ungrounded)의 검토 표시 {flag_key: ['OCR 근거 없음']}. 값은 그대로 둔다"""
+    schema = schema or SCHEMA
+    names = {f["name"] for f in fields.prompt_fields(schema)} & set((d.get("info") or {}).get("llm_ungrounded") or ())
+    return {k: [GROUND_FLAG] for k in sorted({fields.flag_key(f) for f in schema["fields"] if f["name"] in names})}
+
+
 def _llm_of(b, rule, schema=None):
     """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게). 그런 칸이 없으면 빈 값"""
     f = fields.by_rule(schema or SCHEMA, rule)
@@ -202,6 +214,7 @@ class DocState(TypedDict, total=False):
     skipped: Annotated[list[str], operator.add]  # LLM_PROVIDER=off로 건너뛴 단계 (extract·read)
     # 응답 모양이 틀려 빈 값으로 둔 추출 칸 이름 (https://github.com/reddol18/docflow/issues/27)
     failed: Annotated[list[str], operator.add]
+    ungrounded: Annotated[list[str], operator.add]  # 값이 OCR에 근거가 없는 추출 칸 이름 (app/grounding.py)
     b: dict  # GPT 텍스트 추출 (PoC의 B 갈래)
     recipient: str
     recipient_fix: str
@@ -285,6 +298,8 @@ def validate(s: VolState):
             fl[k] = [*rest, *v]
         for k, v in mf.items():
             fl.setdefault(k, []).extend(v)
+        for k, v in ground_flags(d).items():  # 근거 없는 추출 값 — 확신도 사유('LLM')와 따로 붙인다
+            fl.setdefault(k, []).extend(v)
         d["flags"] = fl
     return {"docs": docs}
 
@@ -361,8 +376,11 @@ def extract(s: DocState):
         # 그 칸만 '추출 실패'(빈 값, 검토 표시), 철 실행은 이어 간다 (https://github.com/reddol18/docflow/issues/27).
         # 서버 로그에는 칸 이름·오류 종류만 (응답 값·원문 없음)
         print(f"[graph] extract 응답 형식 오류 {s['vol']}/{s['doc_id']}: {why}", file=sys.stderr, flush=True)
+    # 근거 확인: 값이 OCR(지시 꼴 줄은 빼고)에 없으면 그 칸만 검토 표시 (값은 그대로). 칸 이름만 남긴다 (app/grounding.py)
+    ungrounded = [] if skipped else grounding.check_extract(fields.prompt_fields(SCHEMA), b, d["lines"], failed)
     rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
-    return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped, "failed": failed}
+    return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped, "failed": failed,
+            "ungrounded": ungrounded}
 
 
 def locate(s: DocState):
@@ -460,7 +478,8 @@ def merge(s: DocState):
                  "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
                  "b_serial": layout.serial_of(b_doc), "b_date": b_date,
                  "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
-                 "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or [], "llm_failed": s.get("failed") or []},
+                 "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or [], "llm_failed": s.get("failed") or [],
+                 "llm_ungrounded": s.get("ungrounded") or []},
         "flags": {},
     }]}
 
