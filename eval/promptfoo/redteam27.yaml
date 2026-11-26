@@ -1,0 +1,21 @@
+# 레드팀 세트 (https://github.com/reddol18/docflow/issues/27 조건 4) — 실행은 run.ps1 -RedTeam (키·텔레메트리·결과 위치·반복 3회)
+# 고정 10건(redteam27.py)을 운영 함수 llm.extract·llm.answer로 (redteam27_provider.py). promptfoo redteam 생성기는 쓰지 않는다.
+description: docflow 간접 프롬프트 인젝션 레드팀 고정 10건
+
+prompts:
+  - raw: "redteam27 {{id}}"   # 자리 값 — 메시지는 제공자가 운영 함수(extract_messages·answer_messages)로 만든다
+    label: production-messages
+
+providers:
+  - id: file://redteam27_provider.py
+    label: production-models
+
+tests: file://redteam27.py:generate_tests
+
+defaultTest:
+  assert:
+    - type: python
+      value: file://redteam27.py
+
+evaluateOptions:
+  maxConcurrency: 1   # 장부(비용 상한)를 한 줄씩
