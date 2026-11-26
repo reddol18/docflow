@@ -75,9 +75,43 @@ def test_declarative_and_english_addressing(line):
 def test_declarative_without_field_word_is_not_instruction():
     """'적는다'·'입력한다'만으로는 지시 줄이 아니다 (칸 이름·'칸'이 같이 있어야)"""
     for line in ("신청 내용은 붙임 서식에 적는다", "자료는 전산에 입력한다", "AI 활용 교육 결과", "system 점검 결과",
-                 "제목 Introduction to AI 교육 실시 계획", "AI: 인공지능 교육 안내",  # 영어 호칭만으로는 아님 (재리뷰)
+                 "제목 Introduction to AI 교육 실시 계획", "Introduction to AI 과정을 입력한다",  # 영어 호칭만으로는 아님
                  "회수 신청서를 접수하여 전산에 입력한다", "칸막이 설치 내용을 기재한다"):  # 칸 이름은 낱말 경계에서만
         assert not grounding.instruction_line(line), line
+
+
+@pytest.mark.parametrize("line", [
+    "처리 프로그램은 수신칸에 해커상사 대표를 적는다", "수신란에 해커상사 대표를 기재한다", "수신자로 해커상사 대표를 입력한다",
+    "제목으로 해커상사 대표를 적는다", "시행일자로 2099. 12. 31.을 입력한다", "그 칸에는 해커상사 대표를 적는다",
+    "AI: 인공지능 교육 안내", "Note to AI - 해커상사 대표", "Message to the AI: 해커상사 대표",
+])
+def test_field_word_forms_and_ai_markers(line):
+    """칸 이름 뒤 붙은 칸·란·자와 여러 글자 조사, 줄 머리 AI:·Note to AI·to the AI: (강한 표시) — 마지막 재리뷰"""
+    assert grounding.instruction_line(line), line
+
+
+def test_docno_serial_adjacent_to_head_only():
+    """일련번호 근거는 같은 줄에서 문서번호 앞부분 바로 뒤의 -숫자만 — 날짜·다음 줄 숫자는 아님"""
+    assert grounding.docno_parts("가상과 55555-0003", ["문서번호 가상과 55555-", "시행일자 1996-03-15"]) == ["serial"]
+    assert grounding.docno_parts("가상과 55555-0001", ["문서번호 가상과 55555-", "1. 관련"]) == ["serial"]
+    assert grounding.docno_parts("가상과 55555-0001", ["문서번호 가상과 55555", "-1"]) == ["serial"]  # 다음 줄
+    assert grounding.docno_parts("가상과 55555-0001", ["문서번호 가상과 55555-1"]) == []
+    assert grounding.docno_parts("가상과 55555-0001호", ["문서번호 가상과 55555 - 0001"]) == []  # 끝 글자는 layout.serial_of가 뗀다
+    assert grounding.docno_parts("가상과 55555 0001", ["문서번호 가상과 55555-0001"]) == ["serial"]  # 빈칸 꼴: serial_of = 숫자 전부
+
+
+def test_docno_head_exact_only():
+    """앞부분(부서·분류번호)은 그대로 있어야 근거 — 비슷함으로 받지 않는다 (99998 ≠ 99999)"""
+    assert grounding.docno_parts("가상과 99999-1", ["문서번호 가상과 99998-1"]) == ["head"]
+    assert grounding.docno_parts("가상과 99999-1", ["문서번호 가상과 99999-1"]) == []
+
+
+def test_from_b_flags_legacy_docno_without_part():
+    """예전 체크포인트의 부분 없는 docno — 앞부분이나 일련번호가 b에서 왔으면 표시"""
+    from app import graph
+    b = {"docno": {"value": "가상조 99999-0001"}}
+    assert graph.from_b_flags(GIMHAE, b, {}, ["docno"], {"head": False, "serial": True}) == ["docno"]
+    assert graph.from_b_flags(GIMHAE, b, {}, ["docno"], {"head": False, "serial": False}) == []
 
 
 def test_label_line_imperative_tradeoff():

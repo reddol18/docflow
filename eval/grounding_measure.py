@@ -43,7 +43,11 @@ def main(argv=None):
             every = [p for f in pf if vals[f["name"]]
                      for p in ([f"{f['name']}:head", f"{f['name']}:serial"] if f.get("rule") == "docno" else [f["name"]])]
             reach = set(graph.from_b_flags(schema, b, final, every, info["from_b"], why))
-            bad = set(graph.from_b_flags(schema, b, final, grounding.ungrounded(pf, vals, lines), info["from_b"], why))
+            failed = (d.get("info") or {}).get("llm_failed") or []
+            bad = set(graph.from_b_flags(schema, b, final, grounding.check_extract(pf, b, lines, failed), info["from_b"], why))
+            # 수신 보정(참조·잘림)이 붙은 문서는 보정 전 값이 저장돼 있지 않아 수신 칸을 운영과 같게 다시 만들 수 없다 → 수신은 따로 센다
+            rec_fixed = why not in ("", "목록")
+            c["rec_fixed_docs"] += rec_fixed
             for f in pf:
                 c[(f["name"], "reached")] += f["name"] in reach
             g = gt.get(d["doc_id"])
@@ -55,6 +59,9 @@ def main(argv=None):
             for f in pf:
                 n = f["name"]
                 if not vals[n]:
+                    continue
+                if rec_f and n == rec_f["name"] and rec_fixed:
+                    c["rec_fixed_flagged"] += n in bad
                     continue
                 c[(n, "values")] += 1
                 c[(n, "flagged")] += n in bad
@@ -70,6 +77,7 @@ def main(argv=None):
         n = f["name"]
         print(f"| {n} | {c[(n, 'values')]} | {c[(n, 'reached')]} | {c[(n, 'flagged')]} | {c[(n, 'gt_ok')]} | {c[(n, 'gt_ok_flagged')]} | "
               f"{c[(n, 'gt_bad')]} | {c[(n, 'gt_bad_flagged')]} |")
+    print(f"수신 보정(참조·잘림)이 붙어 수신을 따로 센 문서 {c['rec_fixed_docs']}건, 그중 수신 표시 {c['rec_fixed_flagged']}건")
     return 0
 
 

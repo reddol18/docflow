@@ -491,6 +491,8 @@ def from_b_flags(schema, b, final, cand, from_b, recipient_fix=""):
             continue
         if part:  # 문서번호 부분
             hit = from_b.get(part, False)
+        elif rule == "docno":  # 예전 체크포인트의 부분 없는 'docno' — 앞부분·일련번호 중 하나라도 b에서 왔으면
+            hit = from_b.get("head", False) or from_b.get("serial", False)
         elif rule == "date":
             hit = from_b.get("date", False)
         elif rule == "recipient":
