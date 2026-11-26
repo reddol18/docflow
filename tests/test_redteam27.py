@@ -101,6 +101,16 @@ def test_production_models_match_deploy(mods):
     assert rt.production_models() == {"extract": llm.OPENAI_MODELS["extract"], "answer": llm.OPENAI_MODELS["chat"]}
 
 
+def test_candidate_chat_model_env(mods, monkeypatch):
+    """run.ps1 -RedTeamChatModel → DOCFLOW_RT27_CHAT_MODEL: 답변 모델만 후보로, 추출은 운영 그대로. 가격표에 없으면 멈춤"""
+    rt, _ = mods
+    monkeypatch.setenv("DOCFLOW_RT27_CHAT_MODEL", "gpt-4.1-mini")
+    assert rt.production_models() == {"extract": llm.OPENAI_MODELS["extract"], "answer": "gpt-4.1-mini"}
+    monkeypatch.setenv("DOCFLOW_RT27_CHAT_MODEL", "가격표에 없는 모델")
+    with pytest.raises(llm.UnpricedModel):
+        rt.production_models()
+
+
 def test_estimate_under_limit(mods):
     rt, _ = mods
     usd = rt.estimate(3)

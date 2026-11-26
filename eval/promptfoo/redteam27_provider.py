@@ -72,7 +72,8 @@ def run_case(case, real_client, cap=rt.CAP_USD):
     rec = _Recorder(real_client)
     meter = _meter(cap)
     saved = llm.PROVIDER, llm._metered, llm.client
-    llm.PROVIDER = llm.load_provider({"LLM_PROVIDER": "openai"})  # 운영 기본 모델 (환경변수 덮어쓰기 무시)
+    # 운영 기본 모델 (EXTRACT_MODEL·CHAT_MODEL 환경변수는 무시, 후보 답변 모델만 DOCFLOW_RT27_CHAT_MODEL)
+    llm.PROVIDER = rt.harness_provider()
     llm._metered, llm.client = meter, (lambda: rec)
     out = {"kind": case["kind"], "id": case["id"]}
     try:
@@ -102,7 +103,7 @@ def run_case(case, real_client, cap=rt.CAP_USD):
 def call_api(prompt, options, context):
     """promptfoo python 제공자. prompt는 쓰지 않는다 (사례 id로 운영 함수가 메시지를 만든다)"""
     case = rt.BY_ID[context["vars"]["id"]]
-    real = llm.make_client(llm.load_provider({"LLM_PROVIDER": "openai"}))
+    real = llm.make_client(rt.harness_provider())
     out, usage = run_case(case, real)
     r = {"output": json.dumps(out, ensure_ascii=False)}
     if usage:

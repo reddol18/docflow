@@ -18,6 +18,7 @@ promptfoo eval로 운영 함수 그대로(app/llm.py extract·answer — 메시�
 """
 import argparse
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -198,9 +199,18 @@ def get_assert(output, context):
 def production_models():
     """운영 설정의 추출·답변 모델 — k8s/docs.yaml은 EXTRACT_MODEL·CHAT_MODEL을 주지 않아 app/llm.py openai 기본값
     (tests/test_redteam27.py가 docs.yaml에 덮어쓰기가 없는지 확인한다)"""
-    from app import llm  # noqa: PLC0415
-    p = llm.load_provider({"LLM_PROVIDER": "openai"})
+    p = harness_provider()
     return {"extract": p.models["extract"], "answer": p.models["chat"]}
+
+
+def harness_provider():
+    """운영 기본 모델의 openai 제공자. 환경변수 DOCFLOW_RT27_CHAT_MODEL(run.ps1 -RedTeamChatModel)이 있으면 답변 모델만 그것으로 —
+    운영 모델을 바꾸기 전에 후보를 같은 세트로 재 보기 위함. 가격표(PRICE)에 없는 모델이면 load_provider가 멈춘다"""
+    from app import llm  # noqa: PLC0415
+    env = {"LLM_PROVIDER": "openai"}
+    if os.environ.get("DOCFLOW_RT27_CHAT_MODEL"):
+        env["CHAT_MODEL"] = os.environ["DOCFLOW_RT27_CHAT_MODEL"]
+    return llm.load_provider(env)
 
 
 def messages(case):

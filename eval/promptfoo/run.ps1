@@ -37,7 +37,8 @@ synth_manifest.json에 있지(이름 SYNTH…) 않으면 부르기 전에 멈춘
                                                 운영 함수 llm.extract·llm.answer + 운영 모델(gpt-4.1-mini·gpt-4o-mini). 가상 값만이라
                                                 합성 철 확인은 하지 않는다. 부르기 전에 비용 상한 추정(> $0.25면 멈춤), 실행 중 누적
                                                 상한 $0.5(장부). 결과 work/promptfoo/redteam27/ (results.json·redteam27.md·json).
-                                                종료 코드 0 조종 0건, 1 조종(또는 오류) 있음, 2 실행 실패
+                                                종료 코드 0 조종 0건, 1 조종(또는 오류) 있음, 2 실행 실패.
+                                                -RedTeamChatModel gpt-4.1-mini: 답변 모델만 후보로 바꿔 같은 세트를 잰다
 
 종료 코드는 gate.py 그대로: 0 통과, 1 기준을 어긴 후보 있음, 2 입력 문제.
 OpenAI 키는 Windows 사용자 환경변수 OPENAI_API_KEY에서 읽어 promptfoo를 부르는 동안만 이 프로세스 환경에 둔다
@@ -65,13 +66,14 @@ param(
     [string]$RemoteModel = '',
     [int]$Concurrency = 0,
     [switch]$RedTeam,            # 레드팀 고정 10건 (#27 조건 4)
-    [int]$Repeat = 3
+    [int]$Repeat = 3,
+    [string]$RedTeamChatModel = ''   # 레드팀 답변 모델 후보 (비우면 운영 기본값, PRICE에 있어야 함)
 )
 $ErrorActionPreference = 'Stop'
 # 이 스크립트는 부른 셸 안에서 돈다 → 바꾼 DOCFLOW_* 환경변수는 맨 끝 finally에서 시작 값으로 되돌린다
 # (안 그러면 -Work 다음 실행이 -Work 없이도 그 work를 잰다). 키 두 개는 따로 아래에서 되돌린다
 $envNames = 'DOCFLOW_EVAL_WORK', 'DOCFLOW_EVAL_VOLS', 'DOCFLOW_LOCAL_MODEL', 'DOCFLOW_REMOTE_MODEL', 'DOCFLOW_REMOTE_BASE',
-            'DOCFLOW_RT27_LEDGER'
+            'DOCFLOW_RT27_LEDGER', 'DOCFLOW_RT27_CHAT_MODEL'
 $envSaved = @{}
 foreach ($n in $envNames) { $envSaved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
 try {   # 끝: 환경변수 되돌리기 (맨 아래 finally)
@@ -160,6 +162,7 @@ try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원�
     if ($RedTeam) {   # 레드팀 고정 10건 (#27 조건 4) — 가상 값만, 운영 함수·운영 모델
         if ($Local -or $Replay -or $Remote -or $BaselineFrom -or $Vols) { throw '-RedTeam은 다른 실행 방식(-Local·-Replay·-Remote·-BaselineFrom·-Vols)과 같이 쓰지 않는다' }
         if ($Repeat -lt 1 -or $Repeat -gt 3) { throw '-Repeat는 1~3 (사용자 결정: 10건 × 최대 3회)' }
+        $env:DOCFLOW_RT27_CHAT_MODEL = $RedTeamChatModel   # 빈 값이면 운영 기본 답변 모델
         $rt = Join-Path $out 'redteam27'
         New-Item -ItemType Directory -Force $rt | Out-Null
         $env:DOCFLOW_RT27_LEDGER = Join-Path $rt ('ledger-{0}.jsonl' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
