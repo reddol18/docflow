@@ -65,7 +65,7 @@ param(
     [string]$Remote = '',        # 원격 OpenAI 호환 주소 (…/v1)
     [string]$RemoteModel = '',
     [int]$Concurrency = 0,
-    [switch]$RedTeam,            # 레드팀 고정 10건 (#27 조건 4)
+    [switch]$RedTeam,            # 레드팀 고정 10건 (https://github.com/reddol18/docflow/issues/27 조건 4)
     [int]$Repeat = 3,
     [string]$RedTeamChatModel = ''   # 레드팀 답변 모델 후보 (비우면 운영 기본값, PRICE에 있어야 함)
 )
@@ -93,7 +93,7 @@ $env:PROMPTFOO_DISABLE_TELEMETRY = '1'
 $env:PROMPTFOO_DISABLE_UPDATE = '1'
 $env:PROMPTFOO_DISABLE_SHARING = '1'
 $env:PROMPTFOO_DISABLE_REMOTE_GENERATION = 'true'
-$env:PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = 'true'   # 레드팀 세트는 손으로 쓴 고정 10건 — 외부 생성 안 씀 (#27)
+$env:PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = 'true'   # 레드팀 세트는 손으로 쓴 고정 10건 — 외부 생성 안 씀 (https://github.com/reddol18/docflow/issues/27)
 $env:PROMPTFOO_CONFIG_DIR = Join-Path $out '.promptfoo'   # 결과 DB(실제 문서 글자)도 work/ 아래
 $env:PYTHONUTF8 = '1'
 $env:DOCFLOW_EVAL_WORK = $work
@@ -159,7 +159,7 @@ $served = $null
 $servedAt = $null
 $baseDir = $null
 try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원은 아래 finally 하나로
-    if ($RedTeam) {   # 레드팀 고정 10건 (#27 조건 4) — 가상 값만, 운영 함수·운영 모델
+    if ($RedTeam) {   # 레드팀 고정 10건 (https://github.com/reddol18/docflow/issues/27 조건 4) — 가상 값만, 운영 함수·운영 모델
         if ($Local -or $Replay -or $Remote -or $BaselineFrom -or $Vols) { throw '-RedTeam은 다른 실행 방식(-Local·-Replay·-Remote·-BaselineFrom·-Vols)과 같이 쓰지 않는다' }
         if ($Repeat -lt 1 -or $Repeat -gt 3) { throw '-Repeat는 1~3 (사용자 결정: 10건 × 최대 3회)' }
         $env:DOCFLOW_RT27_CHAT_MODEL = $RedTeamChatModel   # 빈 값이면 운영 기본 답변 모델
@@ -179,7 +179,7 @@ try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원�
         try { Invoke-Promptfoo @args_; $pcode = $LASTEXITCODE }
         finally { Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue; Pop-Location }
         if (($pcode -ne 0 -and $pcode -ne 100) -or -not (Test-Path $res)) { Write-Output "promptfoo 실패 (종료 코드 $pcode)"; exit 2 }
-        & $py -I -X utf8 (Join-Path $here 'redteam27.py') report $res --out $rt --ledger $env:DOCFLOW_RT27_LEDGER
+        & $py -I -X utf8 (Join-Path $here 'redteam27.py') report $res --out $rt --ledger $env:DOCFLOW_RT27_LEDGER --repeat $Repeat
         exit $LASTEXITCODE
     }
     if ($Replay) {

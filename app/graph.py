@@ -446,10 +446,9 @@ def read(s: DocState):
     return {"hw": hw, "skipped": skipped}
 
 
-def merge(s: DocState):
-    """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
-    b = s["b"]
-    hw = {k: s["hw"].get(k) or {"text": "", "conf": 0.0} for k in CELLS}
+def rule_values_of(b, hw, recipient, n_pages):
+    """규칙 칸 값 (merge와 레드팀 하네스가 같이 씀) → (rule_values, 덧붙일 info). hw = {칸: {text, conf}} (없으면 못 읽은 칸)"""
+    hw = {k: (hw or {}).get(k) or {"text": "", "conf": 0.0} for k in CELLS}
     b_doc = _llm_of(b, "docno")
     b_date = _llm_of(b, "date") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", _llm_of(b, "date")) else ""
     doc_text_ = hw["docno"]["text"]
@@ -468,18 +467,27 @@ def merge(s: DocState):
             head = f"{m.group(1)} {m.group(2)}"
             break
     docno = f"{head}-{serial}" if (head or serial) else ""
-    rule_values = {"docno": docno, "serial": serial, "date": date, "recipient": s["recipient"],
-                   "pages": str(len(s["pages"]))}
+    rule_values = {"docno": docno, "serial": serial, "date": date, "recipient": recipient, "pages": str(n_pages)}
+    info = {"prefix": layout.prefix_of(b_doc) or layout.prefix_of(doc_text_), "blank": blank,
+            "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
+            "b_serial": layout.serial_of(b_doc), "b_date": b_date}
+    return rule_values, info
+
+
+def merge(s: DocState):
+    """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
+    b = s["b"]
+    rule_values, info = rule_values_of(b, s["hw"], s["recipient"], len(s["pages"]))
+    final = fields.assemble(SCHEMA, b, rule_values)
+    # 근거 없는 추출 값 표시는 그 LLM 값이 최종 칸 값에 실제로 들어간 칸만 (손글씨 판독·배치 규칙이 만든 값이면 LLM 값은 화면에 안 감)
+    ungrounded = [n for n in s.get("ungrounded") or () if grounding.reached((b.get(n) or {}).get("value"), final.get(n))]
     return {"docs": [{
         "doc_id": s["doc_id"], "vol": s["vol"], "pages": s["pages"],
-        "fields": fields.assemble(SCHEMA, b, rule_values),
+        "fields": final,
         "b": b, "hw": s["hw"],
-        "info": {"prefix": layout.prefix_of(b_doc) or layout.prefix_of(doc_text_), "blank": blank,
-                 "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
-                 "b_serial": layout.serial_of(b_doc), "b_date": b_date,
-                 "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
+        "info": {**info, "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
                  "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or [], "llm_failed": s.get("failed") or [],
-                 "llm_ungrounded": s.get("ungrounded") or []},
+                 "llm_ungrounded": ungrounded},
         "flags": {},
     }]}
 

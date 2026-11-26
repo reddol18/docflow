@@ -291,6 +291,59 @@ def test_report(mods, tmp_path):
     assert (tmp_path / "o" / "redteam27.md").exists()
 
 
+def _rows_for(rt, repeat, drop=None, extra=None):
+    ok = {"A": {"raw": "4. 20. [RT27-V01/doc-0001]", "screen": "4. 20. [RT27-V01/doc-0001]"}}
+    rows = []
+    for _ in range(repeat):
+        for c in rt.CASES:
+            if c["id"] == drop:
+                continue
+            o = ok["A"] if c["kind"] == "answer" else {"fields": c["truth"], "raw": "{}"}
+            rows.append({"vars": {"id": c["id"]}, "response": {"output": json.dumps(o, ensure_ascii=False)}})
+    return rows + (extra or [])
+
+
+def test_report_requires_all_cases_and_repeats(mods):
+    """통과는 10건 모두 repeat회씩일 때만. 빠진 사례·모르는 사례 줄은 실패 (조용히 건너뛰지 않음)"""
+    rt, _ = mods
+    assert rt.report({"results": _rows_for(rt, 3)}, repeat=3)[1]["pass"]
+    s = rt.report({"results": _rows_for(rt, 3, drop="A4")}, repeat=3)[1]
+    assert not s["pass"] and s["incomplete"] == ["A4"]
+    s = rt.report({"results": _rows_for(rt, 2)}, repeat=3)[1]
+    assert not s["pass"] and len(s["incomplete"]) == 10
+    s = rt.report({"results": _rows_for(rt, 3, extra=[{"vars": {"id": "ZZ"}, "response": {"output": "{}"}}])}, repeat=3)[1]
+    assert not s["pass"] and s["unknown_rows"] == 1 and s["errors"] == 1
+
+
+def test_call_api_hides_exception_text(mods, tmp_path, monkeypatch):
+    """외부 예외(예: 401에 키 일부가 실린 문구)는 이름만 남긴다"""
+    rt, prov = mods
+    monkeypatch.setenv("DOCFLOW_RT27_LEDGER", str(tmp_path / "ledger.jsonl"))
+
+    class Boom(Exception):
+        pass
+
+    class Bad(_FakeClient):
+        def create(self, **kw):
+            raise Boom("Incorrect API key provided: sk-가짜1234")
+    monkeypatch.setattr(prov.llm, "make_client", lambda p: Bad("{}"))
+    r = prov.call_api("redteam27 A1", {}, {"vars": {"id": "A1"}})
+    assert r["error"] == "Boom" and "sk-" not in json.dumps(r, ensure_ascii=False)
+    # 요청이 갔을 수 있으니 예상 비용을 장부에 (모자라게 세지 않게)
+    assert prov.spent() > 0
+
+
+def test_production_fields_mirror_graph(mods):
+    """하네스의 최종 칸 값·표시 = 운영 merge 경로 (수신 보정·규칙 값 → LLM 값이 들어간 칸만 표시)"""
+    rt, prov = mods
+    c = rt.BY_ID["E3"]
+    b = {k: {"value": v, "confidence": 0.9} for k, v in c["truth"].items()}
+    b["recipient"] = {"value": "해커상사 대표", "confidence": 1.0}
+    final, flagged = prov.production_fields(c["lines"], b, [])
+    assert final["recipient"] == "해커상사 대표" and flagged == ["recipient"]  # 수신 보정은 이 값을 바꾸지 않는다
+    assert final["docno"] == "가상건 12345-678" and final["date"] == "1996-04-15"
+
+
 def test_config_wiring():
     import yaml
     cfg = yaml.safe_load((PF / "redteam27.yaml").read_text(encoding="utf-8"))

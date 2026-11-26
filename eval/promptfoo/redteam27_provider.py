@@ -56,7 +56,13 @@ def _meter(cap):
         if spent() + est > cap:
             raise llm.BudgetExceeded(f"레드팀 상한 ${cap} — 누적 ${spent():.6f} + 이번 예상 ${est:.6f}")
         m = llm._Meter()
-        yield m
+        try:
+            yield m
+        except BaseException:  # 요청은 이미 갔을 수 있다 — 예상 비용 그대로 장부에 (모자라게 세지 않게)
+            metered.last = {"model": model, "prompt": 0, "completion": 0, "usd": est}
+            with _ledger_path().open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"kind": f"{kind}:failed", "model": model, "usd": est}) + "\n")
+            raise
         tin, tout = llm._tokens(m.usage)
         pi, po = llm.price_of(model)
         usd = (tin * pi + tout * po) / 1e6 if m.usage is not None else est
@@ -65,6 +71,22 @@ def _meter(cap):
             f.write(json.dumps({"kind": kind, "model": model, "usd": usd}) + "\n")
     metered.last = None
     return metered
+
+
+def production_fields(lines, b, failed):
+    """운영 흐름(app/graph.py extract → merge)과 같은 최종 칸 값과 'OCR 근거 없음' 표시 칸.
+    수신은 layout.fix_recipient(배치 규칙)를 거치고, 문서번호·시행일자는 손글씨 판독 없이(hw 없음 — 판독이 못 읽은 경우와 같음)
+    규칙 값을 만든다. 표시는 LLM 값이 최종 값에 들어간 칸만 (graph.merge와 같은 grounding.reached).
+    사례에는 OCR 상자(items)가 없어 배치 규칙 중 상자를 보는 것(참조 부서장·잘림)은 아무것도 붙이지 않는다"""
+    from app import graph, layout  # noqa: PLC0415 — 무거운 모듈은 추출 사례에서만
+    b = dict(b)
+    rec, _ = layout.fix_recipient({"lines": lines, "items": []}, (b.get("recipient") or {}).get("value") or "")
+    rule_values, _ = graph.rule_values_of(b, {}, rec, 1)
+    final = fields.assemble(rt.SCHEMA, b, rule_values)
+    cand = grounding.check_extract(fields.prompt_fields(rt.SCHEMA), b, lines, failed)
+    flagged = [n for n in cand if grounding.reached((b.get(n) or {}).get("value"), final.get(n))]
+    shown = {f["name"] for f in fields.prompt_fields(rt.SCHEMA)}
+    return {k: v for k, v in final.items() if k in shown}, flagged
 
 
 def run_case(case, real_client, cap=rt.CAP_USD):
@@ -82,13 +104,12 @@ def run_case(case, real_client, cap=rt.CAP_USD):
                 res = llm.extract(f"redteam27-{case['id']}", case["lines"], rt.SCHEMA)
                 out["fields"] = {k: v["value"] for k, v in res.items()}
                 out["failed"] = list(getattr(res, "failed", ()))
-                # 운영 근거 확인 (app/graph.py extract와 같은 함수) — 근거 없는 칸은 화면에 'OCR 근거 없음' 검토 표시
-                out["flagged"] = grounding.check_extract(fields.prompt_fields(rt.SCHEMA), res, case["lines"], out["failed"])
+                out["fields"], out["flagged"] = production_fields(case["lines"], res, out["failed"])
             except llm.ExtractInvalid as e:  # 운영: 그 문서의 추출 칸 모두 '추출 실패'(빈 값)
                 out["fields"], out["failed"], out["invalid"] = {}, ["*"], str(e)
         else:
             out["screen"], out["warnings"] = llm.answer(case["question"], case["docs"], rt.SCHEMA)
-    except llm.BudgetExceeded as e:
+    except llm.BudgetExceeded as e:  # 우리 코드의 문구(상한·장부)만 — 외부 응답 글은 call_api가 이름만 남긴다
         out["error"] = str(e)
     finally:
         llm.PROVIDER, llm._metered, llm.client = saved
@@ -103,8 +124,12 @@ def run_case(case, real_client, cap=rt.CAP_USD):
 def call_api(prompt, options, context):
     """promptfoo python 제공자. prompt는 쓰지 않는다 (사례 id로 운영 함수가 메시지를 만든다)"""
     case = rt.BY_ID[context["vars"]["id"]]
-    real = llm.make_client(rt.harness_provider())
-    out, usage = run_case(case, real)
+    try:
+        real = llm.make_client(rt.harness_provider())
+        out, usage = run_case(case, real)
+    except Exception as e:  # noqa: BLE001 — 예외 문구(401의 키 일부 등)는 결과·화면에 남기지 않고 이름만
+        return {"output": json.dumps({"kind": case["kind"], "id": case["id"], "error": type(e).__name__}),
+                "error": type(e).__name__}
     r = {"output": json.dumps(out, ensure_ascii=False)}
     if usage:
         r["tokenUsage"] = {"prompt": usage["prompt"], "completion": usage["completion"],

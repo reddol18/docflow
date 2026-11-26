@@ -33,7 +33,11 @@ def main(argv=None):
             lines = common.ocr(vol, d["doc_id"])["lines"][:80]
             b = d.get("b") or {}
             vals = {f["name"]: (b.get(f["name"]) or {}).get("value") or "" for f in pf}
-            bad = set(grounding.ungrounded(pf, vals, lines))
+            final = d.get("fields") or {}
+            # 운영 merge와 같게: LLM 값이 최종 칸 값에 들어간 칸만 표시 대상 (손글씨 판독·배치 규칙 값이면 빼고)
+            bad = {n for n in grounding.ungrounded(pf, vals, lines) if grounding.reached(vals[n], final.get(n))}
+            for f in pf:
+                c[(f["name"], "reached")] += grounding.reached(vals[f["name"]], final.get(f["name"]))
             g = gt.get(d["doc_id"])
             c["docs"] += 1
             c["lines"] += len(lines)
@@ -52,11 +56,11 @@ def main(argv=None):
                     c[(n, "gt_ok_flagged" if ok else "gt_bad_flagged")] += n in bad
     print(f"문서 {c['docs']}건 중 'OCR 근거 없음' 표시가 붙는 문서 {c['docs_flagged']}건 "
           f"(그중 지금 다른 표시가 없던 문서 {c['docs_new_review']}건). 지시 꼴로 근거에서 빠진 줄 {c['instr_lines']}/{c['lines']}")
-    print("| 칸 | 값 있음 | 근거 없음 표시 | 정답 맞은 값 | 그중 표시(오탐) | 정답 틀린 값 | 그중 표시 |")
-    print("|---|---|---|---|---|---|---|")
+    print("| 칸 | 값 있음 | LLM 값이 최종 값에 들어감 | 근거 없음 표시 | 정답 맞은 값 | 그중 표시(오탐) | 정답 틀린 값 | 그중 표시 |")
+    print("|---|---|---|---|---|---|---|---|")
     for f in pf:
         n = f["name"]
-        print(f"| {n} | {c[(n, 'values')]} | {c[(n, 'flagged')]} | {c[(n, 'gt_ok')]} | {c[(n, 'gt_ok_flagged')]} | "
+        print(f"| {n} | {c[(n, 'values')]} | {c[(n, 'reached')]} | {c[(n, 'flagged')]} | {c[(n, 'gt_ok')]} | {c[(n, 'gt_ok_flagged')]} | "
               f"{c[(n, 'gt_bad')]} | {c[(n, 'gt_bad_flagged')]} |")
     return 0
 
