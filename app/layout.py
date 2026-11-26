@@ -567,8 +567,61 @@ def line_box(d, kind, fix=None, value=None):
     return None, "", "항목명 못 찾음"
 
 
+# 수신 값에 낱말 하나로 끼어드는 결재란 글자 (https://github.com/reddol18/docflow/issues/1).
+# 1990년대 표 양식은 OCR 한 줄에 수신 칸과 결재란이 섞여, LLM·규칙 값 끝(또는 이어 붙인 줄 사이)에 '국장'·'실장'·'국'이 남는다.
+# 낱말 전체가 이것일 때만 뗀다 — '환경관리국'·'보건위생과장'처럼 이름에 붙은 글자는 그대로
+APPROVAL_WORD = re.compile(r"(?:국|국\s*장|과\s*장|부\s*시\s*장|부\s*군\s*수|실\s*장|계\s*장|담\s*당|심\s*사\s*자|결\s*재|전\s*결|선\s*결)")
+RULE_MAX = 60  # 이보다 긴(정규화 글자 수) 규칙 값은 본문까지 읽어 들인 것으로 보고 쓰지 않는다
+
+
+def strip_approval_tail(val):
+    """값 끝에 낱말로 붙은 결재란 글자를 뗀다 ('가상시 가상면 가상리 국' → '가상시 가상면 가상리'). 값이 그 낱말뿐이면 그대로"""
+    words = (val or "").split()
+    while len(words) > 1 and APPROVAL_WORD.fullmatch(words[-1]):
+        words.pop()
+    return " ".join(words) if words else (val or "")
+
+
+def clean_rule(val):
+    """규칙 값(여러 줄 이어 붙임)을 LLM 값과 견줄 꼴로: 낱말로 끼어든 결재란 글자, 글자 하나짜리 기호·숫자 낱말('1', '−')과 '과'·'기',
+    맨 앞 한 글자 낱말(항목명 '참조'의 '조' 같은 조각)을 떼고 '_'·'·'는 띄어쓰기로"""
+    words = [w for w in re.sub(r"[_·]", " ", val or "").split()
+             if not APPROVAL_WORD.fullmatch(w) and not re.fullmatch(r"[^가-힣A-Za-z]|과|기", w)]  # '과'·'기' = 과장·기안 칸 조각
+    if len(words) > 1 and len(words[0]) == 1:
+        words = words[1:]
+    return " ".join(words)
+
+
+# 규칙 값이 다른 항목명 줄까지 읽어 들였으면(OCR이 두 줄을 한 줄로 묶음) 쓰지 않는다
+OTHER_LABEL = re.compile(sp("시행일자") + "|" + sp("문서번호") + "|" + sp("경유") + "|" + sp("제목"))
+
+
+def _in_order(val, rule):
+    """val의 낱말(정규화)이 모두 rule(정규화) 안에 차례대로 들어 있나 — LLM이 주소·상호 일부를 빠뜨린 값"""
+    nr, pos = norm(rule), 0
+    for w in (norm(w) for w in val.split()):
+        if not w:
+            continue
+        k = nr.find(w, pos)
+        if k < 0:
+            return False
+        pos = k + len(w)
+    return True
+
+
+def _usable_rule(rule):
+    nr = norm(rule)
+    return (bool(nr) and len(nr) <= RULE_MAX and not is_list_ref(rule) and not OTHER_LABEL.search(rule)
+            and not re.match(r"\s*(내\s*부\s*결|처|참\s*조)", rule))
+
+
 def fix_recipient(d, val):
-    """LLM이 뽑은 수신 값을 규칙으로 보정한다. (새 값, 적용한 규칙 이름 또는 '')"""
+    """LLM이 뽑은 수신 값을 규칙으로 보정한다. (새 값, 적용한 규칙 이름('·'로 이음) 또는 '')
+      목록    '수신처 참조'면 쪽 아래 수신처 목록
+      결재란  값 끝의 결재란 낱말('국장'·'실장'·'국' 등)을 뗌
+      잘림·규칙  배치 규칙 값(rule_recipient, 결재란 낱말을 뗀 것)이 LLM 값을 차례대로 다 담고 더 길면 규칙 값을 쓴다
+              (잘림 = 규칙 값이 LLM 값으로 시작, 규칙 = 가운데·앞을 빠뜨림). LLM 값에 결재란 낱말이 있었으면 길이가 같아도
+      참조    머리부 '참조' 부서장을 붙임"""
     val = val or ""
     if is_list_ref(val):
         lst = bottom_list(d["lines"])
@@ -576,16 +629,21 @@ def fix_recipient(d, val):
             return lst, "목록"
     if not val or re.match(r"내부\s*결", val):
         return val, ""
+    why = []
+    out = strip_approval_tail(val)
+    had_stop = out != val or any(APPROVAL_WORD.fullmatch(w) for w in val.split())
+    if out != val:
+        why.append("결재란")
+    rule = clean_rule(rule_recipient(d))
+    nv, nr = norm(out), norm(rule)
     office = ref_office(d)
-    if office and norm(office) not in norm(val):
-        return f"{val} {office}", "참조"
-    # 잘림: 다음 줄의 상호·'대표'를 LLM이 빠뜨린 경우 규칙 값의 뒷부분을 붙인다
-    rule = rule_recipient(d)
-    nv, nr = norm(val), norm(rule)
-    if nr.startswith(nv) and len(nr) > len(nv) and nr.endswith("대표"):
-        k = 0  # rule 원문에서 B 값에 해당하는 앞부분을 건너뛴다
-        for i, ch in enumerate(rule):
-            if k >= len(nv):
-                return f"{val} {rule[i:].strip()}", "잘림"
-            k += len(norm(ch))
-    return val, ""
+    if _usable_rule(rule) and nr != nv and (
+            (len(nr) > len(nv) and _in_order(out, rule)) or (had_stop and len(nr) >= len(nv) and nr[:2] == nv[:2])):
+        # 규칙 값이 LLM 값 + 참조 부서장뿐이면 '참조'로 센다 (부서장 줄이 규칙 값에 이어 붙은 것)
+        tag = "참조" if office and nr == nv + norm(office) else ("잘림" if nr.startswith(nv) else "규칙")
+        out = rule
+        why.append(tag)
+    if office and norm(office) not in norm(out):
+        out = f"{out} {office}"
+        why.append("참조")
+    return out, "·".join(why)
