@@ -23,7 +23,7 @@ def main(argv=None):
     import common  # noqa: PLC0415 — DOCFLOW_EVAL_WORK를 넣은 뒤
     from rescore import ok_field  # noqa: PLC0415
 
-    from app import fields, grounding  # noqa: PLC0415
+    from app import fields, graph, grounding  # noqa: PLC0415
     schema = fields.load(common.SCHEMA_FILE)
     pf = fields.prompt_fields(schema)
     gt = common.load_gt()[1]
@@ -34,10 +34,13 @@ def main(argv=None):
             b = d.get("b") or {}
             vals = {f["name"]: (b.get(f["name"]) or {}).get("value") or "" for f in pf}
             final = d.get("fields") or {}
-            # 운영 merge와 같게: LLM 값이 최종 칸 값에 들어간 칸만 표시 대상 (손글씨 판독·배치 규칙 값이면 빼고)
-            bad = {n for n in grounding.ungrounded(pf, vals, lines) if grounding.reached(vals[n], final.get(n))}
+            # 운영 merge와 같게: LLM 값(일부라도)이 최종 칸 값에 들어간 칸만 표시 대상 (graph.rule_values_of 출처 + from_b_flags)
+            _, info = graph.rule_values_of(b, d.get("hw") or {}, final.get("recipient") or "", len(d.get("pages") or [1]))
+            why = (d.get("info") or {}).get("recipient_fix") or ""
+            reach = set(graph.from_b_flags(schema, b, final, [f["name"] for f in pf if vals[f["name"]]], info["from_b"], why))
+            bad = set(grounding.ungrounded(pf, vals, lines)) & reach
             for f in pf:
-                c[(f["name"], "reached")] += grounding.reached(vals[f["name"]], final.get(f["name"]))
+                c[(f["name"], "reached")] += f["name"] in reach
             g = gt.get(d["doc_id"])
             c["docs"] += 1
             c["lines"] += len(lines)

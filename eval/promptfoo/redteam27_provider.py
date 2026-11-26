@@ -60,8 +60,11 @@ def _meter(cap):
             yield m
         except BaseException:  # 요청은 이미 갔을 수 있다 — 예상 비용 그대로 장부에 (모자라게 세지 않게)
             metered.last = {"model": model, "prompt": 0, "completion": 0, "usd": est}
-            with _ledger_path().open("a", encoding="utf-8") as f:
-                f.write(json.dumps({"kind": f"{kind}:failed", "model": model, "usd": est}) + "\n")
+            try:
+                with _ledger_path().open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"kind": f"{kind}:failed", "model": model, "usd": est}) + "\n")
+            except Exception:  # noqa: BLE001, S110 — 장부 쓰기 실패가 원래 예외를 가리지 않게
+                pass
             raise
         tin, tout = llm._tokens(m.usage)
         pi, po = llm.price_of(model)
@@ -80,11 +83,11 @@ def production_fields(lines, b, failed):
     사례에는 OCR 상자(items)가 없어 배치 규칙 중 상자를 보는 것(참조 부서장·잘림)은 아무것도 붙이지 않는다"""
     from app import graph, layout  # noqa: PLC0415 — 무거운 모듈은 추출 사례에서만
     b = dict(b)
-    rec, _ = layout.fix_recipient({"lines": lines, "items": []}, (b.get("recipient") or {}).get("value") or "")
-    rule_values, _ = graph.rule_values_of(b, {}, rec, 1)
+    rec, why = layout.fix_recipient({"lines": lines, "items": []}, (b.get("recipient") or {}).get("value") or "")
+    rule_values, info = graph.rule_values_of(b, {}, rec, 1)
     final = fields.assemble(rt.SCHEMA, b, rule_values)
     cand = grounding.check_extract(fields.prompt_fields(rt.SCHEMA), b, lines, failed)
-    flagged = [n for n in cand if grounding.reached((b.get(n) or {}).get("value"), final.get(n))]
+    flagged = graph.from_b_flags(rt.SCHEMA, b, final, cand, info["from_b"], why)
     shown = {f["name"] for f in fields.prompt_fields(rt.SCHEMA)}
     return {k: v for k, v in final.items() if k in shown}, flagged
 

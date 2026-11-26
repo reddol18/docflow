@@ -460,27 +460,51 @@ def rule_values_of(b, hw, recipient, n_pages):
     # 문서번호 = 부서 약칭 + 5자리 분류번호 + 손글씨 일련번호.
     # 앞부분은 손글씨 칸 판독(칸만 잘라 읽어 우편번호 등이 안 섞임)을 먼저 쓰고, 없으면 B 값.
     # (처음엔 B 값을 먼저 썼다가 '우621-363'처럼 우편번호를 문서번호로 뽑은 B 값이 그대로 남았다)
-    head = ""
-    for src in (doc_text_, b_doc):
+    head, head_from_b = "", False
+    for i, src in enumerate((doc_text_, b_doc)):
         m = re.search(r"([가-힣]{1,4})\s*(\d{5})", src or "")
         if m:
-            head = f"{m.group(1)} {m.group(2)}"
+            head, head_from_b = f"{m.group(1)} {m.group(2)}", i == 1
             break
     docno = f"{head}-{serial}" if (head or serial) else ""
     rule_values = {"docno": docno, "serial": serial, "date": date, "recipient": recipient, "pages": str(n_pages)}
     info = {"prefix": layout.prefix_of(b_doc) or layout.prefix_of(doc_text_), "blank": blank,
             "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
             "b_serial": layout.serial_of(b_doc), "b_date": b_date}
-    return rule_values, info
+    # 어느 부분이 LLM 값(b)에서 왔나 — 근거 없는 LLM 값의 표시를 그 값이 최종 칸에 들어간 칸에만 붙이려고 (from_b_flags)
+    serial_from_b = bool(serial) and not s_doc
+    from_b = {"docno": head_from_b or serial_from_b, "serial": serial_from_b,
+              "date": bool(date) and not layout.date_of(hw["date"]["text"])}
+    return rule_values, {**info, "from_b": from_b}
+
+
+def from_b_flags(schema, b, final, cand, from_b, recipient_fix=""):
+    """근거 없는 추출 칸(cand) 중 그 LLM 값(일부라도)이 최종 칸 값에 들어간 칸. 규칙 칸은 rule_values_of가 센 출처(from_b)로 —
+    문서번호는 앞부분(부서·분류번호)이나 일련번호 중 하나라도 b에서 왔으면. 수신은 배치 규칙이 쪽 아래 목록으로 바꾼 때('목록')만 빼고
+    LLM 값이 그대로 있으면. 그 밖의 칸(llm_extract 등)은 LLM 값이 최종 값에 들어 있으면 (grounding.reached)"""
+    rules = {f["name"]: f.get("rule") for f in schema["fields"]}
+    out = []
+    for n in cand:
+        rule = rules.get(n)
+        if rule in ("docno", "serial", "date"):
+            hit = from_b.get(rule, False)
+        elif rule == "recipient":
+            hit = recipient_fix != "목록" and grounding.reached((b.get(n) or {}).get("value"), final.get(n))
+        else:
+            hit = grounding.reached((b.get(n) or {}).get("value"), final.get(n))
+        if hit:
+            out.append(n)
+    return out
 
 
 def merge(s: DocState):
     """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
     b = s["b"]
     rule_values, info = rule_values_of(b, s["hw"], s["recipient"], len(s["pages"]))
+    from_b = info.pop("from_b")
     final = fields.assemble(SCHEMA, b, rule_values)
-    # 근거 없는 추출 값 표시는 그 LLM 값이 최종 칸 값에 실제로 들어간 칸만 (손글씨 판독·배치 규칙이 만든 값이면 LLM 값은 화면에 안 감)
-    ungrounded = [n for n in s.get("ungrounded") or () if grounding.reached((b.get(n) or {}).get("value"), final.get(n))]
+    # 근거 없는 추출 값 표시는 그 LLM 값(일부라도)이 최종 칸 값에 실제로 들어간 칸만 (손글씨 판독·배치 규칙이 만든 값이면 화면에 안 감)
+    ungrounded = from_b_flags(SCHEMA, b, final, s.get("ungrounded") or (), from_b, s["recipient_fix"])
     return {"docs": [{
         "doc_id": s["doc_id"], "vol": s["vol"], "pages": s["pages"],
         "fields": final,
