@@ -33,6 +33,12 @@ synth_manifest.json에 있지(이름 SYNTH…) 않으면 부르기 전에 멈춘
 -Work·-Vols 등으로 바꾼 DOCFLOW_* 환경변수는 끝나면 시작 값으로 되돌린다. -Work면 그 드라이브 여유(2GB)를 먼저 본다. AI Hub 철은 -Local(이 PC Ollama)과 -BaselineFrom(지난 결과, 호출 없음)으로만 잰다.
   .\eval\promptfoo\run.ps1 -Replay              LLM 호출 없이 저장 결과로 채점 연결만 확인 (eval/score.py와 같아야 함)
   .\eval\promptfoo\run.ps1 -View                마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
+  .\eval\promptfoo\run.ps1 -RedTeam [-Repeat 3]  레드팀 고정 10건 (https://github.com/reddol18/docflow/issues/27 조건 4, redteam27.yaml).
+                                                운영 함수 llm.extract·llm.answer + 운영 모델(추출·답변 모두 gpt-4.1-mini). 가상 값만이라
+                                                합성 철 확인은 하지 않는다. 부르기 전에 비용 상한 추정(> $0.25면 멈춤), 실행 중 누적
+                                                상한 $0.5(장부). 결과 work/promptfoo/redteam27/ (results.json·redteam27.md·json).
+                                                종료 코드 0 조종 0건, 1 조종(또는 오류) 있음, 2 실행 실패.
+                                                -RedTeamChatModel gpt-4.1-mini: 답변 모델만 후보로 바꿔 같은 세트를 잰다
 
 종료 코드는 gate.py 그대로: 0 통과, 1 기준을 어긴 후보 있음, 2 입력 문제.
 OpenAI 키는 Windows 사용자 환경변수 OPENAI_API_KEY에서 읽어 promptfoo를 부르는 동안만 이 프로세스 환경에 둔다
@@ -58,12 +64,16 @@ param(
     [string]$Work = '',          # work 폴더 (기본 records_poc/work 또는 DOCFLOW_EVAL_WORK)
     [string]$Remote = '',        # 원격 OpenAI 호환 주소 (…/v1)
     [string]$RemoteModel = '',
-    [int]$Concurrency = 0
+    [int]$Concurrency = 0,
+    [switch]$RedTeam,            # 레드팀 고정 10건 (https://github.com/reddol18/docflow/issues/27 조건 4)
+    [int]$Repeat = 3,
+    [string]$RedTeamChatModel = ''   # 레드팀 답변 모델 후보 (비우면 운영 기본값, PRICE에 있어야 함)
 )
 $ErrorActionPreference = 'Stop'
 # 이 스크립트는 부른 셸 안에서 돈다 → 바꾼 DOCFLOW_* 환경변수는 맨 끝 finally에서 시작 값으로 되돌린다
 # (안 그러면 -Work 다음 실행이 -Work 없이도 그 work를 잰다). 키 두 개는 따로 아래에서 되돌린다
-$envNames = 'DOCFLOW_EVAL_WORK', 'DOCFLOW_EVAL_VOLS', 'DOCFLOW_LOCAL_MODEL', 'DOCFLOW_REMOTE_MODEL', 'DOCFLOW_REMOTE_BASE'
+$envNames = 'DOCFLOW_EVAL_WORK', 'DOCFLOW_EVAL_VOLS', 'DOCFLOW_LOCAL_MODEL', 'DOCFLOW_REMOTE_MODEL', 'DOCFLOW_REMOTE_BASE',
+            'DOCFLOW_RT27_LEDGER', 'DOCFLOW_RT27_CHAT_MODEL'
 $envSaved = @{}
 foreach ($n in $envNames) { $envSaved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
 try {   # 끝: 환경변수 되돌리기 (맨 아래 finally)
@@ -83,6 +93,7 @@ $env:PROMPTFOO_DISABLE_TELEMETRY = '1'
 $env:PROMPTFOO_DISABLE_UPDATE = '1'
 $env:PROMPTFOO_DISABLE_SHARING = '1'
 $env:PROMPTFOO_DISABLE_REMOTE_GENERATION = 'true'
+$env:PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = 'true'   # 레드팀 세트는 손으로 쓴 고정 10건 — 외부 생성 안 씀 (https://github.com/reddol18/docflow/issues/27)
 $env:PROMPTFOO_CONFIG_DIR = Join-Path $out '.promptfoo'   # 결과 DB(실제 문서 글자)도 work/ 아래
 $env:PYTHONUTF8 = '1'
 $env:DOCFLOW_EVAL_WORK = $work
@@ -148,6 +159,29 @@ $served = $null
 $servedAt = $null
 $baseDir = $null
 try {   # 입력 검사도 여기 안에서 — 어디서 멈추든 키 복원은 아래 finally 하나로
+    if ($RedTeam) {   # 레드팀 고정 10건 (https://github.com/reddol18/docflow/issues/27 조건 4) — 가상 값만, 운영 함수·운영 모델
+        if ($Local -or $Replay -or $Remote -or $BaselineFrom -or $Vols) { throw '-RedTeam은 다른 실행 방식(-Local·-Replay·-Remote·-BaselineFrom·-Vols)과 같이 쓰지 않는다' }
+        if ($Repeat -lt 1 -or $Repeat -gt 3) { throw '-Repeat는 1~3 (사용자 결정: 10건 × 최대 3회)' }
+        $env:DOCFLOW_RT27_CHAT_MODEL = $RedTeamChatModel   # 빈 값이면 운영 기본 답변 모델
+        $rt = Join-Path $out 'redteam27'
+        New-Item -ItemType Directory -Force $rt | Out-Null
+        $env:DOCFLOW_RT27_LEDGER = Join-Path $rt ('ledger-{0}.jsonl' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        & $py -I -X utf8 (Join-Path $here 'redteam27.py') estimate --repeat $Repeat
+        if ($LASTEXITCODE -ne 0) { throw '비용 상한 추정이 $0.25를 넘거나 추정 실패 — 부르지 않음' }
+        $key = if ($prevKey) { $prevKey } else { [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User') }
+        if (-not $key) { throw 'OPENAI_API_KEY가 없다 — Windows 사용자 환경변수에 넣는다' }
+        $res = Join-Path $rt 'results.json'
+        Remove-Item $res -ErrorAction SilentlyContinue
+        $args_ = @('eval', '-c', (Join-Path $here 'redteam27.yaml'), '-o', $res, '--repeat', "$Repeat", '-j', '1',
+                   '--no-cache', '--no-share', '--no-table', '--no-progress-bar')
+        Push-Location $here
+        $env:OPENAI_API_KEY = $key   # promptfoo를 부르는 동안만
+        try { Invoke-Promptfoo @args_; $pcode = $LASTEXITCODE }
+        finally { Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue; Pop-Location }
+        if (($pcode -ne 0 -and $pcode -ne 100) -or -not (Test-Path $res)) { Write-Output "promptfoo 실패 (종료 코드 $pcode)"; exit 2 }
+        & $py -I -X utf8 (Join-Path $here 'redteam27.py') report $res --out $rt --ledger $env:DOCFLOW_RT27_LEDGER --repeat $Repeat
+        exit $LASTEXITCODE
+    }
     if ($Replay) {
         if ($BaselineFrom) { throw '-BaselineFrom은 -Replay와 같이 쓰지 않는다 (Replay는 저장 결과와의 일치만 본다)' }
         $providers = '^replay$'

@@ -20,6 +20,8 @@ LLM이 채울 칸에 'LLM 꺼짐' 검토 표시가 붙고, review_mode가 auto�
 드러나고 그 칸에 '추출 실패' 검토 표시가 붙는다. 맞는 칸은 값을 그대로 쓴다. 응답이 JSON 객체가 아니면 추출 칸 모두가 실패.
 철 실행은 멈추지 않는다 — 표시가 있으니 human이면 사람 검토에서 멈추고, auto(평가용)면 실패 칸을 빈 값·표시로 둔 채 색인까지
 간다(내보내기 전 검증 /export/check의 '검토 안 끝난 건'과 검토 목록이 잡는다).
+추출 값이 OCR 텍스트(지시처럼 보이는 줄은 빼고)에 근거가 없으면 그 칸에 'OCR 근거 없음' 검토 표시 (값은 그대로, info.llm_ungrounded,
+app/grounding.py) — 문서에 심은 지시로 넣은 값을 사람이 보게 한다 (레드팀 세트 E3).
 """
 import json
 import operator
@@ -33,7 +35,7 @@ import cv2
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
-from app import cancel, errors, fields, flags, layout, line_crops, llm, ocr, store
+from app import cancel, errors, fields, flags, grounding, layout, line_crops, llm, ocr, store
 
 # 검토 표시 규칙은 app/flags.py. 환경변수 FLAG_CONFIG(JSON)로 기준값·추가 규칙을 덮어쓸 수 있다.
 # 예: FLAG_CONFIG='{"conf_date": 0.9, "rules": ["doc_head", "rec_part"]}'
@@ -129,6 +131,16 @@ def off_flags(d, schema=None):
     return dict(sorted(out.items()))
 
 
+GROUND_FLAG = "OCR 근거 없음"  # 추출 값이 OCR(지시 꼴 줄 빼고)에 없음 — app/grounding.py (https://github.com/reddol18/docflow/issues/27)
+
+
+def ground_flags(d, schema=None):
+    """추출 값이 OCR 텍스트에 근거가 없는 칸(info.llm_ungrounded)의 검토 표시 {flag_key: ['OCR 근거 없음']}. 값은 그대로 둔다"""
+    schema = schema or SCHEMA
+    names = {f["name"] for f in fields.prompt_fields(schema)} & set((d.get("info") or {}).get("llm_ungrounded") or ())
+    return {k: [GROUND_FLAG] for k in sorted({fields.flag_key(f) for f in schema["fields"] if f["name"] in names})}
+
+
 def _llm_of(b, rule, schema=None):
     """규칙이 재료로 쓰는 LLM 추출값: 그 rule을 가진 칸의 이름으로 찾는다 (매핑에서 칸 이름을 바꿔도 되게). 그런 칸이 없으면 빈 값"""
     f = fields.by_rule(schema or SCHEMA, rule)
@@ -202,6 +214,7 @@ class DocState(TypedDict, total=False):
     skipped: Annotated[list[str], operator.add]  # LLM_PROVIDER=off로 건너뛴 단계 (extract·read)
     # 응답 모양이 틀려 빈 값으로 둔 추출 칸 이름 (https://github.com/reddol18/docflow/issues/27)
     failed: Annotated[list[str], operator.add]
+    ungrounded: Annotated[list[str], operator.add]  # 값이 OCR에 근거가 없는 추출 칸 이름 (app/grounding.py)
     b: dict  # GPT 텍스트 추출 (PoC의 B 갈래)
     recipient: str
     recipient_fix: str
@@ -285,6 +298,8 @@ def validate(s: VolState):
             fl[k] = [*rest, *v]
         for k, v in mf.items():
             fl.setdefault(k, []).extend(v)
+        for k, v in ground_flags(d).items():  # 근거 없는 추출 값 — 확신도 사유('LLM')와 따로 붙인다
+            fl.setdefault(k, []).extend(v)
         d["flags"] = fl
     return {"docs": docs}
 
@@ -361,8 +376,11 @@ def extract(s: DocState):
         # 그 칸만 '추출 실패'(빈 값, 검토 표시), 철 실행은 이어 간다 (https://github.com/reddol18/docflow/issues/27).
         # 서버 로그에는 칸 이름·오류 종류만 (응답 값·원문 없음)
         print(f"[graph] extract 응답 형식 오류 {s['vol']}/{s['doc_id']}: {why}", file=sys.stderr, flush=True)
+    # 근거 확인: 값이 OCR(지시 꼴 줄은 빼고)에 없으면 그 칸만 검토 표시 (값은 그대로). 칸 이름만 남긴다 (app/grounding.py)
+    ungrounded = [] if skipped else grounding.check_extract(fields.prompt_fields(SCHEMA), b, d["lines"], failed)
     rec, why = layout.fix_recipient(d, _llm_of(b, "recipient"))
-    return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped, "failed": failed}
+    return {"b": b, "recipient": rec, "recipient_fix": why, "skipped": skipped, "failed": failed,
+            "ungrounded": ungrounded}
 
 
 def locate(s: DocState):
@@ -428,10 +446,9 @@ def read(s: DocState):
     return {"hw": hw, "skipped": skipped}
 
 
-def merge(s: DocState):
-    """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
-    b = s["b"]
-    hw = {k: s["hw"].get(k) or {"text": "", "conf": 0.0} for k in CELLS}
+def rule_values_of(b, hw, recipient, n_pages):
+    """규칙 칸 값 (merge와 레드팀 하네스가 같이 씀) → (rule_values, 덧붙일 info). hw = {칸: {text, conf}} (없으면 못 읽은 칸)"""
+    hw = {k: (hw or {}).get(k) or {"text": "", "conf": 0.0} for k in CELLS}
     b_doc = _llm_of(b, "docno")
     b_date = _llm_of(b, "date") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", _llm_of(b, "date")) else ""
     doc_text_ = hw["docno"]["text"]
@@ -443,24 +460,65 @@ def merge(s: DocState):
     # 문서번호 = 부서 약칭 + 5자리 분류번호 + 손글씨 일련번호.
     # 앞부분은 손글씨 칸 판독(칸만 잘라 읽어 우편번호 등이 안 섞임)을 먼저 쓰고, 없으면 B 값.
     # (처음엔 B 값을 먼저 썼다가 '우621-363'처럼 우편번호를 문서번호로 뽑은 B 값이 그대로 남았다)
-    head = ""
-    for src in (doc_text_, b_doc):
+    head, head_from_b = "", False
+    for i, src in enumerate((doc_text_, b_doc)):
         m = re.search(r"([가-힣]{1,4})\s*(\d{5})", src or "")
         if m:
-            head = f"{m.group(1)} {m.group(2)}"
+            head, head_from_b = f"{m.group(1)} {m.group(2)}", i == 1
             break
     docno = f"{head}-{serial}" if (head or serial) else ""
-    rule_values = {"docno": docno, "serial": serial, "date": date, "recipient": s["recipient"],
-                   "pages": str(len(s["pages"]))}
+    rule_values = {"docno": docno, "serial": serial, "date": date, "recipient": recipient, "pages": str(n_pages)}
+    info = {"prefix": layout.prefix_of(b_doc) or layout.prefix_of(doc_text_), "blank": blank,
+            "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
+            "b_serial": layout.serial_of(b_doc), "b_date": b_date}
+    # 어느 부분이 LLM 값(b)에서 왔나 — 근거 없는 LLM 값의 표시를 그 값이 최종 칸에 들어간 칸에만 붙이려고 (from_b_flags)
+    serial_from_b = bool(serial) and not s_doc
+    from_b = {"head": head_from_b, "serial": serial_from_b, "date": bool(date) and not layout.date_of(hw["date"]["text"])}
+    return rule_values, {**info, "from_b": from_b}
+
+
+def from_b_flags(schema, b, final, cand, from_b, recipient_fix=""):
+    """근거 없는 추출 칸(cand, grounding.check_extract) 중 그 LLM 값(일부라도)이 최종 칸 값에 들어간 칸. 규칙 칸은 rule_values_of가 센
+    출처(from_b)로 — 문서번호는 부분별('칸:head' 부서·분류번호, '칸:serial' 일련번호): 근거 없는 부분이 b에서 와 최종 값에 들어갔으면.
+    수신은 배치 규칙이 쪽 아래 목록으로 바꾼 때('목록')만 빼고 LLM 값이 그대로 있으면. 그 밖의 칸(llm_extract 등)은 LLM 값이 최종 값에
+    들어 있으면 (grounding.reached)"""
+    rules = {f["name"]: f.get("rule") for f in schema["fields"]}
+    out = []
+    for c in cand:
+        n, _, part = c.partition(":")
+        rule = rules.get(n)
+        if n in out:
+            continue
+        if part:  # 문서번호 부분
+            hit = from_b.get(part, False)
+        elif rule == "docno":  # 예전 체크포인트의 부분 없는 'docno' — 앞부분·일련번호 중 하나라도 b에서 왔으면
+            hit = from_b.get("head", False) or from_b.get("serial", False)
+        elif rule == "date":
+            hit = from_b.get("date", False)
+        elif rule == "recipient":
+            hit = recipient_fix != "목록" and grounding.reached((b.get(n) or {}).get("value"), final.get(n))
+        else:
+            hit = grounding.reached((b.get(n) or {}).get("value"), final.get(n))
+        if hit:
+            out.append(n)
+    return out
+
+
+def merge(s: DocState):
+    """B 값에 손글씨 칸 판독을 끼워 넣어 규칙 값을 만들고(PoC hw_flags.build와 같은 규칙), 스키마대로 칸을 조립한다."""
+    b = s["b"]
+    rule_values, info = rule_values_of(b, s["hw"], s["recipient"], len(s["pages"]))
+    from_b = info.pop("from_b")
+    final = fields.assemble(SCHEMA, b, rule_values)
+    # 근거 없는 추출 값 표시는 그 LLM 값(일부라도)이 최종 칸 값에 실제로 들어간 칸만 (손글씨 판독·배치 규칙이 만든 값이면 화면에 안 감)
+    ungrounded = from_b_flags(SCHEMA, b, final, s.get("ungrounded") or (), from_b, s["recipient_fix"])
     return {"docs": [{
         "doc_id": s["doc_id"], "vol": s["vol"], "pages": s["pages"],
-        "fields": fields.assemble(SCHEMA, b, rule_values),
+        "fields": final,
         "b": b, "hw": s["hw"],
-        "info": {"prefix": layout.prefix_of(b_doc) or layout.prefix_of(doc_text_), "blank": blank,
-                 "conf_serial": hw["docno"]["conf"], "conf_date": hw["date"]["conf"],
-                 "b_serial": layout.serial_of(b_doc), "b_date": b_date,
-                 "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
-                 "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or [], "llm_failed": s.get("failed") or []},
+        "info": {**info, "recipient_fix": s["recipient_fix"], "head_ratio": HEAD_RATIOS[s["ratio_i"]],
+                 "box_fail": s["box_fail"], "llm_skipped": s.get("skipped") or [], "llm_failed": s.get("failed") or [],
+                 "llm_ungrounded": ungrounded},
         "flags": {},
     }]}
 

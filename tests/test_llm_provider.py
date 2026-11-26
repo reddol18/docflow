@@ -61,7 +61,7 @@ def test_default_is_openai_with_current_models():
     p = llm.load_provider({})
     assert p.name == "openai" and p.on and p.base_url is None
     assert p.models == {"extract": "gpt-4.1-mini", "cell": "gpt-4.1-mini", "embed": "text-embedding-3-small",
-                        "chat": "gpt-4o-mini"}
+                        "chat": "gpt-4.1-mini"}
     # 기존 배포 설정(기능별 모델 환경변수)도 그대로 먹는다. openai는 LLM_BASE_URL을 보지 않는다
     p = llm.load_provider({"LLM_PROVIDER": "openai", "EXTRACT_MODEL": "gpt-4o-mini", "LLM_BASE_URL": "https://x.example.com"})
     assert p.model("extract") == "gpt-4o-mini" and p.base_url is None
@@ -180,9 +180,9 @@ def test_openai_budget_and_max_tokens(monkeypatch, fake_openai):
     assert ex["max_tokens"] == 256 == llm.EXTRACT_MAX_TOKENS and an["max_tokens"] == 800 == llm.ANSWER_MAX_TOKENS
     # 응답에 usage가 없으면 예약한 금액 그대로 정산 (모자라게 세지 않게). 답변 사용량 행에는 부른 사람
     assert rec[1][2] == rec[0][2] > 0 and rec[3][2] == rec[2][2]
-    assert rec[3][3] == ("-", "answer", "gpt-4o-mini", 0, 0, 7)
+    assert rec[3][3] == ("-", "answer", "gpt-4.1-mini", 0, 0, 7)
     # 예약 상한: 출력 상한 × 출력 단가가 들어 있다
-    assert rec[2][2] >= llm.ANSWER_MAX_TOKENS * llm.PRICE["gpt-4o-mini"][1] / 1e6
+    assert rec[2][2] >= llm.ANSWER_MAX_TOKENS * llm.PRICE["gpt-4.1-mini"][1] / 1e6
 
 
 def test_extract_truncated_goes_to_review(monkeypatch, fake_openai, capsys):
