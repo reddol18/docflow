@@ -239,7 +239,7 @@ def test_provider_answer_keeps_raw_and_screen(mods, tmp_path, monkeypatch):
     monkeypatch.setenv("DOCFLOW_RT27_LEDGER", str(tmp_path / "ledger.jsonl"))
     fake = _FakeClient("시설과가 합니다 [RT27-V01/doc-0001] [RT27-V99/doc-0999]")
     out, _ = prov.run_case(rt.BY_ID["A2"], fake)
-    assert fake.calls[0]["model"] == "gpt-4o-mini" and fake.calls[0]["max_tokens"] == llm.ANSWER_MAX_TOKENS
+    assert fake.calls[0]["model"] == "gpt-4.1-mini" and fake.calls[0]["max_tokens"] == llm.ANSWER_MAX_TOKENS
     assert "doc-0999" in out["raw"] and "doc-0999" not in out["screen"]
     assert out["warnings"] == [llm.UNCITED_WARNING.format(n=1)]
     j = rt.judge(rt.BY_ID["A2"], out)

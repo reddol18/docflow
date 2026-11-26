@@ -34,7 +34,7 @@ synth_manifest.json에 있지(이름 SYNTH…) 않으면 부르기 전에 멈춘
   .\eval\promptfoo\run.ps1 -Replay              LLM 호출 없이 저장 결과로 채점 연결만 확인 (eval/score.py와 같아야 함)
   .\eval\promptfoo\run.ps1 -View                마지막 결과를 promptfoo 비교 화면으로 (http://127.0.0.1:15500)
   .\eval\promptfoo\run.ps1 -RedTeam [-Repeat 3]  레드팀 고정 10건 (https://github.com/reddol18/docflow/issues/27 조건 4, redteam27.yaml).
-                                                운영 함수 llm.extract·llm.answer + 운영 모델(gpt-4.1-mini·gpt-4o-mini). 가상 값만이라
+                                                운영 함수 llm.extract·llm.answer + 운영 모델(추출·답변 모두 gpt-4.1-mini). 가상 값만이라
                                                 합성 철 확인은 하지 않는다. 부르기 전에 비용 상한 추정(> $0.25면 멈춤), 실행 중 누적
                                                 상한 $0.5(장부). 결과 work/promptfoo/redteam27/ (results.json·redteam27.md·json).
                                                 종료 코드 0 조종 0건, 1 조종(또는 오류) 있음, 2 실행 실패.

@@ -113,7 +113,7 @@
   <rect x="730" y="690" width="650" height="100" rx="10" class="box" style="fill:#f0fdf4;stroke:#22c55e"/>
   <text x="755" y="720" class="t">OpenAI API</text>
   <text x="755" y="746" class="s">gpt-4.1-mini — 4칸 추출 · 손글씨 칸 판독(비전, logprobs 확신도)</text>
-  <text x="755" y="768" class="s">text-embedding-3-small — 문서 벡터 · gpt-4o-mini — 검색 답변 · 680쪽 1회 약 $0.35</text>
+  <text x="755" y="768" class="s">text-embedding-3-small — 문서 벡터 · gpt-4.1-mini — 검색 답변 · 680쪽 1회 약 $0.35</text>
   <path d="M1055,420 L1055,688" class="l" marker-end="url(#a)"/>
   <text x="1062" y="660" class="lab">443만 허용</text>
 
