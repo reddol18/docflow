@@ -1,0 +1,42 @@
+# 합성 양식 draft2000 — 2000년대 기안문, 가로 표 머리부 (eval/synth/render.py, https://github.com/reddol18/docflow/issues/139 조건 3).
+# 기본 스키마(isad_g.yaml) 칸에 잇는 기관 매핑 (https://github.com/reddol18/docflow/issues/9). 기관·사람·주소는 모두 지어낸 것.
+# 문서번호('부서명-일련번호')·시행일자가 인쇄 글자라 손글씨 판독 규칙(docno·date)을 쓰지 않고 LLM 추출만 한다.
+name: 합성 기안문 4칸 (2000년대)
+base: isad_g.yaml
+extract:
+  preamble: |-
+    입력은 2000년대 지방자치단체 기안문 첫 쪽을 OCR로 줄 단위로 옮긴 텍스트다.
+    머리부는 가로 표다: 윗줄에 항목명(문서번호·시행일자·보존기간·기안자), 아랫줄에 같은 순서로 값이 있다. 표 아래 수신·경유·제목이 온다.
+  rules: |-
+    OCR 텍스트에는 글자를 잘못 읽은 곳이 많다. 행정 문서 문맥상 명백한 오독은 바른 글자로 고쳐 적는다. 숫자·고유명사는 근거 없이 바꾸지 않는다.
+    표의 값 줄은 항목명 줄과 같은 순서로 짝짓는다 (보존기간·기안자 값을 문서번호·시행일자에 넣지 않는다). 제목은 '제목' 줄의 끝까지 빠짐없이 적는다.
+    칸마다 confidence(0~1)를 붙인다. 텍스트에 없는 것을 지어내지 않는다.
+fields:
+  - name: docno
+    label: 문서번호
+    level: document
+    method: llm_extract
+    isad: reference_code
+    prompt: '문서번호 (예: "건축과-12345"). 부서명 + "-" + 일련번호'
+    normalize: [strip]
+  - name: date
+    label: 시행일자
+    level: document
+    method: llm_extract
+    isad: dates
+    prompt: '시행일자를 YYYY-MM-DD로 (예: "2003. 5. 12." → "2003-05-12")'
+    normalize: [strip]
+  - name: recipient
+    label: 수신
+    level: document
+    method: llm_extract
+    isad: scope_content
+    note: ISAD(G)에 수신 요소가 없어 범위와 내용(3.3.1)에 잇는다
+    prompt: '수신 (기관·사람·상호). "내부결재", "수신자 참조"도 그대로 값이다'
+    crop: recipient
+  - {name: title, label: 제목, level: document, method: llm_extract, isad: title, prompt: 제목, crop: title}
+search:
+  keyword: [title, recipient, docno]
+  embed: [title, recipient, docno, date]
+  year: date
+  columns: [date, docno, title, recipient]

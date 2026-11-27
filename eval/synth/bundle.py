@@ -15,6 +15,7 @@
 
 실행 (Augraphy 환경, eval/synth/requirements.txt):
   uv run --no-project --with-requirements eval/synth/requirements.txt python -I eval/synth/bundle.py out_dir --seed 1 --docs 5 --level mix
+  양식: --form gimhae(기본)·agency1990·draft2000·mix (render.FORMS)
 """
 import argparse
 import csv
@@ -32,7 +33,10 @@ from PIL import ImageDraw  # noqa: E402
 
 # synth-0.2: 손글씨 칸 이름(annotation.cell)을 라벨에 남긴다 (https://github.com/reddol18/docflow/issues/80).
 # 같은 시드면 쪽 이미지·정답은 0.1과 같다
-VERSION = "synth-0.2"
+# synth-0.3: 양식 고르기(--form: gimhae 기본·agency1990·draft2000·mix, https://github.com/reddol18/docflow/issues/139 조건 3),
+# meta.json에 form. --form gimhae(기본)면 같은 시드의 쪽 이미지·라벨·정답은 0.2와 같다
+VERSION = "synth-0.3"
+FORM_CHOICES = (*render.FORMS, "mix")  # mix: 철마다 시드로 양식을 고른다
 GT_COLS = ["page", "확인", "is_start", "docno", "date", "recipient", "title", "check", "note", "saved"]
 
 
@@ -58,15 +62,28 @@ def hard_note(hard):
     return "합성" + "".join(f"; {f}:판독 불가({v:.1f})" for f, v in sorted(hard.items()))
 
 
-def plan(seed, n_docs):
+def pick_form(seed, form="gimhae"):
+    """철 양식. mix면 시드로 고른다 (철 하나 = 기관 하나라 양식도 하나). 양식 난수는 따로 — gimhae 철의 난수 순서를 바꾸지 않는다"""
+    if form == "mix":
+        return random.Random(f"{seed}-form").choice(render.FORMS)
+    if form not in render.FORMS:
+        raise ValueError(f"모르는 양식 {form!r} (가능: {FORM_CHOICES})")
+    return form
+
+
+def plan(seed, n_docs, form="gimhae"):
     """문서별 쪽 계획 → (city, year, pages). pages는 쪽 순서대로 [(Case, kind, cont, attach)]:
     kind는 first·cont·attach, cont는 첫 쪽 본문이 다음 쪽으로 이어지는지, attach는 붙임 서식 쪽이 따르는지
-    (first·cont 쪽에서만 참일 수 있다). 그리기 전 단계라 시험에서 따로 본다."""
+    (first·cont 쪽에서만 참일 수 있다). 그리기 전 단계라 시험에서 따로 본다.
+    form: render.FORMS 중 하나 (mix는 pick_form으로 먼저 푼다). gimhae는 예전과 같은 난수 순서"""
     r = random.Random(seed)
-    city, year = r.choice(render.CITY), r.randint(1991, 1998)
+    lo, hi = render.YEARS[form]
+    city, year = r.choice(render.CITY), r.randint(lo, hi)
+    org = render.new_org(r, form, city) if form != "gimhae" else None
     pages = []
     for _ in range(n_docs):
-        c = render.new_case(r, city=city, year=year)
+        c = render.new_case(r, city=city, year=year) if form == "gimhae" else \
+            render.new_case_form(r, form, city=city, year=year, org=org)
         cont, attach = r.random() < 0.3, r.random() < 0.35
         pages.append((c, "first", cont, attach))
         if cont:
@@ -78,16 +95,17 @@ def plan(seed, n_docs):
 
 def draw(c, kind, cont, attach, fonts, r, typewriter):
     if kind == "first":
-        return render.first_page(c, fonts, r, typewriter, cont=cont, attach=attach)
+        return render.FIRST_PAGE[c.form](c, fonts, r, typewriter, cont=cont, attach=attach)
     if kind == "cont":
         return render.cont_page(c, fonts, r, typewriter, attach=attach)
     return render.attach_page(c, fonts, r, typewriter)
 
 
-def label(page_id, img_w, img_h, year, ann, boxes):
+def label(page_id, img_w, img_h, year, ann, boxes, form="gimhae"):
     return {
         # AI Hub 88 라벨처럼 images는 배열 하나. 만든 시각은 같은 시드 같은 결과를 위해 비워 둔다
-        "images": [{"image.make.code": "SYNTH", "image.make.year": str(year), "image.category": "합성.시행문",
+        "images": [{"image.make.code": "SYNTH", "image.make.year": str(year),
+                    "image.category": "합성.기안문" if form == "draft2000" else "합성.시행문",
                     "image.width": img_w, "image.height": img_h, "image.file.name": f"{page_id}.jpg",
                     "image.create.time": ""}],
         "annotations": [
@@ -98,14 +116,16 @@ def label(page_id, img_w, img_h, year, ann, boxes):
     }
 
 
-def make(out, seed, n_docs=5, level="mix", fonts=None, check=False, bundle_no=1):
+def make(out, seed, n_docs=5, level="mix", fonts=None, check=False, bundle_no=1, form="gimhae"):
     check_seed(seed)
+    form = pick_form(seed, form)
     fonts = fonts or render.Fonts(hand=font_pins.installed())
-    city, year, pages = plan(seed, n_docs)
+    city, year, pages = plan(seed, n_docs, form)
     vol = f"SYNTH{seed:04d}-{year}-{bundle_no:04d}"
     d = Path(out) / vol
     d.mkdir(parents=True, exist_ok=True)
-    rows, meta = [], {"vol": vol, "generator": VERSION, "seed": seed, "level": level, "synthetic": True, "pages": []}
+    rows, meta = [], {"vol": vol, "generator": VERSION, "seed": seed, "level": level, "form": form, "synthetic": True,
+                      "pages": []}
     lr = random.Random(seed * 7 + 3)
     for n, (c, kind, cont, attach) in enumerate(pages, 1):
         pid = f"{vol}-{n:04d}"
@@ -114,7 +134,7 @@ def make(out, seed, n_docs=5, level="mix", fonts=None, check=False, bundle_no=1)
         p = draw(c, kind, cont, attach, fonts, r, typewriter=lv != "light")
         img, boxes, legib, ang = age.age(p.img, p.ann, lv, seed * 1000 + n)
         img.save(d / f"{pid}.jpg", quality=age.QUALITY[lv])  # 판독 밝기 차를 잰 품질과 같게
-        (d / f"{pid}.json").write_text(json.dumps(label(pid, img.size[0], img.size[1], year, p.ann, boxes),
+        (d / f"{pid}.json").write_text(json.dumps(label(pid, img.size[0], img.size[1], year, p.ann, boxes, form),
                                                   ensure_ascii=False, indent=1), encoding="utf-8")
         start = kind == "first"
         hard = {f: v for f, v in legib.items() if v < age.LEGIBLE_MIN} if start else {}
@@ -149,12 +169,14 @@ def main(argv=None):
     ap.add_argument("--docs", type=int, default=5)
     ap.add_argument("--level", choices=[*age.LEVELS, "mix"], default="mix")
     ap.add_argument("--check", action="store_true", help="상자 확인용 이미지도 만든다")
+    ap.add_argument("--form", choices=FORM_CHOICES, default="gimhae",
+                    help="첫 쪽 양식 (mix: 시드로 고름). 기본 gimhae = 예전 철과 같음")
     a = ap.parse_args(argv)
     hand = font_pins.installed()  # 해시 계산은 여기서 한 번만
     if not hand:
         print("손글씨 글꼴이 없습니다: python -I eval/synth/fonts.py 로 먼저 받으세요", file=sys.stderr)
         return 1
-    d, rows, meta = make(a.out, a.seed, a.docs, a.level, fonts=render.Fonts(hand=hand), check=a.check)
+    d, rows, meta = make(a.out, a.seed, a.docs, a.level, fonts=render.Fonts(hand=hand), check=a.check, form=a.form)
     starts = sum(r["is_start"] == "Y" for r in rows)
     hard = sum(bool(p["hard_fields"]) for p in meta["pages"])
     print(f"{d}: 쪽 {len(rows)}, 문서 {starts}, 판독 어려운 칸이 있는 문서 {hard}")

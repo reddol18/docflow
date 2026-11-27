@@ -45,7 +45,7 @@ OTHER_CELLS = ("recv_no", "recv_date", "sign_drafter", "sign_reviewer", "sign_ap
 OTHER_PROMPT = ("1990년대 공문서에서 사람이 손으로 쓴 칸 하나를 잘라낸 이미지다 (접수란의 번호·일자 또는 서명란의 사람 이름). "
                 "손글씨를 보이는 그대로 한 줄로 적어라. 숫자는 아라비아 숫자로, 이름은 한글로 적는다. "
                 "흘려 써서 애매해도 가장 그럴듯한 글자를 적는다. 값만 적고 설명은 쓰지 않는다.")
-CELL_GENERATORS = {"synth-0.2"}  # annotation.cell을 남기는 eval/synth/bundle.py VERSION
+CELL_GENERATORS = {"synth-0.2", "synth-0.3"}  # annotation.cell을 남기는 eval/synth/bundle.py VERSION
 PAD = 16 # 기타 칸: 라벨 상자를 사방으로 넓힐 픽셀 (글자 끝이 잘리지 않게)
 GROUPS = [("serial", "문서번호 칸 (운영)"), ("date", "시행일자 칸 (운영)"), ("recv_no", "접수 번호"),
           ("recv_date", "접수 일자"), ("sign", "서명 이름")]

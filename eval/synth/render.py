@@ -3,6 +3,10 @@
 모든 기관·사람·주소·번호는 지어낸 것이다. 실제 자료(AI Hub 공개 데이터 등)는 읽지도 베끼지도 않는다.
 지명은 실제 없는 것(CITY), 사람 이름은 음절 조합이다. 회사 이름은 흔한 낱말 조합이라 우연히 실제 상호와 같을 수 있다.
 
+양식(FORMS, Case.form) — 첫 쪽 머리만 다르고 4칸(docno·date·recipient·title)은 같다
+  gimhae      1990년대 시청 시행문 (김해 4칸 머리 세로줄, 오른쪽 접수란) — 기본. 같은 시드면 예전과 같은 쪽
+  agency1990  1990년대 다른 기관(지어낸 도 사업소) 시행문 — 기관명 머리, 문서번호·시행일자 한 줄, 접수란은 쪽 아래
+  draft2000   2000년대 기안문 — 가로 표 머리부(문서번호|시행일자|보존기간|기안자), 인쇄 문서번호 '부서명-번호'
 쪽 종류
   first     시행문 첫 쪽 — 김해 4칸(문서번호·시행일자·수신·제목) 머리, 접수란, 본문, 발신 명의·관인, 서명란
   cont      본문이 이어지는 쪽 (머리 없음, 쪽 번호)
@@ -45,10 +49,19 @@ CASES = [
     ("영업신고 수리", "식품접객업 영업신고 수리 통보", "식품위생법 제22조"),
 ]
 FIELDS = ("docno", "date", "recipient", "title")
+FORMS = ("gimhae", "agency1990", "draft2000")
+PROVINCE = ["새벌도", "한누리도"]  # 실제 없는 도 이름 (agency1990·draft2000 기관)
+# agency1990 기관: (단위 기관 이름, 문서번호 약칭) — 도 이름과 이어 '새벌도 수자원관리사업소'
+UNIT = [("수자원관리사업소", "수관"), ("산림환경연구소", "산연"), ("도로관리사업소", "도관"), ("보건환경연구원", "보연")]
+# draft2000 기관·부서: 도시·군(CITY) + 부서명. 문서번호는 '부서명-일련번호'
+DEPT2000 = ["건축과", "지역경제과", "도시계획과", "환경위생과", "민원봉사과"]
+YEARS = {"gimhae": (1991, 1998), "agency1990": (1990, 1999), "draft2000": (2001, 2009)}
+# 양식별 칸 정의 (app/field_schemas/ 파일 이름 — https://github.com/reddol18/docflow/issues/9 설정 검증을 시험이 돌린다)
+SCHEMA_FILE = {"gimhae": "gimhae.yaml", "agency1990": "synth_agency1990.yaml", "draft2000": "synth_draft2000.yaml"}
 # 손글씨 칸 (annotation.cell): 한 칸 = hand() 한 번. serial·date는 운영 판독 칸(문서번호 일련번호·시행일자)의 손글씨 부분,
 # 나머지는 운영이 읽지 않는 칸 — 접수란 번호·일자, 서명란 이름(기안자·검토자·결재권자), 붙임 서식 검토자 이름
 SIGN_CELLS = ("sign_drafter", "sign_reviewer", "sign_approver")
-HAND_CELLS = ("serial", "date", "recv_no", "recv_date", *SIGN_CELLS, "sign_attach")
+HAND_CELLS = ("serial", "date", "recv_no", "recv_date", *SIGN_CELLS, "sign_attach", "sign_table")  # sign_table: draft2000 머리 표 기안자
 
 
 def person(r):
@@ -187,12 +200,30 @@ class Case:
     addr: str
     recipient: str
     title: str
+    form: str = "gimhae"
+    org: str = ""  # 발신 기관 (agency1990·draft2000). gimhae는 city
+
+    @property
+    def docno(self):
+        if self.form == "draft2000":
+            return f"{self.dept[1]}-{self.serial}"
+        return f"{self.dept[0]} {self.classno}-{self.serial}"
 
     @property
     def fields(self):
-        return {"docno": f"{self.dept[0]} {self.classno}-{self.serial}",
+        return {"docno": self.docno,
                 "date": f"{self.year:04d}-{self.month:02d}-{self.day:02d}",
                 "recipient": self.recipient, "title": self.title}
+
+    @property
+    def sender(self):
+        """발신 명의 (서명란 위 큰 글자·관인)"""
+        return f"{self.org or self.city}장"
+
+    @property
+    def us(self):
+        """본문의 '우리 시' 자리"""
+        return {"agency1990": "우리 사업소", "draft2000": "우리 시"}.get(self.form, "우리 시")
 
 
 def new_case(r, city=None, year=None):
@@ -216,9 +247,51 @@ def new_case(r, city=None, year=None):
                 recipient=recipient, title=title)
 
 
+def new_org(r, form, city):
+    """철 하나의 발신 기관 — agency1990은 '도 + 사업소', draft2000은 시·군"""
+    return f"{r.choice(PROVINCE)} {r.choice(UNIT)[0]}" if form == "agency1990" else city
+
+
+def new_case_form(r, form, city=None, year=None, org=None):
+    """agency1990·draft2000 문서 한 건. gimhae는 new_case (난수 순서를 바꾸지 않으려고 따로 둔다)."""
+    if form == "gimhae":
+        return new_case(r, city=city, year=year)
+    if form not in FORMS:
+        raise ValueError(f"모르는 양식 {form!r} (가능: {FORMS})")
+    city = city or r.choice(CITY)
+    company, rep = r.choice(COMPANY), person(r)
+    case = r.choice(CASES)
+    kind = r.random()
+    if kind < 0.6:
+        recipient = f"주식회사 {company} 대표이사 {rep}" if form == "draft2000" else f"{company} 대표 {rep}"
+    elif kind < 0.75:
+        recipient = f"{rep} 귀하"
+    elif kind < 0.9:
+        recipient = "내부결재"
+    else:
+        recipient = "수신자 참조" if form == "draft2000" else "수신처 참조"
+    lo, hi = YEARS[form]
+    if form == "agency1990":
+        org = org or new_org(r, form, city)
+        abbr = dict(UNIT)[org.split(" ")[-1]]
+        dept = (abbr, org)
+        title = case[1] + (" 통보" if r.random() < 0.4 and not case[1].endswith("통보") else "")
+        classno = r.choice(["1420", "2231", "3015", "7110"])
+    else:
+        org = org or new_org(r, form, city)
+        dept = ("", r.choice(DEPT2000))
+        title = case[1] + (" 알림" if r.random() < 0.3 and not case[1].endswith("통보") else "")
+        classno = ""
+    return Case(city=city, dept=dept, case=case, company=company, rep=rep,
+                year=year or r.randint(lo, hi), month=r.randint(1, 12), day=r.randint(1, 28),
+                classno=classno, serial=str(r.randint(100, 2999) if form == "agency1990" else r.randint(1000, 19999)),
+                addr=f"{city} {r.choice(['중앙로', '새터길', '솔내로', '가람대로'])} {r.randint(1, 300)}",
+                recipient=recipient, title=title, form=form, org=org)
+
+
 def body_lines(c, r):
     return [
-        f"1. 귀사에서 {c.year}. {c.month}. {max(c.day - r.randint(3, 15), 1)}. 우리 시에 제출한 {c.case[0]} 신청에 대하여",
+        f"1. 귀사에서 {c.year}. {c.month}. {max(c.day - r.randint(3, 15), 1)}. {c.us}에 제출한 {c.case[0]} 신청에 대하여",
         f"   {c.case[2]} 및 관계 규정에 따라 검토한 결과를 다음과 같이 알려 드립니다.",
         "2. 처리 내용",
         f"   가. 신청인 : 주식회사 {c.company} (대표 {c.rep})",
@@ -293,8 +366,13 @@ def first_page(c, fonts, r, typewriter=False, cont=False, attach=False):
 
 
 def sign_block(p, c, r, top=2420):
-    p.spaced((W // 2 - 330, top), f"{c.city}장", 96, letter_gap=70)
-    p.seal((W // 2 + 380, top + 40), 240, f"{c.city}장인")
+    if c.form == "gimhae":
+        p.spaced((W // 2 - 330, top), f"{c.city}장", 96, letter_gap=70)
+        p.seal((W // 2 + 380, top + 40), 240, f"{c.city}장인")
+    else:  # 기관 이름이 길다 — 글자 사이를 좁히고 가운데로
+        n = len(c.sender.replace(" ", ""))
+        xe = p.spaced((W // 2 - n * 50, top), c.sender, 84, letter_gap=14)
+        p.seal((min(xe + 170, W - 170), top + 40), 220, c.sender.split(" ")[-1] + "인")
     fy = top + 380
     p.line((150, fy), (W - 150, fy), 2)
     for i, role in enumerate(["기안자", "검토자", "결재권자"]):
@@ -304,6 +382,109 @@ def sign_block(p, c, r, top=2420):
     p.text((200, fy + 160), f"{c.dept[1]}-{c.serial}  ( {c.year}. {c.month}. {c.day}. )   접수   "
                             f"{r.choice(['민원실', '건축과', '종합민원실'])}-{r.randint(1, 999)}", 34)
     p.text((200, fy + 230), f"{c.addr}  /  전화 {r.randint(20, 99)}-{r.randint(1000, 9999)}  /  {r.choice(['공개', '부분공개'])}", 34)
+
+
+def agency_first_page(c, fonts, r, typewriter=False, cont=False, attach=False):
+    """agency1990: 지어낸 도 사업소 시행문 첫 쪽. 김해 꼴과 다르게 기관명이 머리 맨 위에 가로로,
+    문서번호·시행일자가 한 줄(일련번호·일자는 손글씨), 그 아래 수신·경유·제목, 접수란은 쪽 아래 서명란 옆 도장꼴."""
+    p = Page(fonts, r, typewriter)
+    p.text((170, 140), r.choice(["맑은 물 푸른 숲 우리 손으로", "함께 가꾸는 새 고장", "친절 봉사 신속 정확"]), 38)
+    n = len(c.org.replace(" ", ""))
+    p.spaced((W // 2 - n * 48, 220), c.org, 88, letter_gap=12)
+    p.line((150, 360), (W - 150, 360), 6)
+    p.line((150, 372), (W - 150, 372), 2)
+    y0, step = 430, 100
+    p.spaced((170, y0), "문서번호", 46, letter_gap=4)
+    xe = p.text((440, y0), f"{c.dept[0]} {c.classno}-", 50, fld="docno")
+    p.hand((xe, y0 - 18), c.serial, 78, fld="docno", cell="serial")
+    p.spaced((1350, y0), "시행일자", 46, letter_gap=4)
+    p.hand((1620, y0 - 18), f"{c.year % 100}. {c.month}. {c.day}.", 78, fld="date", cell="date")
+    p.spaced((170, y0 + step), "수 신", 46, letter_gap=30)
+    p.text((440, y0 + step), c.recipient, 48, fld="recipient")
+    p.spaced((170, y0 + 2 * step), "경 유", 46, letter_gap=30)
+    p.spaced((1350, y0 + 2 * step), "참 조", 46, letter_gap=30)
+    p.line((150, y0 + 3 * step - 20), (W - 150, y0 + 3 * step - 20), 2)
+    ty = y0 + 3 * step + 10
+    p.spaced((170, ty), "제 목", 50, letter_gap=30)
+    p.text((440, ty), c.title, 52, fld="title")
+    p.line((150, ty + 90), (W - 150, ty + 90), 4)
+
+    lines = body_lines(c, r)
+    if cont:
+        lines = lines[:5]
+    elif attach:
+        lines += ["", f"붙임  {c.case[0]} 검토서 1부.  끝."]
+    else:
+        lines += ["", "끝."]
+    y = ty + 180
+    for ln in lines:
+        if ln:
+            lead = len(ln) - len(ln.lstrip(" "))
+            p.text((220 + lead * 22, y), ln.strip(), 46)
+        y += 92
+    if cont:
+        p.text((W // 2 - 60, H - 260), "- 1 -", 40)
+        return p
+    sign_block(p, c, r, top=2300)
+    bx0, by0 = W - 760, H - 520  # 접수란 (받는 쪽이 찍는 고무인 꼴)
+    p.rect((bx0, by0, bx0 + 560, by0 + 230), 3)
+    p.line((bx0, by0 + 115), (bx0 + 560, by0 + 115), 2)
+    p.text((bx0 + 20, by0 + 35), "접수", 38)
+    p.text((bx0 + 20, by0 + 150), "번호", 38)
+    if r.random() < 0.7:
+        p.hand((bx0 + 160, by0 + 20), f"{c.month}. {min(c.day + r.randint(1, 3), 28)}.", 60, cell="recv_date")
+        p.hand((bx0 + 160, by0 + 135), str(r.randint(10, 999)), 60, cell="recv_no")
+    return p
+
+
+def draft_first_page(c, fonts, r, typewriter=False, cont=False, attach=False):
+    """draft2000: 2000년대 기안문 첫 쪽. 맨 위 기관명·'기 안 문', 가로 표 머리부
+    (윗줄 항목명 문서번호|시행일자|보존기간|기안자, 아랫줄 값 — 문서번호·일자는 인쇄, 기안자는 손글씨),
+    표 아래 수신·(경유)·제목, 본문, 서명란."""
+    p = Page(fonts, r, typewriter)
+    p.text((170, 150), c.org, 44)
+    p.spaced((W // 2 - 280, 230), "기 안 문", 100, letter_gap=40)
+    x0, x1, ya, yb, yc = 150, W - 150, 420, 520, 640  # 표: 항목명 줄 ya~yb, 값 줄 yb~yc
+    cols = [x0, 820, 1430, 1830, x1]
+    p.rect((x0, ya, x1, yc), 4)
+    p.line((x0, yb), (x1, yb), 2)
+    for cx in cols[1:-1]:
+        p.line((cx, ya), (cx, yc), 2)
+    for i, lab in enumerate(["문서번호", "시행일자", "보존기간", "기안자"]):
+        p.spaced((cols[i] + 40, ya + 25), lab, 42, letter_gap=6)
+    p.text((cols[0] + 30, yb + 32), c.docno, 48, fld="docno")
+    p.text((cols[1] + 30, yb + 32), f"{c.year}. {c.month}. {c.day}.", 48, fld="date")
+    p.text((cols[2] + 30, yb + 32), r.choice(["3년", "5년", "10년", "영구"]), 46)
+    p.hand((cols[3] + 30, yb + 18), person(r), 66, cell="sign_table")
+    y0, step = 720, 100
+    p.spaced((170, y0), "수 신", 46, letter_gap=30)
+    p.text((440, y0), c.recipient, 48, fld="recipient")
+    p.spaced((170, y0 + step), "(경 유)", 46, letter_gap=8)
+    p.spaced((170, y0 + 2 * step), "제 목", 50, letter_gap=30)
+    p.text((440, y0 + 2 * step), c.title, 52, fld="title")
+    p.line((150, y0 + 2 * step + 90), (W - 150, y0 + 2 * step + 90), 2)
+
+    lines = body_lines(c, r)
+    if cont:
+        lines = lines[:5]
+    elif attach:
+        lines += ["", f"붙임  {c.case[0]} 검토서 1부.  끝."]
+    else:
+        lines += ["", "끝."]
+    y = y0 + 2 * step + 180
+    for ln in lines:
+        if ln:
+            lead = len(ln) - len(ln.lstrip(" "))
+            p.text((220 + lead * 22, y), ln.strip(), 46)
+        y += 92
+    if cont:
+        p.text((W // 2 - 60, H - 260), "- 1 -", 40)
+        return p
+    sign_block(p, c, r, top=2350)
+    return p
+
+
+FIRST_PAGE = {"gimhae": first_page, "agency1990": agency_first_page, "draft2000": draft_first_page}
 
 
 def cont_page(c, fonts, r, typewriter=False, attach=False):
