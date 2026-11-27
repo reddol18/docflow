@@ -16,6 +16,18 @@ def test_only_this_pc(url, tmp_path):
         rv.main(["--images", str(tmp_path), "--out", str(tmp_path / "o"), "--base-url", url])
 
 
+def test_client_ignores_proxy_env(monkeypatch):
+    """프록시 환경 변수가 있어도 127.0.0.1 요청을 프록시로 보내지 않는다 (네트워크 호출 없음 — 클라이언트만 만든다)"""
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(k, "http://10.0.0.9:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    c = rv.make_client("http://127.0.0.1:11434/v1")
+    http = c._client
+    assert http.trust_env is False
+    assert not http._mounts  # 환경 변수에서 읽은 프록시 전송이 없다
+
+
 def test_out_outside_repo(tmp_path):
     with pytest.raises(SystemExit, match="저장소 밖"):
         rv.main(["--images", str(tmp_path), "--out", str(Path(rv.common.APP_ROOT) / "tmp_vision")])

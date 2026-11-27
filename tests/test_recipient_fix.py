@@ -150,6 +150,55 @@ def test_merge_with_rule():
     assert f("가상시 없는말", "가상시 가상동 1") == "가상시 가상동 1"
 
 
+def test_whitespace_only_is_not_approval_strip():
+    """띄어쓰기만 다른 값은 결재란을 뗀 것으로 보지 않는다 — 앞 두 글자만 같은 딴 규칙 값으로 바뀌지 않게"""
+    assert layout.strip_approval_tail("가상시  가상동 가상상사") == "가상시  가상동 가상상사"
+    d = doc([(800, [(200, "수신", 160), (450, "가상시청 가상민원봉사실 가상", 700)])])
+    assert layout.fix_recipient(d, "가상시  가상동 가상상사") == ("가상시  가상동 가상상사", "")
+
+
+def test_approval_word_needs_overlap_with_rule():
+    """결재란 낱말이 있어도 규칙 값이 LLM 값과 거의 안 겹치면(앞 두 글자만 같음) 바꾸지 않는다"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상군 가상읍 9-9 다른공업사 대표", 800)])])
+    assert layout.fix_recipient(d, "가상시 가상동 1-2 가상테크 실장") == ("가상시 가상동 1-2 가상테크", "결재란")
+    # 가운데 결재란 낱말은 빼고 견주고, 값에서도 뺀다
+    d = doc([(800, [(200, "수신", 160), (450, "가상도지사", 300), (1300, "국장", 120)]),
+             (880, [(450, "가상기획담당관", 300)])])
+    assert layout.fix_recipient(d, "가상도지사 국장") == ("가상도지사 가상기획담당관", "결재란·잘림")
+    assert layout.fix_recipient(d, "가상도지사 국장 가상기획") == ("가상도지사 가상기획담당관", "규칙")
+
+
+def test_company_line_not_mistaken_for_body_or_title():
+    """'주)가상산업'(가나다 번호가 아님)·'(주)가상 폐기물처리'(상호 표지)는 이어 붙인다"""
+    addr = (800, [(200, "수신", 160), (450, "가상시 가상동 3-4", 400)])
+    d = doc([addr, (880, [(450, "주)가상산업 대표", 400)])])
+    assert layout.rule_recipient(d) == "가상시 가상동 3-4 주)가상산업 대표"
+    d = doc([addr, (880, [(450, "(주)가상 폐기물처리", 400)])])
+    assert layout.rule_recipient(d) == "가상시 가상동 3-4 (주)가상 폐기물처리"
+    assert not layout.title_or_body("가상폐기물처리")  # 낱말 하나뿐인 상호
+    assert layout.title_or_body("가. 가상 시설 현황") and layout.title_or_body("가상 시설 정비 결과 보고")
+
+
+def test_lot_digit_kept_when_filling():
+    """규칙 값의 번지 숫자 한 글자('가상리 5')는 견줄 때만 떼고 채운 값에는 남긴다"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상군 가상면 가상리 5", 500)]), (880, [(450, "가상농원 대표", 400)])])
+    assert layout.clean_rule(layout.rule_recipient(d)) == "가상군 가상면 가상리 가상농원 대표"
+    assert layout.fix_recipient(d, "가상군 가상면 가상리") == ("가상군 가상면 가상리 5 가상농원 대표", "잘림")
+
+
+def test_tail_stops_at_header_words():
+    """뒤에 붙일 규칙 값이 결재·처리란 낱말('접수번호')까지 읽었으면 거기서 끊는다"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상시 가상동 8-9", 400)]), (880, [(450, "가상유통 대표 접수번호 12", 600)])])
+    assert layout.fix_recipient(d, "가상시 가상동 8-9") == ("가상시 가상동 8-9 가상유통 대표", "잘림")
+
+
+def test_split_je_in_value_column_is_not_title():
+    """값 칸에서 '제'가 따로 읽힌 상호('제 일가상 대표')는 제목 줄이 아니다 — 항목명 자리의 '제'만 제목"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상시 가상동 10-1", 400)]),
+             (880, [(450, "제", 50), (520, "일가상 대표", 300)])])
+    assert layout.rule_recipient(d) == "가상시 가상동 10-1 제 일가상 대표"
+
+
 def test_internal_and_list_unchanged():
     d = doc([(800, [(200, "수신", 160), (450, "내부결재", 200)])])
     assert layout.fix_recipient(d, "내부결재") == ("내부결재", "")

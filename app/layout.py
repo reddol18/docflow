@@ -6,6 +6,7 @@ PoC 스크립트에서 가져왔다. 파일 경로 대신 쪽 dict({"page","line
   수신 보정                     scripts/recipient_fix.py
   일련번호·날짜 풀이, 비교용 정규화 scripts/hw_score.py, scripts/score_extract.py
 """
+import difflib
 import re
 
 
@@ -292,17 +293,25 @@ def value_x0(row, rx):
     return None
 
 
-TITLE_ROW = re.compile(r"^\s*\[?\s*(제\W*목|경\W*유|제\s*$|제\s+\S)")  # "제'목", 항목명이 '제' 한 글자로만 읽힌 줄
+TITLE_ROW = re.compile(r"^\s*\[?\s*(제\W*목|경\W*유)")  # "제'목"·"제 목"도
+TITLE_JE = re.compile(r"^\s*\[?\s*제\W*$")  # 항목명 '제목'이 '제' 한 글자로만 읽힌 상자 (항목명 칸에 있을 때만 제목 줄로 본다)
 # 제목·본문 줄 (항목명이 안 읽혀도): 공문 제목 끝말로 끝나거나, '1.' 같은 본문 번호로 시작하거나, 서술문 끝말이 있는 줄.
 # 수신 값(주소·상호·'대표')은 이렇게 끝나지 않는다 (https://github.com/reddol18/docflow/issues/1 사람 표본 회귀)
 TITLE_END = re.compile(r"(통\s*보|교\s*부|알\s*림|요\s*청|회\s*신|제\s*출|결\s*과|신\s*청|안\s*내|보\s*고|승\s*인|허\s*가|"
                        r"반\s*환|송\s*부|통\s*지|의\s*뢰|처\s*리|개\s*최)\s*[\])）.]*\s*$")
-BODY_ROW = re.compile(r"^\s*(\d{1,2}|[가-하])\s*[.)]\s*[가-힣]|(습\s*니\s*다|바\s*랍\s*니\s*다|하\s*오\s*니|하\s*여\s*야)")
+# 상호 표지 — 이런 줄은 '…처리'·'…개최'로 끝나도 제목으로 보지 않는다 ('(주)가상폐기물처리').
+# '건설'·'산업'·'공사' 같은 낱말은 제목에도 흔해('주택건설 사업 승인') 넣지 않는다.
+# 낱말 하나뿐인 줄('가상폐기물처리')도 제목으로 보지 않는다
+COMPANY = re.compile(r"\(\s*[주유합]\s*\)|[㈜㈲]|주식회사|유한회사|대\s*표")
+BODY_ROW = re.compile(r"^\s*(\d{1,2}|[가나다라마바사아자차카타파하])\s*[.)]\s*[가-힣]|"
+                      r"(습\s*니\s*다|바\s*랍\s*니\s*다|하\s*오\s*니|하\s*여\s*야)")
 
 
 def title_or_body(text):
-    """수신 다음 줄이 제목·본문으로 보이나 (이어 붙이지 않는다)"""
-    return bool(TITLE_ROW.match(text) or TITLE_END.search(text) or BODY_ROW.search(text))
+    """수신 다음 줄이 제목·본문으로 보이나 (이어 붙이지 않는다). 제목 끝말은 낱말 둘 이상이고 상호 표지가 없는 줄에만"""
+    if TITLE_ROW.match(text) or BODY_ROW.search(text):
+        return True
+    return bool(TITLE_END.search(text)) and len(text.split()) >= 2 and not COMPANY.search(text)
 
 
 def continuation(rows, i, x0, page_w, max_rows=3):
@@ -311,8 +320,8 @@ def continuation(rows, i, x0, page_w, max_rows=3):
     out = []
     for row in rows[i + 1:i + 1 + max_rows]:
         head = " ".join(it["text"] for it in row[:2])
-        if TITLE_ROW.match(head):
-            break
+        if TITLE_ROW.match(head) or (TITLE_JE.match(row[0]["text"]) and row[0]["box"][2] < x0 - 0.01 * page_w):
+            break  # 제목 항목명 (한 글자 '제'는 값 칸 왼쪽 항목명 자리일 때만 — 값 칸의 '제 일산업' 조각은 아님)
         cols = [it for it in row if it["box"][0] >= x0 - 0.02 * page_w]
         if not cols or cols[0]["box"][0] > x0 + 0.1 * page_w:
             continue  # 결재란만 있는 줄
@@ -597,19 +606,34 @@ RULE_MAX = 60  # 이보다 긴(정규화 글자 수) 규칙 값은 본문까지 
 def strip_approval_tail(val):
     """값 끝에 낱말로 붙은 결재란 글자를 뗀다 ('가상시 가상면 가상리 국' → '가상시 가상면 가상리'). 값이 그 낱말뿐이면 그대로"""
     words = (val or "").split()
+    n = len(words)
     while len(words) > 1 and APPROVAL_WORD.fullmatch(words[-1]):
         words.pop()
-    return " ".join(words) if words else (val or "")
+    return " ".join(words) if len(words) < n else (val or "")  # 뗀 낱말이 없으면 띄어쓰기도 원래 값 그대로
 
 
-def clean_rule(val):
+def _lot_digit(words, i):
+    """words[i](숫자 한 글자)가 번지 일부로 보이나 — 앞 낱말이 리·동·가·로·길·산으로 끝나거나 뒤 낱말이 번지·번·호로 시작"""
+    prev = words[i - 1] if i > 0 else ""
+    nxt = words[i + 1] if i + 1 < len(words) else ""
+    return bool(re.search(r"[리동가로길산]$", prev) or re.match(r"번|호", nxt))
+
+
+def clean_rule(val, keep_lot=False):
     """규칙 값(여러 줄 이어 붙임)을 LLM 값과 견줄 꼴로: 낱말로 끼어든 결재란 글자, 글자 하나짜리 기호·숫자 낱말('1', '−')과 '과'·'기',
-    맨 앞 한 글자 낱말(항목명 '참조'의 '조' 같은 조각)을 떼고 '_'·'·'는 띄어쓰기로"""
-    words = [w for w in re.sub(r"[_·]", " ", val or "").split()
-             if not APPROVAL_WORD.fullmatch(w) and not re.fullmatch(r"[^가-힣A-Za-z]|과|기", w)]  # '과'·'기' = 과장·기안 칸 조각
-    if len(words) > 1 and len(words[0]) == 1:
-        words = words[1:]
-    return " ".join(words)
+    맨 앞 한 글자 한글 낱말(항목명 '참조'의 '조' 같은 조각)을 떼고 '_'·'·'는 띄어쓰기로.
+    keep_lot=True(값을 채울 때)면 번지로 보이는 숫자 한 글자('가상리 5')는 남긴다 — 견줄 때만 떼고 값에서는 잃지 않게"""
+    words = re.sub(r"[_·]", " ", val or "").split()
+    keep = []
+    for i, w in enumerate(words):
+        if APPROVAL_WORD.fullmatch(w) or re.fullmatch(r"과|기", w):  # '과'·'기' = 과장·기안 칸 조각
+            continue
+        if re.fullmatch(r"[^가-힣A-Za-z]", w) and not (keep_lot and w.isdigit() and _lot_digit(words, i)):
+            continue
+        keep.append(w)
+    if len(keep) > 1 and re.fullmatch(r"[가-힣]", keep[0]):
+        keep = keep[1:]
+    return " ".join(keep)
 
 
 # 규칙 값이 다른 항목명 줄까지 읽어 들였으면(OCR이 두 줄을 한 줄로 묶음) 쓰지 않는다
@@ -627,6 +651,11 @@ def _in_order(val, rule):
             return False
         pos = k + len(w)
     return True
+
+
+# 규칙 값 뒤에 이어 붙이지 않는 낱말 (결재·처리란 글자, 다른 항목명). 낱말 머리에서 본다 — '가상담당관'처럼 이름 속 글자는 그대로
+TAIL_JUNK = re.compile(r"(취\s*급|보\s*존|공\s*개\s*여|선\s*결|전\s*결|접\s*수|처\s*리\s*과|결\s*재|시\s*행|기\s*안|협\s*조|경\s*유|"
+                       r"참\s*조|심\s*사|담\s*당\s*자|일\s*자|문\s*서\s*번|번\s*호|전\s*화|우\s*\d)")
 
 
 def merge_with_rule(val, rule):
@@ -656,6 +685,11 @@ def merge_with_rule(val, rule):
         parts.append((w, glue))
         pos, end = k + len(nw), keep[k + len(nw) - 1] + 1
     tail = rule[end:]
+    words = tail.split()
+    for j, w in enumerate(words):  # 뒤에 붙일 부분은 결재·처리란 글자·항목명 낱말에서 끊는다 ('… 대표 접수 2001.1.2')
+        if TAIL_JUNK.match(w):
+            tail = tail[:len(tail) - len(tail.lstrip())] + " ".join(words[:j])
+            break
     if norm(tail):
         parts.append((tail.strip(), bool(parts) and not tail[:1].isspace()))
     s = ""
@@ -664,10 +698,21 @@ def merge_with_rule(val, rule):
     return s
 
 
+OVERLAP_MIN = 0.6  # 결재란 낱말이 있던 LLM 값을 규칙 값으로 바꿀 때 — LLM 값 글자 중 규칙 값과 겹쳐야 하는 몫
+
+
+def _overlap(val, rule):
+    """LLM 값(정규화) 글자 중 규칙 값과 같은 차례로 겹치는 몫 (0~1)"""
+    a, b = norm(val), norm(rule)
+    if not a:
+        return 0.0
+    return sum(m.size for m in difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks()) / len(a)
+
+
 def _usable_rule(rule):
     nr = norm(rule)
     return (bool(nr) and len(nr) <= RULE_MAX and not is_list_ref(rule) and not OTHER_LABEL.search(rule)
-            and not re.match(r"\s*(내\s*부\s*결|처|참\s*조)", rule))
+            and not re.match(r"\s*(내\s*부\s*결|처|참\s*조)", rule) and not re.search(r"내\s*부\s*결\s*재", rule))
 
 
 def fix_recipient(d, val):
@@ -690,14 +735,19 @@ def fix_recipient(d, val):
     had_stop = out != val or any(APPROVAL_WORD.fullmatch(w) for w in val.split())
     if out != val:
         why.append("결재란")
-    rule = clean_rule(rule_recipient(d))
+    raw = rule_recipient(d)
+    rule = clean_rule(raw)  # 견주기용
     nv, nr = norm(out), norm(rule)
+    # 가운데 결재란 낱말('가상도지사 국장 가상담당관')을 뺀 LLM 값
+    core = " ".join(w for w in out.split() if not APPROVAL_WORD.fullmatch(w))
     office = ref_office(d)
+    core = core or out  # 값이 결재란 낱말뿐('과장')이면 그 낱말로 견준다 — 빈 값은 아무 규칙 값에나 '차례대로 들어 있음'이 되므로
     if _usable_rule(rule) and nr != nv and (
-            (len(nr) > len(nv) and _in_order(out, rule)) or (had_stop and len(nr) >= len(nv) and nr[:2] == nv[:2])):
+            (len(nr) > len(nv) and _in_order(core, rule))
+            or (had_stop and len(nr) >= len(nv) and nr[:2] == nv[:2] and _overlap(core, rule) >= OVERLAP_MIN)):
         # 규칙 값이 LLM 값 + 참조 부서장뿐이면 '참조'로 센다 (부서장 줄이 규칙 값에 이어 붙은 것)
         tag = "참조" if office and nr == nv + norm(office) else ("잘림" if nr.startswith(nv) else "규칙")
-        out = merge_with_rule(out, rule)
+        out = merge_with_rule(core, clean_rule(raw, keep_lot=True))  # 채울 때는 번지 숫자를 남긴 값에서
         why.append(tag)
     if office and norm(office) not in norm(out):
         out = f"{out} {office}"

@@ -80,6 +80,15 @@ def find_image(root, doc_id):
     return hits[0]
 
 
+def make_client(base_url):
+    """이 PC Ollama 클라이언트. trust_env=False — HTTP(S)_PROXY·ALL_PROXY 환경 변수가 127.0.0.1 요청을 밖(프록시)으로 돌리지 못하게"""
+    import httpx  # noqa: PLC0415
+    from openai import OpenAI  # noqa: PLC0415
+
+    return OpenAI(base_url=base_url, api_key="ollama", timeout=600, max_retries=0,
+                  http_client=httpx.Client(trust_env=False, timeout=600))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--images", required=True, help="쪽 이미지 폴더 (하위 폴더까지 {doc_id}.jpg를 찾는다)")
@@ -93,9 +102,7 @@ def main(argv=None):
         raise SystemExit("이 PC Ollama(127.0.0.1)만 — AI Hub 자료는 PC 밖으로 보내지 않는다")
     if (Path(a.out).resolve().is_relative_to(common.APP_ROOT.resolve())):
         raise SystemExit("결과는 저장소 밖에 쓴다 (문서 값이 들어 있다)")
-    from openai import OpenAI  # noqa: PLC0415
-
-    client = OpenAI(base_url=a.base_url, api_key="ollama", timeout=600, max_retries=0)
+    client = make_client(a.base_url)
     _, idx, _, _ = common.load_gt()
     docs, ocrs = common.load_vol(a.vol)
     by_id = {d["doc_id"]: d for d in docs}

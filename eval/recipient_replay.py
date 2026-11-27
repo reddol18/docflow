@@ -17,7 +17,7 @@ import gate  # noqa: E402
 from rescore import ok_field  # noqa: E402  (common이 records_poc/scripts를 경로에 넣는다)
 
 
-def counts(docs, m):
+def counts(m):
     return {name: {f: m["fields"][name][f][0] for f in gate.FIELDS} for name in ("B", "final")}
 
 
@@ -28,7 +28,7 @@ def main():
     m0, m1 = gate.metrics(stored), gate.metrics(replayed)
     n = m0["n_gt"]
     print(f"철 {len(data)}개, 정답 시작 쪽 {n}건, 문서 {len(stored)}건\n")
-    c0, c1 = counts(stored, m0), counts(replayed, m1)
+    c0, c1 = counts(m0), counts(m1)
     print(f"{'칸':10s}{'저장 B':>10s}{'재조립 B':>10s}{'저장 최종':>10s}{'재조립 최종':>10s}")
     for f in gate.FIELDS:
         print(f"{f:10s}{c0['B'][f]:>10d}{c1['B'][f]:>10d}{c0['final'][f]:>10d}{c1['final'][f]:>10d}   (/{n})")
@@ -51,7 +51,7 @@ def main():
                 why = d["info"].get("recipient_fix") or "(없음)"
                 fixes[why] = fixes.get(why, 0) + 1
         print(f"{label}의 수신 보정 규칙: " + ", ".join(f"{k} {v}" for k, v in sorted(fixes.items())))
-    # 잘못 뗀 결재란 낱말: LLM 값 끝 낱말을 뗐는데 정답도 그 낱말로 끝나는 문서
+    # 잘못 뗀 결재란 낱말: LLM 값 끝 낱말을 뗐는데 정답의 끝 낱말도 바로 그 낱말인 문서 ('가상위생과장'의 '과장'은 아님)
     cut = wrong_cut = 0
     for p, g in idx.items():
         if p not in stored:
@@ -60,7 +60,8 @@ def main():
         if "결재란" in (replayed[p]["info"].get("recipient_fix") or ""):
             cut += 1
             tail = val.split()[-1]
-            wrong_cut += gate.layout.norm(g["recipient"]).endswith(gate.layout.norm(tail))
+            gw = (g["recipient"] or "").split()
+            wrong_cut += bool(gw) and gate.layout.norm(gw[-1]) == gate.layout.norm(tail)
     print(f"값 끝 결재란 낱말을 뗀 정답 문서 {cut}건, 그중 정답도 그 낱말로 끝남(잘못 뗌) {wrong_cut}건")
     return 0
 
