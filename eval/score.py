@@ -133,7 +133,8 @@ def metrics(docs, gt, form_of=None, vols=None):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("results", nargs="+")
-    ap.add_argument("--gt", nargs="+", help="정답 CSV (저장소 밖). 안 주면 결과 파일 옆 work의 gt/review.csv")
+    ap.add_argument("--gt", action="append",  # nargs='+'면 뒤 결과 파일(위치 인자)까지 삼킨다
+                    help="정답 CSV (저장소 밖), 여럿이면 --gt를 여러 번. 안 주면 결과 파일 옆 work의 gt/review.csv")
     ap.add_argument("--detail", action="store_true")
     a = ap.parse_args(argv)
     docs = {}

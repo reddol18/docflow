@@ -9,7 +9,8 @@
             틀렸던 칸마다 비전 값이 맞는지 (채점 = eval/scoring.ok_field, 텍스트 경로와 같은 규칙)
 합성 쪽만 보낸다: 쪽 이미지는 meta.json synthetic=true이고 이름이 SYNTH로 시작하는 철 폴더에서만 읽는다 (아니면 멈춤).
 비용: 부르기 전에 상한 추정(쪽마다 이미지 2,500 + 글자 300 입력, 출력 200토큰 × app/llm.py PRICE)이 --max-usd를 넘으면 멈추고,
-실행 중 실제 사용량 누적이 넘어도 멈춘다. 키는 환경변수 OPENAI_API_KEY (화면·파일에 남기지 않는다).
+실행 중 실제 사용량 누적이 넘어도 멈춘다 (예외로 끝난 호출은 사용량을 몰라 상한 추정 × (재시도+1)로 센다).
+대상은 (경계/칸, 쪽)마다 한 번만. 키는 OPENAI_API_KEY — 프로세스 환경 → Windows 사용자 환경변수 (화면·파일에 남기지 않는다).
 부르기 전에 모든 대상 쪽이 정답(경계 확인 쪽·시작 쪽)에 있는지 확인하고, 호출 실패는 그 쪽만 읽기 실패로 센다.
 실제 자료 경로(aihub_extracted, records_poc/work와 그 아래)를 --bundles·--gt로 주면 멈춘다 (eval/compare_common.reject_real_data).
 출력: 화면 = 수·비용만, <out>/vision_<모델>.json = 쪽별 판정·비전 값 (합성 값만). 호출마다 다시 써서 중간에 멈춰도 남는다.
@@ -61,12 +62,22 @@ def synthetic_dirs(bundles):
 
 
 def targets(forms_jsons):
-    out = []
+    """대상 목록 — 같은 (kind, page)는 한 번만 (같은 forms json을 두 번 주거나 여러 결과가 같은 쪽을 내도 두 번 부르지 않게).
+    칸 대상이 겹치면 틀린 칸 이름을 합친다"""
+    out, seen = [], {}
     for fp in forms_jsons:
         rep = json.loads(Path(fp).read_text(encoding="utf-8"))
         for form, r in rep["forms"].items():
-            out += [{"kind": "boundary", "form": form, **x} for x in r["boundary_wrong"]]
-            out += [{"kind": "fields", "form": form, **x} for x in r["field_wrong"]]
+            for kind, xs in (("boundary", r["boundary_wrong"]), ("fields", r["field_wrong"])):
+                for x in xs:
+                    k = (kind, x["page"])
+                    if k in seen:
+                        if kind == "fields":
+                            t = seen[k]
+                            t["fields"] = [f for f in FIELDS if f in set(t["fields"]) | set(x["fields"])]
+                        continue
+                    seen[k] = {"kind": kind, "form": form, **x}
+                    out.append(seen[k])
     return out
 
 
@@ -105,13 +116,29 @@ def ask(client, model, img, prompt):
     return val, usd, {"in": u.prompt_tokens, "out": u.completion_tokens, "ms": int(1000 * (time.time() - t0))}
 
 
+MAX_RETRIES = 3
+
+
 def make_client(key, timeout=60):
     """OpenAI 클라이언트. trust_env=False — HTTP(S)_PROXY·ALL_PROXY 환경 변수가 요청을 다른 곳(프록시)으로 돌리지 못하게
     (eval/recipient_vision.py와 같다)"""
     from openai import DefaultHttpxClient, OpenAI  # noqa: PLC0415
 
-    return OpenAI(api_key=key, timeout=timeout, max_retries=3,
+    return OpenAI(api_key=key, timeout=timeout, max_retries=MAX_RETRIES,
                   http_client=DefaultHttpxClient(trust_env=False, timeout=timeout))
+
+
+def openai_key():
+    """OPENAI_API_KEY — 프로세스 환경 → Windows 사용자 환경변수 (eval/compare_common.make_client와 같은 순서). 값은 찍지 않는다"""
+    key = os.environ.get("OPENAI_API_KEY") or cc._user_env("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY가 없다 (프로세스 환경·Windows 사용자 환경변수 둘 다)")
+    return key
+
+
+def failed_usd(model):
+    """예외로 끝난 호출의 비용 — 실제 사용량을 모르니 재시도까지 모두 과금됐다고 보수적으로 (상한 추정 × 시도 수)"""
+    return estimate(1, model) * (MAX_RETRIES + 1)
 
 
 def missing_gt(ts, idx, bnd):
@@ -203,7 +230,7 @@ def main(argv=None):
         return 2
     if a.dry_run:
         return 0
-    client = make_client(os.environ["OPENAI_API_KEY"])
+    client = make_client(openai_key())
     out.mkdir(parents=True, exist_ok=True)
     dest = out / f"vision_{a.model}.json"
     rows, spent = [], 0.0
@@ -216,7 +243,8 @@ def main(argv=None):
             try:
                 val, usd, use = ask(client, a.model, img, ASK_BOUNDARY if t["kind"] == "boundary" else ASK_FIELDS)
             except Exception as e:  # noqa: BLE001 — 호출 실패(재시도 뒤)는 그 쪽만 읽기 실패로 세고 다음 쪽으로
-                val, usd, use, err = None, 0.0, {}, type(e).__name__
+                # 실제 사용량을 모른다 → 재시도까지 모두 과금됐다고 보고 누적에 더한다 (상한 쪽으로)
+                val, usd, use, err = None, failed_usd(a.model), {"estimated": True}, type(e).__name__
             spent += usd
             row = {**t, "usd": usd, "use": use, "judge": judge(t, val, idx, bnd)}
             if err:

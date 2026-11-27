@@ -107,8 +107,13 @@ def _vision_case(tmp_path, boundary, fields):
 
 def test_vision_saves_rows_when_stopped(tmp_path, monkeypatch):
     """중간에 멈춰도(Ctrl+C) 이미 낸 호출 결과·누적 비용이 남고, 호출 실패는 그 쪽만 읽기 실패"""
+    p2 = "SYNTH0001A-1995-0001-0002"
     args = _vision_case(tmp_path, [{"page": P1, "gt_start": True, "pred_start": False}],
-                        [{"page": P1, "fields": ["title"], "found": True}] * 2)
+                        [{"page": P, "fields": ["title"], "found": True} for P in (P1, p2)])
+    (tmp_path / "a" / "SYNTH0001A-1995-0001" / f"{p2}.jpg").write_bytes(b"x")
+    gt = Path(args[args.index("--gt") + 1])
+    gt.write_text(gt.read_text(encoding="utf-8-sig") + f"{p2},경계,Y,가상 1-2,1995-01-03,가상,가상 알림2,,합성,\n",
+                  encoding="utf-8-sig")
     fake = FakeClient(['{"first_page": true}', RuntimeError("가상 실패"), KeyboardInterrupt()])
     monkeypatch.setattr(fv, "make_client", lambda key, timeout=60: fake)
     monkeypatch.setenv("OPENAI_API_KEY", "가짜")
@@ -118,8 +123,9 @@ def test_vision_saves_rows_when_stopped(tmp_path, monkeypatch):
     rep = json.loads((tmp_path / "o" / "vision_gpt-4.1-mini.json").read_text(encoding="utf-8"))
     rows = rep["rows"]
     assert len(rows) == 2 and rows[0]["judge"]["ok"] is True
-    assert rows[1]["judge"] == {"read_fail": True} and rows[1]["error"] == "RuntimeError" and rows[1]["usd"] == 0
-    assert rep["usd"] == pytest.approx(rows[0]["usd"]) and rep["usd"] > 0
+    assert rows[1]["judge"] == {"read_fail": True} and rows[1]["error"] == "RuntimeError"
+    assert rows[1]["usd"] == pytest.approx(fv.failed_usd("gpt-4.1-mini"))  # 2차 리뷰: 실패 호출도 보수적으로 센다
+    assert rep["usd"] == pytest.approx(rows[0]["usd"] + rows[1]["usd"]) and rows[0]["usd"] > 0
     k = rep["summary"]["agency1990"]
     assert k["read_fail"] == 1 and k["fields_cells"] == [0, 1]
     assert k["cells_by_field"] == {"title": [0, 1]}  # 읽기 실패도 칸별 분모에 든다
@@ -205,41 +211,173 @@ def _doc(vol, page):
             "fields": {**G, "serial": "1"}, "info": {"b_serial": "1", "b_date": G["date"]}, "flags": {}}
 
 
-def _work(work, provider):
+def _work(work, provider, doc_ids=(f"{VA}-0001",)):
     (work / "synth_manifest.json").write_text(json.dumps({"vols": [{"vol": VA, "form": "agency1990"},
                                                                     {"vol": VD, "form": "draft2000"}]}), encoding="utf-8")
     for v in (VA, VD):
         (work / "platform" / f"{v}.json").write_text("[]", encoding="utf-8")
-    (work / "gt").mkdir()
+    (work / "gt").mkdir(exist_ok=True)
     g = ",".join(G[f] for f in ("docno", "date", "recipient", "title"))
     (work / "gt" / "review.csv").write_text(GT_HEAD + f"{VA}-0001,경계,Y,{g},,합성,\n{VA}-0002,경계,N,,,,,,합성,\n"
                                             f"{VD}-0001,경계,Y,{g},,합성,\n", encoding="utf-8-sig")
     label, pid, cfg = provider
     res = work / "results.json"
+    rows = [{"provider": {"id": pid, "label": label}, "prompt": {"label": "current"}, "vars": {"doc_id": d}, "latencyMs": 100,
+             "response": {"output": "{}", "tokenUsage": {"prompt": 10, "completion": 5}}} for d in doc_ids]
     res.write_text(json.dumps({"config": {"providers": [{"id": pid, "label": label, "config": cfg}]},
-                               "results": {"results": [{"provider": {"id": pid, "label": label}, "prompt": {"label": "current"},
-                                                        "vars": {"doc_id": f"{VA}-0001"}, "latencyMs": 100,
-                                                        "response": {"output": "{}", "tokenUsage": {"prompt": 10, "completion": 5}}}]}}),
-                   encoding="utf-8")
+                               "results": {"results": rows}}), encoding="utf-8")
     return res
 
 
-def test_forms_compare_local_model_and_empty_form(fc, tmp_path, monkeypatch):
-    """apiBaseUrl 로컬 후보도 비용(0원)을 센다 (예전: cfg를 버려 ValueError), 문서를 하나도 못 찾은 양식(draft2000)도 0으로 남는다"""
-    forms_compare, gate, work = fc
-    res = _work(work, ("local", "openai:chat:가상-로컬:8b", {"apiBaseUrl": "http://127.0.0.1:11434/v1"}))
+LOCAL = ("local", "openai:chat:가상-로컬:8b", {"apiBaseUrl": "http://127.0.0.1:11434/v1"})
+
+
+def _fake_rebuild(gate, monkeypatch, docs):
+    """가짜 조립 — 받은 철(data)을 기록하고 docs를 돌려준다"""
+    seen = {}
     monkeypatch.setattr(gate.common, "load_vol", lambda v: None)
-    monkeypatch.setattr(gate, "rebuild", lambda r, data: ({f"{VA}-0001": _doc(VA, f"{VA}-0001")}, {}, 0))
+
+    def rebuild(r, data):
+        seen["vols"] = sorted(data)
+        return docs, {}, 0
+    monkeypatch.setattr(gate, "rebuild", rebuild)
+    return seen
+
+
+def test_forms_compare_local_model_and_empty_form(fc, tmp_path, monkeypatch):
+    """apiBaseUrl 로컬 후보도 비용(0원)을 센다 (예전: cfg를 버려 ValueError), 실행 대상인데 문서를 하나도 못 찾은
+    양식(draft2000 — 결과 행은 있으나 split 문서 없음)도 0으로 남는다"""
+    forms_compare, gate, work = fc
+    res = _work(work, LOCAL, doc_ids=(f"{VA}-0001", f"{VD}-0001"))
+    seen = _fake_rebuild(gate, monkeypatch, {f"{VA}-0001": _doc(VA, f"{VA}-0001")})
     out = tmp_path / "out"
     assert forms_compare.main(["--work", str(work), "--results", str(res), "--out", str(out),
                                "--provider", "local", "--name", "t"]) == 0
     rep = json.loads((out / "forms_t.json").read_text(encoding="utf-8"))
-    assert rep["usd"] == 0 and rep["n_calls"] == 1
+    assert seen["vols"] == [VA, VD] and rep["vols_run"] == 2 and rep["not_run"] == {}
+    assert rep["usd"] == 0 and rep["n_calls"] == 2
     assert set(rep["forms"]) == {"agency1990", "draft2000"}
     a, d = rep["forms"]["agency1990"], rep["forms"]["draft2000"]
     assert a["all_ok"] == [1, 1] and a["boundary"]["recall"] == [1, 1] and a["docs_split"] == 1
     assert d["docs_split"] == 0 and d["docs_gt"] == 1 and d["all_ok"] == [0, 1] and d["boundary"]["recall"] == [0, 1]
     assert d["field_wrong"] == [{"page": f"{VD}-0001", "fields": list(d["fields_b"]), "found": False}]
+
+
+# ---------- 코드 리뷰 2차 ----------
+
+def test_forms_compare_partial_run_not_scored(fc, tmp_path, monkeypatch, capsys):
+    """run.ps1 -Vols로 agency1990 철만 돌린 결과 — draft2000 철은 조립·채점하지 않고(0점·읽기 실패 아님) '실행 안 됨'으로,
+    비전 대상(field_wrong)에도 넣지 않는다"""
+    forms_compare, gate, work = fc
+    res = _work(work, LOCAL)  # 결과 행은 VA 것뿐
+    seen = _fake_rebuild(gate, monkeypatch, {f"{VA}-0001": _doc(VA, f"{VA}-0001")})
+    out = tmp_path / "out"
+    assert forms_compare.main(["--work", str(work), "--results", str(res), "--out", str(out),
+                               "--provider", "local", "--name", "p"]) == 0
+    rep = json.loads((out / "forms_p.json").read_text(encoding="utf-8"))
+    assert seen["vols"] == [VA]  # VD는 조립(rebuild)에 넣지 않는다 → 읽기 실패로 세지 않음
+    assert set(rep["forms"]) == {"agency1990"} and rep["not_run"] == {"draft2000": 1} and rep["vols_run"] == 1
+    assert rep["forms"]["agency1990"]["vols_not_run"] == 0
+    assert "draft2000 | 실행 안 됨 (철 1)" in capsys.readouterr().out
+    assert [t["page"] for t in fv.targets([out / "forms_p.json"])] == []  # agency1990은 모두 맞음, VD는 대상 아님
+
+
+def test_forms_compare_no_rows_for_work(fc, tmp_path, monkeypatch):
+    forms_compare, gate, work = fc
+    res = _work(work, LOCAL, doc_ids=("SYNTH9999X-2000-0001-0001",))
+    _fake_rebuild(gate, monkeypatch, {})
+    with pytest.raises(SystemExit, match="하나도 없다"):
+        forms_compare.main(["--work", str(work), "--results", str(res), "--out", str(tmp_path / "o"), "--provider", "local"])
+
+
+def test_forms_compare_default_name_and_no_overwrite(fc, tmp_path, monkeypatch):
+    """기본 이름에 후보·판이 들어가고 (파일 이름에 못 쓰는 글자는 _), 같은 파일이 있으면 덮어쓰지 않고 멈춘다"""
+    forms_compare, gate, work = fc
+    res = _work(work, ("lab/x:1", "openai:chat:가상-로컬:8b", {"apiBaseUrl": "http://127.0.0.1:11434/v1"}))
+    _fake_rebuild(gate, monkeypatch, {f"{VA}-0001": _doc(VA, f"{VA}-0001")})
+    out = tmp_path / "out"
+    args = ["--work", str(work), "--results", str(res), "--out", str(out), "--provider", "lab/x:1"]
+    assert forms_compare.main(args) == 0
+    p = out / "forms_work_lab_x_1_current.json"
+    assert p.is_file()
+    before = p.read_bytes()
+    with pytest.raises(SystemExit, match="이미 있다"):
+        forms_compare.main(args)
+    assert p.read_bytes() == before
+
+
+def test_vision_failed_call_counts_conservative_cost(tmp_path, monkeypatch):
+    """예외로 끝난 호출은 usd 0이 아니라 상한 추정 × (재시도+1)를 누적에 더한다 — 상한 판단이 그만큼 일찍 멈춘다"""
+    args = _vision_case(tmp_path, [], [{"page": P1, "fields": ["title"], "found": True}])
+    one = fv.estimate(1, "gpt-4.1-mini")
+    fake = FakeClient([RuntimeError("가상 실패"), '{"title": "가상 알림"}'])
+    monkeypatch.setattr(fv, "make_client", lambda key, timeout=60: fake)
+    monkeypatch.setenv("OPENAI_API_KEY", "가짜")
+    rep_p = Path(args[args.index("--forms") + 1])
+    rep_p.write_text(json.dumps({"forms": {"agency1990": {"boundary_wrong": [{"page": P1, "gt_start": True, "pred_start": False}],
+                                                          "field_wrong": [{"page": P1, "fields": ["title"], "found": True}]}}}),
+                     encoding="utf-8")
+    # 상한: 첫 호출 실패분(one × 4) 뒤에는 다음 호출 추정(one)이 상한을 넘는다 → 두 번째는 부르지 않는다
+    assert fv.main([*args, "--max-usd", str(one * (fv.MAX_RETRIES + 1) + one / 2)]) == 0
+    assert fake.n == 1
+    rep = json.loads((tmp_path / "o" / "vision_gpt-4.1-mini.json").read_text(encoding="utf-8"))
+    assert rep["rows"][0]["usd"] == pytest.approx(one * (fv.MAX_RETRIES + 1)) and rep["rows"][0]["error"] == "RuntimeError"
+    assert rep["usd"] == pytest.approx(one * (fv.MAX_RETRIES + 1))
+
+
+def test_vision_key_order_and_missing(monkeypatch, capsys):
+    """키: 프로세스 환경 → Windows 사용자 환경변수, 둘 다 없으면 분명한 SystemExit (키 값은 문구에 없다)"""
+    monkeypatch.setattr(fv.cc, "_user_env", lambda name: "가짜-사용자키")
+    monkeypatch.setenv("OPENAI_API_KEY", "가짜-프로세스키")
+    assert fv.openai_key() == "가짜-프로세스키"
+    monkeypatch.delenv("OPENAI_API_KEY")
+    assert fv.openai_key() == "가짜-사용자키"
+    monkeypatch.setattr(fv.cc, "_user_env", lambda name: None)
+    with pytest.raises(SystemExit, match="OPENAI_API_KEY가 없다") as e:
+        fv.openai_key()
+    assert "가짜" not in str(e.value)
+
+
+def test_vision_main_missing_key_exits(tmp_path, monkeypatch):
+    args = _vision_case(tmp_path, [], [{"page": P1, "fields": ["title"], "found": True}])
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(fv.cc, "_user_env", lambda name: None)
+    monkeypatch.setattr(fv, "make_client", lambda *a, **k: pytest.fail("키 없으면 클라이언트를 만들지 않는다"))
+    with pytest.raises(SystemExit, match="OPENAI_API_KEY가 없다"):
+        fv.main(args)
+
+
+def test_vision_targets_dedup(tmp_path):
+    """같은 forms json을 두 번 주거나 같은 쪽이 겹쳐도 (kind, page)마다 한 번 — 칸 대상은 틀린 칸을 합친다"""
+    rep = tmp_path / "f.json"
+    rep.write_text(json.dumps({"forms": {"agency1990": {
+        "boundary_wrong": [{"page": P1, "gt_start": True, "pred_start": False}],
+        "field_wrong": [{"page": P1, "fields": ["title"], "found": True}]}}}), encoding="utf-8")
+    rep2 = tmp_path / "g.json"
+    rep2.write_text(json.dumps({"forms": {"agency1990": {
+        "boundary_wrong": [], "field_wrong": [{"page": P1, "fields": ["docno", "title"], "found": True}]}}}), encoding="utf-8")
+    ts = fv.targets([rep, rep, rep2])
+    assert [(t["kind"], t["page"]) for t in ts] == [("boundary", P1), ("fields", P1)]
+    assert ts[1]["fields"] == ["docno", "title"]
+
+
+@pytest.mark.parametrize("mod", ["score", "flag_whatif", "inspection_capture"])
+def test_gt_append_keeps_positionals(mod, monkeypatch, tmp_path):
+    """--gt가 뒤의 결과 파일(위치 인자)을 삼키지 않는다 — `--gt a.csv r.json`이면 results=[r.json], gt=[a.csv]"""
+    import argparse
+    import importlib
+    m = importlib.import_module(mod)
+    got = {}
+
+    def fake_parse(self, argv=None, namespace=None):
+        ns = argparse.ArgumentParser.parse_known_args(self, argv, namespace)[0]
+        got["ns"] = ns
+        raise SystemExit(0)
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", fake_parse)
+    monkeypatch.setattr(sys, "argv", [mod, "--gt", "a.csv", "r.json", "--gt", "b.csv"])  # flag_whatif.main()은 argv를 안 받는다
+    with pytest.raises(SystemExit):
+        m.main()
+    assert got["ns"].results == ["r.json"] and got["ns"].gt == ["a.csv", "b.csv"]
 
 
 def test_forms_compare_unpriced_stops(fc, tmp_path, monkeypatch, capsys):

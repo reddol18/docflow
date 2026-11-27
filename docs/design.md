@@ -385,13 +385,14 @@ https://github.com/reddol18/docflow/issues/139#issuecomment-7209367228).
   --seed 801 --docs 5 --level mix --form agency1990` (802·803 같은 꼴, 804는 `--docs 2`; draft2000은 811~813 `--docs 5`) →
   `..\.venv\Scripts\python.exe -I -X utf8 eval/synth/to_work.py <bundles\양식> ..\work_synth\c8\work` →
   `.\eval\promptfoo\run.ps1 -Work ..\work_synth\c8\work -Providers '^gpt-4\.1-mini$' -Prompts '^current$'` →
-  `python -I -X utf8 eval/forms_compare.py --work <work> --results <work>\promptfoo\results.json --out ..\work_synth\c8\out` →
+  `python -I -X utf8 eval/forms_compare.py --work <work> --results <work>\promptfoo\results.json --out ..\work_synth\c8\out`
+  (출력 `forms_<work>_<후보>_<판>.json` — 이미 있으면 멈춤. 결과에 행이 있는 철만 채점, 철이 하나도 안 돌았던 양식은 `not_run`) →
   `python -I -X utf8 eval/forms_vision.py --forms <forms_*.json>… --bundles <철 폴더 부모>… --gt <work>\gt\review.csv… --out ..\work_synth\c8\out`
-  (키는 환경변수 OPENAI_API_KEY를 그 실행 동안만).
+  (키는 OPENAI_API_KEY — 프로세스 환경, 없으면 Windows 사용자 환경변수).
 
 **조건 3 — 채점 규칙을 `eval/`로** (`eval/scoring.py`): PoC `scripts/rescore.py`의 `match`('?' 와일드카드)·`pdate`(날짜 YYYY-MM-DD/YYYY-MM)·
 `gt_serial`(일련번호 빈칸)·`ok_field`·`pct`·`load_gt`와 그것이 부르던 `gt_draft.norm_date`·`score_extract.norm`(정규화)을 동작 그대로 옮겼다.
-`eval/score.py`는 `--gt 정답.csv …`(여럿 가능 — 합성 철 안의 `gt.csv`도 바로)를 받고, 안 주면 결과 파일 옆 work의 `gt/review.csv`.
+`eval/score.py`는 `--gt 정답.csv`(여럿이면 `--gt`를 여러 번 — 합성 철 안의 `gt.csv`도 바로)를 받고, 안 주면 결과 파일 옆 work의 `gt/review.csv`.
 실제 정답 CSV는 저장소 밖 그대로다. `eval/` 아래 다른 도구(하네스 `common`·`check`·`gate`, `flag_whatif`·`inspection_capture`·`grounding_measure`·
 `recipient_replay`·`recipient_vision`)도 같은 모듈을 쓰고 `records_poc/scripts`를 경로에 넣지 않는다.
 - **상위 폴더 없이 도는지 (측정):** `tests/test_scoring.py` — `records_poc/scripts`를 `sys.path`에서 빼고 PoC 모듈(rescore·gt_draft·score_extract·

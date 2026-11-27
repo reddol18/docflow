@@ -90,7 +90,8 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--loo", action="store_true")
     ap.add_argument("--detail", choices=["이전", "기본", "전체 규칙"])
-    ap.add_argument("--gt", nargs="+", help="정답 CSV (저장소 밖). 안 주면 결과 파일 옆 work의 gt/review.csv")
+    ap.add_argument("--gt", action="append",  # nargs='+'면 뒤 결과 파일(위치 인자)까지 삼킨다
+                    help="정답 CSV (저장소 밖), 여럿이면 --gt를 여러 번. 안 주면 결과 파일 옆 work의 gt/review.csv")
     a = ap.parse_args()
     vols = load(a.results)
     docs = {d["doc_id"]: d for ds in vols.values() for d in ds}
