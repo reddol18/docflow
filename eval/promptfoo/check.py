@@ -12,29 +12,38 @@ from score import FIELDS
 
 from app import fields, layout
 
-# 수신 보정의 재료 = rule: recipient 칸의 LLM 값 (app/graph.py _llm_of와 같은 찾기, graph는 무거워 불러오지 않는다)
-RECIPIENT = next((f["name"] for f in SCHEMA["fields"] if f.get("rule") == "recipient"), "recipient")
+
+def recipient_name(schema):
+    """수신 보정의 재료 = rule: recipient 칸의 LLM 값 (app/graph.py _llm_of와 같은 찾기, graph는 무거워 불러오지 않는다).
+    rule: recipient 칸이 없는 칸 정의(합성 draft2000 — 모두 LLM 추출)면 None"""
+    return next((f["name"] for f in schema["fields"] if f.get("rule") == "recipient"), None)
 
 
-def b_values(b, vol, doc_id):
-    """eval/score.py b_val과 같은 값: 칸은 LLM 추출 값, 수신만 보정 뒤 값"""
+RECIPIENT = recipient_name(SCHEMA) or "recipient"  # 김해
+
+
+def b_values(b, vol, doc_id, schema=None):
+    """eval/score.py b_val과 같은 값: 칸은 LLM 추출 값, 수신만 보정 뒤 값. schema: 그 철 양식의 칸 정의 (없으면 김해).
+    수신 규칙 칸이 없는 칸 정의면 운영 조립(app/fields.assemble)처럼 LLM 값 그대로"""
     vals = {f: (b.get(f) or {}).get("value") or "" for f in FIELDS}
-    if "recipient" in vals:
-        vals["recipient"], _ = layout.fix_recipient(common.ocr(vol, doc_id), (b.get(RECIPIENT) or {}).get("value") or "")
+    rec = recipient_name(schema) if schema is not None else RECIPIENT
+    if "recipient" in vals and rec:
+        vals["recipient"], _ = layout.fix_recipient(common.ocr(vol, doc_id), (b.get(rec) or {}).get("value") or "")
     return vals
 
 
 def get_assert(output, context):
+    v = context["vars"]
+    schema = common.schema_of(v["vol"])  # 철 양식의 칸 정의 (합성 새 양식 철이 김해 칸 정의로 판정되지 않게, #139)
     try:
-        b = fields.validate_extract(SCHEMA, output)
+        b = fields.validate_extract(schema, output)
     except (ValueError, TypeError) as e:  # fields.ExtractInvalid는 ValueError
         return {"pass": False, "score": 0, "reason": f"JSON 객체 아님: {e}"}
     invalid = f" (추출 실패 칸: {', '.join(b.failed)})" if b.failed else ""
-    v = context["vars"]
     g = common.load_gt()[1].get(v["doc_id"])  # 정답은 work 폴더 기준 (합성 work면 합성 정답)
     if g is None:
         return {"pass": True, "score": 1, "reason": "정답 없는 문서 (형식만 확인)" + invalid}
-    got = b_values(b, v["vol"], v["doc_id"])
+    got = b_values(b, v["vol"], v["doc_id"], schema)
     named = {f: float(ok_field(f, got[f], g[f])) for f in FIELDS}
     bad = [f for f, ok in named.items() if not ok]
     return {"pass": True, "score": sum(named.values()) / len(named), "namedScores": named,

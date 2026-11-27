@@ -6,7 +6,9 @@
            지시문(CELL_PROMPT)·설정(temperature 0, max_tokens 40, detail high, logprobs)으로 묻는다.
            맞음: 문서번호 칸 → app/graph.merge와 같게 '-'가 있을 때의 일련번호(layout.serial_of)가 정답 일련번호와 같음,
                  시행일자 칸 → layout.date_of가 정답 날짜와 같음. 칸을 못 찾으면(box_fail) 모든 후보가 같이 틀림.
-  기타 칸  recv_no·recv_date(접수란 번호·일자), sign_*(서명란 이름) — 운영은 읽지 않는 칸. 라벨 상자(annotation.cell)를
+           두 칸을 손으로 쓰는 양식(eval/synth/forms.HAND_PROD_FORMS: gimhae·agency1990)의 철만 — draft2000은 인쇄 글자라 뺀다.
+  기타 칸  recv_no·recv_date(접수란 번호·일자), sign_*(서명란 이름, draft2000 머리 표 기안자 sign_table 포함)
+           — 운영은 읽지 않는 칸. 라벨 상자(annotation.cell)를
            조금 넓혀 자르고, 운영 지시문이 없어 OTHER_PROMPT 하나로 묻는다. 맞음: 공백·마침표를 뺀 글자가 같음.
 '판독 불가'(gt note, 낡아서 사람도 읽기 어려운 칸)는 따로 센다 (읽을 수 있는 칸만의 정답 수도 낸다).
 
@@ -41,11 +43,12 @@ import cv2  # noqa: E402
 from app import layout, ocr  # noqa: E402
 
 PROD_CELLS = {"docno": "serial", "date": "date"}  # 운영 판독 칸(app/graph.CELLS) → 합성 라벨 칸 이름
-OTHER_CELLS = ("recv_no", "recv_date", "sign_drafter", "sign_reviewer", "sign_approver", "sign_attach")
+# sign_table: draft2000 머리 표의 기안자 이름 (손글씨, 서명 이름 묶음으로 센다)
+OTHER_CELLS = ("recv_no", "recv_date", "sign_drafter", "sign_reviewer", "sign_approver", "sign_attach", "sign_table")
 OTHER_PROMPT = ("1990년대 공문서에서 사람이 손으로 쓴 칸 하나를 잘라낸 이미지다 (접수란의 번호·일자 또는 서명란의 사람 이름). "
                 "손글씨를 보이는 그대로 한 줄로 적어라. 숫자는 아라비아 숫자로, 이름은 한글로 적는다. "
                 "흘려 써서 애매해도 가장 그럴듯한 글자를 적는다. 값만 적고 설명은 쓰지 않는다.")
-CELL_GENERATORS = {"synth-0.2"}  # annotation.cell을 남기는 eval/synth/bundle.py VERSION
+CELL_GENERATORS = {"synth-0.2", "synth-0.3"}  # annotation.cell을 남기는 eval/synth/bundle.py VERSION
 PAD = 16 # 기타 칸: 라벨 상자를 사방으로 넓힐 픽셀 (글자 끝이 잘리지 않게)
 GROUPS = [("serial", "문서번호 칸 (운영)"), ("date", "시행일자 칸 (운영)"), ("recv_no", "접수 번호"),
           ("recv_date", "접수 일자"), ("sign", "서명 이름")]
@@ -99,13 +102,18 @@ def png_crop(img, box, pad=0):
 
 def collect(work, bundles, vols):
     """읽을 칸 목록 [{vol, doc_id, page, cell, truth, hard, box, box_fail, png}] — 부르기 전에 모두 만든다"""
+    import forms  # noqa: PLC0415 — eval/synth/forms.py (양식별 손글씨 운영 칸)
     import to_work  # noqa: PLC0415 — 운영 locate (app/graph.locate·widen과 같음)
     gt = cc.load_gt(work)
     cells = []
     for vol in vols:
-        gen = json.loads((Path(bundles) / vol / "meta.json").read_text(encoding="utf-8")).get("generator")
+        meta = json.loads((Path(bundles) / vol / "meta.json").read_text(encoding="utf-8"))
+        gen = meta.get("generator")
         if gen not in CELL_GENERATORS:  # 예전 판 철은 칸 이름이 없어 기타 칸이 조용히 빠진다 → 철 단위로 멈춘다
             raise SystemExit(f"손글씨 칸 이름(annotation.cell)이 없는 생성기 판({gen}) 철: {vol} — eval/synth/bundle.py로 다시 만든다")
+        # 운영 칸(일련번호·시행일자)은 그 칸을 손으로 쓰는 양식만 (draft2000은 인쇄 글자 — 손글씨 정답률에 섞지 않는다).
+        # form 없는 옛 철(synth-0.2)은 김해
+        prod = forms.form_of(meta) in forms.HAND_PROD_FORMS
         n0 = len(cells)
         for d in cc.stored_docs(work, vol):
             page = d["pages"][0]
@@ -118,7 +126,7 @@ def collect(work, bundles, vols):
             row = gt.get(page)
             note = (row or {}).get("note", "")
             base = {"vol": vol, "doc_id": d["doc_id"], "page": page}
-            if row:  # 정답 문서 시작 쪽으로 나뉜 문서만 운영 칸을 센다 (운영 split이 잘못 나눈 문서는 정답 없음)
+            if row and prod:  # 정답 문서 시작 쪽으로 나뉜 문서만 운영 칸을 센다 (운영 split이 잘못 나눈 문서는 정답 없음)
                 _, boxes, fail = to_work.locate(o["items"])
                 truths = {"serial": layout.serial_of(row["docno"]), "date": row["date"]}
                 for k, cell in PROD_CELLS.items():

@@ -24,15 +24,18 @@ def main(argv=None):
     from rescore import ok_field  # noqa: PLC0415
 
     from app import fields, graph, grounding  # noqa: PLC0415
-    schema = fields.load(common.SCHEMA_FILE)
-    pf = fields.prompt_fields(schema)
     gt = common.load_gt()[1]
     c = Counter()
+    # 표 줄 = 김해 추출 칸 (철이 없어도) + 섞인 철 양식에만 있는 칸 (합집합, 처음 나온 차례). 철 루프 안은 vol_pf
+    table_pf = list(fields.prompt_fields(fields.load(common.SCHEMA_FILE)))
     for vol in common.vols():
+        schema = common.schema_of(vol)  # 철 양식의 칸 정의 (실제 철·김해 합성 철은 gimhae.yaml, #139)
+        vol_pf = fields.prompt_fields(schema)
+        table_pf += [f for f in vol_pf if f["name"] not in {t["name"] for t in table_pf}]
         for d in common.stored_docs(vol):
             lines = common.ocr(vol, d["doc_id"])["lines"][:80]
             b = d.get("b") or {}
-            vals = {f["name"]: (b.get(f["name"]) or {}).get("value") or "" for f in pf}
+            vals = {f["name"]: (b.get(f["name"]) or {}).get("value") or "" for f in vol_pf}
             # 운영 merge와 같게: 규칙 값 → fields.assemble로 최종 값, LLM 값(일부라도)이 최종 값에 들어간 칸만 표시 (from_b_flags).
             # 수신 규칙 값 = 저장된 최종 수신 칸 값 (배치 규칙 보정 뒤 — 보정 전 값은 저장돼 있지 않다)
             rec_f = fields.by_rule(schema, "recipient")
@@ -40,15 +43,15 @@ def main(argv=None):
             rule_values, info = graph.rule_values_of(b, d.get("hw") or {}, rec or "", len(d.get("pages") or [1]))
             final = fields.assemble(schema, b, rule_values)
             why = (d.get("info") or {}).get("recipient_fix") or ""
-            every = [p for f in pf if vals[f["name"]]
+            every = [p for f in vol_pf if vals[f["name"]]
                      for p in ([f"{f['name']}:head", f"{f['name']}:serial"] if f.get("rule") == "docno" else [f["name"]])]
             reach = set(graph.from_b_flags(schema, b, final, every, info["from_b"], why))
             failed = (d.get("info") or {}).get("llm_failed") or []
-            bad = set(graph.from_b_flags(schema, b, final, grounding.check_extract(pf, b, lines, failed), info["from_b"], why))
+            bad = set(graph.from_b_flags(schema, b, final, grounding.check_extract(vol_pf, b, lines, failed), info["from_b"], why))
             # 수신 보정(참조·잘림)이 붙은 문서는 보정 전 값이 저장돼 있지 않아 수신 칸을 운영과 같게 다시 만들 수 없다 → 수신은 따로 센다
             rec_fixed = why not in ("", "목록")
             c["rec_fixed_docs"] += rec_fixed
-            for f in pf:
+            for f in vol_pf:
                 c[(f["name"], "reached")] += f["name"] in reach
             g = gt.get(d["doc_id"])
             c["docs"] += 1
@@ -56,7 +59,7 @@ def main(argv=None):
             c["instr_lines"] += sum(grounding.instruction_line(x) for x in lines)  # 근거에서 빠지는 진짜 줄
             c["docs_flagged"] += bool(bad)
             c["docs_new_review"] += bool(bad) and not d.get("flags")  # 지금 표시가 하나도 없던 문서 = 새로 사람 검토로
-            for f in pf:
+            for f in vol_pf:
                 n = f["name"]
                 if not vals[n]:
                     continue
@@ -73,7 +76,7 @@ def main(argv=None):
           f"(그중 지금 다른 표시가 없던 문서 {c['docs_new_review']}건). 지시 꼴로 근거에서 빠진 줄 {c['instr_lines']}/{c['lines']}")
     print("| 칸 | 값 있음 | LLM 값이 최종 값에 들어감 | 근거 없음 표시 | 정답 맞은 값 | 그중 표시(오탐) | 정답 틀린 값 | 그중 표시 |")
     print("|---|---|---|---|---|---|---|---|")
-    for f in pf:
+    for f in table_pf:
         n = f["name"]
         print(f"| {n} | {c[(n, 'values')]} | {c[(n, 'reached')]} | {c[(n, 'flagged')]} | {c[(n, 'gt_ok')]} | {c[(n, 'gt_ok_flagged')]} | "
               f"{c[(n, 'gt_bad')]} | {c[(n, 'gt_bad_flagged')]} |")

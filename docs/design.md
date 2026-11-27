@@ -283,6 +283,59 @@ AI Hub 자료는 이 PC 밖으로 내보내지 않으므로 외부 GPU에서는 
   https://github.com/reddol18/docflow/issues/139 의 AI Hub 로컬 비교 전까지 모른다.
 - **qwen2.5:32b 일자 표시 재현율 0%:** 틀린 시행일자를 검토 표시로 하나도 잡지 못했다(기준 16.7%). 시행일자 정답률은 기준보다 높지만, 운영에 쓰면 날짜 오답은 검토 표시 없이 지나간다.
 
+### 합성 철은 실제와 얼마나 닮았나 — 같은 로컬 모델 4칸 정답률 (https://github.com/reddol18/docflow/issues/139 조건 4, 2026-11-27 이 PC)
+같은 모델(이 PC Ollama `qwen2.5:7b`, 0.13.2, 동시 1)·같은 지시문(current)·같은 하네스(`eval/promptfoo/run.ps1 -Local -BaselineFrom …`)·같은 코드
+(브랜치 `feat/139-synth-forms`, main `ca5c17d` + 생성기 양식 추가 — 추출·채점 코드는 main과 같음)로 같은 날 두 입력을 쟀다.
+AI Hub 88은 이 PC 안에서만 돌렸다(OpenAI·런파드 호출 0). 허용 차이는 칸마다 ±10%p (2026-11-27 사용자 결정,
+https://github.com/reddol18/docflow/issues/139#issuecomment-7209367228).
+- 실제: AI Hub 88 김해 7철, 정답 시작 쪽 164건 (운영 split 450문서). 68분.
+- 합성: 김해 꼴 합성 10철(시드 4701~4710, `--form gimhae`), 정답 50건 (split 49문서, 1건 = 2%p). 6분.
+- 비교 열은 **텍스트 추출(B)** 정답률이다. 합성 work는 손글씨 칸 비전 판독을 하지 않아 최종 = B라서, 실제도 B로 맞춘다
+  (실제 최종은 저장된 GPT 비전 판독이 들어가 문서번호 63.4%·시행일자 78.0%).
+
+| 칸 | 합성 (50건) | 실제 AI Hub 88 (164건) | 차이 (합성 − 실제) | ±10%p |
+|---|---|---|---|---|
+| 문서번호 | 86.0% | 31.1% | +54.9%p | 벗어남 |
+| 시행일자 | 60.0% | 54.9% | +5.1%p | 통과 |
+| 수신 | 78.0% | 41.5% | +36.5%p | 벗어남 |
+| 제목 | 84.0% | 59.8% | +24.2%p | 벗어남 |
+
+- **판정: 4칸 중 시행일자만 통과.** 합성 철은 문서번호·수신·제목에서 실제보다 훨씬 쉽다 — 합성 점수는 실제 정답률의 위쪽 끝으로 읽어야 하고,
+  모델 간 순위 비교에는 쓰되 절대값을 실제 예상치로 쓰지 않는다.
+- **원인 (집계, 값 없이 — 첫 쪽 OCR 글자에 정답 값이 그대로 들어 있는 비율):**
+  일련번호 실제 33.5% · 합성 94.0%, 수신 실제 42.7% · 합성 96.0%, 제목 실제 84.8% · 합성 82.0%.
+  - 문서번호: 합성 손글씨 일련번호는 손글씨 글꼴이라 흘림이 적어 OCR이 거의 다 읽는다. 실제는 흘림 숫자라 OCR이 3건 중 1건만 읽는다
+    (위 "손글씨 칸 판독 — 합성 철 기준"의 '합성 손글씨는 실제보다 쉽다'와 같은 원인).
+  - 수신: 실제 수신은 더 길고(공백 뺀 평균 16.1자 대 10.0자, 주소·상호·대표) 같은 줄에 결재란 낱말이 섞여 OCR 줄이 깨진다. 합성은 짧고 깨끗하다.
+  - 제목: OCR에 든 비율은 비슷한데 모델 정답률이 갈린다 — 합성 제목은 고정 5종 + 꼬리말이라 단순하고, 실제는 따옴표·괄호·한자 섞인 긴 제목과
+    머리부 잡음 때문에 7b가 줄 끝을 자르거나 고쳐 쓴다(같은 실제 철에서 gpt-4.1-mini 87.2%).
+- **조정 안 함:** 맞추려면 김해 꼴 손글씨·수신 줄을 바꿔 쪽 이미지를 다시 만들어야 하는데, 그러면 https://github.com/reddol18/docflow/issues/80 비교에 쓴
+  w47 철(같은 시드 같은 이미지)이 바뀐다. 한 번 조정으로 세 칸 모두 ±10%p에 들기도 어려워(문서번호 차 55%p) 이번에는 차이와 원인만 남긴다.
+  후속: 손글씨 숫자 흘림 강하게(획 변형·겹침), 수신 줄에 주소·결재란 낱말 섞기, 제목 문형 늘리기 — 새 생성기 판·새 시드로
+  https://github.com/reddol18/docflow/issues/171 에서 한다. 조건 4를 측정·기록으로 닫는다는 사용자 결정은
+  https://github.com/reddol18/docflow/issues/139#issuecomment-7210593936 .
+- **같은 모델·옛 결과와의 차이:** 실제 수신 B가 11-07 표(28.0%)보다 높은 41.5%인 것은 https://github.com/reddol18/docflow/issues/1 수신 칸 보정(https://github.com/reddol18/docflow/pull/169) 뒤라서다.
+  나머지 세 칸은 11-07과 같다. 합성 수신 78%(11-21에는 80%)도 같은 보정 영향이다.
+- **재현:** `.\eval\promptfoo\run.ps1 -Local -LocalModel qwen2.5:7b -BaselineFrom ..\work\promptfoo\results_full_20261107.json` (실제),
+  `.\eval\promptfoo\run.ps1 -Work ..\work_synth\w47 -Local -LocalModel qwen2.5:7b -BaselineFrom ..\work_synth\w47\promptfoo\results_gpt41mini.json` (합성).
+  결과는 저장소 밖 `work/promptfoo/c139_qwen2_5_7b_*`, `work_synth/w47/promptfoo/` (gate.md).
+
+### 합성 양식 (https://github.com/reddol18/docflow/issues/139 조건 3)
+`eval/synth/bundle.py --form gimhae|agency1990|draft2000|mix` (기본 gimhae = 예전 철과 같은 시드 같은 이미지, 생성기 판 `synth-0.3`).
+- `agency1990`: 지어낸 도 사업소(예: '새벌도 도로관리사업소') 1990년대 시행문 — 기관명 머리, 문서번호·시행일자 한 줄(일련번호·일자 손글씨),
+  그 아래 수신 줄, 경유·참조 줄, 제목, 접수란은 쪽 아래. 문서번호는 '기관 약칭 + 5자리 분류번호 - 일련번호'(예: '도관 30150-318'),
+  서명란 꼬리는 김해처럼 '과-일련번호'.
+  칸 정의 `app/field_schemas/synth_agency1990.yaml` (김해와 같은 규칙 칸 — 운영 문서번호 규칙이 5자리 분류번호만 받아 생성기도 5자리).
+- `draft2000`: 2000년대 기안문 — 가로 표 머리부(항목명 줄 문서번호|시행일자|보존기간|기안자, 그 아래 값 줄), 인쇄 문서번호 '부서명-번호'.
+  칸 정의 `app/field_schemas/synth_draft2000.yaml` (모두 LLM 추출 칸).
+- 철 이름: 김해는 예전 그대로 `SYNTH<seed>-<연도>-<번호>`, 새 양식은 시드 뒤에 양식 표시(agency1990 `A`, draft2000 `D` —
+  예: `SYNTH0011A-1995-0001`). 이미 있는 철 폴더의 `meta.json` 양식이 다르면 `bundle.py`가 멈춘다.
+- 하네스는 철마다 `meta.json`의 `form`(없으면 gimhae)으로 칸 정의를 고른다: `eval/synth/to_work.py`(저장 철 모양, manifest에 form),
+  `eval/promptfoo/common.schema_of`(current 지시문·응답 판정·조립), `eval/score.py`(모든 양식의 채점 칸이 같은지 확인).
+  `eval/hw_compare.py`는 일련번호·시행일자를 손으로 쓰는 양식(gimhae·agency1990)만 운영 칸에 넣는다 (draft2000은 인쇄 글자).
+- 두 칸 정의 모두 https://github.com/reddol18/docflow/issues/9 설정 검증(`app/fields.load`)과 rule 이름 확인을 통과한다 (`tests/test_synth_forms.py`).
+- 외교 전보·행정처분 꼴은 https://github.com/reddol18/docflow/issues/14 로 미룸.
+
 ### 손글씨 칸 판독 모델 비교 (1997-0002 철 10건, 칸 20개, `eval/cell_variants.py`)
 처음엔 gpt-4o-mini(low)로 시작했는데 일련번호를 빈칸("도시 58430-")으로 답하면서 확신도는 1.0에 가까웠다.
 

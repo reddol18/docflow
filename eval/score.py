@@ -18,12 +18,58 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(1, str(Path(__file__).resolve().parents[1]))  # doc_platform (색인 스키마)
+sys.path.insert(2, str(Path(__file__).resolve().parent / "synth"))  # forms.py (합성 양식 → 칸 정의 파일)
+import forms  # noqa: E402
 from rescore import gt_serial, load_gt, match, ok_field, pct, pdate  # noqa: E402
 
 from app import fields  # noqa: E402
 
-# 채점 칸 = 김해 매핑에서 사람이 고칠 수 있는 칸 (https://github.com/reddol18/docflow/issues/9). 정답은 이 4칸만 있다
-FIELDS = list(fields.editable(fields.load(fields.DIR / "gimhae.yaml")))
+
+def _schema(form):
+    return fields.load(fields.DIR / forms.SCHEMA_FILE[form])
+
+
+def form_fields():
+    """양식별 채점 칸 = 그 양식 칸 정의에서 사람이 고칠 수 있는 칸 (https://github.com/reddol18/docflow/issues/9) → {양식: (칸...)}"""
+    return {f: tuple(fields.editable(_schema(f))) for f in forms.FORMS}
+
+
+HAND_FLAGS = ("serial", "date")  # 손글씨 판독 검토 표시를 집계하는 칸 = 칸 정의 rule 이름 (app/graph.py RULES)
+
+
+def hand_flag_forms():
+    """{표시 칸: 그 칸 규칙(rule)이 있는 양식 집합}. draft2000처럼 규칙이 없는 양식(문서번호·시행일자가 인쇄 글자, LLM 추출만)의
+    문서는 손글씨 표시 집계에서 뺀다 — 최종 칸에 serial이 없고 date 표시도 붙지 않는다 (https://github.com/reddol18/docflow/issues/139)"""
+    rules = {f: {x.get("rule") for x in _schema(f)["fields"]} for f in forms.FORMS}
+    return {fld: {f for f, r in rules.items() if fld in r} for fld in HAND_FLAGS}
+
+
+HAND_FORMS = hand_flag_forms()
+
+
+def manifest_forms(results):
+    """결과 파일(<work>/platform/<철>.json) 옆 work의 synth_manifest.json → {철: 양식}. 없으면 빈 dict (실제 철 = 김해)"""
+    out = {}
+    for p in {Path(x).resolve().parent.parent / "synth_manifest.json" for x in results}:
+        if p.exists():
+            out.update({v["vol"]: forms.form_of(v) for v in json.loads(p.read_text(encoding="utf-8")).get("vols", [])
+                        if v.get("vol")})
+    return out
+
+
+def scoring_fields():
+    """채점 칸 — 정답(gt.csv·review.csv)은 docno·date·recipient·title 4칸 열뿐이라, 모든 양식(김해·합성 새 양식,
+    https://github.com/reddol18/docflow/issues/139)의 고칠 수 있는 칸이 같아야 한 실행에 섞인 철을 같은 칸으로 채점할 수 있다.
+    어느 양식이 다른 칸을 갖게 되면 조용히 김해 칸으로 채점하지 않고 멈춘다"""
+    by_form = form_fields()
+    base = by_form[forms.DEFAULT_FORM]
+    other = {f: v for f, v in by_form.items() if v != base}
+    if other:
+        raise SystemExit(f"양식마다 채점 칸이 다르다 (김해 {base}): {other} — eval/score.py를 철 양식별 칸으로 고친다")
+    return list(base)
+
+
+FIELDS = scoring_fields()
 
 
 def b_val(d, f):
@@ -32,8 +78,10 @@ def b_val(d, f):
     return d["b"][f]["value"]
 
 
-def metrics(docs, gt=None):
-    """docs = {doc_id: 문서 결과}. 결과에 든 철만 채점. 반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다."""
+def metrics(docs, gt=None, form_of=None):
+    """docs = {doc_id: 문서 결과}. 결과에 든 철만 채점. 반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다.
+    form_of(철) → 양식 (없으면 모두 김해). 손글씨 표시(serial·date)는 그 칸 규칙이 있는 양식의 문서만 센다 (HAND_FORMS)"""
+    form_of = form_of or (lambda v: forms.DEFAULT_FORM)
     rows, idx, bnd, _ = gt or load_gt()
     vols = {d["vol"] for d in docs.values()}
     vol = lambda p: p.rsplit("-", 1)[0]  # noqa: E731
@@ -51,8 +99,9 @@ def metrics(docs, gt=None):
                              for f in FIELDS}
 
     m["flag"] = {}
-    for fld in ["serial", "date"]:
-        ps = [p for p in idx if (fld == "date" or gt_serial(idx[p]["docno"]) is not None)]
+    for fld in HAND_FLAGS:
+        ps = [p for p in idx if form_of(vol(p)) in HAND_FORMS[fld]
+              and (fld == "date" or gt_serial(idx[p]["docno"]) is not None)]
         gtv = {p: gt_serial(idx[p]["docno"]) if fld == "serial" else idx[p]["date"] for p in ps}
         conv = (lambda x: x) if fld == "serial" else pdate
         b_key = "b_serial" if fld == "serial" else "b_date"
@@ -84,7 +133,8 @@ def main():
     for path in a.results:
         for d in json.loads(Path(path).read_text(encoding="utf-8")):
             docs[d["doc_id"]] = d
-    m = metrics(docs)
+    by_form = manifest_forms(a.results)
+    m = metrics(docs, form_of=lambda v: by_form.get(v, forms.DEFAULT_FORM))
     idx = m["_idx"]
     print(f"철 {m['vols']}\n정답 시작 쪽 {m['n_gt']}건, 경계 확인 쪽 {m['n_bnd']}쪽, 플랫폼 문서 {m['n_docs']}건\n")
     print(f"## 문서 시작 판별: recall {pct(*m['boundary']['recall'])}, precision {pct(*m['boundary']['precision'])}")

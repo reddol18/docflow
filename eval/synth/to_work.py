@@ -17,6 +17,7 @@ work는 빈 폴더이거나 이미 합성 work(synth_manifest.json, platform/의
 """
 import argparse
 import csv
+import functools
 import hashlib
 import json
 import os
@@ -26,14 +27,25 @@ import time
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[2]
-if str(APP_ROOT) not in sys.path:  # python -I는 스크립트 폴더도 현재 폴더도 path에 넣지 않는다
-    sys.path.insert(0, str(APP_ROOT))
+for _p in (APP_ROOT, Path(__file__).resolve().parent):  # python -I는 스크립트 폴더도 현재 폴더도 path에 넣지 않는다
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+import forms  # noqa: E402
 
 from app import fields, layout  # noqa: E402
 
 HEAD_RATIOS = [0.40, 0.48, 0.56]  # app/graph.py HEAD_RATIOS와 같다 (graph는 langgraph·DB를 불러와 여기서 쓰지 않는다)
 CELLS = ("docno", "date")  # app/graph.py CELLS (김해 스키마)
-SCHEMA = fields.load(fields.DIR / "gimhae.yaml")
+
+
+@functools.cache
+def schema_of(form):
+    """철 양식(meta.json form, 없으면 gimhae) → 칸 정의 (forms.SCHEMA_FILE). 새 양식 철을 김해 칸 정의로 만들지 않게"""
+    return fields.load(fields.DIR / forms.SCHEMA_FILE[form])
+
+
+SCHEMA = schema_of(forms.DEFAULT_FORM)  # 김해 (옛 철·form 없는 meta)
 GT_COLS = ["page", "확인", "is_start", "docno", "date", "recipient", "title", "check", "note", "saved"]
 SYNTH_PREFIX = "SYNTH"  # bundle.py 철 이름 (SYNTH<seed>-<연도>-<번호>)
 POC_WORK = APP_ROOT.parent / "work"  # PoC 확정 정답·AI Hub 결과가 든 work — 여기엔 쓰지 않는다
@@ -78,11 +90,13 @@ def split(vol, ocrs):
     return segs
 
 
-def stored_doc(vol, seg, first_ocr):
+def stored_doc(vol, seg, first_ocr, schema=None):
+    """schema: 그 철 양식의 칸 정의 (schema_of(form)). 없으면 김해"""
+    schema = schema or SCHEMA
     ratio, _, fail = locate(first_ocr["items"])
-    b = fields.parse_extract(SCHEMA, "{}")  # 빈 추출 — 하네스가 후보 응답으로 바꾼다
+    b = fields.parse_extract(schema, "{}")  # 빈 추출 — 하네스가 후보 응답으로 바꾼다
     return {"doc_id": seg["doc_id"], "vol": vol, "pages": seg["pages"],
-            "fields": {f["name"]: "" for f in SCHEMA["fields"]}, "b": dict(b),
+            "fields": {f["name"]: "" for f in schema["fields"]}, "b": dict(b),
             "hw": {k: {"text": "", "conf": 0.0} for k in CELLS},
             "info": {"prefix": "", "blank": False, "conf_serial": 0.0, "conf_date": 0.0, "b_serial": "", "b_date": "",
                      "recipient_fix": "", "head_ratio": ratio, "box_fail": fail, "llm_skipped": [], "llm_failed": [],
@@ -165,15 +179,16 @@ def run(src, work, ocr_page=None):
                 if v in entries:
                     rows.setdefault(v, []).append(r)
     for d, meta in found:
-        vol = meta["vol"]
+        vol, form = meta["vol"], forms.form_of(meta)
         ocrs = ocr_vol(d, vol, work, ocr_page)
-        docs = [stored_doc(vol, s, ocrs[s["doc_id"]]) for s in split(vol, ocrs)]
+        docs = [stored_doc(vol, s, ocrs[s["doc_id"]], schema_of(form)) for s in split(vol, ocrs)]
         (work / "platform" / f"{vol}.json").write_text(json.dumps(docs, ensure_ascii=False, indent=1), encoding="utf-8")
         with (d / "gt.csv").open(encoding="utf-8-sig", newline="") as f:
             rows[vol] = list(csv.DictReader(f))
         starts = sum(r["is_start"] == "Y" for r in rows[vol])
+        # form: 하네스(eval/promptfoo/common.schema_of)가 철마다 이 양식의 칸 정의·지시문으로 추출·채점한다
         entries[vol] = {"vol": vol, "seed": meta["seed"], "level": meta["level"], "generator": meta["generator"],
-                        "pages": len(ocrs), "docs_gt": starts, "docs_split": len(docs)}
+                        "form": form, "pages": len(ocrs), "docs_gt": starts, "docs_split": len(docs)}
         print(f"{vol}: 쪽 {len(ocrs)}, 정답 문서 {starts}, 나눈 문서 {len(docs)}", flush=True)
     # 정답을 먼저 쓰고 manifest를 마지막에 — 중간에 죽으면 manifest가 옛것이라 새 철은 '합성 아님'으로 막힌다
     with gt_p.open("w", encoding="utf-8-sig", newline="") as f:

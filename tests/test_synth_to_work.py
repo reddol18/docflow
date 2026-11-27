@@ -21,7 +21,7 @@ def tw():
     sys.path[:] = before
 
 
-def _bundle(src, vol, pages, starts, synthetic=True):
+def _bundle(src, vol, pages, starts, synthetic=True, form=None):
     d = src / vol
     d.mkdir(parents=True)
     rows = []
@@ -36,7 +36,30 @@ def _bundle(src, vol, pages, starts, synthetic=True):
         w.writeheader()
         w.writerows(rows)
     (d / "meta.json").write_text(json.dumps({"vol": vol, "synthetic": synthetic, "seed": 1, "level": "mix",
-                                             "generator": "synth-0.1"}), encoding="utf-8")
+                                             "generator": "synth-0.3" if form else "synth-0.1",
+                                             **({"form": form} if form else {})}), encoding="utf-8")
+
+
+def test_mixed_forms_use_their_schema(tw, tmp_path, monkeypatch):
+    """섞인 철(mix): 철마다 meta.json form의 칸 정의로 저장 철 모양을 만들고 manifest에 form을 남긴다.
+    form 없는 옛 철은 김해 (https://github.com/reddol18/docflow/issues/139)"""
+    monkeypatch.setattr(tw.layout, "is_start", lambda d: (True, []))
+    src, work = tmp_path / "src", tmp_path / "work"
+    _bundle(src, "SYNTH0001-1995-0001", 1, {1})  # 옛 철 (form 없음)
+    _bundle(src, "SYNTH0002A-1995-0001", 1, {1}, form="agency1990")
+    _bundle(src, "SYNTH0003D-2004-0001", 1, {1}, form="draft2000")
+    m = tw.run(src, work, ocr_page=_fake_ocr())
+    assert {v["vol"]: v["form"] for v in m["vols"]} == {
+        "SYNTH0001-1995-0001": "gimhae", "SYNTH0002A-1995-0001": "agency1990", "SYNTH0003D-2004-0001": "draft2000"}
+    for v in m["vols"]:
+        schema = tw.schema_of(v["form"])
+        d = json.loads((work / "platform" / f"{v['vol']}.json").read_text(encoding="utf-8"))[0]
+        assert set(d["fields"]) == {f["name"] for f in schema["fields"]}
+        assert set(d["b"]) == set(tw.fields.parse_extract(schema, "{}"))
+    assert tw.schema_of("gimhae") is tw.SCHEMA
+    # draft2000은 규칙 칸이 없어 일련번호(hidden) 칸이 없다 — 김해 칸 정의로 만들면 생기는 칸
+    d3 = json.loads((work / "platform" / "SYNTH0003D-2004-0001.json").read_text(encoding="utf-8"))[0]
+    assert "serial" not in d3["fields"]
 
 
 def test_run_builds_work(tw, tmp_path, monkeypatch):
@@ -193,3 +216,59 @@ def test_second_batch_merges(tw, tmp_path, monkeypatch):
 
 def test_work_outside_repo(tw):
     assert tw.main([str(ROOT), str(ROOT / "eval" / "가상work")]) == 2
+
+# ---------- 코드 리뷰 2차 (https://github.com/reddol18/docflow/issues/139) ----------
+
+@pytest.mark.skipif(not (ROOT.parent / "scripts" / "rescore.py").is_file(), reason="PoC rescore.py 없음")
+def test_mix_work_gate_score_end_to_end(tw, tmp_path, monkeypatch):
+    """섞인 철(김해·agency1990·draft2000) work로 하네스 채점이 끝까지 돈다: to_work → gate.rebuild(후보 응답) → score.metrics.
+    draft2000 문서는 최종 칸에 serial이 없고(규칙 없음) 손글씨 표시(serial·date) 집계에서 빠진다 — 4칸 채점에는 든다"""
+    monkeypatch.setattr(tw.layout, "is_start", lambda d: (True, []))
+    src, work = tmp_path / "src", tmp_path / "work"
+    vols = {"SYNTH0001-1995-0001": None, "SYNTH0002A-1995-0001": "agency1990", "SYNTH0003D-2004-0001": "draft2000"}
+    for v, form in vols.items():
+        _bundle(src, v, 2, {1, 2}, form=form)
+    tw.run(src, work, ocr_page=_fake_ocr())
+
+    monkeypatch.setenv("DOCFLOW_EVAL_WORK", str(work))
+    monkeypatch.delenv("DOCFLOW_EVAL_VOLS", raising=False)
+    before = list(sys.path)
+    # common이 이미 불려 있으면 path를 다시 넣지 않는다 — gate.metrics가 부르는 score(eval/)·rescore(PoC scripts/)
+    for p in (ROOT.parent / "scripts", ROOT / "eval" / "synth", ROOT / "eval"):
+        monkeypatch.syspath_prepend(str(p))
+    spec = importlib.util.spec_from_file_location("e2e_gate", ROOT / "eval" / "promptfoo" / "gate.py")
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    try:
+        monkeypatch.setattr(gate.common, "WORK", work)  # 다른 시험이 먼저 불러 둔 common이면 WORK가 예전 값
+        monkeypatch.delitem(sys.modules, "score", raising=False)  # 다른 시험의 가짜 score가 남지 않게
+        assert gate.common.WORK == work and [gate.common.form_of(v) for v in vols] == ["gimhae", "agency1990", "draft2000"]
+        gate.common.load_gt.cache_clear()
+        ans = json.dumps({"docno": {"value": "가상 12345-1", "confidence": 0.9},
+                          "date": {"value": "1995-01-02", "confidence": 0.9}}, ensure_ascii=False)
+        res = {f"{v}-{n:04d}": {"response": {"output": ans}} for v in vols for n in (1, 2)}
+        data = {v: gate.common.load_vol(v) for v in gate.common.vols()}
+        docs, by_vol, errors = gate.rebuild(res, data)
+        assert errors == 0 and len(docs) == 6
+        assert all("serial" not in d["fields"] for d in by_vol["SYNTH0003D-2004-0001"])
+        assert all("serial" in d["fields"] for v in list(vols)[:2] for d in by_vol[v])
+        m = gate.metrics(docs)  # 예전: draft2000 문서의 fields["serial"]에서 KeyError
+        assert m["n_gt"] == 6 and m["fields"]["final"]["docno"][1] == 6
+        assert set(m["flag"]["serial"]["gt"]) == set(m["flag"]["date"]["gt"]) == {
+            p for p in docs if not p.startswith("SYNTH0003D")}
+        assert m["flag"]["date"]["final"][1] == 4
+        s = gate.summary(m)
+        assert set(s["fields"]) == set(gate.FIELDS)
+        gate.table([{"provider": "가상", "prompt": "current", "s": s, "errors": 0, "verdict": "",
+                     "c": gate.cost_latency({k: {**r, "provider": {"id": "file://replay.py"}} for k, r in res.items()})}])
+        # 같은 채점기를 form_of 없이(모두 김해로) 부르면 draft2000 문서에서 다시 KeyError — 양식을 넘기는 것이 고친 점
+        import score
+        with pytest.raises(KeyError):
+            score.metrics(docs, gate.common.load_gt())
+        # eval/score.py 단독 실행: 결과 파일 옆 synth_manifest.json에서 철 양식을 읽는다
+        assert score.manifest_forms([work / "platform" / "SYNTH0003D-2004-0001.json"]) == {
+            "SYNTH0001-1995-0001": "gimhae", "SYNTH0002A-1995-0001": "agency1990", "SYNTH0003D-2004-0001": "draft2000"}
+        assert score.HAND_FORMS == {"serial": {"gimhae", "agency1990"}, "date": {"gimhae", "agency1990"}}
+    finally:
+        gate.common.load_gt.cache_clear()
+        sys.path[:] = before

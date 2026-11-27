@@ -364,6 +364,37 @@ def test_common_gt_and_synthetic_guard(monkeypatch, tmp_path):
     assert c.non_synthetic() == ["가상-0001"]
 
 
+def test_schema_per_vol_form(monkeypatch, tmp_path, gate):
+    """철마다 그 양식의 칸 정의·지시문으로 추출·판정·조립 (https://github.com/reddol18/docflow/issues/139).
+    manifest에 form이 없거나 실제 철이면 김해 — 김해 철의 current 지시문은 예전과 같은 글자(prompt_versions.NEW)"""
+    (tmp_path / "platform").mkdir()
+    vols = {"SYNTH0001-1995-0001": None, "SYNTH0002A-1995-0001": "agency1990", "SYNTH0003D-2004-0001": "draft2000"}
+    (tmp_path / "synth_manifest.json").write_text(json.dumps(
+        {"vols": [{"vol": v, **({"form": f} if f else {})} for v, f in vols.items()]}), encoding="utf-8")
+    c = _common(monkeypatch, tmp_path)
+    assert [c.form_of(v) for v in vols] == ["gimhae", "agency1990", "draft2000"] and c.form_of("가상-0001") == "gimhae"
+    assert c.schema_file_of("SYNTH0003D-2004-0001").name == "synth_draft2000.yaml"
+    assert c.schema_of("SYNTH0001-1995-0001") == GIMHAE
+    draft = c.schema_of("SYNTH0003D-2004-0001")
+    assert not any(f.get("rule") for f in draft["fields"])  # 김해 규칙 칸이 섞이지 않는다
+    # 지시문: gate가 불러 둔 prompts 모듈(같은 common)로 — WORK만 이 시험 폴더로
+    prompts = sys.modules["prompts"]
+    monkeypatch.setattr(prompts.common, "WORK", tmp_path)
+    assert prompts.system_of("current", "SYNTH0001-1995-0001") == prompts.NEW
+    assert prompts.system_of("current", "SYNTH0003D-2004-0001") == fields.extract_prompt(draft) != prompts.NEW
+    assert prompts.system_of("current", "SYNTH0002A-1995-0001") != prompts.NEW
+    assert prompts.system_of("before_ocr_fix", "SYNTH0003D-2004-0001") == prompts.OLD
+    # 조립: 새 양식 철에서만 app/graph 칸 정의를 잠시 바꾸고 되돌린다
+    monkeypatch.setattr(gate.common, "WORK", tmp_path)
+    before = gate.graph.SCHEMA
+    with gate.graph_schema("SYNTH0003D-2004-0001"):
+        assert gate.graph.SCHEMA == draft
+    with gate.graph_schema("SYNTH0001-1995-0001"):
+        assert gate.graph.SCHEMA is before
+    assert gate.graph.SCHEMA is before
+    assert gate.empty_of(draft) == {f["name"]: {"value": "", "confidence": 0.0} for f in fields.prompt_fields(draft)}
+
+
 def test_load_gt_no_silent_poc_fallback(monkeypatch, tmp_path):
     """기본(PoC) work가 아닌데 정답 파일이 없으면 PoC 정답으로 넘어가지 않고 멈춘다"""
     c = _common(monkeypatch, tmp_path)
@@ -407,7 +438,7 @@ def test_scoring_uses_work_gt(gate, monkeypatch):
     assert "common.load_gt" in calls
     seen = {}
     fake = types.ModuleType("score")
-    fake.metrics = lambda docs, gt=None: seen.setdefault("gt", gt)
+    fake.metrics = lambda docs, gt=None, form_of=None: seen.setdefault("gt", gt)
     monkeypatch.setitem(sys.modules, "score", fake)
     monkeypatch.setattr(gate.common, "load_gt", lambda: "work-gt")
     gate.metrics({})
