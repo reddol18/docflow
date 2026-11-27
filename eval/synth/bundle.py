@@ -12,6 +12,7 @@
   meta.json         쪽별 낡음 정도·기울기·글꼴·칸별 밝기 차, 생성기 판
   check/<쪽>.jpg    (--check) 단어 상자를 그린 확인용 이미지 (절반 크기)
 실제 자료는 읽지 않는다. 같은 --seed·--level이면 같은 철이 나온다 (같은 글꼴 목록일 때).
+같은 이름 철 폴더가 이미 있으면 옛 쪽 파일(.jpg·.json·check/)을 지우고 다시 만든다 (clear_old_pages).
 
 실행 (Augraphy 환경, eval/synth/requirements.txt):
   uv run --no-project --with-requirements eval/synth/requirements.txt python -I eval/synth/bundle.py out_dir --seed 1 --docs 5 --level mix
@@ -76,7 +77,10 @@ def plan(seed, n_docs, form="gimhae"):
     """문서별 쪽 계획 → (city, year, pages). pages는 쪽 순서대로 [(Case, kind, cont, attach)]:
     kind는 first·cont·attach, cont는 첫 쪽 본문이 다음 쪽으로 이어지는지, attach는 붙임 서식 쪽이 따르는지
     (first·cont 쪽에서만 참일 수 있다). 그리기 전 단계라 시험에서 따로 본다.
-    form: render.FORMS 중 하나 (mix는 pick_form으로 먼저 푼다). gimhae는 예전과 같은 난수 순서"""
+    form: render.FORMS 중 하나 (mix는 pick_form으로 먼저 푼다). gimhae는 예전과 같은 난수 순서.
+    mix·모르는 양식이 바로 오면 ValueError (양식 난수를 plan 난수와 섞지 않게 — make처럼 pick_form을 먼저 부른다)"""
+    if form not in render.FORMS:
+        raise ValueError(f"plan 양식은 {render.FORMS} 중 하나 (mix는 pick_form으로 먼저 푼다): {form!r}")
     r = random.Random(seed)
     lo, hi = render.YEARS[form]
     city, year = r.choice(render.CITY), r.randint(lo, hi)
@@ -123,14 +127,21 @@ def vol_name(seed, year, bundle_no, form="gimhae"):
     return f"SYNTH{seed:04d}{forms.VOL_TAG[form]}-{year}-{bundle_no:04d}"
 
 
-def check_existing(d, form):
-    """이미 있는 철 폴더의 meta.json 양식이 이번 양식과 다르면 멈춘다 (덮어쓰면 쪽·정답이 섞인다). 같은 양식이면 다시 만든다"""
-    meta_p = Path(d) / "meta.json"
-    if not meta_p.exists():
-        return
-    old = forms.form_of(json.loads(meta_p.read_text(encoding="utf-8")))
-    if old != form:
-        raise SystemExit(f"이미 있는 철 폴더의 양식({old})이 이번 양식({form})과 달라 덮어쓰지 않는다: {d}")
+def clear_old_pages(d, vol):
+    """같은 이름 철 폴더를 다시 만들 때 옛 쪽 파일(<철>-<4자리>.jpg·.json, check/<철>-<4자리>.jpg)을 지운다 — 쪽 수가 줄면
+    옛 쪽이 남아 to_work가 OCR·문서로 섞는다 (gt.csv·meta.json은 새로 쓴다). 합성 철이 아닌 폴더(meta.json synthetic이 참이
+    아님)면 아무것도 지우지 않고 멈춘다. 지운 파일 수를 돌려준다"""
+    d = Path(d)
+    if not d.is_dir():
+        return 0
+    meta_p = d / "meta.json"
+    if meta_p.exists() and json.loads(meta_p.read_text(encoding="utf-8")).get("synthetic") is not True:
+        raise SystemExit(f"합성 철이 아닌 폴더라 덮어쓰지 않는다 (meta.json synthetic): {d}")
+    old = [p for p in (*d.glob(f"{vol}-[0-9][0-9][0-9][0-9].*"), *(d / "check").glob(f"{vol}-[0-9][0-9][0-9][0-9].jpg"))
+           if p.is_file() and p.suffix in (".jpg", ".json")]
+    for p in old:
+        p.unlink()
+    return len(old)
 
 
 def make(out, seed, n_docs=5, level="mix", fonts=None, check=False, bundle_no=1, form="gimhae"):
@@ -140,7 +151,7 @@ def make(out, seed, n_docs=5, level="mix", fonts=None, check=False, bundle_no=1,
     city, year, pages = plan(seed, n_docs, form)
     vol = vol_name(seed, year, bundle_no, form)
     d = Path(out) / vol
-    check_existing(d, form)
+    clear_old_pages(d, vol)
     d.mkdir(parents=True, exist_ok=True)
     rows, meta = [], {"vol": vol, "generator": VERSION, "seed": seed, "level": level, "form": form, "synthetic": True,
                       "pages": []}

@@ -438,7 +438,7 @@ def test_scoring_uses_work_gt(gate, monkeypatch):
     assert "common.load_gt" in calls
     seen = {}
     fake = types.ModuleType("score")
-    fake.metrics = lambda docs, gt=None: seen.setdefault("gt", gt)
+    fake.metrics = lambda docs, gt=None, form_of=None: seen.setdefault("gt", gt)
     monkeypatch.setitem(sys.modules, "score", fake)
     monkeypatch.setattr(gate.common, "load_gt", lambda: "work-gt")
     gate.metrics({})

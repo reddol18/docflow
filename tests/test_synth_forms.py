@@ -255,26 +255,57 @@ def test_draft_title_no_double_notice():
     assert not any(t.endswith(("통보 알림", "알림 알림")) for t in titles)
 
 
-def test_vol_name_has_form_and_refuses_other_form(tmp_path):
-    """철 이름: gimhae는 예전 그대로(w47 재현), 새 양식은 표시가 붙어 같은 시드 다른 양식이 겹치지 않는다.
-    이미 있는 폴더의 meta 양식이 다르면 덮어쓰지 않고 멈춘다"""
-    import json
-
+def test_vol_name_has_form():
+    """철 이름: gimhae는 예전 그대로(w47 재현), 새 양식은 표시가 붙어 같은 시드 다른 양식이 겹치지 않는다"""
     import bundle
 
     assert bundle.vol_name(4701, 1995, 1) == bundle.vol_name(4701, 1995, 1, "gimhae") == "SYNTH4701-1995-0001"
     names = {bundle.vol_name(11, 1995, 1, f) for f in render.FORMS}
     assert len(names) == len(render.FORMS) and all(n.startswith("SYNTH0011") for n in names)
-    d = tmp_path / "SYNTH0011-1995-0001"
-    d.mkdir()
-    bundle.check_existing(d, "gimhae")  # meta 없음 → 통과
-    (d / "meta.json").write_text(json.dumps({"vol": d.name, "synthetic": True}), encoding="utf-8")  # 옛 철 = 김해
-    bundle.check_existing(d, "gimhae")
-    with pytest.raises(SystemExit, match="양식"):
-        bundle.check_existing(d, "agency1990")
-    (d / "meta.json").write_text(json.dumps({"vol": d.name, "synthetic": True, "form": "draft2000"}), encoding="utf-8")
-    with pytest.raises(SystemExit, match="양식"):
-        bundle.check_existing(d, "gimhae")
+
+
+def _fake_age(monkeypatch, bundle):
+    monkeypatch.setattr(bundle.age, "age", lambda img, ann, level, seed: (img, [a["box"] for a in ann],
+                                                                          {f: 200.0 for f in render.FIELDS}, 0.0))
+
+
+# ---------- 코드 리뷰 2차 (https://github.com/reddol18/docflow/issues/139) ----------
+
+def test_remake_same_vol_drops_old_pages(tmp_path, monkeypatch):
+    """같은 이름 철 폴더를 다시 만들면 옛 쪽 파일(.jpg·.json·check/)이 남지 않는다 — 쪽 수가 줄어도 폴더 = 새 철 그대로.
+    다른 파일은 건드리지 않고, 합성 철이 아닌 폴더(meta synthetic 아님)면 지우지 않고 멈춘다"""
+    import json
+
+    import bundle
+
+    _fake_age(monkeypatch, bundle)
+    d, rows, _ = bundle.make(tmp_path, seed=21, n_docs=4, level="light", fonts=NOFONTS, form="draft2000", check=True)
+    many = {p.name for p in d.rglob("*") if p.is_file()}
+    (d / "메모.txt").write_text("남김", encoding="utf-8")
+    d2, rows2, meta2 = bundle.make(tmp_path, seed=21, n_docs=1, level="light", fonts=NOFONTS, form="draft2000")
+    assert d2 == d and len(rows2) < len(rows)
+    pages = {r["page"] for r in rows2}
+    left = {p.stem for p in d.glob("SYNTH*.*")} | {p.stem for p in (d / "check").glob("*.jpg")}
+    assert left == pages and len(many) > len(pages) * 2 + 2  # 첫 철은 쪽이 더 많았다
+    assert (d / "메모.txt").exists() and [p["page"] for p in meta2["pages"]] == [r["page"] for r in rows2]
+    assert bundle.clear_old_pages(tmp_path / "없음", "SYNTH0021D-2004-0001") == 0
+    other = tmp_path / "남의폴더"
+    other.mkdir()
+    (other / "meta.json").write_text(json.dumps({"vol": "x"}), encoding="utf-8")
+    (other / "x-0001.jpg").write_bytes(b"")
+    with pytest.raises(SystemExit, match="합성 철이 아닌"):
+        bundle.clear_old_pages(other, "x")
+    assert (other / "x-0001.jpg").exists()
+
+
+def test_plan_rejects_mix_and_unknown_form():
+    """plan()은 이미 푼 양식만 받는다 — mix·모르는 양식이면 KeyError가 아니라 ValueError (make는 pick_form을 먼저 부른다)"""
+    import bundle
+
+    for bad in ("mix", "telegram", None):
+        with pytest.raises(ValueError, match="plan 양식"):
+            bundle.plan(1, 2, bad)
+    assert bundle.plan(1, 2, bundle.pick_form(1, "mix"))[2]
 
 
 def test_scoring_fields_same_for_all_forms(monkeypatch):

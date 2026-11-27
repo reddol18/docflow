@@ -25,9 +25,36 @@ from rescore import gt_serial, load_gt, match, ok_field, pct, pdate  # noqa: E40
 from app import fields  # noqa: E402
 
 
+def _schema(form):
+    return fields.load(fields.DIR / forms.SCHEMA_FILE[form])
+
+
 def form_fields():
     """양식별 채점 칸 = 그 양식 칸 정의에서 사람이 고칠 수 있는 칸 (https://github.com/reddol18/docflow/issues/9) → {양식: (칸...)}"""
-    return {f: tuple(fields.editable(fields.load(fields.DIR / forms.SCHEMA_FILE[f]))) for f in forms.FORMS}
+    return {f: tuple(fields.editable(_schema(f))) for f in forms.FORMS}
+
+
+HAND_FLAGS = ("serial", "date")  # 손글씨 판독 검토 표시를 집계하는 칸 = 칸 정의 rule 이름 (app/graph.py RULES)
+
+
+def hand_flag_forms():
+    """{표시 칸: 그 칸 규칙(rule)이 있는 양식 집합}. draft2000처럼 규칙이 없는 양식(문서번호·시행일자가 인쇄 글자, LLM 추출만)의
+    문서는 손글씨 표시 집계에서 뺀다 — 최종 칸에 serial이 없고 date 표시도 붙지 않는다 (https://github.com/reddol18/docflow/issues/139)"""
+    rules = {f: {x.get("rule") for x in _schema(f)["fields"]} for f in forms.FORMS}
+    return {fld: {f for f, r in rules.items() if fld in r} for fld in HAND_FLAGS}
+
+
+HAND_FORMS = hand_flag_forms()
+
+
+def manifest_forms(results):
+    """결과 파일(<work>/platform/<철>.json) 옆 work의 synth_manifest.json → {철: 양식}. 없으면 빈 dict (실제 철 = 김해)"""
+    out = {}
+    for p in {Path(x).resolve().parent.parent / "synth_manifest.json" for x in results}:
+        if p.exists():
+            out.update({v["vol"]: forms.form_of(v) for v in json.loads(p.read_text(encoding="utf-8")).get("vols", [])
+                        if v.get("vol")})
+    return out
 
 
 def scoring_fields():
@@ -51,8 +78,10 @@ def b_val(d, f):
     return d["b"][f]["value"]
 
 
-def metrics(docs, gt=None):
-    """docs = {doc_id: 문서 결과}. 결과에 든 철만 채점. 반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다."""
+def metrics(docs, gt=None, form_of=None):
+    """docs = {doc_id: 문서 결과}. 결과에 든 철만 채점. 반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다.
+    form_of(철) → 양식 (없으면 모두 김해). 손글씨 표시(serial·date)는 그 칸 규칙이 있는 양식의 문서만 센다 (HAND_FORMS)"""
+    form_of = form_of or (lambda v: forms.DEFAULT_FORM)
     rows, idx, bnd, _ = gt or load_gt()
     vols = {d["vol"] for d in docs.values()}
     vol = lambda p: p.rsplit("-", 1)[0]  # noqa: E731
@@ -70,8 +99,9 @@ def metrics(docs, gt=None):
                              for f in FIELDS}
 
     m["flag"] = {}
-    for fld in ["serial", "date"]:
-        ps = [p for p in idx if (fld == "date" or gt_serial(idx[p]["docno"]) is not None)]
+    for fld in HAND_FLAGS:
+        ps = [p for p in idx if form_of(vol(p)) in HAND_FORMS[fld]
+              and (fld == "date" or gt_serial(idx[p]["docno"]) is not None)]
         gtv = {p: gt_serial(idx[p]["docno"]) if fld == "serial" else idx[p]["date"] for p in ps}
         conv = (lambda x: x) if fld == "serial" else pdate
         b_key = "b_serial" if fld == "serial" else "b_date"
@@ -103,7 +133,8 @@ def main():
     for path in a.results:
         for d in json.loads(Path(path).read_text(encoding="utf-8")):
             docs[d["doc_id"]] = d
-    m = metrics(docs)
+    by_form = manifest_forms(a.results)
+    m = metrics(docs, form_of=lambda v: by_form.get(v, forms.DEFAULT_FORM))
     idx = m["_idx"]
     print(f"철 {m['vols']}\n정답 시작 쪽 {m['n_gt']}건, 경계 확인 쪽 {m['n_bnd']}쪽, 플랫폼 문서 {m['n_docs']}건\n")
     print(f"## 문서 시작 판별: recall {pct(*m['boundary']['recall'])}, precision {pct(*m['boundary']['precision'])}")
