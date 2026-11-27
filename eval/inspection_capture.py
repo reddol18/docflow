@@ -1,22 +1,24 @@
 """표시 없이 틀린 문서가 검사 표본에 얼마나 잡히나 (https://github.com/reddol18/docflow/issues/10). LLM 없음, 기준 없음(측정만).
 
-플랫폼 결과(/volumes/{vol}/documents JSON)를 PoC 확정 정답(work/gt/review.csv)으로 채점해(eval/score.py와 같은 규칙)
+플랫폼 결과(/volumes/{vol}/documents JSON)를 정답 CSV(저장소 밖 — --gt, 안 주면 결과 옆 work의 gt/review.csv)로
+채점해(채점 규칙은 eval/scoring.py, eval/score.py와 같음)
 철마다 표시 없는 문서 b건, 그중 4칸 중 하나라도 틀린 문서 w건을 세고, 표본 비율 p마다
   표본 수 n = ceil(b×p) (app/inspection.py sample_size와 같음)
   기대 포착 수 = w×n/b,  1건 이상 잡을 확률 = 1 − C(b−w, n)/C(b, n)  (비복원 무작위 추출, 초기하분포)
 를 낸다. 출력은 수치만 — 문서 제목·값은 내지 않는다.
 
 실행 (records_poc 폴더에서): .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/inspection_capture.py work/platform/*.json
+  [--gt 정답.csv]
 """
+import argparse
 import json
 import sys
 from math import comb
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from rescore import load_gt, ok_field  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scoring import default_gt, load_gt, ok_field  # noqa: E402 — 채점 규칙 (eval/scoring.py, #8)
 
 from app.inspection import sample_size  # noqa: E402
 from app.review_input import EDITABLE as FIELDS  # noqa: E402
@@ -31,12 +33,17 @@ def capture(b, w, rate):
     return n, w * n / b, 1 - comb(b - w, n) / comb(b, n)
 
 
-def main(paths):
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results", nargs="+")
+    ap.add_argument("--gt", action="append",  # nargs='+'면 뒤 결과 파일(위치 인자)까지 삼킨다
+                    help="정답 CSV (저장소 밖), 여럿이면 --gt를 여러 번. 안 주면 결과 파일 옆 work의 gt/review.csv")
+    a = ap.parse_args(argv)
     docs = {}
-    for path in paths:
+    for path in a.results:
         for d in json.loads(Path(path).read_text(encoding="utf-8")):
             docs[d["doc_id"]] = d
-    _, idx, _, _ = load_gt()
+    _, idx, _, _ = load_gt(a.gt or default_gt(a.results))
     vols = sorted({d["vol"] for d in docs.values()})
     per = []
     for v in vols:
@@ -59,4 +66,4 @@ def main(paths):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

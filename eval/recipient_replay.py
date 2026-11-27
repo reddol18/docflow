@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "promptfoo"))  # python -I 로 돌려도 하네스 모듈을 찾게
 import common  # noqa: E402
 import gate  # noqa: E402
-from rescore import ok_field  # noqa: E402  (common이 records_poc/scripts를 경로에 넣는다)
+from scoring import ok_field  # noqa: E402  (common이 eval/을 경로에 넣는다)
 
 
 def counts(m):

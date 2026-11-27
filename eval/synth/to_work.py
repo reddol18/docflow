@@ -6,7 +6,7 @@
                                        (layout.value_box, 머리부 비율 넓히기까지). LLM 값은 비워 둔다 — 하네스가 후보 응답으로 채운다.
                                        손글씨 칸 판독(GPT 비전, hw)은 하지 않는다: 모든 후보가 같은 빈 판독으로 채점된다
                                        (텍스트 모델 비교용. 비전 판독 비교는 #80 완료 조건 4에서 따로)
-  <work>/gt/review.csv                 철마다 gt.csv를 이어 붙인 정답 (eval/score.py·rescore.py와 같은 열)
+  <work>/gt/review.csv                 철마다 gt.csv를 이어 붙인 정답 (eval/score.py·scoring.load_gt와 같은 열)
   <work>/synth_manifest.json           합성 철 목록·시드·쪽 수. run.ps1은 외부(OpenAI·원격) 후보를 이 목록의 철에만 보낸다
 
 meta.json의 synthetic이 true이고 이름이 SYNTH로 시작하는 철만 받는다 — 실제 자료(AI Hub 등)는 이 길로 들어오지 않는다.

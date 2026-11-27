@@ -2,7 +2,7 @@
 
   python -I -X utf8 eval/grounding_measure.py [--work <work 폴더>]
 work/platform/<철>.json의 b(LLM 추출 값)와 work/ocr_platform의 첫 쪽 OCR 앞 80줄(운영 추출 입력과 같음)로 칸마다 근거를 보고,
-정답 시작 쪽(gt/review.csv)이면 그 값이 맞았는지(PoC rescore.ok_field)와 묶어 센다. 출력은 개수만 (문서 글자 없음).
+정답 시작 쪽(gt/review.csv)이면 그 값이 맞았는지(eval/scoring.ok_field)와 묶어 센다. 출력은 개수만 (문서 글자 없음).
 https://github.com/reddol18/docflow/issues/27
 """
 import argparse
@@ -21,7 +21,7 @@ def main(argv=None):
     if a.work:
         os.environ["DOCFLOW_EVAL_WORK"] = str(Path(a.work).resolve())
     import common  # noqa: PLC0415 — DOCFLOW_EVAL_WORK를 넣은 뒤
-    from rescore import ok_field  # noqa: PLC0415
+    from scoring import ok_field  # noqa: PLC0415
 
     from app import fields, graph, grounding  # noqa: PLC0415
     gt = common.load_gt()[1]

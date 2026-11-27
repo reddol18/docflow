@@ -34,6 +34,21 @@ class NotSynthetic(SystemExit):
     """합성 철이 아닌 입력 — 아무것도 보내기 전에 멈춘다"""
 
 
+REAL_DATA_DIRS = ("aihub_extracted",)  # AI Hub 원본 (폴더 이름만 — 실제 위치는 적지 않는다)
+
+
+def reject_real_data(path, what="경로"):
+    """실제 자료 경로면 멈춘다: 경로 안 어디든 aihub_extracted 폴더, 또는 records_poc/work 자체와 그 아래
+    (PoC 확정 정답·AI Hub 결과). 이름이 다른 형제 폴더(records_poc/work_synth 등 합성 work)는 받는다. → 정리한 경로"""
+    p = Path(path).resolve()
+    parts = [x.lower() for x in p.parts]
+    under_poc = p.is_relative_to(POC_WORK.resolve()) or any(
+        a == "records_poc" and b == "work" for a, b in zip(parts, parts[1:]))
+    if under_poc or any(x in REAL_DATA_DIRS for x in parts):
+        raise NotSynthetic(f"{what}에 실제 자료 폴더(aihub_extracted, records_poc/work)를 주지 않는다 — 합성 자료만: {path}")
+    return p
+
+
 def check_base_url(url):
     """원격 OpenAI 호환 주소 검사 → 정리한 주소. https, 또는 http면 루프백(터널·이 PC)만. 사용자·비밀번호 거부"""
     try:

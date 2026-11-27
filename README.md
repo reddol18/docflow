@@ -520,6 +520,6 @@ ssh user@mac "PATH=/usr/local/bin:`$PATH kubectl get secret keycloak-realm-secre
 | `app/` | FastAPI · LangGraph 흐름(`graph.py`) · OCR · 규칙(`layout.py`) · GPT 호출(`llm.py`) · 저장소 |
 | `frontend/` | Next.js 16 대시보드 (업로드 · 진행 단계 · 검토 에디터 · 검색). 운영 이미지 `Dockerfile`(next build → next start)·TLS 종단 `tls-proxy.mjs` |
 | `k8s/` | 네임스페이스 · 네트워크 정책 · Postgres · Qdrant · docflow (`docs.yaml`), 데모 Keycloak(`keycloak.yaml`, realm `keycloak/docflow-realm.json`) |
-| `eval/` | 정답 채점(`score.py`), 모델·지시문 비교 하네스(`promptfoo/`, 예전 일회성 `cell_variants.py`, `extract_variants.py`). 정답 데이터와 채점 규칙은 이전 PoC 폴더에 있어 이 레포만으로는 돌지 않음 |
+| `eval/` | 정답 채점(`score.py`), 모델·지시문 비교 하네스(`promptfoo/`, 예전 일회성 `cell_variants.py`, `extract_variants.py`). 채점 규칙은 `eval/scoring.py`, 정답 CSV만 저장소 밖에 둔다(`--gt`) |
 | `sim/` | breakscale_wrap 부하 시나리오 (지금 구성 / 클라우드)와 실행기 |
 | `docs/` | 설계(`design.md`), 실습 기록(`lab_log.md`), 화면 캡처·시뮬레이션 영상 |

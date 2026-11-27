@@ -47,7 +47,7 @@ REMOTE_GPU_SUFFIX = ".proxy.runpod.net"  # 단가 0으로 칠 원격 GPU 주소 
 
 
 def metrics(docs):
-    # 채점기(eval/score.py)는 정답·PoC 채점 규칙(records_poc/scripts/rescore.py)을 불러오므로 쓸 때 불러온다
+    # 채점기(eval/score.py)는 앱 칸 정의를 읽으므로 쓸 때 불러온다 (채점 규칙은 eval/scoring.py)
     from score import metrics as m  # noqa: PLC0415
     # 정답은 work 폴더 기준 (합성 work면 합성 정답, #80). 철 양식은 manifest — 손글씨 표시 집계는 규칙 있는 양식만 (#139)
     return m(docs, common.load_gt(), form_of=common.form_of)

@@ -314,8 +314,6 @@ def test_scoring_fields_same_for_all_forms(monkeypatch):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("score_forms", ROOT / "eval" / "score.py")
-    if not (ROOT.parent / "scripts" / "rescore.py").is_file():
-        pytest.skip("PoC rescore.py 없음")
     score = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(score)
     assert score.FIELDS == list(render.FIELDS)

@@ -2,11 +2,10 @@
 
   DOCFLOW_EVAL_WORK  기본 records_poc/work — platform/<vol>.json(저장된 철 결과), ocr_platform/<vol>/<쪽>.json(docflow OCR)
   DOCFLOW_EVAL_VOLS  쉼표로 철 고르기 (비우면 platform/ 전부)
-채점 규칙은 PoC records_poc/scripts/rescore.py (이 레포 밖이라 고치지 않는다). 정답은 load_gt()가 work 폴더의 gt/review.csv에서
-읽는다 — 기본 work면 rescore.py가 고정으로 읽는 PoC 확정 정답과 같은 파일, 합성 work(eval/synth/to_work.py)면 합성 정답.
+채점 규칙은 eval/scoring.py (PoC scripts/rescore.py에서 옮김, https://github.com/reddol18/docflow/issues/8). 정답은 load_gt()가
+work 폴더의 gt/review.csv에서 읽는다 — 기본 work면 PoC 확정 정답, 합성 work(eval/synth/to_work.py)면 합성 정답.
 외부 후보 막기: 합성 철이 아닌 철이 하나라도 있으면 `python -I common.py --require-synthetic`이 종료 코드 2 (run.ps1이 부른다).
 """
-import csv
 import functools
 import json
 import os
@@ -15,11 +14,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parents[1]  # doc_platform
-POC_ROOT = HERE.parents[2]  # records_poc (scripts/rescore.py — 정답·채점 규칙)
+POC_ROOT = HERE.parents[2]  # records_poc (기본 work 폴더의 부모)
 POC_WORK = POC_ROOT / "work"
 WORK = Path(os.environ.get("DOCFLOW_EVAL_WORK") or POC_WORK)
 SYNTH_PREFIX = "SYNTH"  # 합성 철 이름 (eval/synth/bundle.py)
-for p in (APP_ROOT, APP_ROOT / "eval", APP_ROOT / "eval" / "synth", POC_ROOT / "scripts"):
+for p in (APP_ROOT, APP_ROOT / "eval", APP_ROOT / "eval" / "synth"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -60,26 +59,19 @@ def _manifest_vols():
 
 
 def gt_path():
-    """정답 파일: work 폴더의 gt/review.csv (기본 work면 rescore.py가 읽는 PoC 확정 정답과 같은 파일,
+    """정답 파일: work 폴더의 gt/review.csv (기본 work면 PoC 확정 정답,
     합성 work면 eval/synth/to_work.py가 이어 붙인 합성 정답 — https://github.com/reddol18/docflow/issues/80)"""
     return WORK / "gt" / "review.csv"
 
 
 @functools.cache
 def load_gt():
-    """rescore.load_gt와 같은 (rows, idx, bnd, src) — 다만 정답 파일은 work 폴더 기준 (gt_path)"""
+    """scoring.load_gt (rows, idx, bnd, src) — 정답 파일은 work 폴더 기준 (gt_path). 없으면 다른 정답으로 조용히 채점하지 않는다"""
     p = gt_path()
     if not p.exists():
-        if WORK.resolve() != POC_WORK.resolve():  # 다른 work(합성 등)에 정답이 없으면 PoC 정답으로 조용히 채점하지 않는다
-            raise SystemExit(f"정답 파일이 없다: {p} (합성 work면 eval/synth/to_work.py를 끝까지 돌린다)")
-        from rescore import load_gt as poc  # noqa: PLC0415 — 기본 work에 정답이 없을 때만 PoC 고정 위치
-        return poc()
-    with p.open(encoding="utf-8-sig", newline="") as f:
-        rows = list(csv.DictReader(f))
-    idx = {r["page"]: r for r in rows if r["is_start"] == "Y"}
-    bnd = {r["page"]: r["is_start"] == "Y" for r in rows if "경계" in r["확인"]}
-    src = {r["page"]: "claude" if "Claude 판독" in r["note"] else "human" for r in rows}
-    return rows, idx, bnd, src
+        raise SystemExit(f"정답 파일이 없다: {p} (합성 work면 eval/synth/to_work.py를 끝까지 돌린다)")
+    from scoring import load_gt as load  # noqa: PLC0415
+    return load(p)
 
 
 def synthetic_vols():
