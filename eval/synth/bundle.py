@@ -1,6 +1,6 @@
 """합성 기록물 철 만들기 — 문서 여러 건(첫 쪽·이어지는 쪽·붙임 서식)을 한 철로 (https://github.com/reddol18/docflow/issues/139).
 
-출력 (<out>/<철 이름>/)
+출력 (<out>/<철 이름>/ — 철 이름은 vol_name: gimhae SYNTH<seed>-<연도>-<번호>, 새 양식은 시드 뒤에 A·D)
   <쪽>.jpg          낡게 만든 쪽 (docflow에 그대로 올릴 수 있는 이름: <철>-<4자리 쪽 번호>)
   <쪽>.json         AI Hub 88 라벨과 같은 꼴(images + annotations, bbox [x,y,w,h]). 손글씨는 ttype handwritten,
                     칸 값 단어에는 annotation.field (docno·date·recipient·title),
@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I는 스크�
 
 import age  # noqa: E402
 import fonts as font_pins  # noqa: E402
+import forms  # noqa: E402
 import render  # noqa: E402
 from PIL import ImageDraw  # noqa: E402
 
@@ -116,13 +117,30 @@ def label(page_id, img_w, img_h, year, ann, boxes, form="gimhae"):
     }
 
 
+def vol_name(seed, year, bundle_no, form="gimhae"):
+    """철 이름. gimhae는 예전 이름 그대로 SYNTH<seed>-<연도>-<번호> (w47 재현), 새 양식은 시드 뒤에 양식 표시
+    (forms.VOL_TAG: agency1990 'A', draft2000 'D' — 예: SYNTH0011A-1995-0001). 같은 시드 다른 양식 철이 같은 폴더에 겹치지 않는다"""
+    return f"SYNTH{seed:04d}{forms.VOL_TAG[form]}-{year}-{bundle_no:04d}"
+
+
+def check_existing(d, form):
+    """이미 있는 철 폴더의 meta.json 양식이 이번 양식과 다르면 멈춘다 (덮어쓰면 쪽·정답이 섞인다). 같은 양식이면 다시 만든다"""
+    meta_p = Path(d) / "meta.json"
+    if not meta_p.exists():
+        return
+    old = forms.form_of(json.loads(meta_p.read_text(encoding="utf-8")))
+    if old != form:
+        raise SystemExit(f"이미 있는 철 폴더의 양식({old})이 이번 양식({form})과 달라 덮어쓰지 않는다: {d}")
+
+
 def make(out, seed, n_docs=5, level="mix", fonts=None, check=False, bundle_no=1, form="gimhae"):
     check_seed(seed)
     form = pick_form(seed, form)
     fonts = fonts or render.Fonts(hand=font_pins.installed())
     city, year, pages = plan(seed, n_docs, form)
-    vol = f"SYNTH{seed:04d}-{year}-{bundle_no:04d}"
+    vol = vol_name(seed, year, bundle_no, form)
     d = Path(out) / vol
+    check_existing(d, form)
     d.mkdir(parents=True, exist_ok=True)
     rows, meta = [], {"vol": vol, "generator": VERSION, "seed": seed, "level": level, "form": form, "synthetic": True,
                       "pages": []}

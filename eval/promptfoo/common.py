@@ -19,11 +19,44 @@ POC_ROOT = HERE.parents[2]  # records_poc (scripts/rescore.py — 정답·채점
 POC_WORK = POC_ROOT / "work"
 WORK = Path(os.environ.get("DOCFLOW_EVAL_WORK") or POC_WORK)
 SYNTH_PREFIX = "SYNTH"  # 합성 철 이름 (eval/synth/bundle.py)
-for p in (APP_ROOT, APP_ROOT / "eval", POC_ROOT / "scripts"):
+for p in (APP_ROOT, APP_ROOT / "eval", APP_ROOT / "eval" / "synth", POC_ROOT / "scripts"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-SCHEMA_FILE = APP_ROOT / "app" / "field_schemas" / "gimhae.yaml"
+import forms  # noqa: E402 — eval/synth/forms.py (합성 양식 → 칸 정의 파일)
+
+SCHEMA_DIR = APP_ROOT / "app" / "field_schemas"
+SCHEMA_FILE = SCHEMA_DIR / forms.SCHEMA_FILE[forms.DEFAULT_FORM]  # 김해 — 실제 철(PoC work)과 form 없는 옛 합성 철
+
+
+def form_of(vol):
+    """철의 양식: 합성 work면 synth_manifest.json 항목의 form(eval/synth/to_work.py가 meta.json에서 옮김), 없으면 gimhae.
+    실제 철(PoC work)도 gimhae"""
+    return forms.form_of(_manifest_vols().get(vol))
+
+
+def schema_file_of(vol):
+    return SCHEMA_DIR / forms.SCHEMA_FILE[form_of(vol)]
+
+
+@functools.cache
+def _schema_of_file(path):
+    from app import fields  # noqa: PLC0415 — check.py가 문서마다 새로 띄우는 Python에서도 가볍게
+    return fields.load(path)
+
+
+def schema_of(vol):
+    """그 철 양식의 칸 정의 — 지시문(prompts.current)·응답 판정(check·gate)·조립(gate.assemble)을 철마다 이것으로.
+    섞인 철(mix)을 한 실행에 넣어도 철별로 맞는 칸 정의를 쓴다 (https://github.com/reddol18/docflow/issues/139)"""
+    return _schema_of_file(schema_file_of(vol))
+
+
+def _manifest_vols():
+    """{철: synth_manifest 항목} — 목록은 작아 부를 때마다 읽는다 (같은 실행 중 to_work가 고쳐 써도 새 값)"""
+    p = WORK / "synth_manifest.json"
+    if not p.exists():
+        return {}
+    return {v["vol"]: v for v in json.loads(p.read_text(encoding="utf-8")).get("vols", []) if v.get("vol")}
 
 
 def gt_path():

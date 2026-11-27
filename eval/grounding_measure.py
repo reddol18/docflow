@@ -24,11 +24,12 @@ def main(argv=None):
     from rescore import ok_field  # noqa: PLC0415
 
     from app import fields, graph, grounding  # noqa: PLC0415
-    schema = fields.load(common.SCHEMA_FILE)
-    pf = fields.prompt_fields(schema)
     gt = common.load_gt()[1]
     c = Counter()
+    pf = fields.prompt_fields(fields.load(common.SCHEMA_FILE))  # 표 줄 (철이 없어도) — 김해 추출 칸
     for vol in common.vols():
+        schema = common.schema_of(vol)  # 철 양식의 칸 정의 (실제 철·김해 합성 철은 gimhae.yaml, #139)
+        pf = fields.prompt_fields(schema)
         for d in common.stored_docs(vol):
             lines = common.ocr(vol, d["doc_id"])["lines"][:80]
             b = d.get("b") or {}

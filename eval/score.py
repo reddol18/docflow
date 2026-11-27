@@ -18,12 +18,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(1, str(Path(__file__).resolve().parents[1]))  # doc_platform (색인 스키마)
+sys.path.insert(2, str(Path(__file__).resolve().parent / "synth"))  # forms.py (합성 양식 → 칸 정의 파일)
+import forms  # noqa: E402
 from rescore import gt_serial, load_gt, match, ok_field, pct, pdate  # noqa: E402
 
 from app import fields  # noqa: E402
 
-# 채점 칸 = 김해 매핑에서 사람이 고칠 수 있는 칸 (https://github.com/reddol18/docflow/issues/9). 정답은 이 4칸만 있다
-FIELDS = list(fields.editable(fields.load(fields.DIR / "gimhae.yaml")))
+
+def form_fields():
+    """양식별 채점 칸 = 그 양식 칸 정의에서 사람이 고칠 수 있는 칸 (https://github.com/reddol18/docflow/issues/9) → {양식: (칸...)}"""
+    return {f: tuple(fields.editable(fields.load(fields.DIR / forms.SCHEMA_FILE[f]))) for f in forms.FORMS}
+
+
+def scoring_fields():
+    """채점 칸 — 정답(gt.csv·review.csv)은 docno·date·recipient·title 4칸 열뿐이라, 모든 양식(김해·합성 새 양식,
+    https://github.com/reddol18/docflow/issues/139)의 고칠 수 있는 칸이 같아야 한 실행에 섞인 철을 같은 칸으로 채점할 수 있다.
+    어느 양식이 다른 칸을 갖게 되면 조용히 김해 칸으로 채점하지 않고 멈춘다"""
+    by_form = form_fields()
+    base = by_form[forms.DEFAULT_FORM]
+    other = {f: v for f, v in by_form.items() if v != base}
+    if other:
+        raise SystemExit(f"양식마다 채점 칸이 다르다 (김해 {base}): {other} — eval/score.py를 철 양식별 칸으로 고친다")
+    return list(base)
+
+
+FIELDS = scoring_fields()
 
 
 def b_val(d, f):

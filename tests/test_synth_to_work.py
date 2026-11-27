@@ -21,7 +21,7 @@ def tw():
     sys.path[:] = before
 
 
-def _bundle(src, vol, pages, starts, synthetic=True):
+def _bundle(src, vol, pages, starts, synthetic=True, form=None):
     d = src / vol
     d.mkdir(parents=True)
     rows = []
@@ -36,7 +36,30 @@ def _bundle(src, vol, pages, starts, synthetic=True):
         w.writeheader()
         w.writerows(rows)
     (d / "meta.json").write_text(json.dumps({"vol": vol, "synthetic": synthetic, "seed": 1, "level": "mix",
-                                             "generator": "synth-0.1"}), encoding="utf-8")
+                                             "generator": "synth-0.3" if form else "synth-0.1",
+                                             **({"form": form} if form else {})}), encoding="utf-8")
+
+
+def test_mixed_forms_use_their_schema(tw, tmp_path, monkeypatch):
+    """섞인 철(mix): 철마다 meta.json form의 칸 정의로 저장 철 모양을 만들고 manifest에 form을 남긴다.
+    form 없는 옛 철은 김해 (https://github.com/reddol18/docflow/issues/139)"""
+    monkeypatch.setattr(tw.layout, "is_start", lambda d: (True, []))
+    src, work = tmp_path / "src", tmp_path / "work"
+    _bundle(src, "SYNTH0001-1995-0001", 1, {1})  # 옛 철 (form 없음)
+    _bundle(src, "SYNTH0002A-1995-0001", 1, {1}, form="agency1990")
+    _bundle(src, "SYNTH0003D-2004-0001", 1, {1}, form="draft2000")
+    m = tw.run(src, work, ocr_page=_fake_ocr())
+    assert {v["vol"]: v["form"] for v in m["vols"]} == {
+        "SYNTH0001-1995-0001": "gimhae", "SYNTH0002A-1995-0001": "agency1990", "SYNTH0003D-2004-0001": "draft2000"}
+    for v in m["vols"]:
+        schema = tw.schema_of(v["form"])
+        d = json.loads((work / "platform" / f"{v['vol']}.json").read_text(encoding="utf-8"))[0]
+        assert set(d["fields"]) == {f["name"] for f in schema["fields"]}
+        assert set(d["b"]) == set(tw.fields.parse_extract(schema, "{}"))
+    assert tw.schema_of("gimhae") is tw.SCHEMA
+    # draft2000은 규칙 칸이 없어 일련번호(hidden) 칸이 없다 — 김해 칸 정의로 만들면 생기는 칸
+    d3 = json.loads((work / "platform" / "SYNTH0003D-2004-0001.json").read_text(encoding="utf-8"))[0]
+    assert "serial" not in d3["fields"]
 
 
 def test_run_builds_work(tw, tmp_path, monkeypatch):

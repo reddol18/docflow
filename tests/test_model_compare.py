@@ -271,6 +271,38 @@ def test_collect_refuses_bundles_without_cells(mods, tmp_path, gen, msg):
         mods.hw.collect(w, tmp_path / "bundles", [vol])
 
 
+@pytest.mark.parametrize("form,prod", [(None, True), ("gimhae", True), ("agency1990", True), ("draft2000", False)])
+def test_collect_prod_cells_only_for_hand_forms(mods, tmp_path, monkeypatch, form, prod):
+    """운영 칸(일련번호·시행일자)은 두 칸을 손으로 쓰는 양식 철만 — draft2000(인쇄 글자)은 손글씨 정답률에 섞지 않는다.
+    form 없는 옛 철은 김해. draft2000 머리 표 기안자(sign_table)는 기타 칸 (https://github.com/reddol18/docflow/issues/139)"""
+    import cv2
+    import numpy as np
+
+    vol = "SYNTH0001-2003-0001"
+    page = f"{vol}-0001"
+    w = _work(tmp_path, [vol])
+    (w / "platform" / f"{vol}.json").write_text(json.dumps([{"doc_id": page, "pages": [page]}]), encoding="utf-8")
+    (w / "gt").mkdir()
+    (w / "gt" / "review.csv").write_text("page,확인,is_start,docno,date,recipient,title,check,note,saved\n"
+                                         f"{page},경계,Y,가상과-1234,2003-05-12,내부결재,가상 제목,,합성,\n", encoding="utf-8-sig")
+    bd = tmp_path / "bundles" / vol
+    bd.mkdir(parents=True)
+    meta = {"vol": vol, "synthetic": True, "generator": "synth-0.3", **({"form": form} if form else {})}
+    (bd / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    cv2.imwrite(str(bd / f"{page}.jpg"), np.full((200, 300, 3), 255, np.uint8))
+    lab = {"annotations": [{"annotation.text": "김민서", "annotation.bbox": [10, 10, 60, 30], "annotation.cell": "sign_table"}]}
+    (bd / f"{page}.json").write_text(json.dumps(lab, ensure_ascii=False), encoding="utf-8")
+    (w / "ocr_platform" / vol).mkdir(parents=True)
+    (w / "ocr_platform" / vol / f"{page}.json").write_text(
+        json.dumps({"image_sha256": mods.hw.sha256(bd / f"{page}.jpg"), "items": []}), encoding="utf-8")
+    import to_work  # hw_compare가 쓰는 운영 locate — 칸 위치만 가짜로
+    monkeypatch.setattr(to_work, "locate", lambda items: (0.4, {"docno": [0, 0, 50, 50], "date": [0, 60, 50, 110]}, {}))
+    cells = mods.hw.collect(w, tmp_path / "bundles", [vol])
+    kinds = {c["cell"]: c["kind"] for c in cells}
+    assert ({"serial", "date"} <= set(kinds)) is prod and ("serial" in kinds) is prod
+    assert kinds["sign_table"] == "other" and mods.hw.group_of("sign_table") == "sign"
+
+
 def test_bundle_version_marks_cells(mods):
     sys.path.insert(0, str(EVAL / "synth"))
     bundle = _load("synth_bundle_v", EVAL / "synth" / "bundle.py")

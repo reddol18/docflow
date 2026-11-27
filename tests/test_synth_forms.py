@@ -80,7 +80,7 @@ def test_forms_differ_in_layout():
     assert len(labels) == 4 and labels["문서번호"][3] < box(d, "docno")[1]  # 항목명 줄 아래 값
     assert not any(x["ttype"] == "handwritten" for x in d.ann if x.get("field") in ("docno", "date"))
     assert re.fullmatch(r"[가-힣]+과-\d{4,5}", page("draft2000", 3)[0].fields["docno"])
-    assert re.fullmatch(r"[가-힣]{2} \d{4}-\d{3,4}", page("agency1990", 3)[0].fields["docno"])
+    assert re.fullmatch(r"[가-힣]{2} \d{5}-\d{3,4}", page("agency1990", 3)[0].fields["docno"])
 
 
 def test_names_are_invented_and_no_real_data_paths():
@@ -93,7 +93,7 @@ def test_names_are_invented_and_no_real_data_paths():
             assert c.city in render.CITY
             if form == "agency1990":
                 prov, unit = c.org.split(" ")
-                assert prov in render.PROVINCE and unit in dict(render.UNIT)
+                assert prov in render.PROVINCE and unit in {u for u, *_ in render.UNIT}
             else:
                 assert c.org in render.CITY and c.dept[1] in render.DEPT2000
     for f in list(SYNTH.glob("*.py")) + [ROOT / "app" / "field_schemas" / n for n in render.SCHEMA_FILE.values()]:
@@ -175,3 +175,120 @@ def test_bundle_pages_and_labels(form, tmp_path, monkeypatch):
     lab = json.loads((d / f"{starts[0]['page']}.json").read_text(encoding="utf-8"))
     assert lab["images"][0]["image.category"] == ("합성.기안문" if form == "draft2000" else "합성.시행문")
     assert {a["annotation.field"] for a in lab["annotations"] if "annotation.field" in a} == set(render.FIELDS)
+
+
+# ---------- 코드 리뷰 1차 (https://github.com/reddol18/docflow/issues/139) ----------
+
+GRAPH_HEAD_RX = r"([가-힣]{1,4})\s*(\d{5})"  # app/graph.py rule_values_of 문서번호 머리 (운영 규칙 — 바꾸지 않는다)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_agency_docno_survives_gimhae_rule(seed):
+    """agency1990은 김해 문서번호 규칙(rule: docno)을 그대로 쓴다 — 머리 '약칭 + 5자리 분류번호'가 빠지지 않아야 한다
+    (4자리 분류번호면 머리가 빠져 '-318'이 된다)"""
+    sys.path.insert(0, str(ROOT))
+    from app import layout
+
+    assert GRAPH_HEAD_RX in (ROOT / "app" / "graph.py").read_text(encoding="utf-8")
+    assert re.search(r"\(\\d\{5\}\)\\s\*\[-~\]", (ROOT / "app" / "layout.py").read_text(encoding="utf-8"))  # prefix_of
+    c = render.new_case_form(random.Random(seed), "agency1990")
+    # rule_values_of와 같은 조립: 머리(약칭 + 5자리) + '-' + 일련번호 (손글씨 칸 판독·B 값 모두 그린 문서번호라고 보고)
+    m = re.search(GRAPH_HEAD_RX, c.docno)
+    assert m, c.docno
+    assert f"{m.group(1)} {m.group(2)}-{layout.serial_of(c.docno)}" == c.docno
+    assert layout.prefix_of(c.docno) == c.classno and len(c.classno) == 5
+    assert not re.search(GRAPH_HEAD_RX, "수관 1420-318")  # 예전 4자리 — 머리를 못 찾는다
+
+
+def _all_text(p):
+    return " ".join(a["text"] for a in p.ann)
+
+
+@pytest.mark.parametrize("form", render.FORMS)
+@pytest.mark.parametrize("seed", range(8))
+def test_sign_tail_matches_dept_fact(form, seed):
+    """서명란 꼬리 '과-일련번호 ( 연도.' — eval/answer/make_queries.py 부서 사실 정규식이 읽고, 일련번호는 문서번호와 같다"""
+    sys.path.insert(0, str(ROOT / "eval" / "answer"))
+    import make_queries
+
+    if form == "gimhae":
+        c = render.new_case(random.Random(seed))
+        p = render.first_page(c, NOFONTS, random.Random(f"{seed}-p"))
+    else:
+        c, p = page(form, seed)
+    m = make_queries.RX["dept"].search(_all_text(p))
+    assert m and m.group(1) == c.dept[1] and m.group(1).endswith("과")
+    tail = re.search(r"(\S+과)-(\d+) \( (\d{4})\.", _all_text(p))
+    assert tail.group(2) == c.serial == c.docno.rsplit("-", 1)[1] and int(tail.group(3)) == c.year
+
+
+def test_seal_and_sender_names():
+    """관인 글자는 잘리지 않는 짧은 이름(약칭 + '장인'), 군은 군수"""
+    for seed in range(20):
+        a = render.new_case_form(random.Random(seed), "agency1990")
+        assert a.seal_text == f"{a.dept[0]}장인" and len(a.seal_text) == 4 and a.sender == f"{a.org}장"
+    d = render.new_case_form(random.Random(1), "draft2000", city="가람군")
+    assert d.sender == "가람군수" and d.seal_text == "가람군수인"
+    d = render.new_case_form(random.Random(1), "draft2000", city="한빛시")
+    assert d.sender == "한빛시장" and d.seal_text == "한빛시장인"
+    p = render.Page(NOFONTS, random.Random(3))
+    p.seal((400, 400), 220, "가람군수인", per_col=3)  # 다섯 글자 관인도 그린다 (예외 없음)
+    assert np.asarray(p.img).min() < 255
+
+
+def test_agency_header_order_matches_preamble():
+    """agency1990 그림: 수신 한 줄, 그 아래 줄에 경유·참조 — 칸 정의 지시문 머리말도 같은 순서"""
+    pytest.importorskip("yaml")
+    import yaml
+
+    _, p = page("agency1990", 2)
+    y = {a["text"]: a["box"][1] for a in p.ann if a["text"] in ("수신", "경유", "참조", "제목")}
+    assert y["수신"] < y["경유"] and abs(y["경유"] - y["참조"]) < 10 and y["참조"] < y["제목"]
+    pre = yaml.safe_load((ROOT / "app" / "field_schemas" / "synth_agency1990.yaml").read_text(encoding="utf-8"))["extract"]["preamble"]
+    assert "다음 줄에 수신, 그 아래 한 줄에 경유와 참조" in pre
+
+
+def test_draft_title_no_double_notice():
+    """draft2000 제목: 이미 '통보'·'알림'으로 끝나면 '알림'을 덧붙이지 않는다"""
+    titles = {render.new_case_form(random.Random(s), "draft2000").title for s in range(300)}
+    assert any(t.endswith(" 알림") for t in titles)
+    assert not any(t.endswith(("통보 알림", "알림 알림")) for t in titles)
+
+
+def test_vol_name_has_form_and_refuses_other_form(tmp_path):
+    """철 이름: gimhae는 예전 그대로(w47 재현), 새 양식은 표시가 붙어 같은 시드 다른 양식이 겹치지 않는다.
+    이미 있는 폴더의 meta 양식이 다르면 덮어쓰지 않고 멈춘다"""
+    import json
+
+    import bundle
+
+    assert bundle.vol_name(4701, 1995, 1) == bundle.vol_name(4701, 1995, 1, "gimhae") == "SYNTH4701-1995-0001"
+    names = {bundle.vol_name(11, 1995, 1, f) for f in render.FORMS}
+    assert len(names) == len(render.FORMS) and all(n.startswith("SYNTH0011") for n in names)
+    d = tmp_path / "SYNTH0011-1995-0001"
+    d.mkdir()
+    bundle.check_existing(d, "gimhae")  # meta 없음 → 통과
+    (d / "meta.json").write_text(json.dumps({"vol": d.name, "synthetic": True}), encoding="utf-8")  # 옛 철 = 김해
+    bundle.check_existing(d, "gimhae")
+    with pytest.raises(SystemExit, match="양식"):
+        bundle.check_existing(d, "agency1990")
+    (d / "meta.json").write_text(json.dumps({"vol": d.name, "synthetic": True, "form": "draft2000"}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="양식"):
+        bundle.check_existing(d, "gimhae")
+
+
+def test_scoring_fields_same_for_all_forms(monkeypatch):
+    """eval/score.py 채점 칸 = 모든 양식 칸 정의의 고칠 수 있는 칸 (같지 않으면 김해 칸으로 조용히 채점하지 않고 멈춘다)"""
+    pytest.importorskip("yaml")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("score_forms", ROOT / "eval" / "score.py")
+    if not (ROOT.parent / "scripts" / "rescore.py").is_file():
+        pytest.skip("PoC rescore.py 없음")
+    score = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(score)
+    assert score.FIELDS == list(render.FIELDS)
+    assert set(score.form_fields()) == set(render.FORMS)
+    monkeypatch.setattr(score, "form_fields", lambda: {"gimhae": ("docno", "date"), "draft2000": ("docno",)})
+    with pytest.raises(SystemExit, match="채점 칸"):
+        score.scoring_fields()

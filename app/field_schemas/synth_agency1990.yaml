@@ -1,13 +1,14 @@
 # 합성 양식 agency1990 — 지어낸 도 사업소의 1990년대 시행문 (eval/synth/render.py, https://github.com/reddol18/docflow/issues/139 조건 3).
 # 기본 스키마(isad_g.yaml) 칸에 잇는 기관 매핑 (https://github.com/reddol18/docflow/issues/9). 기관·사람·주소는 모두 지어낸 것.
 # 김해 꼴과 머리 배치만 다르고(문서번호·시행일자 한 줄, 접수란은 쪽 아래) 4칸·손글씨 칸(일련번호·시행일자)은 같다 →
-# 김해와 같은 규칙(app/graph.py RULES)을 쓴다.
+# 김해와 같은 규칙(app/graph.py RULES)을 쓴다. 문서번호 규칙(rule_values_of 머리 '약칭 + 5자리', layout.prefix_of)이
+# 5자리 분류번호만 받으므로 생성기(render.CLASSNO_AGENCY)도 김해처럼 5자리 분류번호를 쓴다 (운영 규칙은 그대로).
 name: 합성 도 사업소 시행문 4칸 (1990년대)
 base: isad_g.yaml
 extract:
   preamble: |-
     입력은 1990년대 도 소속 사업소·연구소 공문서(시행문) 첫 쪽을 OCR로 줄 단위로 옮긴 텍스트다.
-    맨 위에 기관 이름, 그 아래 한 줄에 문서번호와 시행일자, 다음 줄에 수신·경유·참조, 그 아래 제목이 온다.
+    맨 위에 기관 이름, 그 아래 한 줄에 문서번호와 시행일자, 다음 줄에 수신, 그 아래 한 줄에 경유와 참조, 그 아래 제목이 온다.
   rules: |-
     OCR 텍스트에는 글자를 잘못 읽은 곳이 많다. 행정 문서 문맥상 명백한 오독은 바른 글자로 고쳐 적는다. 숫자·고유명사는 근거 없이 바꾸지 않는다.
     문서번호와 시행일자가 한 줄에 있으면 '시행일자' 낱말 앞까지가 문서번호다. 제목은 '제목' 항목 줄의 끝까지 빠짐없이 적는다.
@@ -21,7 +22,7 @@ fields:
     rule: docno
     isad: reference_code
     flag_key: serial
-    prompt: '문서번호 (예: "수관 1420-318"). 기관 약칭 + 분류번호 + "-" + 일련번호'
+    prompt: '문서번호 (예: "수관 14210-318"). 기관 약칭 + 5자리 분류번호 + "-" + 일련번호'
   - {name: serial, label: 일련번호, level: document, method: hidden, rule: serial, derive_from: docno, isad: reference_code}
   - name: date
     label: 시행일자

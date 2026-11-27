@@ -311,7 +311,9 @@ https://github.com/reddol18/docflow/issues/139#issuecomment-7209367228).
     머리부 잡음 때문에 7b가 줄 끝을 자르거나 고쳐 쓴다(같은 실제 철에서 gpt-4.1-mini 87.2%).
 - **조정 안 함:** 맞추려면 김해 꼴 손글씨·수신 줄을 바꿔 쪽 이미지를 다시 만들어야 하는데, 그러면 https://github.com/reddol18/docflow/issues/80 비교에 쓴
   w47 철(같은 시드 같은 이미지)이 바뀐다. 한 번 조정으로 세 칸 모두 ±10%p에 들기도 어려워(문서번호 차 55%p) 이번에는 차이와 원인만 남긴다.
-  후속 후보: 손글씨 숫자 흘림 강하게(획 변형·겹침), 수신 줄에 주소·결재란 낱말 섞기, 제목 문형 늘리기 — 새 생성기 판·새 시드로.
+  후속: 손글씨 숫자 흘림 강하게(획 변형·겹침), 수신 줄에 주소·결재란 낱말 섞기, 제목 문형 늘리기 — 새 생성기 판·새 시드로
+  https://github.com/reddol18/docflow/issues/171 에서 한다. 조건 4를 측정·기록으로 닫는다는 사용자 결정은
+  https://github.com/reddol18/docflow/issues/139#issuecomment-7210593936 .
 - **같은 모델·옛 결과와의 차이:** 실제 수신 B가 11-07 표(28.0%)보다 높은 41.5%인 것은 https://github.com/reddol18/docflow/issues/1 수신 칸 보정(https://github.com/reddol18/docflow/pull/169) 뒤라서다.
   나머지 세 칸은 11-07과 같다. 합성 수신 78%(11-21에는 80%)도 같은 보정 영향이다.
 - **재현:** `.\eval\promptfoo\run.ps1 -Local -LocalModel qwen2.5:7b -BaselineFrom ..\work\promptfoo\results_full_20261107.json` (실제),
@@ -320,10 +322,17 @@ https://github.com/reddol18/docflow/issues/139#issuecomment-7209367228).
 
 ### 합성 양식 (https://github.com/reddol18/docflow/issues/139 조건 3)
 `eval/synth/bundle.py --form gimhae|agency1990|draft2000|mix` (기본 gimhae = 예전 철과 같은 시드 같은 이미지, 생성기 판 `synth-0.3`).
-- `agency1990`: 지어낸 도 사업소(예: '새벌도 도로관리사업소') 1990년대 시행문 — 기관명 머리, 문서번호·시행일자 한 줄(일련번호·일자 손글씨), 접수란은 쪽 아래.
-  칸 정의 `app/field_schemas/synth_agency1990.yaml` (김해와 같은 규칙 칸).
+- `agency1990`: 지어낸 도 사업소(예: '새벌도 도로관리사업소') 1990년대 시행문 — 기관명 머리, 문서번호·시행일자 한 줄(일련번호·일자 손글씨),
+  그 아래 수신 줄, 경유·참조 줄, 제목, 접수란은 쪽 아래. 문서번호는 '기관 약칭 + 5자리 분류번호 - 일련번호'(예: '도관 30150-318'),
+  서명란 꼬리는 김해처럼 '과-일련번호'.
+  칸 정의 `app/field_schemas/synth_agency1990.yaml` (김해와 같은 규칙 칸 — 운영 문서번호 규칙이 5자리 분류번호만 받아 생성기도 5자리).
 - `draft2000`: 2000년대 기안문 — 가로 표 머리부(항목명 줄 문서번호|시행일자|보존기간|기안자, 그 아래 값 줄), 인쇄 문서번호 '부서명-번호'.
   칸 정의 `app/field_schemas/synth_draft2000.yaml` (모두 LLM 추출 칸).
+- 철 이름: 김해는 예전 그대로 `SYNTH<seed>-<연도>-<번호>`, 새 양식은 시드 뒤에 양식 표시(agency1990 `A`, draft2000 `D` —
+  예: `SYNTH0011A-1995-0001`). 이미 있는 철 폴더의 `meta.json` 양식이 다르면 `bundle.py`가 멈춘다.
+- 하네스는 철마다 `meta.json`의 `form`(없으면 gimhae)으로 칸 정의를 고른다: `eval/synth/to_work.py`(저장 철 모양, manifest에 form),
+  `eval/promptfoo/common.schema_of`(current 지시문·응답 판정·조립), `eval/score.py`(모든 양식의 채점 칸이 같은지 확인).
+  `eval/hw_compare.py`는 일련번호·시행일자를 손으로 쓰는 양식(gimhae·agency1990)만 운영 칸에 넣는다 (draft2000은 인쇄 글자).
 - 두 칸 정의 모두 https://github.com/reddol18/docflow/issues/9 설정 검증(`app/fields.load`)과 rule 이름 확인을 통과한다 (`tests/test_synth_forms.py`).
 - 외교 전보·행정처분 꼴은 https://github.com/reddol18/docflow/issues/14 로 미룸.
 

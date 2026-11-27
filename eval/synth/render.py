@@ -17,11 +17,16 @@
 """
 import functools
 import random
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+if str(Path(__file__).resolve().parent) not in sys.path:  # 파일 경로로 불러와도 옆 forms.py를 찾게
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from forms import FORMS, SCHEMA_FILE  # noqa: E402, F401 — 양식 목록·칸 정의 파일은 forms.py 한 곳 (render.FORMS로도 쓴다)
 
 W, H = 2464, 3504  # AI Hub 88 쪽 크기와 같게
 SYS_FONTS = Path("C:/Windows/Fonts")
@@ -49,15 +54,17 @@ CASES = [
     ("영업신고 수리", "식품접객업 영업신고 수리 통보", "식품위생법 제22조"),
 ]
 FIELDS = ("docno", "date", "recipient", "title")
-FORMS = ("gimhae", "agency1990", "draft2000")
 PROVINCE = ["새벌도", "한누리도"]  # 실제 없는 도 이름 (agency1990·draft2000 기관)
-# agency1990 기관: (단위 기관 이름, 문서번호 약칭) — 도 이름과 이어 '새벌도 수자원관리사업소'
-UNIT = [("수자원관리사업소", "수관"), ("산림환경연구소", "산연"), ("도로관리사업소", "도관"), ("보건환경연구원", "보연")]
+# agency1990 기관: (단위 기관 이름, 문서번호 약칭, 시행문을 낸 과) — 도 이름과 이어 '새벌도 수자원관리사업소'.
+# 서명란 꼬리는 김해처럼 '과-일련번호' (eval/answer/make_queries.py 부서 사실이 이 꼴을 읽는다)
+UNIT = [("수자원관리사업소", "수관", "관리과"), ("산림환경연구소", "산연", "연구기획과"), ("도로관리사업소", "도관", "도로시설과"),
+        ("보건환경연구원", "보연", "총무과")]
+# agency1990 분류번호 — 김해와 같은 5자리. 운영 문서번호 규칙(app/graph.py rule_values_of 머리 '약칭 + 5자리',
+# app/layout.prefix_of)이 5자리만 받으므로 4자리면 머리가 빠져 '-318'이 된다
+CLASSNO_AGENCY = ["14210", "22310", "30150", "71120"]
 # draft2000 기관·부서: 도시·군(CITY) + 부서명. 문서번호는 '부서명-일련번호'
 DEPT2000 = ["건축과", "지역경제과", "도시계획과", "환경위생과", "민원봉사과"]
 YEARS = {"gimhae": (1991, 1998), "agency1990": (1990, 1999), "draft2000": (2001, 2009)}
-# 양식별 칸 정의 (app/field_schemas/ 파일 이름 — https://github.com/reddol18/docflow/issues/9 설정 검증을 시험이 돌린다)
-SCHEMA_FILE = {"gimhae": "gimhae.yaml", "agency1990": "synth_agency1990.yaml", "draft2000": "synth_draft2000.yaml"}
 # 손글씨 칸 (annotation.cell): 한 칸 = hand() 한 번. serial·date는 운영 판독 칸(문서번호 일련번호·시행일자)의 손글씨 부분,
 # 나머지는 운영이 읽지 않는 칸 — 접수란 번호·일자, 서명란 이름(기안자·검토자·결재권자), 붙임 서식 검토자 이름
 SIGN_CELLS = ("sign_drafter", "sign_reviewer", "sign_approver")
@@ -168,16 +175,24 @@ class Page:
     def rect(self, box, width=3):
         self.d.rectangle(box, outline=(30, 30, 30), width=width)
 
-    def seal(self, center, size, text):
-        """붉은 관인(네모 도장). 라벨에는 넣지 않는다 (도장 글자는 판독 대상 아님)."""
+    def seal(self, center, size, text, per_col=2):
+        """붉은 관인(네모 도장). 라벨에는 넣지 않는다 (도장 글자는 판독 대상 아님).
+        per_col: 세로줄 하나의 글자 수 — 2면 4자(gimhae는 예전 그림 그대로 이 길), 3이면 6자까지(셋째 줄이 짧으면 3+2)"""
         r = self.r
         cx, cy = center
         layer = Image.new("L", (size, size), 0)
         ld = ImageDraw.Draw(layer)
         ld.rectangle((6, 6, size - 6, size - 6), outline=255, width=14)
-        f = self._font(self.fonts.print, size // 3)
-        for i, ch in enumerate(list(text.replace(" ", ""))[:4]):  # 오른쪽 세로줄부터 읽는다
-            ld.text((size * (0.55 if i < 2 else 0.18), size * (0.15 + 0.38 * (i % 2))), ch, font=f, fill=255)
+        chars = list(text.replace(" ", ""))
+        if per_col == 2:
+            f = self._font(self.fonts.print, size // 3)
+            for i, ch in enumerate(chars[:4]):  # 오른쪽 세로줄부터 읽는다
+                ld.text((size * (0.55 if i < 2 else 0.18), size * (0.15 + 0.38 * (i % 2))), ch, font=f, fill=255)
+        else:
+            f = self._font(self.fonts.print, size // 4)
+            for i, ch in enumerate(chars[:2 * per_col]):
+                col, row = divmod(i, per_col)
+                ld.text((size * (0.55 if col == 0 else 0.2), size * (0.12 + 0.27 * row)), ch, font=f, fill=255)
         layer = layer.rotate(r.uniform(-8, 8), resample=Image.BICUBIC)
         holes = np.random.default_rng(r.randint(0, 2**31)).random((size, size)) > 0.25
         layer = Image.fromarray(np.minimum(np.asarray(layer), holes.astype(np.uint8) * 255))
@@ -217,8 +232,16 @@ class Case:
 
     @property
     def sender(self):
-        """발신 명의 (서명란 위 큰 글자·관인)"""
-        return f"{self.org or self.city}장"
+        """발신 명의 (서명란 위 큰 글자). 군은 군수 (gimhae 서명란은 예전 그림 그대로 '<시군>장' — sign_block)"""
+        org = self.org or self.city
+        return f"{org}수" if org.endswith("군") else f"{org}장"
+
+    @property
+    def seal_text(self):
+        """관인 글자 (agency1990·draft2000). 긴 기관명은 문서번호 약칭으로 줄여 '수관장인', 시·군은 '한빛시장인'·'가람군수인'"""
+        if self.form == "agency1990":
+            return f"{self.dept[0]}장인"
+        return f"{self.sender}인"
 
     @property
     def us(self):
@@ -273,14 +296,15 @@ def new_case_form(r, form, city=None, year=None, org=None):
     lo, hi = YEARS[form]
     if form == "agency1990":
         org = org or new_org(r, form, city)
-        abbr = dict(UNIT)[org.split(" ")[-1]]
-        dept = (abbr, org)
+        abbr, sec = next((a, s) for u, a, s in UNIT if u == org.split(" ")[-1])
+        dept = (abbr, sec)  # (문서번호 약칭, 서명란 꼬리의 과)
         title = case[1] + (" 통보" if r.random() < 0.4 and not case[1].endswith("통보") else "")
-        classno = r.choice(["1420", "2231", "3015", "7110"])
+        classno = r.choice(CLASSNO_AGENCY)
     else:
         org = org or new_org(r, form, city)
         dept = ("", r.choice(DEPT2000))
-        title = case[1] + (" 알림" if r.random() < 0.3 and not case[1].endswith("통보") else "")
+        # 이미 '통보'·'알림'으로 끝나는 제목에는 '알림'을 덧붙이지 않는다 ('… 결과 통보 알림' 막기)
+        title = case[1] + (" 알림" if r.random() < 0.3 and not case[1].endswith(("통보", "알림")) else "")
         classno = ""
     return Case(city=city, dept=dept, case=case, company=company, rep=rep,
                 year=year or r.randint(lo, hi), month=r.randint(1, 12), day=r.randint(1, 28),
@@ -372,7 +396,7 @@ def sign_block(p, c, r, top=2420):
     else:  # 기관 이름이 길다 — 글자 사이를 좁히고 가운데로
         n = len(c.sender.replace(" ", ""))
         xe = p.spaced((W // 2 - n * 50, top), c.sender, 84, letter_gap=14)
-        p.seal((min(xe + 170, W - 170), top + 40), 220, c.sender.split(" ")[-1] + "인")
+        p.seal((min(xe + 170, W - 170), top + 40), 220, c.seal_text, per_col=3 if len(c.seal_text) > 4 else 2)
     fy = top + 380
     p.line((150, fy), (W - 150, fy), 2)
     for i, role in enumerate(["기안자", "검토자", "결재권자"]):

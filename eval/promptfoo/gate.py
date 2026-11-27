@@ -21,6 +21,7 @@
 종료 코드: 0 모두 통과, 1 기준을 어긴 후보가 있음(또는 --expect-stored 불일치), 2 입력 문제(기준 후보 없음·단가 모름 등)
 """
 import argparse
+import contextlib
 import json
 import math
 import re
@@ -134,11 +135,32 @@ def _recipient_fixer(ocrs):
     return fix
 
 
+@contextlib.contextmanager
+def graph_schema(vol):
+    """새 양식 합성 철(agency1990·draft2000)이면 app/graph의 칸 정의를 그 철 양식 것으로 잠시 바꾼다 (merge·validate가
+    모듈 SCHEMA를 읽는다 — 운영 코드는 그대로). 김해 철(실제 철·form 없는 옛 합성 철)은 바꾸지 않는다"""
+    if common.form_of(vol) == common.forms.DEFAULT_FORM:
+        yield
+        return
+    old = graph.SCHEMA
+    graph.SCHEMA = common.schema_of(vol)
+    try:
+        yield
+    finally:
+        graph.SCHEMA = old
+
+
+def empty_of(schema):
+    return {f["name"]: {"value": "", "confidence": 0.0} for f in fields.prompt_fields(schema)}
+
+
 def assemble(data, b_of=None):
     """{vol: (저장 문서, {doc_id: OCR})} → ({doc_id: 문서}, {vol: [문서]}).
-    기준(저장 b, --expect-stored)과 후보가 같은 길: schema_replay.replay + 수신을 b로 다시 보정"""
-    by_vol = {vol: replay(graph, stored, b_of=b_of, recipient_of=_recipient_fixer(ocrs))
-              for vol, (stored, ocrs) in data.items()}
+    기준(저장 b, --expect-stored)과 후보가 같은 길: schema_replay.replay + 수신을 b로 다시 보정. 철마다 그 양식의 칸 정의로"""
+    by_vol = {}
+    for vol, (stored, ocrs) in data.items():
+        with graph_schema(vol):
+            by_vol[vol] = replay(graph, stored, b_of=b_of, recipient_of=_recipient_fixer(ocrs))
     return {x["doc_id"]: x for ds in by_vol.values() for x in ds}, by_vol
 
 
@@ -149,14 +171,15 @@ def rebuild(results, data):
     def b_of(d):
         nonlocal errors
         out = response_of(results.get(d["doc_id"]))
+        schema = common.schema_of(d["vol"]) if "vol" in d else SCHEMA  # 철 양식의 칸 정의 (#139)
         try:
             if out is None:
                 raise ValueError("응답 없음")
             # 운영과 같은 판정 (https://github.com/reddol18/docflow/issues/27): 틀린 칸은 빈 값, JSON 객체가 아니면 읽기 실패
-            return dict(fields.validate_extract(SCHEMA, out))
+            return dict(fields.validate_extract(schema, out))
         except (ValueError, TypeError):
             errors += 1
-            return json.loads(json.dumps(EMPTY))
+            return empty_of(schema)
 
     docs, by_vol = assemble(data, b_of)
     return docs, by_vol, errors
