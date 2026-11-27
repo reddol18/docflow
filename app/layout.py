@@ -294,24 +294,31 @@ def value_x0(row, rx):
 
 
 TITLE_ROW = re.compile(r"^\s*\[?\s*(제\W*목|경\W*유)")  # "제'목"·"제 목"도
-TITLE_JE = re.compile(r"^\s*\[?\s*제\W*$")  # 항목명 '제목'이 '제' 한 글자로만 읽힌 상자 (항목명 칸에 있을 때만 제목 줄로 본다)
+# 항목명 '제목'이 '제' 한 글자로만 읽힌 상자 ('제', '제 가상사업 승인'처럼 값과 한 상자). 상자가 값 칸 왼쪽(항목명 자리)에서
+# 시작할 때만 제목 줄로 본다 — 값 칸에서 따로 읽힌 '제 일가상' 조각은 아님 (title_label)
+TITLE_JE = re.compile(r"^\s*\[?\s*제(\W*$|\s+\S)")
 # 제목·본문 줄 (항목명이 안 읽혀도): 공문 제목 끝말로 끝나거나, '1.' 같은 본문 번호로 시작하거나, 서술문 끝말이 있는 줄.
 # 수신 값(주소·상호·'대표')은 이렇게 끝나지 않는다 (https://github.com/reddol18/docflow/issues/1 사람 표본 회귀)
 TITLE_END = re.compile(r"(통\s*보|교\s*부|알\s*림|요\s*청|회\s*신|제\s*출|결\s*과|신\s*청|안\s*내|보\s*고|승\s*인|허\s*가|"
                        r"반\s*환|송\s*부|통\s*지|의\s*뢰|처\s*리|개\s*최)\s*[\])）.]*\s*$")
 # 상호 표지 — 이런 줄은 '…처리'·'…개최'로 끝나도 제목으로 보지 않는다 ('(주)가상폐기물처리').
-# '건설'·'산업'·'공사' 같은 낱말은 제목에도 흔해('주택건설 사업 승인') 넣지 않는다.
-# 낱말 하나뿐인 줄('가상폐기물처리')도 제목으로 보지 않는다
-COMPANY = re.compile(r"\(\s*[주유합]\s*\)|[㈜㈲]|주식회사|유한회사|대\s*표")
+# '건설'·'산업'·'공사' 같은 낱말은 제목에도 흔해('주택건설 사업 승인') 넣지 않는다. '대표'는 줄 끝일 때만 ('대표자 변경 신청'은 제목)
+COMPANY = re.compile(r"\(\s*[주유합]\s*\)|[㈜㈲]|주식회사|유한회사|대\s*표\W*$")
 BODY_ROW = re.compile(r"^\s*(\d{1,2}|[가나다라마바사아자차카타파하])\s*[.)]\s*[가-힣]|"
                       r"(습\s*니\s*다|바\s*랍\s*니\s*다|하\s*오\s*니|하\s*여\s*야)")
 
 
 def title_or_body(text):
-    """수신 다음 줄이 제목·본문으로 보이나 (이어 붙이지 않는다). 제목 끝말은 낱말 둘 이상이고 상호 표지가 없는 줄에만"""
+    """수신 다음 줄이 제목·본문으로 보이나 (이어 붙이지 않는다). 제목 끝말은 상호 표지가 없는 줄에만"""
     if TITLE_ROW.match(text) or BODY_ROW.search(text):
         return True
-    return bool(TITLE_END.search(text)) and len(text.split()) >= 2 and not COMPANY.search(text)
+    return bool(TITLE_END.search(text)) and not COMPANY.search(text)
+
+
+def title_label(row, x0, page_w):
+    """줄이 제목·경유 항목명으로 시작하나. 한 글자 '제' 상자(TITLE_JE)는 값 칸(x0) 왼쪽 항목명 자리에서 시작할 때만"""
+    head = " ".join(it["text"] for it in row[:2])
+    return bool(TITLE_ROW.match(head) or (TITLE_JE.match(row[0]["text"]) and row[0]["box"][0] < x0 - 0.02 * page_w))
 
 
 def continuation(rows, i, x0, page_w, max_rows=3):
@@ -319,9 +326,8 @@ def continuation(rows, i, x0, page_w, max_rows=3):
     줄 맨 앞 '참조' 항목명은 건너뛴다. 제목·경유 줄이나 제목·본문으로 보이는 줄(title_or_body)이 나오면 멈춘다."""
     out = []
     for row in rows[i + 1:i + 1 + max_rows]:
-        head = " ".join(it["text"] for it in row[:2])
-        if TITLE_ROW.match(head) or (TITLE_JE.match(row[0]["text"]) and row[0]["box"][2] < x0 - 0.01 * page_w):
-            break  # 제목 항목명 (한 글자 '제'는 값 칸 왼쪽 항목명 자리일 때만 — 값 칸의 '제 일산업' 조각은 아님)
+        if title_label(row, x0, page_w):
+            break
         cols = [it for it in row if it["box"][0] >= x0 - 0.02 * page_w]
         if not cols or cols[0]["box"][0] > x0 + 0.1 * page_w:
             continue  # 결재란만 있는 줄
@@ -493,7 +499,7 @@ def _next_rows(rows, i, vx0, page_w, h, max_rows, title):
         if len(out) >= max_rows:
             break
         head = " ".join(it["text"] for it in row[:2])
-        if TITLE_ROW.match(head) or (title and LABEL_ROW.match(head)):
+        if title_label(row, vx0, page_w) or (title and LABEL_ROW.match(head)):
             break
         cols = [it for it in row if it["box"][0] >= vx0 - 0.03 * page_w]
         if not cols or cols[0]["box"][0] > vx0 + 0.1 * page_w:
@@ -613,10 +619,9 @@ def strip_approval_tail(val):
 
 
 def _lot_digit(words, i):
-    """words[i](숫자 한 글자)가 번지 일부로 보이나 — 앞 낱말이 리·동·가·로·길·산으로 끝나거나 뒤 낱말이 번지·번·호로 시작"""
+    """words[i](숫자 한 글자)가 번지 일부로 보이나 — 앞 낱말이 두 글자 넘는 리·동·가·로·길 꼴이고 숫자가 마지막 낱말이 아님"""
     prev = words[i - 1] if i > 0 else ""
-    nxt = words[i + 1] if i + 1 < len(words) else ""
-    return bool(re.search(r"[리동가로길산]$", prev) or re.match(r"번|호", nxt))
+    return i + 1 < len(words) and bool(re.fullmatch(r"[가-힣\d]+[리동가로길]", prev))
 
 
 def clean_rule(val, keep_lot=False):
@@ -631,7 +636,7 @@ def clean_rule(val, keep_lot=False):
         if re.fullmatch(r"[^가-힣A-Za-z]", w) and not (keep_lot and w.isdigit() and _lot_digit(words, i)):
             continue
         keep.append(w)
-    if len(keep) > 1 and re.fullmatch(r"[가-힣]", keep[0]):
+    if len(keep) > 1 and re.fullmatch(r"[가-힣A-Za-z]", keep[0]):
         keep = keep[1:]
     return " ".join(keep)
 
@@ -653,9 +658,10 @@ def _in_order(val, rule):
     return True
 
 
-# 규칙 값 뒤에 이어 붙이지 않는 낱말 (결재·처리란 글자, 다른 항목명). 낱말 머리에서 본다 — '가상담당관'처럼 이름 속 글자는 그대로
-TAIL_JUNK = re.compile(r"(취\s*급|보\s*존|공\s*개\s*여|선\s*결|전\s*결|접\s*수|처\s*리\s*과|결\s*재|시\s*행|기\s*안|협\s*조|경\s*유|"
-                       r"참\s*조|심\s*사|담\s*당\s*자|일\s*자|문\s*서\s*번|번\s*호|전\s*화|우\s*\d)")
+# 규칙 값 뒤에 이어 붙이지 않는 낱말 (결재·처리란 글자, 다른 항목명). 낱말 전체가 이것(뒤에 ':'·숫자만 붙음)일 때만 —
+# '일자리경제과'·'시행사'·'심사평가원'·'보존과'처럼 이름 속 글자는 그대로
+TAIL_JUNK = re.compile(r"(취급|보존|보존기간|공개여부|선결|전결|접수|접수번호|처리과|결재|시행|시행일자|기안|기안자|협조|경유|"
+                       r"참조|심사|심사자|담당자|일자|문서번호|번호|전화|우)[:：]?[\d.\-~()]*")
 
 
 def merge_with_rule(val, rule):
@@ -687,7 +693,7 @@ def merge_with_rule(val, rule):
     tail = rule[end:]
     words = tail.split()
     for j, w in enumerate(words):  # 뒤에 붙일 부분은 결재·처리란 글자·항목명 낱말에서 끊는다 ('… 대표 접수 2001.1.2')
-        if TAIL_JUNK.match(w):
+        if TAIL_JUNK.fullmatch(w):
             tail = tail[:len(tail) - len(tail.lstrip())] + " ".join(words[:j])
             break
     if norm(tail):
@@ -737,18 +743,24 @@ def fix_recipient(d, val):
         why.append("결재란")
     raw = rule_recipient(d)
     rule = clean_rule(raw)  # 견주기용
-    nv, nr = norm(out), norm(rule)
-    # 가운데 결재란 낱말('가상도지사 국장 가상담당관')을 뺀 LLM 값
+    # 가운데 결재란 낱말('가상도지사 국장 가상담당관')을 뺀 LLM 값. 견주기(길이·같음·앞부분)는 모두 이 값으로
     core = " ".join(w for w in out.split() if not APPROVAL_WORD.fullmatch(w))
-    office = ref_office(d)
     core = core or out  # 값이 결재란 낱말뿐('과장')이면 그 낱말로 견준다 — 빈 값은 아무 규칙 값에나 '차례대로 들어 있음'이 되므로
+    nv, nr = norm(core), norm(rule)
+    office = ref_office(d)
+    stripped = out
     if _usable_rule(rule) and nr != nv and (
             (len(nr) > len(nv) and _in_order(core, rule))
             or (had_stop and len(nr) >= len(nv) and nr[:2] == nv[:2] and _overlap(core, rule) >= OVERLAP_MIN)):
         # 규칙 값이 LLM 값 + 참조 부서장뿐이면 '참조'로 센다 (부서장 줄이 규칙 값에 이어 붙은 것)
         tag = "참조" if office and nr == nv + norm(office) else ("잘림" if nr.startswith(nv) else "규칙")
         out = merge_with_rule(core, clean_rule(raw, keep_lot=True))  # 채울 때는 번지 숫자를 남긴 값에서
-        why.append(tag)
+        if norm(out) != nv:  # 붙일 부분이 다 끊겨 LLM 값 그대로면 규칙 이름을 남기지 않는다
+            why.append(tag)
+    elif _usable_rule(rule) and nr == nv:
+        out = core  # 규칙 값(결재란 낱말 없음)과 같으면 가운데 결재란 낱말만 뗀다
+    if core != stripped and out != stripped and "결재란" not in why:  # 가운데 결재란 낱말을 뗐다
+        why.insert(0, "결재란")
     if office and norm(office) not in norm(out):
         out = f"{out} {office}"
         why.append("참조")

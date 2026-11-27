@@ -165,7 +165,7 @@ def test_approval_word_needs_overlap_with_rule():
     d = doc([(800, [(200, "수신", 160), (450, "가상도지사", 300), (1300, "국장", 120)]),
              (880, [(450, "가상기획담당관", 300)])])
     assert layout.fix_recipient(d, "가상도지사 국장") == ("가상도지사 가상기획담당관", "결재란·잘림")
-    assert layout.fix_recipient(d, "가상도지사 국장 가상기획") == ("가상도지사 가상기획담당관", "규칙")
+    assert layout.fix_recipient(d, "가상도지사 국장 가상기획") == ("가상도지사 가상기획담당관", "결재란·잘림")
 
 
 def test_company_line_not_mistaken_for_body_or_title():
@@ -175,8 +175,43 @@ def test_company_line_not_mistaken_for_body_or_title():
     assert layout.rule_recipient(d) == "가상시 가상동 3-4 주)가상산업 대표"
     d = doc([addr, (880, [(450, "(주)가상 폐기물처리", 400)])])
     assert layout.rule_recipient(d) == "가상시 가상동 3-4 (주)가상 폐기물처리"
-    assert not layout.title_or_body("가상폐기물처리")  # 낱말 하나뿐인 상호
     assert layout.title_or_body("가. 가상 시설 현황") and layout.title_or_body("가상 시설 정비 결과 보고")
+    # 상호 표지가 없으면 낱말 하나뿐인 제목도, 줄 가운데 '대표'가 있는 제목도 제목
+    assert layout.title_or_body("가상공사계획승인신청") and layout.title_or_body("가상상사 대표자 변경 신청")
+    assert not layout.title_or_body("(주)가상폐기물처리") and not layout.title_or_body("가상정밀 대표")
+
+
+def test_one_char_title_label_with_text_in_one_box():
+    """'제 가상사업 승인'이 항목명 자리에서 시작하는 한 상자로 읽혀도 제목 줄로 보고 이어 붙이지 않는다"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상시 가상동 7-1", 400)]), (880, [(200, "제 가상사업 승인 알림판", 900)]),
+             (960, [(450, "가상 둘째 줄", 400)])])  # 제목 둘째 줄 (멈추지 않으면 이 줄이 붙는다)
+    assert layout.rule_recipient(d) == "가상시 가상동 7-1"
+
+
+def test_middle_approval_word_dropped_when_rule_agrees():
+    """LLM 값 가운데 결재란 낱말 — 규칙 값과 나머지가 같으면 그 낱말만 뗀다 (길이·같음 판정은 뗀 값으로)"""
+    d = doc([(800, [(200, "수신", 160), (450, "가상도지사", 300), (1300, "국장", 120)]),
+             (880, [(450, "가상기획담당관", 300)])])
+    assert layout.fix_recipient(d, "가상도지사 국장 가상기획담당관") == ("가상도지사 가상기획담당관", "결재란")
+
+
+def test_tail_junk_only_whole_words():
+    """'일자리경제과'·'시행사'처럼 이름 앞머리가 같은 낱말은 끊지 않는다. 다 끊겨 LLM 값 그대로면 규칙 이름도 없음"""
+    addr = (800, [(200, "수신", 160), (450, "가상시 가상동 8-9", 400)])
+    d = doc([addr, (880, [(450, "가상시청 일자리경제과", 600)])])
+    assert layout.fix_recipient(d, "가상시 가상동 8-9") == ("가상시 가상동 8-9 가상시청 일자리경제과", "잘림")
+    d = doc([addr, (880, [(450, "가상건설 시행사 대표", 600)])])
+    assert layout.fix_recipient(d, "가상시 가상동 8-9")[0] == "가상시 가상동 8-9 가상건설 시행사 대표"
+    d = doc([addr, (880, [(450, "시행 2001.1.2", 300)])])
+    assert layout.fix_recipient(d, "가상시 가상동 8-9") == ("가상시 가상동 8-9", "")
+
+
+def test_lot_digit_needs_area_word_and_not_last():
+    f = layout.clean_rule
+    assert f("가상리 5 가상농원", keep_lot=True) == "가상리 5 가상농원"
+    assert f("가상시장 1 가상민원과장", keep_lot=True) == "가상시장 가상민원과장"  # 앞 낱말이 리·동 꼴이 아님
+    assert f("가상농원 가상리 5", keep_lot=True) == "가상농원 가상리"  # 마지막 낱말
+    assert f("A 가상상사 대표") == "가상상사 대표"  # 맨 앞 한 글자 조각 (영문도)
 
 
 def test_lot_digit_kept_when_filling():

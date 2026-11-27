@@ -82,11 +82,10 @@ def find_image(root, doc_id):
 
 def make_client(base_url):
     """이 PC Ollama 클라이언트. trust_env=False — HTTP(S)_PROXY·ALL_PROXY 환경 변수가 127.0.0.1 요청을 밖(프록시)으로 돌리지 못하게"""
-    import httpx  # noqa: PLC0415
-    from openai import OpenAI  # noqa: PLC0415
+    from openai import DefaultHttpxClient, OpenAI  # noqa: PLC0415
 
     return OpenAI(base_url=base_url, api_key="ollama", timeout=600, max_retries=0,
-                  http_client=httpx.Client(trust_env=False, timeout=600))
+                  http_client=DefaultHttpxClient(trust_env=False, timeout=600))
 
 
 def main(argv=None):

@@ -56,6 +56,19 @@ def test_recipient_with_continuation_and_ref_office():
     assert box[3] < 1200  # 제목 줄은 넣지 않는다
 
 
+def test_recipient_box_stops_at_one_char_title_label():
+    """제목 항목명이 '제' 한 글자로 읽혀도(따로 또는 값과 한 상자) 수신 상자는 제목 줄 앞에서 멈춘다 — 값 칸의 '제 …' 조각은 이어감"""
+    for title_row in [(880, [(200, "제", 60), (450, "가상 사업 허가", 500)]),
+                      (880, [(200, "제 가상사업 승인", 700)])]:
+        d = doc([(800, [(200, "수신", 160), (450, "가상시 나라동 1-2", 500)]), title_row], [])
+        box, src, _ = layout.line_box(d, "recipient")
+        assert src == "head" and inside(box, 700, 825) and box[3] < 880
+    d = doc([(800, [(200, "수신", 160), (450, "가상시 나라동 1-2", 500)]), (880, [(450, "제", 50), (520, "일가상 대표", 300)])],
+            [(1200, [(200, "제목", 160), (450, "가상 허가 통보", 500)])])
+    box, _, _ = layout.line_box(d, "recipient")
+    assert inside(box, 600, 905)
+
+
 def test_title_single_line_stops_before_body():
     d = doc([(800, [(200, "수신", 160), (450, "가상상사 대표", 400)])],
             [(1200, [(200, "제목", 160), (450, "가상 허가 통보", 500)]),
