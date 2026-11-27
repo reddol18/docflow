@@ -219,7 +219,6 @@ def test_work_outside_repo(tw):
 
 # ---------- 코드 리뷰 2차 (https://github.com/reddol18/docflow/issues/139) ----------
 
-@pytest.mark.skipif(not (ROOT.parent / "scripts" / "rescore.py").is_file(), reason="PoC rescore.py 없음")
 def test_mix_work_gate_score_end_to_end(tw, tmp_path, monkeypatch):
     """섞인 철(김해·agency1990·draft2000) work로 하네스 채점이 끝까지 돈다: to_work → gate.rebuild(후보 응답) → score.metrics.
     draft2000 문서는 최종 칸에 serial이 없고(규칙 없음) 손글씨 표시(serial·date) 집계에서 빠진다 — 4칸 채점에는 든다"""
@@ -233,8 +232,8 @@ def test_mix_work_gate_score_end_to_end(tw, tmp_path, monkeypatch):
     monkeypatch.setenv("DOCFLOW_EVAL_WORK", str(work))
     monkeypatch.delenv("DOCFLOW_EVAL_VOLS", raising=False)
     before = list(sys.path)
-    # common이 이미 불려 있으면 path를 다시 넣지 않는다 — gate.metrics가 부르는 score(eval/)·rescore(PoC scripts/)
-    for p in (ROOT.parent / "scripts", ROOT / "eval" / "synth", ROOT / "eval"):
+    # common이 이미 불려 있으면 path를 다시 넣지 않는다 — gate.metrics가 부르는 score·scoring(eval/)
+    for p in (ROOT / "eval" / "synth", ROOT / "eval"):
         monkeypatch.syspath_prepend(str(p))
     spec = importlib.util.spec_from_file_location("e2e_gate", ROOT / "eval" / "promptfoo" / "gate.py")
     gate = importlib.util.module_from_spec(spec)

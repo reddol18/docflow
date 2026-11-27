@@ -7,8 +7,8 @@
 promptfoo가 문서마다 Python을 새로 띄우므로 openai·DB·그래프 모듈은 불러오지 않는다 (app.fields·app.layout만)."""
 import common
 from prompts import SCHEMA
-from rescore import ok_field
 from score import FIELDS
+from scoring import ok_field
 
 from app import fields, layout
 

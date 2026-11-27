@@ -6,7 +6,7 @@ https://github.com/reddol18/docflow/issues/1 조건 1.
   text   운영과 같음 (텍스트만)
   image  같은 메시지 + 지시문 끝에 이미지 안내 한 단락 + user에 머리부 이미지 (수신 줄 위 ~ 제목 줄 아래, 쪽 너비 전체 —
          결재란도 보이게. 수신·제목 줄은 layout.line_box, 못 찾으면 쪽 위 graph.HEAD_RATIOS[저장된 머리부 비율]까지)
-수신 값은 운영처럼 layout.fix_recipient를 거친 값과 거치기 전 값을 함께 센다 (정답 = 확정 정답, rescore.ok_field).
+수신 값은 운영처럼 layout.fix_recipient를 거친 값과 거치기 전 값을 함께 센다 (정답 = 확정 정답, scoring.ok_field).
 AI Hub 자료는 이 PC 밖으로 보내지 않는다: 주소는 127.0.0.1만 받는다. 결과(값 포함)는 저장소 밖 --out에만 쓰고 화면에는 수만 찍는다.
 
 실행 (doc_platform 폴더, Ollama를 127.0.0.1:11434로 켠 뒤):
@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent / "promptfoo"))  # python -I: 하네스 공통 (데이터 위치·정답)
 import common  # noqa: E402
 import cv2  # noqa: E402
-from rescore import ok_field  # noqa: E402  (common이 records_poc/scripts를 경로에 넣는다)
+from scoring import ok_field  # noqa: E402  (common이 eval/을 경로에 넣는다)
 
 from app import fields, layout, llm, ocr  # noqa: E402
 

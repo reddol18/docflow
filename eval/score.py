@@ -1,7 +1,11 @@
-"""플랫폼 결과(/volumes/{vol}/documents JSON)를 PoC 확정 정답(work/gt/review.csv)으로 채점한다. LLM은 쓰지 않는다.
+"""플랫폼 결과(/volumes/{vol}/documents JSON)를 정답 CSV로 채점한다. LLM은 쓰지 않는다.
 
-실행 (records_poc 폴더에서): .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/score.py work/platform/*.json [--detail]
-채점 규칙은 PoC scripts/rescore.py를 그대로 쓴다 (정규화, '?' 와일드카드, 일련번호 빈칸, 날짜 YYYY-MM).
+실행 (records_poc 폴더에서): .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/score.py work/platform/*.json
+  [--gt 정답.csv ...] [--detail]
+  --gt  정답 CSV (PoC 확정 정답 review.csv 또는 합성 철 안의 gt.csv — 여럿 가능). 저장소 밖에 둔다.
+        안 주면 결과 파일 옆 work 폴더의 gt/review.csv (<work>/platform/<철>.json → <work>/gt/review.csv)
+채점 규칙은 eval/scoring.py (PoC scripts/rescore.py에서 옮김 — 정규화, '?' 와일드카드, 일련번호 빈칸, 날짜 YYYY-MM,
+https://github.com/reddol18/docflow/issues/8 조건 3). 저장소 밖 PoC 폴더 없이 돈다.
 결과 JSON에 들어 있는 철만 채점한다.
   경계      확인 열에 '경계'가 있는 쪽: 시작 쪽 판정의 재현율·정밀도
   4칸       정답 시작 쪽마다 B(GPT 텍스트 추출+수신 보정) / 최종(B+손글씨 판독) 정답률. 못 찾은 문서 = 틀림
@@ -15,12 +19,12 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "scripts"))
-sys.path.insert(1, str(Path(__file__).resolve().parents[1]))  # doc_platform (색인 스키마)
-sys.path.insert(2, str(Path(__file__).resolve().parent / "synth"))  # forms.py (합성 양식 → 칸 정의 파일)
+HERE = Path(__file__).resolve().parent
+for _i, _p in enumerate((HERE, HERE.parent, HERE / "synth")):  # eval(scoring), doc_platform(색인 스키마), forms.py(합성 양식)
+    if str(_p) not in sys.path:
+        sys.path.insert(_i, str(_p))
 import forms  # noqa: E402
-from rescore import gt_serial, load_gt, match, ok_field, pct, pdate  # noqa: E402
+from scoring import default_gt, gt_serial, load_gt, match, ok_field, pct, pdate  # noqa: E402
 
 from app import fields  # noqa: E402
 
@@ -78,11 +82,12 @@ def b_val(d, f):
     return d["b"][f]["value"]
 
 
-def metrics(docs, gt=None, form_of=None):
-    """docs = {doc_id: 문서 결과}. 결과에 든 철만 채점. 반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다.
+def metrics(docs, gt, form_of=None):
+    """docs = {doc_id: 문서 결과}, gt = scoring.load_gt(정답 CSV) 결과. 결과에 든 철만 채점.
+    반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다.
     form_of(철) → 양식 (없으면 모두 김해). 손글씨 표시(serial·date)는 그 칸 규칙이 있는 양식의 문서만 센다 (HAND_FORMS)"""
     form_of = form_of or (lambda v: forms.DEFAULT_FORM)
-    rows, idx, bnd, _ = gt or load_gt()
+    rows, idx, bnd, _ = gt
     vols = {d["vol"] for d in docs.values()}
     vol = lambda p: p.rsplit("-", 1)[0]  # noqa: E731
     idx = {p: r for p, r in idx.items() if vol(p) in vols}
@@ -124,17 +129,18 @@ def metrics(docs, gt=None, form_of=None):
     return m
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("results", nargs="+")
+    ap.add_argument("--gt", nargs="+", help="정답 CSV (저장소 밖). 안 주면 결과 파일 옆 work의 gt/review.csv")
     ap.add_argument("--detail", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     docs = {}
     for path in a.results:
         for d in json.loads(Path(path).read_text(encoding="utf-8")):
             docs[d["doc_id"]] = d
     by_form = manifest_forms(a.results)
-    m = metrics(docs, form_of=lambda v: by_form.get(v, forms.DEFAULT_FORM))
+    m = metrics(docs, load_gt(a.gt or default_gt(a.results)), form_of=lambda v: by_form.get(v, forms.DEFAULT_FORM))
     idx = m["_idx"]
     print(f"철 {m['vols']}\n정답 시작 쪽 {m['n_gt']}건, 경계 확인 쪽 {m['n_bnd']}쪽, 플랫폼 문서 {m['n_docs']}건\n")
     print(f"## 문서 시작 판별: recall {pct(*m['boundary']['recall'])}, precision {pct(*m['boundary']['precision'])}")

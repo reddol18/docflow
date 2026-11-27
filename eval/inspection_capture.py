@@ -7,16 +7,17 @@
 를 낸다. 출력은 수치만 — 문서 제목·값은 내지 않는다.
 
 실행 (records_poc 폴더에서): .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/inspection_capture.py work/platform/*.json
+  [--gt 정답.csv]
 """
+import argparse
 import json
 import sys
 from math import comb
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from rescore import load_gt, ok_field  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scoring import default_gt, load_gt, ok_field  # noqa: E402 — 채점 규칙 (eval/scoring.py, #8)
 
 from app.inspection import sample_size  # noqa: E402
 from app.review_input import EDITABLE as FIELDS  # noqa: E402
@@ -31,12 +32,16 @@ def capture(b, w, rate):
     return n, w * n / b, 1 - comb(b - w, n) / comb(b, n)
 
 
-def main(paths):
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results", nargs="+")
+    ap.add_argument("--gt", nargs="+", help="정답 CSV (저장소 밖). 안 주면 결과 파일 옆 work의 gt/review.csv")
+    a = ap.parse_args(argv)
     docs = {}
-    for path in paths:
+    for path in a.results:
         for d in json.loads(Path(path).read_text(encoding="utf-8")):
             docs[d["doc_id"]] = d
-    _, idx, _, _ = load_gt()
+    _, idx, _, _ = load_gt(a.gt or default_gt(a.results))
     vols = sorted({d["vol"] for d in docs.values()})
     per = []
     for v in vols:
@@ -59,4 +64,4 @@ def main(paths):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

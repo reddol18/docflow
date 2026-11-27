@@ -2,7 +2,8 @@
 
 규칙은 app/flags.py 하나를 그래프와 같이 쓴다. 표시는 저장된 값이 아니라 여기서 다시 계산한다.
 실행 (records_poc 폴더에서):
-  .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/flag_whatif.py work/platform/*.json [--sweep] [--loo] [--detail 이름]
+  .venv/Scripts/python.exe -I -X utf8 doc_platform/eval/flag_whatif.py work/platform/*.json [--gt 정답.csv]
+      [--sweep] [--loo] [--detail 이름]
 
   기본      이전 규칙(LEGACY)·기본값(DEFAULT)·전체 규칙을 칸별·문서별로 비교
   --sweep   확신도 기준값(이전보다 낮은 값, 0=끔 포함) × 일자 불일치 켬/끔 × 추가 규칙 조합의 파레토 경계,
@@ -18,15 +19,14 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-ROOT = HERE.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(HERE))
-from rescore import load_gt, ok_field  # noqa: E402
+sys.path.insert(0, str(HERE / "eval"))
+from scoring import default_gt, load_gt, ok_field  # noqa: E402 — 채점 규칙 (eval/scoring.py, #8)
 
 from app import fields as S  # noqa: E402 — 색인 스키마 (FIELD_SCHEMA, 없으면 김해 매핑)
 from app import flags as F  # noqa: E402
 
-# 정답(rescore)의 칸(김해 4칸) → 스키마 칸: 그래프(app/graph.py validate)와 같은 길로 칸 이름 대신 rule·ISAD(G)로 찾는다
+# 정답(scoring)의 칸(김해 4칸) → 스키마 칸: 그래프(app/graph.py validate)와 같은 길로 칸 이름 대신 rule·ISAD(G)로 찾는다
 # (https://github.com/reddol18/docflow/issues/72 — 칸 이름을 바꾼 김해 매핑에서도 같은 결과)
 SCHEMA = S.SCHEMA
 FIELDS = ["docno", "date", "recipient", "title"]
@@ -90,10 +90,11 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--loo", action="store_true")
     ap.add_argument("--detail", choices=["이전", "기본", "전체 규칙"])
+    ap.add_argument("--gt", nargs="+", help="정답 CSV (저장소 밖). 안 주면 결과 파일 옆 work의 gt/review.csv")
     a = ap.parse_args()
     vols = load(a.results)
     docs = {d["doc_id"]: d for ds in vols.values() for d in ds}
-    _, idx, _, _ = load_gt()
+    _, idx, _, _ = load_gt(a.gt or default_gt(a.results))
     idx = {p: r for p, r in idx.items() if p.rsplit("-", 1)[0] in vols}
 
     # 저장된 표시(이전 규칙으로 실행한 결과)와 LEGACY 재계산이 같은지 = 규칙을 옮기며 바뀐 것이 없는지

@@ -428,7 +428,7 @@ def test_require_synthetic_cli(tmp_path):
 
 
 def test_scoring_uses_work_gt(gate, monkeypatch):
-    """check.py·gate.py는 정답을 common.load_gt(work 폴더 기준)에서 읽는다 — rescore.load_gt(PoC 고정)가 아니라"""
+    """check.py·gate.py는 정답을 common.load_gt(work 폴더 기준)에서 읽는다 — PoC 고정 위치가 아니라"""
     import ast
     import types
     tree = ast.parse((PF / "check.py").read_text(encoding="utf-8"))
@@ -438,7 +438,7 @@ def test_scoring_uses_work_gt(gate, monkeypatch):
     assert "common.load_gt" in calls
     seen = {}
     fake = types.ModuleType("score")
-    fake.metrics = lambda docs, gt=None, form_of=None: seen.setdefault("gt", gt)
+    fake.metrics = lambda docs, gt, form_of=None: seen.setdefault("gt", gt)
     monkeypatch.setitem(sys.modules, "score", fake)
     monkeypatch.setattr(gate.common, "load_gt", lambda: "work-gt")
     gate.metrics({})

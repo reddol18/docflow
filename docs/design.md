@@ -336,6 +336,70 @@ https://github.com/reddol18/docflow/issues/139#issuecomment-7209367228).
 - 두 칸 정의 모두 https://github.com/reddol18/docflow/issues/9 설정 검증(`app/fields.load`)과 rule 이름 확인을 통과한다 (`tests/test_synth_forms.py`).
 - 외교 전보·행정처분 꼴은 https://github.com/reddol18/docflow/issues/14 로 미룸.
 
+### 다른 양식에서 경계·4칸이 버티나 — 합성 양식 두 개 (https://github.com/reddol18/docflow/issues/8, 2026-11-27 이 PC + OpenAI)
+결정: https://github.com/reddol18/docflow/issues/8#issuecomment-7211394401 . 실제 자료는 쓰지 않았다 (OpenAI에는 합성 쪽만).
+- **표본:** `eval/synth/bundle.py --form agency1990` 시드 801~804 (4철 25쪽, 정답 문서 17건), `--form draft2000` 시드 811~813
+  (3철 24쪽, 15건), 생성기 `synth-0.3`, 저장소 밖 `work_synth/c8/`. 비교 기준 김해 합성 = 기존 w47 철(시드 4701~4710, 10철 84쪽, 50건).
+- **처리:** 기존 합성 측정 길 그대로 — `eval/synth/to_work.py`(운영 OCR·운영 split·칸 위치) → `eval/promptfoo/run.ps1 -Work … -Providers '^gpt-4\.1-mini$'
+  -Prompts '^current$'`(운영 추출 모델·지시문, 철 양식의 칸 정의) → `eval/forms_compare.py`(gate.rebuild 조립 + `eval/score.py` metrics를 양식별로).
+  김해는 w47에 저장된 gpt-4.1-mini 응답(`results_gpt41mini.json`, 11-21)을 지금 코드로 다시 조립했다 (OpenAI 다시 안 부름).
+  합성 work는 손글씨 판독을 하지 않아 4칸 = 텍스트 추출(B)+수신 보정이다.
+- **합격 기준:** 양식마다 경계 재현율·정밀도·4칸 정답률이 김해 합성보다 10%p 넘게 떨어지지 않음.
+
+| 양식 | 철 / 쪽 / 정답 문서 | 경계 재현율 | 경계 정밀도 | 문서번호 | 시행일자 | 수신 | 제목 | 4칸 모두 정답 | 판정 |
+|---|---|---|---|---|---|---|---|---|---|
+| 김해 합성 (기준) | 10 / 84 / 50 | 98.0% (49/50) | 100% (49/49) | 86.0% | 88.0% | 92.0% | 90.0% | 74.0% | 기준 |
+| agency1990 | 4 / 25 / 17 | 88.2% (15/17) | 100% (15/15) | 88.2% | 88.2% | 88.2% | 88.2% | 88.2% | 통과 (최대 하락 경계 재현율 −9.8%p) |
+| draft2000 | 3 / 24 / 15 | 100% (15/15) | 100% (15/15) | 93.3% | 100% | 93.3% | 100% | 86.7% | 통과 (하락 없음) |
+
+- **조건 1 판정: 두 양식 모두 통과** → 조건 2(규칙이 틀린 양식) 대상 양식은 없다. 다만 agency1990 경계 재현율은 −9.8%p로 기준선 바로 안쪽이고
+  표본이 작다(1건 = 5.9%p). 놓친 2건: ① 낡게 하기가 강해 머리부 OCR이 거의 깨진 쪽(신호 0개), ② 시행일자 항목명이 OCR로 잘못 읽히고
+  (`시헬일자`) 기관명 줄이 운영 `layout.ORG`(…시·군·도·청·공사·공단으로 끝남)에 맞지 않아 문서번호 신호 하나만 남은 쪽 —
+  agency1990의 '…사업소·…연구원' 꼴 기관명을 ORG가 받지 않는 규칙 틈이다. 운영 코드는 이번에 바꾸지 않았다.
+  agency1990의 칸별 틀림은 모두 이 2건(문서를 못 찾아 4칸 다 틀림)이고 찾은 문서 15건은 4칸 모두 맞았다.
+- draft2000 틀림 2건: 수신 1, 문서번호 1 (다른 칸은 모두 맞음). 날짜 채점 규칙은 옛 규칙 그대로 1990~2005년 글자만 고쳐 읽는데
+  (ISO `YYYY-MM-DD`는 그대로 받음), 2007년 철도 모델이 ISO로 내 영향이 없었다.
+- **비용:** c8 추출 30문서 $0.0127 (gpt-4.1-mini, 22,940토큰). 김해는 저장 응답이라 0.
+
+**조건 2 — 규칙이 틀린 합성 쪽만 gpt-4.1-mini 비전** (`eval/forms_vision.py`, 운영 경로에 넣지 않음, 쪽 이미지 detail high).
+대상 = 위 실행에서 운영 split이 틀린 쪽(경계)과 4칸이 하나라도 틀린 정답 시작 쪽(칸). 떨어지는 양식이 없어 대상 양식은 없지만,
+규칙 틀림 쪽은 있어 세 양식 모두 쟀다. 경계는 '새 문서의 첫 쪽인가', 칸은 4칸을 읽게 하고 틀렸던 칸만 같은 채점 규칙(`eval/scoring.py`)으로 본다.
+
+| 양식 | 경계 틀린 쪽 → 비전 맞힘 | 칸 틀린 쪽 (틀린 칸) | 비전이 고친 칸 | 고친 쪽 (틀린 칸 모두) | 비전 4칸 모두 정답 | 비용 |
+|---|---|---|---|---|---|---|
+| 김해 | 1 → 1 | 13 (22) | 15/22 (문서번호 5/7, 시행일자 5/6, 수신 1/4, 제목 4/5) | 9/13 | 6/13 | $0.0281 |
+| agency1990 | 2 → 2 | 2 (8) ³ | 5/8 (문서번호 0/2, 시행일자 2/2, 수신 1/2, 제목 2/2) | 0/2 | 0/2 | $0.0079 |
+| draft2000 | 0 | 2 (2) | 1/2 (문서번호 1/1, 수신 0/1) | 1/2 | 1/2 | $0.0040 |
+| 합계 | 3 → 3 | 17 (32) | 21/32 | 10/17 | 7/17 | **$0.0400** (20회, 읽기 실패 0) |
+
+³ 경계를 놓쳐 문서가 없는 쪽 2건 (4칸 모두 틀림으로 셈).
+
+- **채택 판단: 지금은 운영에 넣지 않는다 (권고).** 경계는 3/3을 맞혔지만, 규칙이 놓친 시작 쪽은 표시 없이 지나가 어느 쪽을 비전에 보낼지
+  운영에서 알 수 없다 — 보내려면 시작 아님으로 본 쪽 전부를 보내야 하고, 그때 맞던 쪽을 비전이 뒤집는 비율(정밀도)은 이번에 재지 않았다
+  (틀린 쪽만 보냄). 쪽당 약 $0.002라 680쪽 철 전부면 한 번 처리 약 $1.4(지금 약 $0.35의 4배). 칸은 틀린 칸의 66%를 고치지만
+  수신(5/7 못 고침)이 약하고, 틀린 칸 위치를 아는 경우(검토 표시)에만 쓸 수 있다. 다시 볼 조건: 실제 자료에서 경계 재현율이 떨어지는 양식이
+  나오거나, 맞던 쪽을 포함한 표본으로 비전 정밀도를 잰 뒤.
+- **전체 비용 (#8):** 추출 $0.0127 + 비전 $0.0400 = **약 $0.053** (상한 $2).
+- **재현:** `uv run --no-project --with-requirements eval/synth/requirements.txt python -I eval/synth/bundle.py ..\work_synth\c8\bundles\agency1990
+  --seed 801 --docs 5 --level mix --form agency1990` (802·803 같은 꼴, 804는 `--docs 2`; draft2000은 811~813 `--docs 5`) →
+  `..\.venv\Scripts\python.exe -I -X utf8 eval/synth/to_work.py <bundles\양식> ..\work_synth\c8\work` →
+  `.\eval\promptfoo\run.ps1 -Work ..\work_synth\c8\work -Providers '^gpt-4\.1-mini$' -Prompts '^current$'` →
+  `python -I -X utf8 eval/forms_compare.py --work <work> --results <work>\promptfoo\results.json --out ..\work_synth\c8\out` →
+  `python -I -X utf8 eval/forms_vision.py --forms <forms_*.json>… --bundles <철 폴더 부모>… --gt <work>\gt\review.csv… --out ..\work_synth\c8\out`
+  (키는 환경변수 OPENAI_API_KEY를 그 실행 동안만).
+
+**조건 3 — 채점 규칙을 `eval/`로** (`eval/scoring.py`): PoC `scripts/rescore.py`의 `match`('?' 와일드카드)·`pdate`(날짜 YYYY-MM-DD/YYYY-MM)·
+`gt_serial`(일련번호 빈칸)·`ok_field`·`pct`·`load_gt`와 그것이 부르던 `gt_draft.norm_date`·`score_extract.norm`(정규화)을 동작 그대로 옮겼다.
+`eval/score.py`는 `--gt 정답.csv …`(여럿 가능 — 합성 철 안의 `gt.csv`도 바로)를 받고, 안 주면 결과 파일 옆 work의 `gt/review.csv`.
+실제 정답 CSV는 저장소 밖 그대로다. `eval/` 아래 다른 도구(하네스 `common`·`check`·`gate`, `flag_whatif`·`inspection_capture`·`grounding_measure`·
+`recipient_replay`·`recipient_vision`)도 같은 모듈을 쓰고 `records_poc/scripts`를 경로에 넣지 않는다.
+- **상위 폴더 없이 도는지 (측정):** `tests/test_scoring.py` — `records_poc/scripts`를 `sys.path`에서 빼고 PoC 모듈(rescore·gt_draft·score_extract·
+  hw_flags·hw_score) import를 막은 Python으로 `eval/score.py`를 끝까지 돌림(`--gt` 줌·안 줌 둘 다) → 통과. `eval/` 안 PoC import 0건도 시험한다.
+- **옛 규칙과 같은 점수인지 (이 PC 안, 수만):** 실제 7철 저장 결과(450문서, 정답 164건)를 같은 `metrics()`로 옛 함수·새 함수 각각 채점 →
+  모든 수가 같음(경계 85/86·85/85, B 50·101·75·145, 최종 105·129·75·145, 4칸 모두 41, 표시 없이 틀림 16, 일련번호·일자 표시 수 모두 같음),
+  틀린 쪽·표시 없이 틀린 쪽 목록도 같음. 함수 단위로 결과 값 × 정답 3,260쌍의 `ok_field`·`pdate`·`norm`과 정답 164건의 `gt_serial`도 다른 것 0.
+  위 "전체 680쪽" 표·#1 절의 저장 결과 수(수신 75, 문서번호 105, 시행일자 129, 제목 145, 4칸 41, 16건)와도 같다.
+
 ### 손글씨 칸 판독 모델 비교 (1997-0002 철 10건, 칸 20개, `eval/cell_variants.py`)
 처음엔 gpt-4o-mini(low)로 시작했는데 일련번호를 빈칸("도시 58430-")으로 답하면서 확신도는 1.0에 가까웠다.
 
