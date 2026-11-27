@@ -292,12 +292,22 @@ def value_x0(row, rx):
     return None
 
 
-TITLE_ROW = re.compile(r"^\s*\[?\s*(제\s*목|경\s*유)")
+TITLE_ROW = re.compile(r"^\s*\[?\s*(제\W*목|경\W*유|제\s*$|제\s+\S)")  # "제'목", 항목명이 '제' 한 글자로만 읽힌 줄
+# 제목·본문 줄 (항목명이 안 읽혀도): 공문 제목 끝말로 끝나거나, '1.' 같은 본문 번호로 시작하거나, 서술문 끝말이 있는 줄.
+# 수신 값(주소·상호·'대표')은 이렇게 끝나지 않는다 (https://github.com/reddol18/docflow/issues/1 사람 표본 회귀)
+TITLE_END = re.compile(r"(통\s*보|교\s*부|알\s*림|요\s*청|회\s*신|제\s*출|결\s*과|신\s*청|안\s*내|보\s*고|승\s*인|허\s*가|"
+                       r"반\s*환|송\s*부|통\s*지|의\s*뢰|처\s*리|개\s*최)\s*[\])）.]*\s*$")
+BODY_ROW = re.compile(r"^\s*(\d{1,2}|[가-하])\s*[.)]\s*[가-힣]|(습\s*니\s*다|바\s*랍\s*니\s*다|하\s*오\s*니|하\s*여\s*야)")
+
+
+def title_or_body(text):
+    """수신 다음 줄이 제목·본문으로 보이나 (이어 붙이지 않는다)"""
+    return bool(TITLE_ROW.match(text) or TITLE_END.search(text) or BODY_ROW.search(text))
 
 
 def continuation(rows, i, x0, page_w, max_rows=3):
     """수신 값이 다음 줄로 이어지면 이어 붙인다. 값 칸 x0 근처에서 시작하는 단어만 쓰고,
-    줄 맨 앞 '참조' 항목명은 건너뛴다. 제목·경유 줄이 나오면 멈춘다."""
+    줄 맨 앞 '참조' 항목명은 건너뛴다. 제목·경유 줄이나 제목·본문으로 보이는 줄(title_or_body)이 나오면 멈춘다."""
     out = []
     for row in rows[i + 1:i + 1 + max_rows]:
         head = " ".join(it["text"] for it in row[:2])
@@ -315,9 +325,19 @@ def continuation(rows, i, x0, page_w, max_rows=3):
                 break
             pieces.append(it["text"])
             last = it["box"][2]
+        if pieces and title_or_body(" ".join(pieces)):
+            break
         if pieces:
             out.append(" ".join(pieces))
     return out
+
+
+def join_lines(parts):
+    """이어지는 줄을 띄어쓰기로 잇되, 번지 '1119-'처럼 숫자 뒤 '-'로 끝난 줄은 다음 줄에 붙인다 ('1119-81')"""
+    s = ""
+    for p in parts:
+        s = s + p if re.search(r"\d\s*-$", s) else (f"{s} {p}" if s else p)
+    return s
 
 
 def rule_recipient(d):
@@ -333,7 +353,7 @@ def rule_recipient(d):
         if v and not re.match(r"처|내부\s*결재", v):
             x0 = value_x0(row, rx)
             more = continuation(rows, i, x0, page_w) if x0 is not None else []
-            v = " ".join([v] + more)
+            v = join_lines([v] + more)
         return v
     return ""
 
@@ -609,6 +629,41 @@ def _in_order(val, rule):
     return True
 
 
+def merge_with_rule(val, rule):
+    """규칙 값을 쓰되 LLM 값(val)과 겹치는 낱말은 LLM 글자·띄어쓰기 그대로 두고, 빠진 부분(앞·가운데·뒤)만 규칙 값 원문에서 채운다.
+    OCR 줄 나눔이 만든 띄어쓰기('1119- 81번지', '17번지(주)')가 LLM이 바로 읽은 값을 덮지 않게.
+    채운 부분은 원문에서 앞뒤가 붙어 있었으면 붙이고 띄어 있었으면 띄운다. val 낱말이 차례대로 다 안 맞으면 규칙 값 그대로"""
+    keep = [i for i, ch in enumerate(rule) if norm(ch)]  # 정규화 글자 k → 원문 위치
+    nr = "".join(norm(rule[i]) for i in keep)
+    if nr != norm(rule):  # '주식회사' 같은 여러 글자 치환이 있으면 위치를 못 맞춘다
+        return rule
+    parts, pos, end = [], 0, 0  # parts = [(글자, 앞에 붙임)], pos = 정규화 위치, end = 원문 위치
+    for w in val.split():
+        nw = norm(w)
+        if not nw:
+            continue
+        k = nr.find(nw, pos)
+        if k < 0:
+            return rule
+        start = keep[k]
+        while start > end and not rule[start - 1].isspace() and not norm(rule[start - 1]):
+            start -= 1  # 낱말 앞 괄호·따옴표('(주)'의 '(')는 LLM 낱말 쪽으로
+        gap = rule[end:start]
+        glue = False
+        if norm(gap):
+            parts.append((gap.strip(), bool(parts) and not gap[:1].isspace()))
+            glue = not gap[-1:].isspace()
+        parts.append((w, glue))
+        pos, end = k + len(nw), keep[k + len(nw) - 1] + 1
+    tail = rule[end:]
+    if norm(tail):
+        parts.append((tail.strip(), bool(parts) and not tail[:1].isspace()))
+    s = ""
+    for text, glue in parts:
+        s = s + text if glue or not s else f"{s} {text}"
+    return s
+
+
 def _usable_rule(rule):
     nr = norm(rule)
     return (bool(nr) and len(nr) <= RULE_MAX and not is_list_ref(rule) and not OTHER_LABEL.search(rule)
@@ -620,7 +675,8 @@ def fix_recipient(d, val):
       목록    '수신처 참조'면 쪽 아래 수신처 목록
       결재란  값 끝의 결재란 낱말('국장'·'실장'·'국' 등)을 뗌
       잘림·규칙  배치 규칙 값(rule_recipient, 결재란 낱말을 뗀 것)이 LLM 값을 차례대로 다 담고 더 길면 규칙 값을 쓴다
-              (잘림 = 규칙 값이 LLM 값으로 시작, 규칙 = 가운데·앞을 빠뜨림). LLM 값에 결재란 낱말이 있었으면 길이가 같아도
+              (잘림 = 규칙 값이 LLM 값으로 시작, 규칙 = 가운데·앞을 빠뜨림). LLM 값에 결재란 낱말이 있었으면 길이가 같아도.
+              LLM 값과 겹치는 낱말은 LLM 띄어쓰기 그대로 (merge_with_rule)
       참조    머리부 '참조' 부서장을 붙임"""
     val = val or ""
     if is_list_ref(val):
@@ -641,7 +697,7 @@ def fix_recipient(d, val):
             (len(nr) > len(nv) and _in_order(out, rule)) or (had_stop and len(nr) >= len(nv) and nr[:2] == nv[:2])):
         # 규칙 값이 LLM 값 + 참조 부서장뿐이면 '참조'로 센다 (부서장 줄이 규칙 값에 이어 붙은 것)
         tag = "참조" if office and nr == nv + norm(office) else ("잘림" if nr.startswith(nv) else "규칙")
-        out = rule
+        out = merge_with_rule(out, rule)
         why.append(tag)
     if office and norm(office) not in norm(out):
         out = f"{out} {office}"
