@@ -93,6 +93,9 @@ def pct(a, b):
 
 def default_gt(results):
     """정답 CSV를 안 줬을 때: 결과 파일(<work>/platform/<철>.json) 옆 work의 gt/review.csv. 결과가 여러 work에 걸치면 멈춘다"""
+    off = [x for x in results if Path(x).resolve().parent.name != "platform"]
+    if off:
+        raise SystemExit(f"결과 파일이 <work>/platform/ 아래가 아니다 ({len(off)}개) — --gt로 정답 CSV를 준다")
     gts = {Path(x).resolve().parent.parent / "gt" / "review.csv" for x in results}
     if len(gts) != 1:
         raise SystemExit(f"결과 파일이 work {len(gts)}곳에 걸친다 — --gt로 정답 CSV를 준다")

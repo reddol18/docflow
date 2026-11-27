@@ -10,7 +10,9 @@
 합성 쪽만 보낸다: 쪽 이미지는 meta.json synthetic=true이고 이름이 SYNTH로 시작하는 철 폴더에서만 읽는다 (아니면 멈춤).
 비용: 부르기 전에 상한 추정(쪽마다 이미지 2,500 + 글자 300 입력, 출력 200토큰 × app/llm.py PRICE)이 --max-usd를 넘으면 멈추고,
 실행 중 실제 사용량 누적이 넘어도 멈춘다. 키는 환경변수 OPENAI_API_KEY (화면·파일에 남기지 않는다).
-출력: 화면 = 수·비용만, <out>/vision_<모델>.json = 쪽별 판정·비전 값 (합성 값만).
+부르기 전에 모든 대상 쪽이 정답(경계 확인 쪽·시작 쪽)에 있는지 확인하고, 호출 실패는 그 쪽만 읽기 실패로 센다.
+실제 자료 경로(aihub_extracted, records_poc/work와 그 아래)를 --bundles·--gt로 주면 멈춘다 (eval/compare_common.reject_real_data).
+출력: 화면 = 수·비용만, <out>/vision_<모델>.json = 쪽별 판정·비전 값 (합성 값만). 호출마다 다시 써서 중간에 멈춰도 남는다.
 """
 import argparse
 import base64
@@ -25,6 +27,7 @@ APP_ROOT = HERE.parent
 for _p in (HERE, APP_ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+import compare_common as cc  # noqa: E402
 import scoring  # noqa: E402
 
 FIELDS = ("docno", "date", "recipient", "title")
@@ -102,6 +105,25 @@ def ask(client, model, img, prompt):
     return val, usd, {"in": u.prompt_tokens, "out": u.completion_tokens, "ms": int(1000 * (time.time() - t0))}
 
 
+def make_client(key, timeout=60):
+    """OpenAI 클라이언트. trust_env=False — HTTP(S)_PROXY·ALL_PROXY 환경 변수가 요청을 다른 곳(프록시)으로 돌리지 못하게
+    (eval/recipient_vision.py와 같다)"""
+    from openai import DefaultHttpxClient, OpenAI  # noqa: PLC0415
+
+    return OpenAI(api_key=key, timeout=timeout, max_retries=3,
+                  http_client=DefaultHttpxClient(trust_env=False, timeout=timeout))
+
+
+def missing_gt(ts, idx, bnd):
+    """정답에 없는 대상 쪽 — 경계 대상은 bnd(경계 확인 쪽), 칸 대상은 idx(정답 시작 쪽)에 있어야 판정할 수 있다"""
+    return [t["page"] for t in ts if t["page"] not in (bnd if t["kind"] == "boundary" else idx)]
+
+
+def save(path, model, rows, spent):
+    path.write_text(json.dumps({"model": model, "usd": spent, "summary": summarize(rows), "rows": rows},
+                               ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def judge(t, val, idx, bnd):
     if val is None:
         return {"read_fail": True}
@@ -128,6 +150,8 @@ def summarize(rows):
             else:
                 k["fields_pages"][1] += 1
                 k["fields_cells"][1] += len(r["fields"])
+                for f in r["fields"]:
+                    k["cells_by_field"].setdefault(f, [0, 0])[1] += 1
                 k["all4"][1] += 1
             continue
         if r["kind"] == "boundary":
@@ -160,10 +184,17 @@ def main(argv=None):
     out = Path(a.out).resolve()
     if out.is_relative_to(APP_ROOT):
         raise SystemExit("결과는 저장소 밖에 쓴다")
+    for p in a.bundles:
+        cc.reject_real_data(p, "--bundles")
+    for p in a.gt:
+        cc.reject_real_data(p, "--gt")
     dirs = synthetic_dirs(a.bundles)
     ts = targets(a.forms)
     imgs = [image_of(t["page"], dirs) for t in ts]  # 모두 합성 철인지 부르기 전에 확인
     _, idx, bnd, _ = scoring.load_gt(a.gt)
+    miss = missing_gt(ts, idx, bnd)  # 판정할 수 없는 쪽에 돈을 쓰지 않게 부르기 전에 확인
+    if miss:
+        raise SystemExit(f"정답에 없는 대상 쪽 {len(miss)}개 (경계는 '경계' 확인 쪽, 칸은 시작 쪽이어야): {miss[:5]}")
     est = estimate(len(ts), a.model)
     print(f"대상 {len(ts)}쪽 (경계 {sum(t['kind'] == 'boundary' for t in ts)}, 칸 {sum(t['kind'] == 'fields' for t in ts)}), "
           f"상한 추정 ${est:.4f} (상한 ${a.max_usd})")
@@ -172,22 +203,29 @@ def main(argv=None):
         return 2
     if a.dry_run:
         return 0
-    from openai import OpenAI  # noqa: PLC0415
-
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=60, max_retries=3)
-    rows, spent = [], 0.0
-    for t, img in zip(ts, imgs, strict=True):
-        if spent + estimate(1, a.model) > a.max_usd:
-            print(f"누적 ${spent:.4f} — 다음 호출이 상한을 넘을 수 있어 멈춘다", file=sys.stderr)
-            break
-        val, usd, use = ask(client, a.model, img, ASK_BOUNDARY if t["kind"] == "boundary" else ASK_FIELDS)
-        spent += usd
-        rows.append({**t, "usd": usd, "use": use, "judge": judge(t, val, idx, bnd)})
-    s = summarize(rows)
+    client = make_client(os.environ["OPENAI_API_KEY"])
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"vision_{a.model}.json").write_text(
-        json.dumps({"model": a.model, "usd": spent, "summary": s, "rows": rows}, ensure_ascii=False, indent=1),
-        encoding="utf-8")
+    dest = out / f"vision_{a.model}.json"
+    rows, spent = [], 0.0
+    try:  # 중간에 멈춰도(예외·Ctrl+C) 이미 낸 호출 결과와 누적 비용은 남긴다
+        for t, img in zip(ts, imgs, strict=True):
+            if spent + estimate(1, a.model) > a.max_usd:
+                print(f"누적 ${spent:.4f} — 다음 호출이 상한을 넘을 수 있어 멈춘다", file=sys.stderr)
+                break
+            err = None
+            try:
+                val, usd, use = ask(client, a.model, img, ASK_BOUNDARY if t["kind"] == "boundary" else ASK_FIELDS)
+            except Exception as e:  # noqa: BLE001 — 호출 실패(재시도 뒤)는 그 쪽만 읽기 실패로 세고 다음 쪽으로
+                val, usd, use, err = None, 0.0, {}, type(e).__name__
+            spent += usd
+            row = {**t, "usd": usd, "use": use, "judge": judge(t, val, idx, bnd)}
+            if err:
+                row["error"] = err  # 예외 종류만 (메시지에 요청 내용이 섞일 수 있어 남기지 않는다)
+            rows.append(row)
+            save(dest, a.model, rows, spent)
+    finally:
+        save(dest, a.model, rows, spent)
+    s = summarize(rows)
     for form, k in sorted(s.items()):
         print(f"{form}: 경계 맞힘 {k['boundary'][0]}/{k['boundary'][1]}, 칸 쪽 모두 고침 {k['fields_pages'][0]}/{k['fields_pages'][1]}, "
               f"틀린 칸 고침 {k['fields_cells'][0]}/{k['fields_cells'][1]} {k['cells_by_field']}, "

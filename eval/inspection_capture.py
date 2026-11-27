@@ -1,6 +1,7 @@
 """표시 없이 틀린 문서가 검사 표본에 얼마나 잡히나 (https://github.com/reddol18/docflow/issues/10). LLM 없음, 기준 없음(측정만).
 
-플랫폼 결과(/volumes/{vol}/documents JSON)를 PoC 확정 정답(work/gt/review.csv)으로 채점해(eval/score.py와 같은 규칙)
+플랫폼 결과(/volumes/{vol}/documents JSON)를 정답 CSV(저장소 밖 — --gt, 안 주면 결과 옆 work의 gt/review.csv)로
+채점해(채점 규칙은 eval/scoring.py, eval/score.py와 같음)
 철마다 표시 없는 문서 b건, 그중 4칸 중 하나라도 틀린 문서 w건을 세고, 표본 비율 p마다
   표본 수 n = ceil(b×p) (app/inspection.py sample_size와 같음)
   기대 포착 수 = w×n/b,  1건 이상 잡을 확률 = 1 − C(b−w, n)/C(b, n)  (비복원 무작위 추출, 초기하분포)

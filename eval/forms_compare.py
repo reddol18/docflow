@@ -6,7 +6,9 @@
 
 후보 응답으로 철을 다시 조립하는 길은 모델 비교 하네스(eval/promptfoo/gate.py rebuild)와 같고, 채점은 eval/score.py metrics()다
 (정답 = work 폴더 gt/review.csv, 철 양식 = synth_manifest.json). 이 도구가 더하는 것은 양식별로 나눠 세는 것과
-'규칙이 틀린 쪽' 목록(조건 2 비전 판별 대상)뿐이다. 합성 work만 받는다 (실제 자료 work는 멈춤).
+'규칙이 틀린 쪽' 목록(조건 2 비전 판별 대상)뿐이다. 합성 work만 받는다 (실제 자료 work·aihub_extracted 경로는 멈춤 —
+eval/compare_common.reject_real_data). 양식은 synth_manifest의 철 목록으로 나눠, 문서를 하나도 못 찾은 양식도 0으로 낸다.
+단가를 모르는 후보면 gate.py처럼 종료 코드 2 (로컬 모델은 결과 config의 apiBaseUrl로 0원).
 출력
   화면                 양식 × 경계 재현율·정밀도·4칸(B)·4칸 모두 정답 — 수만
   <out>/forms_<이름>.json  같은 수 + 틀린 쪽 목록 (합성 쪽 이름·틀린 칸 이름만, 값 없음)
@@ -24,6 +26,7 @@ APP_ROOT = HERE.parent
 for _p in (HERE / "promptfoo", HERE, HERE / "synth", APP_ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+import compare_common as cc  # noqa: E402
 
 
 def pct(pair):
@@ -32,16 +35,15 @@ def pct(pair):
 
 
 def by_form(gate, score, docs, gt):
-    """{양식: metrics} — 철 양식(manifest)별로 문서를 나눠 같은 metrics()로"""
+    """{양식: metrics} — 철 양식(synth_manifest의 철 목록)별로 정답·문서를 나눠 같은 metrics()로.
+    split 문서가 하나도 없는 양식도 그 철의 정답으로 채점해 0으로 남긴다 (표에서 빠지지 않게)"""
     out = {}
     forms_of = {}
-    for vol in gate.common.vols():
+    for vol in sorted(gate.common.synthetic_vols()):
         forms_of.setdefault(gate.common.form_of(vol), []).append(vol)
     for form, vols in sorted(forms_of.items()):
         sub = {k: d for k, d in docs.items() if d["vol"] in vols}
-        if not sub:
-            continue
-        out[form] = score.metrics(sub, gt, form_of=gate.common.form_of)
+        out[form] = score.metrics(sub, gt, form_of=gate.common.form_of, vols=vols)
     return out
 
 
@@ -76,23 +78,31 @@ def main(argv=None):
     work, out = Path(a.work).resolve(), Path(a.out).resolve()
     if out.is_relative_to(APP_ROOT) or work.is_relative_to(APP_ROOT):
         raise SystemExit("work·결과는 저장소 밖에 둔다")
+    cc.reject_real_data(work, "--work")
+    cc.reject_real_data(a.results, "--results")
     os.environ["DOCFLOW_EVAL_WORK"] = str(work)
     os.environ.pop("DOCFLOW_EVAL_VOLS", None)
     import gate  # noqa: PLC0415 — DOCFLOW_EVAL_WORK를 넣은 뒤 (common.WORK)
     import score  # noqa: PLC0415
 
+    if not gate.common.vols():
+        raise SystemExit(f"work에 철 결과가 없다 ({work / 'platform'}/*.json) — eval/synth/to_work.py로 만든 합성 work를 준다")
     bad = gate.common.non_synthetic()
-    if bad or not gate.common.vols():
+    if bad:
         raise SystemExit(f"합성 철이 아닌 철 {len(bad)}개 — 합성 work만 받는다")
-    rows, _, _ = gate.load_results(a.results)
+    rows, cfg, _ = gate.load_results(a.results)
     groups = gate.group(rows)
     res = groups.get((a.provider, a.prompt))
     if not res:
         raise SystemExit(f"결과에 후보 {a.provider}·{a.prompt}가 없다: {sorted(groups)}")
+    unknown = gate.unpriced(list(res.values()), cfg)  # gate.main과 같이 — 단가 모르는 원격 모델이면 채점 전에 멈춘다
+    if unknown:
+        print(f"단가를 모르는 모델: {unknown} — app/llm.py PRICE에 넣거나 로컬 모델이면 apiBaseUrl을 127.0.0.1로", file=sys.stderr)
+        return 2
     data = {v: gate.common.load_vol(v) for v in gate.common.vols()}
     docs, _, errors = gate.rebuild(res, data)
     gt = gate.common.load_gt()
-    cost = gate.cost_latency(res)
+    cost = gate.cost_latency(res, cfg)
     report = {"work": work.name, "provider": a.provider, "prompt": a.prompt, "read_errors": errors,
               "usd": cost["usd"], "n_calls": cost["n"], "forms": {}}
     print("| 양식 | 철 | 경계 확인 쪽 | 정답 문서 | 경계 재현율 | 경계 정밀도 | " + " | ".join(score.FIELDS) + " | 4칸 모두 |")

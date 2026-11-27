@@ -82,13 +82,14 @@ def b_val(d, f):
     return d["b"][f]["value"]
 
 
-def metrics(docs, gt, form_of=None):
+def metrics(docs, gt, form_of=None, vols=None):
     """docs = {doc_id: 문서 결과}, gt = scoring.load_gt(정답 CSV) 결과. 결과에 든 철만 채점.
+    vols를 주면 그 철들의 정답으로 채점한다 (문서가 하나도 없는 철도 — 못 찾은 문서 = 틀림).
     반환 dict의 (맞은 수, 전체) 쌍과 목록으로 화면·비교를 만든다.
     form_of(철) → 양식 (없으면 모두 김해). 손글씨 표시(serial·date)는 그 칸 규칙이 있는 양식의 문서만 센다 (HAND_FORMS)"""
     form_of = form_of or (lambda v: forms.DEFAULT_FORM)
     rows, idx, bnd, _ = gt
-    vols = {d["vol"] for d in docs.values()}
+    vols = set(vols) if vols is not None else {d["vol"] for d in docs.values()}
     vol = lambda p: p.rsplit("-", 1)[0]  # noqa: E731
     idx = {p: r for p, r in idx.items() if vol(p) in vols}
     bnd = {p: v for p, v in bnd.items() if vol(p) in vols}
